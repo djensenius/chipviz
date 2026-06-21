@@ -25,10 +25,10 @@ shared/
   tools/    Asset conversion, palettes, MIDI/audio preprocessing.
 host/
   bridge/   Desktop bridge for frame generation, playback, and hardware transport.
-  renderers/
-    modern/   Rust + wgpu renderers for Raspberry Pi 5 and Apple Silicon.
-  assets/
-    palettes/ Shared palette experiments.
+renderers/
+  modern/   Rust + wgpu renderers for Raspberry Pi 5 and Apple Silicon.
+assets/
+  palettes/ Shared palette experiments.
   scenes/   Shared scene sketches and data-driven visual definitions.
 ```
 

@@ -121,7 +121,7 @@ pub fn build_uniforms(
     let projection = perspective(52.0_f32.to_radians(), aspect, 0.1, 100.0);
 
     Uniforms {
-        view_projection: multiply4(projection, view),
+        view_projection: transpose4(multiply4(projection, view)),
         time: elapsed,
         energy,
         beat,
@@ -328,6 +328,15 @@ fn multiply4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
         }
     }
     out
+}
+
+fn transpose4(matrix: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    [
+        [matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0]],
+        [matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1]],
+        [matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2]],
+        [matrix[0][3], matrix[1][3], matrix[2][3], matrix[3][3]],
+    ]
 }
 
 fn normalize(value: [f32; 3]) -> [f32; 3] {

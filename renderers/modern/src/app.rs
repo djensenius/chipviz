@@ -1,4 +1,5 @@
 use std::net::UdpSocket;
+use std::sync::Arc;
 use std::time::Instant;
 
 use winit::dpi::LogicalSize;
@@ -60,16 +61,17 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     let udp = UdpFrameSource::bind(args.udp_endpoint.as_deref())?;
 
     let event_loop = EventLoop::new()?;
-    let window = WindowBuilder::new()
-        .with_title(profile.window_title)
-        .with_inner_size(LogicalSize::new(
-            profile.target_width,
-            profile.target_height,
-        ))
-        .build(&event_loop)?;
-    let window: &'static winit::window::Window = Box::leak(Box::new(window));
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title(profile.window_title)
+            .with_inner_size(LogicalSize::new(
+                profile.target_width,
+                profile.target_height,
+            ))
+            .build(&event_loop)?,
+    );
 
-    let mut renderer = pollster::block_on(Renderer::new(window, profile))?;
+    let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
     let mut frame_source = FrameSource::new(udp);
     let start = Instant::now();
 
@@ -115,7 +117,7 @@ impl AppArgs {
                     let Some(endpoint) = args.next() else {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            "--udp requires HOST:PORT",
+                            "--udp requires LISTEN_ADDR:PORT",
                         )
                         .into());
                     };
@@ -123,7 +125,7 @@ impl AppArgs {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [--udp HOST:PORT]\n\nWithout --udp, deterministic procedural frames drive the renderer.",
+                        "usage: {} [--udp LISTEN_ADDR:PORT]\n\nWithout --udp, deterministic procedural frames drive the renderer.",
                         std::env::args()
                             .next()
                             .unwrap_or_else(|| "chipviz".to_string())

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
@@ -7,7 +9,7 @@ use crate::scene::{Instance, QUAD_VERTICES, Vertex, build_instances, build_unifo
 
 pub struct Renderer {
     profile: RenderProfile,
-    window: &'static winit::window::Window,
+    window: Arc<winit::window::Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -67,7 +69,7 @@ impl From<wgpu::SurfaceError> for RendererError {
 
 impl Renderer {
     pub async fn new(
-        window: &'static winit::window::Window,
+        window: Arc<winit::window::Window>,
         profile: RenderProfile,
     ) -> Result<Self, RendererError> {
         let size = window.inner_size();
@@ -75,7 +77,7 @@ impl Renderer {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
-        let surface = instance.create_surface(window)?;
+        let surface = instance.create_surface(window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: profile.power_preference,
