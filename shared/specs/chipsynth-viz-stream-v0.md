@@ -29,6 +29,30 @@ All multibyte integer fields are little-endian. The packet is 81 bytes.
 | 48 | 32 | `voices` | Four 8-byte voice records. |
 | 80 | 1 | `checksum` | XOR of bytes `0..79`. |
 
+## Chip IDs
+
+| ID | Chip |
+| --- | --- |
+| `0x00` | Test tone |
+| `0x01` | SN76489 PSG |
+| `0x02` | Game Boy APU |
+| `0x03` | YM2612 |
+| `0x04` | NES 2A03 |
+| `0x05` | SID |
+
+## Voice record
+
+| Record offset | Size | Field | Meaning |
+| --- | --- | --- | --- |
+| 0 | 1 | `voice` | Synth voice index. |
+| 1 | 1 | `channel` | MIDI channel `0..15`. |
+| 2 | 1 | `chip` | Chip ID from the table above. |
+| 3 | 1 | `note` | MIDI note `0..127`. |
+| 4 | 1 | `velocity` | MIDI velocity or visual emphasis, `0..255`. |
+| 5 | 1 | `level` | Current voice level, `0..255`. |
+| 6 | 1 | `flags` | Voice flags. |
+| 7 | 1 | `reserved` | Must be `0`. |
+
 ## Flags
 
 Frame flags:

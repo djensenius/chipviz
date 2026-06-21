@@ -30,6 +30,10 @@ When an audio adapter is active, audio-derived FFT/beat fields can override
 energy and spectrum fields while chipsynth continues to contribute notes,
 channel/chip identity, scene/palette hints, transport, and performance gestures.
 
+Dominant active voice means the active/gated voice with the highest `level`.
+Ties are resolved by higher `velocity`, then lower `voice` index, so independent
+implementations choose the same scene and palette hints.
+
 ## Native rendering hints
 
 - N64: map voices to 3D emitters and chip/channel-colored planes.

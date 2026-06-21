@@ -140,8 +140,9 @@ def to_control_frame(source: ChipStationVizFrame) -> ControlFrame:
     for index in range(8)
   )
 
-  scene = active_voices[0].chip if active_voices else most_common_chip(source.channel_chips)
-  palette = active_voices[0].channel if active_voices else dominant_channel(levels)
+  dominant_voice = dominant_active_voice(active_voices)
+  scene = dominant_voice.chip if dominant_voice else most_common_chip(source.channel_chips)
+  palette = dominant_voice.channel if dominant_voice else dominant_channel(levels)
   flags = 0
   if source.flags & FLAG_BEAT:
     flags |= 1 << 0
@@ -180,6 +181,12 @@ def average(values: list[int]) -> int:
 
 def dominant_channel(levels: list[int]) -> int:
   return max(range(len(levels)), key=lambda index: levels[index])
+
+
+def dominant_active_voice(voices: list[Voice]) -> Voice | None:
+  if not voices:
+    return None
+  return max(voices, key=lambda voice: (voice.level, voice.velocity, -voice.voice))
 
 
 def most_common_chip(chips: tuple[int, ...]) -> int:
