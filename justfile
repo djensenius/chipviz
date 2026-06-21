@@ -11,6 +11,9 @@ check: scaffold-check build-sim simulate host-sample modern-check
 
 scaffold-check:
     @test -f README.md
+    @test -f shared/specs/source-adapter-v0.md
+    @test -f shared/specs/chipsynth-source-v0.md
+    @test -f shared/specs/chipsynth-viz-stream-v0.md
     @test -f shared/specs/control-frame-v0.md
     @test -f shared/specs/control-frame-v0.json
     @test -f shared/include/chipviz/control_frame.h
@@ -38,7 +41,10 @@ simulate: build-sim
 host-sample:
     @mkdir -p build
     @${PYTHON:-python3} host/bridge/chipviz_bridge.py --frames 8 --output build/control-frame-v0.cvz
+    @${PYTHON:-python3} host/bridge/chipsynth_stream.py --demo-packet build/chipsynth-viz-stream-v0.bin --output build/chipsynth-derived.cvz
     @test -s build/control-frame-v0.cvz
+    @test -s build/chipsynth-viz-stream-v0.bin
+    @test -s build/chipsynth-derived.cvz
     @echo "chipviz host bridge sample OK"
 
 modern-check:

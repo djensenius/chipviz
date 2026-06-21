@@ -52,3 +52,12 @@ python3 host/bridge/chipviz_bridge.py --frames 120 --udp 127.0.0.1:6464
 
 See [`../../docs/connections.md`](../../docs/connections.md) for target-specific
 connection plans, including ESP32 and Raspberry Pi sender paths.
+
+`chipsynth_stream.py` parses the sibling ChipStation visualization stream
+(`CSV0`) and maps it into `control-frame-v0`:
+
+```sh
+python3 host/bridge/chipsynth_stream.py \
+  --demo-packet build/chipsynth-viz-stream-v0.bin \
+  --output build/chipsynth-derived.cvz
+```

@@ -42,7 +42,9 @@ The first common interface is a compact frame that every platform can interpret 
 - scene: scene index, palette index, mode flags
 - notes: small event window for MIDI note-style triggers
 
-See [`shared/specs/control-frame-v0.md`](shared/specs/control-frame-v0.md).
+See [`shared/specs/control-frame-v0.md`](shared/specs/control-frame-v0.md),
+[`shared/specs/source-adapter-v0.md`](shared/specs/source-adapter-v0.md), and
+[`shared/specs/chipsynth-source-v0.md`](shared/specs/chipsynth-source-v0.md).
 See [`docs/connections.md`](docs/connections.md) for the planned hardware,
 ESP32 bridge, and Raspberry Pi sender/audio-analysis paths.
 
