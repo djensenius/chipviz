@@ -35,20 +35,26 @@ current 33-byte control frames.
 
 1. Run the chipviz host bridge on an ESP32, Raspberry Pi, or desktop development
    computer.
-2. The bridge reads one source adapter: procedural frames, a recorded
-   `control-frame-v0` file, MIDI/audio analysis, or a chipsynth adapter.
+2. The bridge reads one or more source adapters: procedural frames, a recorded
+   `control-frame-v0` file, audio analysis, generic MIDI, or the chipsynth
+   visualization stream.
 3. For chipsynth development, keep chipviz beside the sibling `../chipsynth`
-   checkout and add a chipsynth adapter that reads whichever host-visible stream
-   is most stable first: MIDI events, ESP32 `AppState`, Daisy voice telemetry, or
-   ChipStation SysEx.
-4. If a separate ESP32 is doing target-specific transport, send packed frames to
+   checkout. chipsynth should publish a continuous, latest-state visualization
+   stream that chipviz can connect to. That stream mirrors MIDI/control data sent
+   to Daisy and adds Daisy telemetry when available: active voices, channel/chip
+   assignment, note, velocity, level, parameter changes, transport, BPM, and
+   performance gestures.
+4. Keep audio routing separate from this stream. The chipviz Raspberry Pi can
+   capture audio from line-in, Bluetooth, PipeWire/PulseAudio, or another source
+   and combine that FFT/beat analysis with chipsynth's musical/control telemetry.
+5. If a separate ESP32 is doing target-specific transport, send packed frames to
    it over USB serial. Use a simple framed stream: wait for magic byte `0xC7`,
    read 33 bytes, validate version and XOR checksum, then replace the current
    frame.
-5. If the Raspberry Pi or ESP32 is directly connected to the target transport,
+6. If the Raspberry Pi or ESP32 is directly connected to the target transport,
    it can skip the second bridge and emit N64 controller-port, Bluetooth HID,
    network, or serial output itself.
-6. Add Wi-Fi UDP after USB serial works. UDP is a good fit for live visuals
+7. Add Wi-Fi UDP after USB serial works. UDP is a good fit for live visuals
    because fresh frames matter more than retransmitting stale frames.
 
 The ESP32 should also have a procedural fallback mode so each target can run

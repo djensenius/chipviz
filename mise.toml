@@ -4,9 +4,9 @@ cmake = "4.3.4"
 gcc-arm-none-eabi = "15.2.Rel1"
 jq = "1.8.2"
 just = "1.53.0"
-make = "4.4.1"
 ninja = "1.13.2"
 python = "3.14.6"
+rust = "1.96.0"
 
 # Platform SDKs that are not stable first-class mise registry entries yet:
 # - N64 / Analogue 3D: libdragon + tiny3d
@@ -16,4 +16,4 @@ python = "3.14.6"
 
 [tasks.check]
 description = "Validate scaffold files"
-run = "make check"
+run = "just check"
