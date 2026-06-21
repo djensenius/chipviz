@@ -1,6 +1,8 @@
 # chipviz host bridge
 
-Desktop-side bridge for turning live or offline music data into chipviz control frames.
+Bridge software for turning live or offline music data into chipviz control frames.
+The live sender/audio-processing device should be an ESP32 or Raspberry Pi, with
+a desktop computer used as the development host.
 
 ## Planned responsibilities
 
@@ -8,6 +10,14 @@ Desktop-side bridge for turning live or offline music data into chipviz control 
 - Quantize it into `control-frame-v0`.
 - Send frames to platform-specific transports.
 - Record and replay sessions for deterministic demos.
+
+## Sender hardware
+
+| Device | Best role |
+| --- | --- |
+| ESP32 | Low-latency transport, USB serial input, Wi-Fi UDP, Bluetooth HID, N64 controller-port GPIO, simple MIDI/control reduction. |
+| Raspberry Pi | Audio analysis, multiple USB MIDI/audio devices, filesystem-backed recordings, richer chipsynth integration, LAN output to C64 Ultimate or ESP32. |
+| Desktop computer | Development, debugging, baked frame generation, and parity with the Pi bridge before deployment. |
 
 ## Candidate transports
 
@@ -29,4 +39,4 @@ python3 host/bridge/chipviz_bridge.py --frames 120 --udp 127.0.0.1:6464
 ```
 
 See [`../../docs/connections.md`](../../docs/connections.md) for target-specific
-connection plans, including the ESP32 bridge path.
+connection plans, including ESP32 and Raspberry Pi sender paths.

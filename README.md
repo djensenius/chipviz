@@ -40,8 +40,8 @@ The first common interface is a compact frame that every platform can interpret 
 - notes: small event window for MIDI note-style triggers
 
 See [`shared/specs/control-frame-v0.md`](shared/specs/control-frame-v0.md).
-See [`docs/connections.md`](docs/connections.md) for the planned hardware and
-ESP32 bridge paths.
+See [`docs/connections.md`](docs/connections.md) for the planned hardware,
+ESP32 bridge, and Raspberry Pi sender/audio-analysis paths.
 
 ## First milestone
 

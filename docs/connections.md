@@ -8,7 +8,8 @@ music source
   chipsynth, MIDI, audio analysis, recorded frames, or procedural source
       |
       v
-computer host bridge
+sender / analysis device
+  ESP32, Raspberry Pi, or desktop development host
   reduces source data into control-frame-v0
       |
       +--> raw playback files for ROM builds
@@ -16,35 +17,49 @@ computer host bridge
       +--> direct network transport where hardware supports it
 ```
 
-The ESP32 is the first hardware bridge target. It should accept
-`control-frame-v0` packets from a computer, keep the most recent valid frame in
-memory, and expose that frame through the platform-specific transport.
+The sender/audio-processing device should be an ESP32 or Raspberry Pi for live
+setups. A desktop computer is still useful while developing adapters and baked
+playback files, but the hardware goal is a small box that can sit with the retro
+hardware.
 
-## ESP32 to computer or chipsynth
+Use an ESP32 when the job is mostly transport, GPIO timing, Bluetooth HID, or
+simple MIDI/control reduction. Use a Raspberry Pi when the job needs richer
+audio analysis, multiple USB MIDI/audio devices, filesystem-backed recordings,
+or heavier chipsynth integration. Either device should emit the same
+`control-frame-v0` packets so the platform transports stay interchangeable.
+
+## Sender devices and chipsynth
 
 Use USB serial first because it is easiest to debug and reliable enough for the
 current 33-byte control frames.
 
-1. Run the chipviz host bridge on the computer.
-2. The host bridge reads one source adapter: procedural frames, a recorded
+1. Run the chipviz host bridge on an ESP32, Raspberry Pi, or desktop development
+   computer.
+2. The bridge reads one source adapter: procedural frames, a recorded
    `control-frame-v0` file, MIDI/audio analysis, or a chipsynth adapter.
 3. For chipsynth development, keep chipviz beside the sibling `../chipsynth`
    checkout and add a chipsynth adapter that reads whichever host-visible stream
    is most stable first: MIDI events, ESP32 `AppState`, Daisy voice telemetry, or
    ChipStation SysEx.
-4. Send packed frames to the ESP32 over USB serial. Use a simple framed stream:
-   wait for magic byte `0xC7`, read 33 bytes, validate version and XOR checksum,
-   then replace the current frame.
-5. Add Wi-Fi UDP after USB serial works. UDP is a good fit for live visuals
+4. If a separate ESP32 is doing target-specific transport, send packed frames to
+   it over USB serial. Use a simple framed stream: wait for magic byte `0xC7`,
+   read 33 bytes, validate version and XOR checksum, then replace the current
+   frame.
+5. If the Raspberry Pi or ESP32 is directly connected to the target transport,
+   it can skip the second bridge and emit N64 controller-port, Bluetooth HID,
+   network, or serial output itself.
+6. Add Wi-Fi UDP after USB serial works. UDP is a good fit for live visuals
    because fresh frames matter more than retransmitting stale frames.
 
 The ESP32 should also have a procedural fallback mode so each target can run
-without the computer connected.
+without the upstream sender connected.
 
 ## N64 / Analogue 3D: wired controller-port bridge
 
-Preferred live path: the ESP32 emulates wired N64 controllers and plugs into the
-N64 or Analogue 3D controller ports.
+Preferred live path: an ESP32 emulates wired N64 controllers and plugs into the
+N64 or Analogue 3D controller ports. A Raspberry Pi can perform upstream audio
+analysis or chipsynth adaptation, then send frames to the ESP32 over USB serial
+or Wi-Fi UDP.
 
 1. Build and run the N64 ROM from a flashcart or Analogue 3D workflow.
 2. Wire ESP32 GPIOs to one or more N64 controller data lines, with common ground.
@@ -68,6 +83,8 @@ palette-lit geometry.
 
 Preferred low-bandwidth live path: the Analogue Pocket Dock receives a Bluetooth
 controller, and the GBA core treats that controller input as a control surface.
+An ESP32 can present as the Bluetooth HID device; a Raspberry Pi can do upstream
+audio analysis and forward compact frame/control state to the ESP32.
 
 1. Pair a Bluetooth controller with the Analogue Pocket Dock.
 2. Run the `.gba` build through the Pocket's GBA path.
@@ -84,9 +101,12 @@ needed later, add a separate ESP32-to-GBA link-cable transport.
 ## Commodore 64 Ultimate: network bridge
 
 Preferred live path candidate: use the Commodore 64 Ultimate network stack or
-network services from the same LAN as the computer or ESP32.
+network services from the same LAN as the sender. A Raspberry Pi is a good fit
+for audio analysis plus LAN output; an ESP32 is a good fit for compact UDP or
+serial forwarding.
 
-1. Put the Ultimate and the computer/ESP32 on the same network.
+1. Put the Ultimate and the Raspberry Pi, ESP32, or development computer on the
+   same network.
 2. Confirm which Ultimate-side network service is practical for a running C64
    program to consume.
 3. Start with UDP-style latest-frame delivery if available: the host bridge or
