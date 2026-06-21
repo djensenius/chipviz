@@ -22,4 +22,5 @@ target/
 # Tooling caches
 .cache/
 .venv/
+__pycache__/
 node_modules/
