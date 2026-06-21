@@ -14,5 +14,19 @@ Desktop-side bridge for turning live or offline music data into chipviz control 
 | Target | Transport idea |
 | --- | --- |
 | N64 | ESP32 emulating N64 controllers, SummerCart64 USB I/O, or precomputed ROM data. |
-| GBA / Analogue Pocket + Dock | Precomputed ROM data first; Dock controller input and link cable bridge later. |
-| Commodore 64 Ultimate | Precomputed tables first; Ethernet/Wi-Fi/network services or user-port serial bridge later. |
+| GBA / Analogue Pocket + Dock | Bluetooth controller input through the Dock first; baked ROM data and link cable bridge later. |
+| Commodore 64 Ultimate | Network service on the LAN first if practical; user-port serial or precomputed tables as fallback. |
+
+## Current scaffold
+
+`chipviz_bridge.py` emits deterministic procedural `control-frame-v0` packets as
+raw 33-byte records. Use file output for baked playback data, or UDP output for
+early live transport experiments:
+
+```sh
+python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz
+python3 host/bridge/chipviz_bridge.py --frames 120 --udp 127.0.0.1:6464
+```
+
+See [`../../docs/connections.md`](../../docs/connections.md) for target-specific
+connection plans, including the ESP32 bridge path.

@@ -18,10 +18,12 @@ cores/
   gba/      GBA homebrew target, likely Butano or Tonc.
   c64/      C64 target, likely cc65 or KickAssembler.
 shared/
+  include/  Tiny C interface for control frames and platform connection polling.
   specs/    Cross-platform control protocol and scene model.
+  src/      Portable frame packing, validation, and procedural fallback source.
   tools/    Asset conversion, palettes, MIDI/audio preprocessing.
 host/
-  bridge/   Desktop bridge for MIDI/audio analysis and hardware transport.
+  bridge/   Desktop bridge for frame generation, playback, and hardware transport.
 assets/
   palettes/ Shared palette experiments.
   scenes/   Shared scene sketches and data-driven visual definitions.
@@ -38,15 +40,29 @@ The first common interface is a compact frame that every platform can interpret 
 - notes: small event window for MIDI note-style triggers
 
 See [`shared/specs/control-frame-v0.md`](shared/specs/control-frame-v0.md).
-
-## Plan
-
-chipviz can run from chipsynth data, generic MIDI/clock input, audio-analysis listeners, recorded sessions, or self-running procedural sources. See [`PLAN.md`](PLAN.md).
+See [`docs/connections.md`](docs/connections.md) for the planned hardware and
+ESP32 bridge paths.
 
 ## First milestone
 
 Build one self-running demo per platform before live input:
 
-1. `chipviz-n64`: rotating geometry, palette cycling, controller-driven scene changes.
+1. `chipviz-n64`: 3D planes, camera motion, palette cycling, particles, and controller-driven scene changes.
 2. `chipviz-gba`: sprite/tile/affine visualizer with beat simulation.
 3. `chipviz-c64`: raster bars, PETSCII patterning, SID/noise-reactive fake input loop.
+
+## Current scaffold
+
+The first checked-in code path is intentionally portable C and Python so it can
+validate without platform SDKs installed:
+
+```sh
+mise run check
+make simulate
+python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz
+```
+
+Each platform entrypoint consumes the shared `control-frame-v0` shape through a
+small connection abstraction. Until a live receiver is supplied, the connection
+generates deterministic procedural frames so every target has an immediate
+visualization loop.
