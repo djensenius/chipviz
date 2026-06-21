@@ -9,6 +9,7 @@ Original visualization software for real retro hardware and FPGA consoles.
 | N64 / Analogue 3D | `.z64` | Flashcart on Analogue 3D or N64 | Flagship big-screen 3D/particle visualizer. |
 | GBA / Analogue Pocket | `.gba` | GBA cartridge, flashcart, or Pocket adapter path | Portable 2D sketchpad with palettes, sprites, and affine effects. |
 | Commodore 64 / THEC64 | `.prg` / `.d64` | THEC64 USB media or real C64 storage | VIC-II/SID/raster/PETSCII visual personality. |
+| Modern 4K | native app | Raspberry Pi 5 HDMI or Apple Silicon Mac | Dense 3D data-field visualizer rendered with Rust + wgpu. |
 
 ## Project layout
 
@@ -24,6 +25,8 @@ shared/
   tools/    Asset conversion, palettes, MIDI/audio preprocessing.
 host/
   bridge/   Desktop bridge for frame generation, playback, and hardware transport.
+renderers/
+  modern/   Rust + wgpu renderers for Raspberry Pi 5 and Apple Silicon.
 assets/
   palettes/ Shared palette experiments.
   scenes/   Shared scene sketches and data-driven visual definitions.
@@ -50,6 +53,7 @@ Build one self-running demo per platform before live input:
 1. `chipviz-n64`: 3D planes, camera motion, palette cycling, particles, and controller-driven scene changes.
 2. `chipviz-gba`: sprite/tile/affine visualizer with beat simulation.
 3. `chipviz-c64`: raster bars, PETSCII patterning, SID/noise-reactive fake input loop.
+4. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets.
 
 ## Current scaffold
 
@@ -58,7 +62,8 @@ validate without platform SDKs installed:
 
 ```sh
 mise run check
-make simulate
+just simulate
+just modern-m1 -- --udp 127.0.0.1:6464
 python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz
 ```
 

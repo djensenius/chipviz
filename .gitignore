@@ -3,6 +3,7 @@
 # Build output
 build/
 dist/
+target/
 *.elf
 *.map
 *.o
@@ -22,4 +23,3 @@ dist/
 .cache/
 .venv/
 node_modules/
-

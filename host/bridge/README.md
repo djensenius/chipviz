@@ -7,6 +7,7 @@ a desktop computer used as the development host.
 ## Planned responsibilities
 
 - Read MIDI, clock, or audio-analysis data.
+- Connect to the optional chipsynth visualization stream.
 - Quantize it into `control-frame-v0`.
 - Send frames to platform-specific transports.
 - Record and replay sessions for deterministic demos.
@@ -16,16 +17,27 @@ a desktop computer used as the development host.
 | Device | Best role |
 | --- | --- |
 | ESP32 | Low-latency transport, USB serial input, Wi-Fi UDP, Bluetooth HID, N64 controller-port GPIO, simple MIDI/control reduction. |
-| Raspberry Pi | Audio analysis, multiple USB MIDI/audio devices, filesystem-backed recordings, richer chipsynth integration, LAN output to C64 Ultimate or ESP32. |
+| Raspberry Pi | Audio analysis, multiple USB MIDI/audio devices, filesystem-backed recordings, chipsynth stream client, USB HID output, LAN output, and Pi-to-Pico N64 bridge. |
 | Desktop computer | Development, debugging, baked frame generation, and parity with the Pi bridge before deployment. |
 
 ## Candidate transports
 
 | Target | Transport idea |
 | --- | --- |
-| N64 | ESP32 emulating N64 controllers, SummerCart64 USB I/O, or precomputed ROM data. |
-| GBA / Analogue Pocket + Dock | Bluetooth controller input through the Dock first; baked ROM data and link cable bridge later. |
-| Commodore 64 Ultimate | Network service on the LAN first if practical; user-port serial or precomputed tables as fallback. |
+| N64 | Raspberry Pi to Pi Pico over USB serial; Pico emulates four N64 controllers with PIO Joybus. |
+| GBA / Analogue Pocket + Dock | Raspberry Pi as USB HID controller through the Dock first; baked ROM data and link cable bridge later. |
+| Commodore 64 Ultimate | Raspberry Pi as USB HID keyboard/joystick first; network, user-port, or precomputed tables as fallback. |
+
+## chipsynth stream
+
+chipsynth should publish a continuous visualization stream that chipviz connects
+to as a client. The stream mirrors the MIDI/control data sent to Daisy and adds
+Daisy telemetry when available, including active voices, channel/chip assignment,
+note, velocity, level, parameter changes, transport/BPM, and performance
+gestures.
+
+Audio routing stays independent. The bridge can combine chipsynth telemetry with
+local audio analysis from the Pi, desktop, or another source.
 
 ## Current scaffold
 

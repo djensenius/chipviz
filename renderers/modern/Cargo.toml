@@ -1,0 +1,19 @@
+[package]
+name = "chipviz-modern"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1.24", features = ["derive"] }
+pollster = "0.4"
+wgpu = "0.20"
+winit = "0.29"
+
+[[bin]]
+name = "chipviz-pi5"
+path = "src/bin/chipviz-pi5.rs"
+
+[[bin]]
+name = "chipviz-m1"
+path = "src/bin/chipviz-m1.rs"
