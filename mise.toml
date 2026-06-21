@@ -1,0 +1,19 @@
+# Latest stable versions checked with `mise ls-remote` on 2026-06-21.
+[tools]
+cmake = "4.3.4"
+gcc-arm-none-eabi = "15.2.Rel1"
+jq = "1.8.2"
+just = "1.53.0"
+make = "4.4.1"
+ninja = "1.13.2"
+python = "3.14.6"
+
+# Platform SDKs that are not stable first-class mise registry entries yet:
+# - N64 / Analogue 3D: libdragon + tiny3d
+# - GBA / Analogue Pocket: devkitPro/devkitARM plus Butano or Tonc
+# - C64 / Ultimate: cc65; KickAssembler later if raster timing needs Java
+# Keep exact SDK install steps in the target docs once each target is selected.
+
+[tasks.check]
+description = "Validate scaffold files"
+run = "make check"

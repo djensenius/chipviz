@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chipviz.local/specs/control-frame-v0.json",
+  "title": "chipviz control frame v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "frame",
+    "bpm",
+    "beatPhase",
+    "beatCount",
+    "energy",
+    "bass",
+    "mid",
+    "treble",
+    "spectrum",
+    "scene",
+    "palette",
+    "flags",
+    "notes"
+  ],
+  "properties": {
+    "version": {
+      "const": 0
+    },
+    "frame": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "bpm": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "beatPhase": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "beatCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "energy": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "bass": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "mid": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "treble": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "spectrum": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 255
+      }
+    },
+    "scene": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "palette": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "flags": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "notes": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["note", "velocity"],
+        "properties": {
+          "note": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 127
+          },
+          "velocity": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          }
+        }
+      }
+    }
+  }
+}
+

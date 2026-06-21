@@ -1,0 +1,25 @@
+.DS_Store
+
+# Build output
+build/
+dist/
+*.elf
+*.map
+*.o
+*.d
+
+# Platform binaries
+*.z64
+*.n64
+*.v64
+*.gba
+*.gb
+*.gbc
+*.prg
+*.d64
+
+# Tooling caches
+.cache/
+.venv/
+node_modules/
+
