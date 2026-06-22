@@ -12,7 +12,7 @@ include $(DEVKITARM)/base_rules
 ARCH     := -mthumb -mthumb-interwork
 CFLAGS   := -g -Wall -O2 -mcpu=arm7tdmi -mtune=arm7tdmi $(ARCH) $(addprefix -I,$(INCLUDES))
 LDFLAGS  := -g $(ARCH) -specs=gba.specs -Wl,-Map,$(BUILD)/$(TARGET).map
-LIBS     := -lgba
+LIBS     :=
 
 CFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 OFILES := $(CFILES:.c=.o)

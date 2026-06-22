@@ -22,10 +22,14 @@ jobs:
   n64:
     name: N64 ROM
     runs-on: ubuntu-latest
-    container: anacierdem/libdragon:latest
     steps:
       - uses: actions/checkout@v7
       - name: Build N64 ROM
-        run: make -C cores/n64/homebrew
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace/cores/n64/homebrew \
+            anacierdem/libdragon:latest \
+            make
       - name: Verify N64 ROM
         run: test -s cores/n64/homebrew/chipviz-n64.z64
