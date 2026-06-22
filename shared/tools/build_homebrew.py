@@ -14,6 +14,7 @@ TOKEN_GOTO = 0x89
 TOKEN_PRINT = 0x99
 TOKEN_POKE = 0x97
 TOKEN_TO = 0xA4
+TOKEN_REM = 0x8F
 
 
 def ascii_bytes(text: str) -> bytes:
@@ -28,7 +29,8 @@ def build_c64_prg() -> bytes:
   lines = [
     basic_line(10, bytes([TOKEN_PRINT]) + b' "' + bytes([147, 5]) + ascii_bytes("CHIPVIZ C64 HOMEBREW") + b'"'),
     basic_line(20, bytes([TOKEN_PRINT]) + b' "' + ascii_bytes("RASTER PETSCII DEMO SEED") + b'"'),
-    basic_line(30, bytes([TOKEN_PRINT]) + b' "' + ascii_bytes("LOAD BAKED .CVZ TABLES NEXT") + b'"'),
+    basic_line(30, bytes([TOKEN_PRINT]) + b' "' + ascii_bytes("COLOR BARS + VIC BORDER PULSE") + b'"'),
+    basic_line(35, bytes([TOKEN_REM]) + b" " + ascii_bytes("CHIPVIZ HOME BREW STYLE")),
     basic_line(
       40,
       bytes([TOKEN_FOR])
@@ -39,6 +41,16 @@ def build_c64_prg() -> bytes:
       + b" 53280,I:"
       + bytes([TOKEN_POKE])
       + b" 53281,15-I:"
+      + bytes([TOKEN_NEXT]),
+    ),
+    basic_line(
+      45,
+      bytes([TOKEN_FOR])
+      + b" P=1024 "
+      + bytes([TOKEN_TO])
+      + b" 1063:"
+      + bytes([TOKEN_POKE])
+      + b" P,81:"
       + bytes([TOKEN_NEXT]),
     ),
     basic_line(50, bytes([TOKEN_GOTO]) + b" 40"),
@@ -74,6 +86,19 @@ def build_snes_sfc() -> bytes:
       0x8D, 0x22, 0x21,  # sta $2122
       0xA9, 0x0F,  # lda #$0f
       0x8D, 0x00, 0x21,  # sta $2100 (full brightness)
+      0xA9, 0x00,  # lda #$00 (VRAM increments after $2118 low-byte writes)
+      0x8D, 0x15, 0x21,  # sta $2115 (VRAM increment)
+      0xA9, 0x00,  # lda #$00
+      0x8D, 0x16, 0x21,  # sta $2116
+      0x8D, 0x17, 0x21,  # sta $2117
+      0xA9, 0x43,  # lda #'C'
+      0x8D, 0x18, 0x21,  # sta $2118
+      0xA9, 0x48,  # lda #'H'
+      0x8D, 0x18, 0x21,  # sta $2118
+      0xA9, 0x49,  # lda #'I'
+      0x8D, 0x18, 0x21,  # sta $2118
+      0xA9, 0x50,  # lda #'P'
+      0x8D, 0x18, 0x21,  # sta $2118
       0x80, 0xFE,  # bra *
     ]
   )

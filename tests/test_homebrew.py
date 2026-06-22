@@ -19,6 +19,7 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertIn(bytes([build_homebrew.TOKEN_PRINT]), prg)
     self.assertIn(bytes([build_homebrew.TOKEN_FOR]), prg)
     self.assertIn(bytes([build_homebrew.TOKEN_POKE]), prg)
+    self.assertIn(bytes([build_homebrew.TOKEN_REM]), prg)
     self.assertIn(b"CHIPVIZ C64 HOMEBREW", prg)
     self.assertTrue(prg.endswith(b"\x00\x00"))
 
@@ -30,7 +31,9 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertEqual(rom[0x7FD5], 0x20)
     self.assertEqual(rom[0x7FD7], 0x05)
     self.assertEqual(int.from_bytes(rom[0x7FFC:0x7FFE], "little"), 0x8000)
+    self.assertIn(bytes([0xA9, 0x00, 0x8D, 0x15, 0x21]), rom[:96])
     self.assertIn(bytes([0x8D, 0x22, 0x21]), rom[:64])
+    self.assertIn(bytes([0x8D, 0x18, 0x21]), rom[:96])
 
   def test_build_writes_artifacts_and_status(self) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
