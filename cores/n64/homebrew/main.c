@@ -3,7 +3,6 @@
 int main(void) {
   console_init();
   debug_init_isviewer();
-  joypad_init();
 
   console_set_render_mode(RENDER_MANUAL);
   console_clear();
@@ -12,8 +11,7 @@ int main(void) {
   printf("Baked frames drive the same scene model.\n");
   printf("Pi -> Pico -> Joybus comes next.\n");
   console_render();
-
   while (1) {
-    joypad_poll();
+  while (1) {
   }
 }
