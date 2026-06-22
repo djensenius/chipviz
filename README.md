@@ -66,6 +66,8 @@ validate without platform SDKs installed:
 
 ```sh
 mise run check
+just lint
+just test
 just simulate
 just modern-m1 -- --udp 127.0.0.1:6464
 python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz

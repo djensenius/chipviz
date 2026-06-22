@@ -168,7 +168,7 @@ def _parse_notes(raw_notes: object, frame_count: int) -> list[_SourceNote]:
 
 def encode_path(kind: str, path: Path) -> bytes:
   if kind == "music":
-    return encode_music_source(json.loads(path.read_text()))
+    return encode_music_source(json.loads(path.read_text(encoding="utf-8")))
   if kind == "chipsynth":
     return encode_event_log(path.read_bytes())
   raise ValueError(f"unknown fixture kind: {kind}")

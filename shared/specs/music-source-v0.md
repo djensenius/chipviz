@@ -37,7 +37,7 @@ Each entry in `notes`:
 
 ## Deterministic mapping
 
-For each output frame index `i` in `0..frame_count` (all divisions below are
+For each output frame index `i` in `0..frame_count-1` (all divisions below are
 integer/floor division, matching the encoder's `//` operator):
 
 ### Transport

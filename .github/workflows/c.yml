@@ -1,0 +1,17 @@
+name: C
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  c:
+    name: C lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4.2.0
+      - run: mise exec -- just c-lint
+      - run: mise exec -- just c-test
+      - run: mise exec -- just simulate

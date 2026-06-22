@@ -15,5 +15,13 @@ rust = "1.96.0"
 # Keep exact SDK install steps in the target docs once each target is selected.
 
 [tasks.check]
-description = "Validate scaffold files"
+description = "Run all linting and tests"
 run = "just check"
+
+[tasks.lint]
+description = "Run all linters"
+run = "just lint"
+
+[tasks.test]
+description = "Run all tests"
+run = "just test"

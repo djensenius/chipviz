@@ -203,6 +203,9 @@ def pack_demo_packet(
   flags: int,
   voices: list[Voice],
 ) -> bytes:
+  if len(voices) > VOICE_COUNT:
+    raise ValueError(f"at most {VOICE_COUNT} voices fit in one chipsynth packet")
+
   packet = bytearray(PACKET_SIZE)
   packet[:4] = MAGIC
   packet[4] = VERSION
