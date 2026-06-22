@@ -1,0 +1,29 @@
+name: Release Assets
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4.2.0
+      - name: Install Linux renderer dependencies
+        run: sudo apt-get update && sudo apt-get install -y libegl1-mesa-dev libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+      - name: Install Rust lint components
+        run: mise exec -- rustup component add rustfmt clippy
+      - name: Build release assets
+        run: scripts/package-release.sh
+      - name: Upload individual assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/assets/* --clobber
+      - name: Upload combined zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/chipviz-assets.zip --clobber

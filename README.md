@@ -9,6 +9,7 @@ Original visualization software for real retro hardware and FPGA consoles.
 | N64 / Analogue 3D | `.z64` | Flashcart on Analogue 3D or N64 | Flagship big-screen 3D/particle visualizer. |
 | GBA / Analogue Pocket | `.gba` | GBA cartridge, flashcart, or Pocket adapter path | Portable 2D sketchpad with palettes, sprites, and affine effects. |
 | Commodore 64 / THEC64 | `.prg` / `.d64` | THEC64 USB media or real C64 storage | VIC-II/SID/raster/PETSCII visual personality. |
+| SNES / Analogue Pocket Dock | `.sfc` / `.smc` | Pocket Dock SNES core first, real SNES later | Tile/sprite/Mode-7-style visualizer. |
 | Modern 4K | native app | Raspberry Pi 5 HDMI or Apple Silicon Mac | Dense 3D data-field visualizer rendered with Rust + wgpu. |
 
 ## Project layout
@@ -18,6 +19,7 @@ cores/
   n64/      N64 homebrew target, likely libdragon + tiny3d.
   gba/      GBA homebrew target, likely Butano or Tonc.
   c64/      C64 target, likely cc65 or KickAssembler.
+  snes/     SNES target, likely libSFX.
 shared/
   include/  Tiny C interface for control frames and platform connection polling.
   specs/    Cross-platform control protocol and scene model.
@@ -57,7 +59,16 @@ Build one self-running demo per platform before live input:
 1. `chipviz-n64`: 3D planes, camera motion, palette cycling, particles, and controller-driven scene changes.
 2. `chipviz-gba`: sprite/tile/affine visualizer with beat simulation.
 3. `chipviz-c64`: raster bars, PETSCII patterning, SID/noise-reactive fake input loop.
-4. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets.
+4. `chipviz-snes`: tile/sprite/Mode-7-style visualizer with Pocket Dock control input.
+5. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets.
+
+## Releases
+
+Merges to `main` run release-please. Published releases build individual assets
+for the current scaffold (modern renderer binaries, `.cvz` demos, N64 Joybus and
+USB HID mapped streams, and generated C arrays) and upload a combined
+`chipviz-assets.zip`. Real ROM binaries are added to the same release package as
+each platform SDK build lands.
 
 ## Current scaffold
 
