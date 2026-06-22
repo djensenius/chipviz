@@ -26,7 +26,7 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
   state->bands[5] = packet[11];
   state->bands[6] = (packet[14] + packet[15]) & 255;
   state->bands[7] = (packet[14] * 2 + packet[15]) & 255;
-  global_beat = ((packet[0] >> 7) & 0x01) | (packet[12] & 0x01);
+  global_beat = packet[12] & 0x01;
   band_beats = (packet[0] & 0x03) | (packet[4] & 0x03) | (packet[8] & 0x03);
   state->beat = global_beat ? 3 : band_beats;
   state->scene = ((packet[12] >> 4) & 0x03) | (((packet[13] >> 4) & 0x03) << 2);
@@ -42,9 +42,6 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
 
 static int read_joybus_packet(unsigned char packet[16]) {
   struct controller_data output;
-  const int all_ports =
-      CONTROLLER_1_INSERTED | CONTROLLER_2_INSERTED |
-      CONTROLLER_3_INSERTED | CONTROLLER_4_INSERTED;
   int p;
 
   controller_scan();
@@ -56,7 +53,10 @@ static int read_joybus_packet(unsigned char packet[16]) {
     packet[p * 4 + 2] = (unsigned char)((data >> 8) & 0xFF);
     packet[p * 4 + 3] = (unsigned char)(data & 0xFF);
   }
-  return (get_controllers_present() & all_ports) == all_ports;
+  /* Use live data whenever at least one port reports a controller so partial
+     transport bring-up still drives visuals; fall back to the procedural demo
+     only when nothing is connected. */
+  return get_controllers_present() != 0;
 }
 
 static void procedural_packet(int frame, unsigned char packet[16]) {

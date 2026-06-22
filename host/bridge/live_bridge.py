@@ -258,7 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--chipsynth-log", type=Path, help="chipsynth CSV0 event log")
   parser.add_argument("--frames", type=int, default=120, help="procedural frames if no input is supplied")
   parser.add_argument("--rate", type=int, default=60, help="output frame rate")
-  parser.add_argument("--audio-seconds", type=float, help="capture live audio for this many seconds")
+  parser.add_argument("--audio-seconds", type=float, help="record this many seconds of audio, then emit frames (offline record-then-replay, not live)")
   parser.add_argument("--audio-rate", type=int, default=DEFAULT_AUDIO_RATE, help="audio capture sample rate")
   parser.add_argument("--audio-device", help="sounddevice input device name or index")
   parser.add_argument("--midi-port", help="mido input port name; omit only when listing ports outside this tool")
