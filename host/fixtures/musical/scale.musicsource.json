@@ -1,0 +1,19 @@
+{
+  "version": 0,
+  "name": "ascending-scale",
+  "bpm": 120,
+  "frame_rate": 60,
+  "frame_count": 96,
+  "scene": 0,
+  "palette": 1,
+  "notes": [
+    { "start": 0, "duration": 12, "note": 60, "velocity": 110 },
+    { "start": 12, "duration": 12, "note": 62, "velocity": 112 },
+    { "start": 24, "duration": 12, "note": 64, "velocity": 114 },
+    { "start": 36, "duration": 12, "note": 65, "velocity": 116 },
+    { "start": 48, "duration": 12, "note": 67, "velocity": 118 },
+    { "start": 60, "duration": 12, "note": 69, "velocity": 120 },
+    { "start": 72, "duration": 12, "note": 71, "velocity": 122 },
+    { "start": 84, "duration": 12, "note": 72, "velocity": 127 }
+  ]
+}

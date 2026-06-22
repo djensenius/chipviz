@@ -29,6 +29,9 @@ KNOWN_VOICE_FLAGS = VOICE_ACTIVE | VOICE_GATE
 
 CHIP_IDS = range(0x00, 0x06)
 
+# Demo packets advertise a fixed 128.50 BPM (bpm_x100, little-endian u16).
+DEMO_BPM_X100 = 12850
+
 
 @dataclass(frozen=True)
 class Voice:
@@ -193,13 +196,55 @@ def most_common_chip(chips: tuple[int, ...]) -> int:
   return max(CHIP_IDS, key=lambda chip: chips.count(chip))
 
 
+def pack_demo_packet(
+  sequence: int,
+  beat_phase: int,
+  beat_count: int,
+  flags: int,
+  voices: list[Voice],
+) -> bytes:
+  if len(voices) > VOICE_COUNT:
+    raise ValueError(f"at most {VOICE_COUNT} voices fit in one chipsynth packet")
+
+  packet = bytearray(PACKET_SIZE)
+  packet[:4] = MAGIC
+  packet[4] = VERSION
+  packet[5] = flags
+  packet[6:8] = (sequence & 0xFFFF).to_bytes(2, "little")
+  packet[8:10] = DEMO_BPM_X100.to_bytes(2, "little")
+  packet[10] = beat_phase & 0xFF
+  packet[11:13] = (beat_count & 0xFFFF).to_bytes(2, "little")
+  packet[13] = sum(1 for voice in voices if voice.flags & VOICE_ACTIVE)
+  packet[14] = sum(1 for voice in voices if voice.flags & VOICE_GATE)
+
+  for index in range(CHANNEL_COUNT):
+    packet[16 + index] = clamp_byte(16 + index * 8 + (sequence * 3) % 24)
+    packet[32 + index] = 1 if index % 2 == 0 else 2
+
+  for index, voice in enumerate(voices):
+    offset = 48 + index * VOICE_SIZE
+    packet[offset:offset + VOICE_SIZE] = bytes((
+      voice.voice,
+      voice.channel,
+      voice.chip,
+      voice.note,
+      voice.velocity,
+      voice.level,
+      voice.flags,
+      0,
+    ))
+
+  packet[-1] = checksum(packet[:-1])
+  return bytes(packet)
+
+
 def make_demo_packet() -> bytes:
   packet = bytearray(PACKET_SIZE)
   packet[:4] = MAGIC
   packet[4] = VERSION
   packet[5] = FLAG_PLAYING | FLAG_BEAT
   packet[6:8] = (42).to_bytes(2, "little")
-  packet[8:10] = (12850).to_bytes(2, "little")
+  packet[8:10] = DEMO_BPM_X100.to_bytes(2, "little")
   packet[10] = 96
   packet[11:13] = (7).to_bytes(2, "little")
   packet[13] = 2
@@ -232,26 +277,97 @@ def make_demo_packet() -> bytes:
   return bytes(packet)
 
 
+def make_demo_log(count: int) -> bytes:
+  """Build a deterministic chipsynth event log of ``count`` packets."""
+  scale = (60, 62, 64, 67, 72, 76, 79, 84)
+  packets = []
+  for index in range(count):
+    beat_phase = (index * 32) & 0xFF
+    beat_count = index // 8
+    flags = FLAG_PLAYING
+    if beat_phase < 32:
+      flags |= FLAG_BEAT
+      if beat_count % 4 == 0:
+        flags |= FLAG_BAR
+    if beat_count % 4 == 3:
+      flags |= FLAG_FILL
+
+    lead = scale[index % len(scale)]
+    bass = 36 + (beat_count % 4) * 2
+    voices = [
+      Voice(0, 0, 0x05, bass, 112, clamp_byte(140 - beat_phase // 2),
+            VOICE_ACTIVE | VOICE_GATE),
+      Voice(1, 2, 0x03, lead, clamp_byte(80 + (index * 7) % 48),
+            clamp_byte(96 + (index * 5) % 80), VOICE_ACTIVE | VOICE_GATE),
+      Voice(2, 5, 0x04, lead + 7, 64, clamp_byte(48 + (index * 11) % 64),
+            VOICE_ACTIVE if index % 2 == 0 else 0),
+      Voice(3, 9, 0x02, 0, 0, 0, 0),
+    ]
+    packets.append(pack_demo_packet(index, beat_phase, beat_count, flags, voices))
+  return b"".join(packets)
+
+
+def iter_packets(stream: bytes) -> list[bytes]:
+  if not stream or len(stream) % PACKET_SIZE != 0:
+    raise ValueError(
+      f"chipsynth event log must be a positive multiple of {PACKET_SIZE} bytes"
+    )
+  return [stream[offset:offset + PACKET_SIZE] for offset in range(0, len(stream), PACKET_SIZE)]
+
+
+def encode_event_log(stream: bytes) -> bytes:
+  """Map a chipsynth event log into a raw control-frame-v0 stream."""
+  return b"".join(
+    pack_frame(to_control_frame(parse_packet(packet)))
+    for packet in iter_packets(stream)
+  )
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--input", type=Path, help="chipsynth stream packet to parse")
+  parser.add_argument("--stream", type=Path, help="chipsynth event log (many packets) to map")
   parser.add_argument("--demo-packet", type=Path, help="write a deterministic demo packet")
-  parser.add_argument("--output", type=Path, help="write mapped control-frame-v0 packet")
+  parser.add_argument(
+    "--demo-log",
+    type=Path,
+    help="write a deterministic multi-packet demo event log",
+  )
+  parser.add_argument(
+    "--demo-log-frames",
+    type=int,
+    default=96,
+    help="packet count for --demo-log",
+  )
+  parser.add_argument("--output", type=Path, help="write mapped control-frame-v0 stream")
   return parser
 
 
 def main() -> int:
   args = build_parser().parse_args()
-  packet = args.input.read_bytes() if args.input else make_demo_packet()
-  frame = to_control_frame(parse_packet(packet))
 
   if args.demo_packet:
     args.demo_packet.parent.mkdir(parents=True, exist_ok=True)
-    args.demo_packet.write_bytes(packet)
+    args.demo_packet.write_bytes(make_demo_packet())
+  if args.demo_log:
+    args.demo_log.parent.mkdir(parents=True, exist_ok=True)
+    args.demo_log.write_bytes(make_demo_log(args.demo_log_frames))
+
+  if args.stream:
+    stream = encode_event_log(args.stream.read_bytes())
+    if args.output:
+      args.output.parent.mkdir(parents=True, exist_ok=True)
+      args.output.write_bytes(stream)
+    else:
+      print(f"mapped {len(stream) // 33} chipsynth packets")
+    return 0
+
+  packet = args.input.read_bytes() if args.input else make_demo_packet()
+  frame = to_control_frame(parse_packet(packet))
   if args.output:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(pack_frame(frame))
-  if not args.demo_packet and not args.output:
+  if not args.demo_packet and not args.demo_log and not args.output:
     print(frame)
   return 0
 

@@ -2,7 +2,7 @@ cflags := "-std=c99 -Wall -Wextra -Werror -pedantic -Ishared/include"
 sim_platforms := "n64 gba c64"
 shared_srcs := "shared/src/control_frame.c shared/src/connection.c"
 modern_manifest := "renderers/modern/Cargo.toml"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py shared/tools/lint_docs.py tests/test_host_bridge.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py shared/tools/lint_docs.py tests/test_host_bridge.py"
 
 default:
     just --list
@@ -14,6 +14,7 @@ lint: scaffold-check c-lint python-lint docs-lint rust-lint
     @echo "chipviz lint OK"
 
 test: c-test python-test rust-test build-sim simulate host-sample
+    @just host-fixtures
     @echo "chipviz tests OK"
 
 scaffold-check:
@@ -27,6 +28,12 @@ scaffold-check:
     @test -f shared/include/chipviz/connection.h
     @test -f host/bridge/chipviz_bridge.py
     @test -f host/bridge/chipsynth_stream.py
+    @test -f host/bridge/chipviz_encode.py
+    @test -f shared/specs/music-source-v0.md
+    @test -f host/fixtures/musical/scale.musicsource.json
+    @test -f host/fixtures/musical/scale.cvz
+    @test -f host/fixtures/chipsynth/groove.csv0
+    @test -f host/fixtures/chipsynth/groove.cvz
     @test -f shared/tools/lint_docs.py
     @test -f tests/control_frame_tests.c
     @test -f tests/connection_tests.c
@@ -83,6 +90,10 @@ host-sample:
     @test -s build/chipsynth-derived.cvz
     @echo "chipviz host bridge sample OK"
 
+host-fixtures:
+    @${PYTHON:-python3} host/bridge/chipviz_encode.py --verify-fixtures
+    @echo "chipviz host fixtures OK"
+
 rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check
     @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests -- -D warnings
@@ -91,7 +102,6 @@ rust-lint:
 rust-test:
     @cargo test --manifest-path {{ modern_manifest }} --bins --lib
     @echo "chipviz Rust tests OK"
-
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
 
