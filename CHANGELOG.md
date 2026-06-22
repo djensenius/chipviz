@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.2](https://github.com/djensenius/chipviz/compare/chipviz-v0.1.1...chipviz-v0.1.2) (2026-06-22)
+
+### Bug Fixes
+
+* clarify and build homebrew artifacts ([7d486fa](https://github.com/djensenius/chipviz/commit/7d486fa5c222c7da5fc42c4cdafb70e0323ba751))
+
 ## [0.1.1](https://github.com/djensenius/chipviz/compare/chipviz-v0.1.0...chipviz-v0.1.1) (2026-06-22)
 
 
