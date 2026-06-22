@@ -72,8 +72,8 @@ Merges to `main` run release-please. Published releases build individual assets:
 modern renderer binaries, `.cvz` demos, N64 Joybus and USB HID mapped streams,
 generated C arrays, and current homebrew-style artifacts. Today that includes a
 C64 `.prg` intended for C64/C64 Ultimate and a minimal SNES `.sfc` intended for
-emulator/flash-cart/Pocket-core validation; hardware-bootable N64 `.z64` and GBA
-`.gba` outputs are added when their homebrew SDK build paths land.
+emulator/flash-cart/Pocket-core validation. The release asset workflow also
+builds `chipviz-gba.gba` with devkitPro and `chipviz-n64.z64` with libdragon.
 
 ## Current scaffold
 

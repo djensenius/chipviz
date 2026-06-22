@@ -22,7 +22,7 @@ has been validated.
 ## Current generated artifacts
 
 `shared/tools/build_homebrew.py` generates the minimal homebrew artifacts that do
-not require proprietary boot blobs or unavailable SDKs:
+not require external SDKs:
 
 - `chipviz-c64.prg`: a tokenized BASIC/VIC-II color-cycling C64 program intended
   to load directly on C64/C64 Ultimate.
@@ -30,12 +30,12 @@ not require proprietary boot blobs or unavailable SDKs:
   display to a visible backdrop and is intended for emulator, flash cart, or
   Pocket SNES-core validation.
 
-GBA and N64 now have SDK-backed project directories:
+GBA and N64 have SDK-backed project directories:
 
 - `cores/gba/homebrew`: builds `chipviz-gba.gba` with devkitPro/devkitARM and
   `gbafix`.
 - `cores/n64/homebrew`: builds `chipviz-n64.z64` with libdragon via `N64_INST`.
 
 Those SDKs handle the platform-specific boot/header details. The release
-packager includes `.gba` and `.z64` when the SDKs are present, and otherwise
-ships the C64/SNES/minimal assets plus a status file.
+asset workflow installs/uses those SDKs so published releases include
+`chipviz-gba.gba` and `chipviz-n64.z64` in addition to the C64/SNES artifacts.

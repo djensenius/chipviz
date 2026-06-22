@@ -1,0 +1,44 @@
+name: Homebrew ROMs
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  gba:
+    name: GBA ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install devkitPro GBA toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget ca-certificates gnupg
+          wget https://apt.devkitpro.org/install-devkitpro-pacman
+          chmod +x install-devkitpro-pacman
+          sudo ./install-devkitpro-pacman -y
+          sudo dkp-pacman -S --noconfirm gba-dev
+      - name: Build GBA ROM
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          export DEVKITARM=/opt/devkitpro/devkitARM
+          export PATH="$DEVKITARM/bin:/opt/devkitpro/tools/bin:$PATH"
+          make -C cores/gba/homebrew
+      - name: Verify GBA ROM
+        run: test -s cores/gba/homebrew/chipviz-gba.gba
+
+  n64:
+    name: N64 ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build N64 ROM
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace/cores/n64/homebrew \
+            ghcr.io/libdragon/libdragon:latest \
+            make
+      - name: Verify N64 ROM
+        run: test -s cores/n64/homebrew/chipviz-n64.z64

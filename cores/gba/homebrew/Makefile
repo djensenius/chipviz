@@ -1,18 +1,18 @@
-TARGET := chipviz-gba
-BUILD := build
-SOURCES := source
-INCLUDES := include ../../../shared/include
+TARGET    := chipviz-gba
+BUILD     := build
+SOURCES   := source
+INCLUDES  := include ../../../shared/include
 
 ifeq ($(strip $(DEVKITARM)),)
 $(error DEVKITARM is not set. Install devkitPro/devkitARM and source devkit-env.sh)
 endif
 
-include $(DEVKITARM)/gba_rules
+include $(DEVKITARM)/base_rules
 
-ARCH := -mthumb -mthumb-interwork
-CFLAGS := -g -Wall -O2 -mcpu=arm7tdmi -mtune=arm7tdmi $(ARCH) $(addprefix -I,$(INCLUDES))
-LDFLAGS := -g $(ARCH) -Wl,-Map,$(notdir $*.map)
-LIBS :=
+ARCH     := -mthumb -mthumb-interwork
+CFLAGS   := -g -Wall -O2 -mcpu=arm7tdmi -mtune=arm7tdmi $(ARCH) $(addprefix -I,$(INCLUDES))
+LDFLAGS  := -g $(ARCH) -specs=gba.specs -Wl,-Map,$(BUILD)/$(TARGET).map
+LIBS     := -lgba
 
 CFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 OFILES := $(CFILES:.c=.o)
