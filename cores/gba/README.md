@@ -23,6 +23,7 @@ sets sprite count, and total energy drives affine scale. The native simulator
 build prints those values until the Butano or Tonc renderer replaces the stub.
 The simulator is not the product; the target artifact is a bootable homebrew
 `.gba`.
+`cores/gba/homebrew` contains the devkitARM project for `chipviz-gba.gba`.
 
 ## Connection path
 

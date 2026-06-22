@@ -52,7 +52,11 @@ scaffold-check:
     @test -f tests/test_host_bridge.py
     @test -f tests/test_transports.py
     @test -f cores/n64/src/main.c
+    @test -f cores/n64/homebrew/Makefile
+    @test -f cores/n64/homebrew/main.c
     @test -f cores/gba/src/main.c
+    @test -f cores/gba/homebrew/Makefile
+    @test -f cores/gba/homebrew/source/main.c
     @test -f cores/c64/src/main.c
     @test -f cores/snes/src/main.c
     @test -f renderers/modern/Cargo.toml
@@ -125,6 +129,17 @@ homebrew-artifacts:
     @test -s build/homebrew/chipviz-snes.sfc
     @test -s build/homebrew/homebrew-status.json
     @echo "chipviz homebrew artifacts OK"
+
+gba-rom:
+    @cd cores/gba/homebrew && $(MAKE)
+
+n64-rom:
+    @test -n "$${N64_INST:-}" || (echo "N64_INST is required; install libdragon" >&2; exit 1)
+    @cd cores/n64/homebrew && $(MAKE)
+
+sdk-roms:
+    @just gba-rom
+    @just n64-rom
 
 rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check

@@ -1,4 +1,4 @@
-.PHONY: help check lint test scaffold-check c-lint c-test python-lint python-test docs-lint rust-lint rust-test build build-sim simulate host-sample host-fixtures target-arrays homebrew-artifacts modern-check modern-pi5 modern-m1 clean
+.PHONY: help check lint test scaffold-check c-lint c-test python-lint python-test docs-lint rust-lint rust-test build build-sim simulate host-sample host-fixtures target-arrays homebrew-artifacts gba-rom n64-rom sdk-roms modern-check modern-pi5 modern-m1 clean
 
 JUST ?= mise exec -- just
 
@@ -57,6 +57,15 @@ target-arrays:
 
 homebrew-artifacts:
 	@$(JUST) homebrew-artifacts
+
+gba-rom:
+	@$(JUST) gba-rom
+
+n64-rom:
+	@$(JUST) n64-rom
+
+sdk-roms:
+	@$(JUST) sdk-roms
 
 modern-check:
 	@$(JUST) modern-check

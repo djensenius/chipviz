@@ -23,6 +23,7 @@ sets particle density, and bass drives depth pulse. The native simulator build
 prints those values until the libdragon/tiny3d renderer replaces the stub.
 The simulator is not the product; the target artifact is a bootable homebrew
 `.z64`.
+`cores/n64/homebrew` contains the libdragon project for `chipviz-n64.z64`.
 
 The first real renderer should be unmistakably 3D. A good direction is
 graphic/2D-looking planes and sprites arranged in 3D space, with camera angle,
