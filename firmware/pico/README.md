@@ -8,7 +8,8 @@ time; each completed frame replaces four controller state buffers. PIO state
 machines then read those buffers and answer N64 controller status/poll requests
 without reparsing the upstream stream.
 
-Build with a normal Pico SDK checkout:
+Build with a normal Pico SDK checkout by setting `PICO_SDK_PATH` (either as a
+CMake variable or environment variable):
 
 ```sh
 cmake -S firmware/pico -B build/pico -DPICO_SDK_PATH=/path/to/pico-sdk

@@ -58,6 +58,12 @@ class TransportTests(unittest.TestCase):
     self.assertEqual(bands[0], 0)
     self.assertEqual(bands[5], 255)
 
+  def test_live_bridge_band_edges_rejects_invalid_band_count(self) -> None:
+    for bands in (0, -1):
+      with self.subTest(bands=bands):
+        with self.assertRaisesRegex(ValueError, "bands must be at least 1"):
+          live_bridge.band_edges(48000, bands)
+
   def test_live_bridge_frame_from_bands_packs_notes(self) -> None:
     wire = live_bridge.frame_from_bands(9, (255, 128, 64, 32, 16, 8, 4, 2), midi_velocity=90)
     decoded = n64_joybus.decode_control_frame(wire)
@@ -65,6 +71,21 @@ class TransportTests(unittest.TestCase):
     self.assertEqual(decoded.frame, 9)
     self.assertEqual(decoded.spectrum[0], 255)
     self.assertEqual(decoded.note_velocities, (90,))
+
+  def test_live_bridge_frame_from_bands_rejects_too_few_bands(self) -> None:
+    with self.assertRaisesRegex(ValueError, "requires at least 8 bands"):
+      live_bridge.frame_from_bands(0, (1, 2, 3, 4))
+
+  def test_live_bridge_frame_from_bands_clamps_midi_velocity(self) -> None:
+    high_wire = live_bridge.frame_from_bands(0, (1, 2, 3, 4, 5, 6, 7, 8), midi_velocity=300)
+    low_wire = live_bridge.frame_from_bands(1, (1, 2, 3, 4, 5, 6, 7, 8), midi_velocity=-5)
+    high_decoded = n64_joybus.decode_control_frame(high_wire)
+    low_decoded = n64_joybus.decode_control_frame(low_wire)
+
+    self.assertEqual(len(high_wire), chipviz_bridge.WIRE_SIZE)
+    self.assertEqual(len(low_wire), chipviz_bridge.WIRE_SIZE)
+    self.assertEqual(high_decoded.note_velocities, (255,))
+    self.assertEqual(low_decoded.note_velocities, ())
 
   def test_live_bridge_rejects_missing_optional_dependency(self) -> None:
     with self.assertRaisesRegex(RuntimeError, "definitely_missing_chipviz_module"):

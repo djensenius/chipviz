@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-#ifdef PICO_SDK_VERSION_STRING
+#ifdef CHIPVIZ_PICO_SDK
 #include "pico/stdlib.h"
 #endif
 
@@ -13,7 +13,7 @@ int main(void) {
   chipviz_joybus_init(&bridge);
   chipviz_joybus_serial_init(&serial);
 
-#ifdef PICO_SDK_VERSION_STRING
+#ifdef CHIPVIZ_PICO_SDK
   stdio_init_all();
   for (;;) {
     int byte = getchar_timeout_us(0);

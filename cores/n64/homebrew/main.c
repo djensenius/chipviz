@@ -25,8 +25,8 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
   state->bands[6] = (packet[14] + packet[15]) & 255;
   state->bands[7] = (packet[14] * 2 + packet[15]) & 255;
   state->beat = (packet[0] | packet[4] | packet[8] | packet[12]) & 3;
-  state->scene = ((packet[12] >> 4) | (packet[13] >> 2)) & 7;
-  state->palette = ((packet[12] >> 6) | packet[13]) & 7;
+  state->scene = ((packet[12] >> 4) & 0x03) | (((packet[13] >> 4) & 0x03) << 2);
+  state->palette = packet[13] & 0x0F;
   state->energy = packet[14];
   state->midi = packet[15];
   for (i = 0; i < 8; i++) {

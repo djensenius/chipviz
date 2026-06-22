@@ -32,6 +32,8 @@ def frame_records(stream: bytes) -> list[bytes]:
 
 
 def band_edges(sample_rate: int, bands: int) -> list[tuple[float, float]]:
+  if bands < 1:
+    raise ValueError("bands must be at least 1")
   if sample_rate < 8000:
     raise ValueError("audio sample rate must be at least 8000 Hz")
   low = 40.0
@@ -54,6 +56,9 @@ def normalize_bands(values: list[float]) -> tuple[int, ...]:
 
 
 def frame_from_bands(frame_index: int, bands: tuple[int, ...], midi_velocity: int = 0) -> bytes:
+  if len(bands) < 8:
+    raise ValueError("frame_from_bands requires at least 8 bands")
+  midi_velocity = clamp_byte(midi_velocity)
   bass = max(bands[0], bands[1])
   mid = max(bands[3], bands[4])
   treble = max(bands[6], bands[7])

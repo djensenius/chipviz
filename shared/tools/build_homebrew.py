@@ -16,6 +16,7 @@ TOKEN_POKE = 0x97
 TOKEN_TO = 0xA4
 TOKEN_REM = 0x8F
 TOKEN_STEP = 0xA9
+TOKEN_AND = 0xAF
 
 
 def ascii_bytes(text: str) -> bytes:
@@ -61,7 +62,9 @@ def build_c64_prg() -> bytes:
      + bytes([TOKEN_TO])
      + b" 55335:"
      + bytes([TOKEN_POKE])
-     + b" C,I:"
+     + b" C,(C-55296) "
+     + bytes([TOKEN_AND])
+     + b" 15:"
      + bytes([TOKEN_NEXT]),
     ),
     basic_line(
@@ -70,11 +73,18 @@ def build_c64_prg() -> bytes:
      + b" W=0 "
      + bytes([TOKEN_TO])
      + b" 7:"
+     + bytes([TOKEN_FOR])
+     + b" X=0 "
+     + bytes([TOKEN_TO])
+     + b" 7:"
      + bytes([TOKEN_POKE])
-     + b" 1024+W*40+I,160+W:"
+     + b" 1024+W*40+X,160+W:"
      + bytes([TOKEN_POKE])
-     + b" 55296+W*40+I,1+W:"
-     + bytes([TOKEN_NEXT]),
+     + b" 55296+W*40+X,1+W:"
+     + bytes([TOKEN_NEXT])
+     + b" X:"
+     + bytes([TOKEN_NEXT])
+     + b" W",
     ),
     basic_line(60, bytes([TOKEN_GOTO]) + b" 40"),
   ]
