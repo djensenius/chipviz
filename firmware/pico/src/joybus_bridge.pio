@@ -1,0 +1,12 @@
+; Host-buildable documentation PIO program for the four Joybus data state
+; machines. The firmware core stores already-packed 4-byte controller states;
+; the production PIO program shifts those bits during N64 poll responses.
+
+.program chipviz_joybus_tx
+.side_set 1 opt
+
+pull block side 1
+set x, 31 side 1
+bitloop:
+  out pins, 1 side 0 [1]
+  jmp x-- bitloop side 1 [1]

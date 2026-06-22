@@ -106,25 +106,22 @@ This path is intentionally low bandwidth. It is best for scene changes,
 palette/intensity nudges, and beat/drop triggers. If richer live frame data is
 needed later, add a separate ESP32-to-GBA link-cable transport.
 
-## Commodore 64 Ultimate: network bridge
+## Commodore 64 Ultimate: USB HID first, network fallback
 
-Preferred live path candidate: use the Commodore 64 Ultimate network stack or
-network services from the same LAN as the sender. A Raspberry Pi is a good fit
-for audio analysis plus LAN output; an ESP32 is a good fit for compact UDP or
-serial forwarding.
+Preferred live path candidate: present the Raspberry Pi as a USB HID controller
+to the Commodore 64 Ultimate, matching the Pocket Dock reduced-control mapping
+where possible. A Raspberry Pi is a good fit for audio analysis plus USB gadget
+output; an ESP32 is a good fit for compact HID, GPIO, UDP, or serial forwarding.
 
-1. Put the Ultimate and the Raspberry Pi, ESP32, or development computer on the
-   same network.
-2. Confirm which Ultimate-side network service is practical for a running C64
-   program to consume.
-3. Start with UDP-style latest-frame delivery if available: the host bridge or
-   ESP32 sends packed `control-frame-v0` packets, and the C64 side keeps the most
-   recent valid frame.
-4. Reduce the frame before it reaches tight C64 code when needed: scene,
+1. Plug the Pi USB gadget controller into the C64 Ultimate USB input path.
+2. Translate incoming `control-frame-v0` packets into the reduced HID mapping in
+   [`../shared/specs/usb-hid-transport-v0.md`](../shared/specs/usb-hid-transport-v0.md).
+3. Reduce the frame before it reaches tight C64 code when needed: scene,
    palette, flags, energy, beat phase, and a few spectrum bands may be enough for
    raster/PETSCII effects.
-5. Keep `.prg`/`.d64` baked playback as the fallback, and use user-port serial as
-   the hardware fallback if the Ultimate network path is not viable.
+4. Keep `.prg`/`.d64` baked playback as the fallback.
+5. Use Ultimate network services or user-port serial only if the USB HID path is
+   not viable for a live setup.
 
 The C64 target should stay visually native: raster bars, PETSCII, character
 animation, sprites, fixed palettes, and SID/VIC-II timing tricks rather than a

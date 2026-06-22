@@ -15,6 +15,8 @@ TOKEN_PRINT = 0x99
 TOKEN_POKE = 0x97
 TOKEN_TO = 0xA4
 TOKEN_REM = 0x8F
+TOKEN_STEP = 0xA9
+TOKEN_AND = 0xAF
 
 
 def ascii_bytes(text: str) -> bytes:
@@ -53,7 +55,38 @@ def build_c64_prg() -> bytes:
       + b" P,81:"
       + bytes([TOKEN_NEXT]),
     ),
-    basic_line(50, bytes([TOKEN_GOTO]) + b" 40"),
+    basic_line(
+     50,
+     bytes([TOKEN_FOR])
+     + b" C=55296 "
+     + bytes([TOKEN_TO])
+     + b" 55335:"
+     + bytes([TOKEN_POKE])
+     + b" C,(C-55296) "
+     + bytes([TOKEN_AND])
+     + b" 15:"
+     + bytes([TOKEN_NEXT]),
+    ),
+    basic_line(
+     55,
+     bytes([TOKEN_FOR])
+     + b" W=0 "
+     + bytes([TOKEN_TO])
+     + b" 7:"
+     + bytes([TOKEN_FOR])
+     + b" X=0 "
+     + bytes([TOKEN_TO])
+     + b" 7:"
+     + bytes([TOKEN_POKE])
+     + b" 1024+W*40+X,160+W:"
+     + bytes([TOKEN_POKE])
+     + b" 55296+W*40+X,1+W:"
+     + bytes([TOKEN_NEXT])
+     + b" X:"
+     + bytes([TOKEN_NEXT])
+     + b" W",
+    ),
+    basic_line(60, bytes([TOKEN_GOTO]) + b" 40"),
   ]
   program = bytearray()
   load_address = 0x0801
@@ -128,12 +161,12 @@ def build_status() -> dict:
     "generated": {
       "c64": {
         "artifact": "chipviz-c64.prg",
-        "status": "tokenized-basic-homebrew-prg",
+        "status": "tokenized-basic-vic-ii-petscii-visualizer",
         "hardwareBootable": True,
       },
       "snes": {
         "artifact": "chipviz-snes.sfc",
-        "status": "minimal-visible-lorom-homebrew",
+        "status": "visible-lorom-cgram-vram-visualizer",
         "hardwareBootable": True,
         "validation": "emulator/flashcart/Pocket-core dependent",
       },
