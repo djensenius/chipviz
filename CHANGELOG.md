@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.4](https://github.com/djensenius/chipviz/compare/chipviz-v0.1.3...chipviz-v0.1.4) (2026-06-22)
+
+### Bug Fixes
+
+* complete target implementation scaffolds ([61a75d0](https://github.com/djensenius/chipviz/commit/61a75d0))
+
 ## [0.1.3](https://github.com/djensenius/chipviz/compare/chipviz-v0.1.2...chipviz-v0.1.3) (2026-06-22)
 
 ### Bug Fixes
