@@ -2,7 +2,7 @@ cflags := "-std=c99 -Wall -Wextra -Werror -pedantic -Ishared/include"
 sim_platforms := "n64 gba c64 snes"
 shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/interface.c"
 modern_manifest := "renderers/modern/Cargo.toml"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_host_bridge.py tests/test_transports.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py shared/tools/build_homebrew.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py"
 
 default:
     just --list
@@ -13,12 +13,13 @@ check: lint test
 lint: scaffold-check c-lint python-lint docs-lint rust-lint
     @echo "chipviz lint OK"
 
-test: c-test python-test rust-test build-sim simulate host-sample target-arrays
+test: c-test python-test rust-test build-sim simulate host-sample target-arrays homebrew-artifacts
     @just host-fixtures
     @echo "chipviz tests OK"
 
 scaffold-check:
     @test -f README.md
+    @test -f docs/homebrew-targets.md
     @test -f shared/specs/source-adapter-v0.md
     @test -f shared/specs/chipsynth-source-v0.md
     @test -f shared/specs/chipsynth-viz-stream-v0.md
@@ -43,7 +44,9 @@ scaffold-check:
     @test -f host/fixtures/chipsynth/groove.csv0
     @test -f host/fixtures/chipsynth/groove.cvz
     @test -f shared/tools/lint_docs.py
+    @test -f shared/tools/build_homebrew.py
     @test -f shared/tools/cvz_to_c.py
+    @test -f tests/test_homebrew.py
     @test -f tests/control_frame_tests.c
     @test -f tests/connection_tests.c
     @test -f tests/test_host_bridge.py
@@ -114,6 +117,14 @@ target-arrays:
     @${PYTHON:-python3} shared/tools/cvz_to_c.py --input host/fixtures/musical/scale.cvz --symbol chipviz_scale_frames --output build/generated/scale_frames.h
     @test -s build/generated/scale_frames.h
     @echo "chipviz target arrays OK"
+
+homebrew-artifacts:
+    @mkdir -p build/homebrew
+    @${PYTHON:-python3} shared/tools/build_homebrew.py --output build/homebrew
+    @test -s build/homebrew/chipviz-c64.prg
+    @test -s build/homebrew/chipviz-snes.sfc
+    @test -s build/homebrew/homebrew-status.json
+    @echo "chipviz homebrew artifacts OK"
 
 rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check

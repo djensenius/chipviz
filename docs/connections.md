@@ -22,6 +22,10 @@ setups. A desktop computer is still useful while developing adapters and baked
 playback files, but the hardware goal is a small box that can sit with the retro
 hardware.
 
+The retro platform targets are homebrew programs. Analogue 3D, Pocket Dock, C64
+Ultimate, flash carts, and emulators are loading/display/input paths for those
+homebrew artifacts, not replacements for native target builds.
+
 Use an ESP32 when the job is mostly transport, GPIO timing, Bluetooth HID, or
 simple MIDI/control reduction. Use a Raspberry Pi when the job needs richer
 audio analysis, multiple USB MIDI/audio devices, filesystem-backed recordings,

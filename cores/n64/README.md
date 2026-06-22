@@ -1,10 +1,10 @@
 # chipviz-n64
 
-N64 visualizer core for original Nintendo 64 hardware and Analogue 3D.
+N64 homebrew visualizer for original Nintendo 64 hardware and Analogue 3D.
 
-## Planned stack
+## Homebrew stack
 
-- libdragon for toolchain, controllers, video, filesystem, and debugging.
+- libdragon for the homebrew toolchain, controllers, video, filesystem, and debugging.
 - tiny3d for approachable hardware-accelerated geometry.
 - Flashcart deployment, with SummerCart64 as the preferred development path if USB I/O is needed.
 
@@ -21,6 +21,8 @@ N64 visualizer core for original Nintendo 64 hardware and Analogue 3D.
 a minimal N64-style visualization model: beat phase rotates the scene, energy
 sets particle density, and bass drives depth pulse. The native simulator build
 prints those values until the libdragon/tiny3d renderer replaces the stub.
+The simulator is not the product; the target artifact is a bootable homebrew
+`.z64`.
 
 The first real renderer should be unmistakably 3D. A good direction is
 graphic/2D-looking planes and sprites arranged in 3D space, with camera angle,

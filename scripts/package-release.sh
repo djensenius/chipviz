@@ -18,6 +18,7 @@ python3 host/bridge/chipviz_encode.py --chipsynth-log host/fixtures/chipsynth/gr
 python3 host/bridge/n64_joybus.py --input "$assets/scale.cvz" --output "$assets/scale.n64joybus"
 python3 host/bridge/usb_hid.py --input "$assets/scale.cvz" --output "$assets/scale-usb-hid.json"
 python3 shared/tools/cvz_to_c.py --input "$assets/scale.cvz" --symbol chipviz_scale_frames --output "$assets/scale_frames.h"
+python3 shared/tools/build_homebrew.py --output "$assets"
 
 cargo build --manifest-path renderers/modern/Cargo.toml --release --bins
 cp renderers/modern/target/release/chipviz-pi5 "$assets/"

@@ -1,15 +1,15 @@
 # chipviz
 
-Original visualization software for real retro hardware and FPGA consoles.
+Original homebrew visualization software for real retro hardware and FPGA consoles.
 
 ## Initial targets
 
 | Target | Output | Hardware path | Role |
 | --- | --- | --- | --- |
-| N64 / Analogue 3D | `.z64` | Flashcart on Analogue 3D or N64 | Flagship big-screen 3D/particle visualizer. |
-| GBA / Analogue Pocket | `.gba` | GBA cartridge, flashcart, or Pocket adapter path | Portable 2D sketchpad with palettes, sprites, and affine effects. |
-| Commodore 64 / THEC64 | `.prg` / `.d64` | THEC64 USB media or real C64 storage | VIC-II/SID/raster/PETSCII visual personality. |
-| SNES / Analogue Pocket Dock | `.sfc` / `.smc` | Pocket Dock SNES core first, real SNES later | Tile/sprite/Mode-7-style visualizer. |
+| N64 / Analogue 3D | homebrew `.z64` | Flashcart on Analogue 3D or N64 | Flagship big-screen 3D/particle visualizer. |
+| GBA / Analogue Pocket | homebrew `.gba` | GBA cartridge, flashcart, or Pocket adapter path | Portable 2D sketchpad with palettes, sprites, and affine effects. |
+| Commodore 64 / THEC64 | homebrew `.prg` / `.d64` | THEC64 USB media or real C64 storage | VIC-II/SID/raster/PETSCII visual personality. |
+| SNES / Analogue Pocket Dock | homebrew `.sfc` / `.smc` | Pocket Dock SNES core first, real SNES later | Tile/sprite/Mode-7-style visualizer. |
 | Modern 4K | native app | Raspberry Pi 5 HDMI or Apple Silicon Mac | Dense 3D data-field visualizer rendered with Rust + wgpu. |
 
 ## Project layout
@@ -53,6 +53,8 @@ See [`shared/specs/interface-v0.md`](shared/specs/interface-v0.md) for the
 cross-target title/scene-select/auto/demo interface model.
 See [`docs/connections.md`](docs/connections.md) for the planned hardware,
 ESP32 bridge, and Raspberry Pi sender/audio-analysis paths.
+See [`docs/homebrew-targets.md`](docs/homebrew-targets.md) for the target policy:
+N64, GBA, C64, and SNES are real homebrew builds.
 
 ## First milestone
 
@@ -66,11 +68,12 @@ Build one self-running demo per platform before live input:
 
 ## Releases
 
-Merges to `main` run release-please. Published releases build individual assets
-for the current scaffold (modern renderer binaries, `.cvz` demos, N64 Joybus and
-USB HID mapped streams, and generated C arrays) and upload a combined
-`chipviz-assets.zip`. Real ROM binaries are added to the same release package as
-each platform SDK build lands.
+Merges to `main` run release-please. Published releases build individual assets:
+modern renderer binaries, `.cvz` demos, N64 Joybus and USB HID mapped streams,
+generated C arrays, and current homebrew-style artifacts. Today that includes a
+C64 `.prg` intended for C64/C64 Ultimate and a minimal SNES `.sfc` intended for
+emulator/flash-cart/Pocket-core validation; hardware-bootable N64 `.z64` and GBA
+`.gba` outputs are added when their homebrew SDK build paths land.
 
 ## Current scaffold
 
