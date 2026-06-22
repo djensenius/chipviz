@@ -16,6 +16,15 @@ import n64_joybus
 import usb_hid
 
 
+class _RecordingSink:
+  def __init__(self, paced: bool) -> None:
+    self.paced = paced
+    self.received: list[bytes] = []
+
+  def send(self, frame: bytes) -> None:
+    self.received.append(frame)
+
+
 class TransportTests(unittest.TestCase):
   def setUp(self) -> None:
     self.frame = chipviz_bridge.make_procedural_frame(0)
@@ -127,15 +136,6 @@ class TransportTests(unittest.TestCase):
       live_bridge.time.monotonic = original_monotonic
       live_bridge.time.sleep = original_sleep
     return sleeps
-
-
-class _RecordingSink:
-  def __init__(self, paced: bool) -> None:
-    self.paced = paced
-    self.received: list[bytes] = []
-
-  def send(self, frame: bytes) -> None:
-    self.received.append(frame)
 
   def test_cvz_to_c_renders_frame_array(self) -> None:
     header = cvz_to_c.render_header(self.wire, "chipviz_test_frames")
