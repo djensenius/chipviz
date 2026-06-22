@@ -1,0 +1,20 @@
+name: Rust
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rust:
+    name: Rust lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4.2.0
+      - name: Install Linux renderer dependencies
+        run: sudo apt-get update && sudo apt-get install -y libegl1-mesa-dev libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+      - name: Install Rust lint components
+        run: mise exec -- rustup component add rustfmt clippy
+      - run: mise exec -- just modern-check
+      - run: mise exec -- just rust-test
