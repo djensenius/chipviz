@@ -51,6 +51,11 @@ void chipviz_interface_apply_input(ChipvizInterfaceState *state, uint8_t input_f
     state->mode = CHIPVIZ_INTERFACE_MODE_DEMO;
     state->screen = CHIPVIZ_INTERFACE_SCREEN_VISUALIZER;
   }
+
+  if ((input_flags & CHIPVIZ_INTERFACE_INPUT_MANUAL) != 0u) {
+    state->mode = CHIPVIZ_INTERFACE_MODE_MANUAL;
+    state->screen = CHIPVIZ_INTERFACE_SCREEN_VISUALIZER;
+  }
 }
 
 void chipviz_interface_tick(ChipvizInterfaceState *state) {
@@ -73,12 +78,6 @@ void chipviz_interface_apply_to_frame(
   }
 
   frame->scene = state->selected_scene;
-  if (state->mode == CHIPVIZ_INTERFACE_MODE_AUTO) {
-    frame->flags |= 0x10u;
-  }
-  if (state->mode == CHIPVIZ_INTERFACE_MODE_DEMO) {
-    frame->flags |= 0x08u;
-  }
 }
 
 void chipviz_interface_make_demo_frame(
@@ -90,4 +89,11 @@ void chipviz_interface_make_demo_frame(
 
   chipviz_frame_make_procedural(state->ticks, frame);
   chipviz_interface_apply_to_frame(state, frame);
+}
+
+uint8_t chipviz_interface_mode_code(const ChipvizInterfaceState *state) {
+  if (state == 0) {
+    return 0;
+  }
+  return (uint8_t)state->mode;
 }

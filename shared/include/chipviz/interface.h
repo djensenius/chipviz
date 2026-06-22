@@ -25,7 +25,8 @@ typedef enum {
   CHIPVIZ_INTERFACE_INPUT_NEXT_SCENE = 1u << 1,
   CHIPVIZ_INTERFACE_INPUT_PREV_SCENE = 1u << 2,
   CHIPVIZ_INTERFACE_INPUT_AUTO = 1u << 3,
-  CHIPVIZ_INTERFACE_INPUT_DEMO = 1u << 4
+  CHIPVIZ_INTERFACE_INPUT_DEMO = 1u << 4,
+  CHIPVIZ_INTERFACE_INPUT_MANUAL = 1u << 5
 } ChipvizInterfaceInput;
 
 typedef struct {
@@ -46,5 +47,6 @@ void chipviz_interface_apply_to_frame(
 void chipviz_interface_make_demo_frame(
     const ChipvizInterfaceState *state,
     ChipvizFrame *frame);
+uint8_t chipviz_interface_mode_code(const ChipvizInterfaceState *state);
 
 #endif

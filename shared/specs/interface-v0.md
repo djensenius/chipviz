@@ -15,7 +15,7 @@ platform renders it with native UI conventions.
 
 | Mode | Purpose |
 | --- | --- |
-| `manual` | Human-controlled scene and palette changes. |
+| `manual` | Human-controlled scene changes and transport-specific palette controls. |
 | `auto` | Host/chipsynth/Pi can advance scenes using a control combination that is deliberately unlikely for a human controller. |
 | `demo` | Target generates visualizer-like input locally for store/demo/screensaver use. |
 
@@ -27,6 +27,7 @@ platform renders it with native UI conventions.
 | `next_scene` / `prev_scene` | Scene selection pulses. |
 | `auto` | Enter auto mode. |
 | `demo` | Enter demo mode. |
+| `manual` | Exit auto/demo mode and return to human control. |
 
 The concrete button/key combinations live in each transport mapping. USB HID
 uses the manual/auto/demo controls in

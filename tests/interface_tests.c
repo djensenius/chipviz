@@ -45,6 +45,8 @@ static void auto_mode_advances_scene(void) {
   require(state.selected_scene == 0, "scene unchanged before period");
   chipviz_interface_tick(&state);
   require(state.selected_scene == 1, "scene advances on period");
+  chipviz_interface_apply_input(&state, CHIPVIZ_INTERFACE_INPUT_MANUAL);
+  require(state.mode == CHIPVIZ_INTERFACE_MODE_MANUAL, "manual override exits auto");
 }
 
 static void demo_mode_generates_visualizer_input(void) {
@@ -59,7 +61,7 @@ static void demo_mode_generates_visualizer_input(void) {
 
   require(state.mode == CHIPVIZ_INTERFACE_MODE_DEMO, "demo mode selected");
   require(frame.scene == 5, "demo applies selected scene");
-  require((frame.flags & 0x08u) != 0u, "demo flag set");
+  require(chipviz_interface_mode_code(&state) == CHIPVIZ_INTERFACE_MODE_DEMO, "demo mode code");
   require(frame.energy > 0, "demo frame has energy");
 }
 
