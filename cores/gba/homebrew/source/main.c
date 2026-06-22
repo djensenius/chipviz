@@ -33,14 +33,17 @@ int main(void) {
   int y;
   uint8_t scene = 0;
   uint8_t palette = 0;
+  uint16_t prev_keys = 0;
 
   REG_DISPCNT = MODE3 | BG2_ENABLE;
   for (;;) {
     uint16_t keys = (uint16_t)(~REG_KEYINPUT & 0x03FF);
-    if (keys & KEY_RIGHT) {
+    uint16_t pressed = (uint16_t)(keys & ~prev_keys);
+    prev_keys = keys;
+    if (pressed & KEY_RIGHT) {
       scene = (uint8_t)((scene + 1u) & 7u);
     }
-    if (keys & KEY_LEFT) {
+    if (pressed & KEY_LEFT) {
       palette = (uint8_t)((palette + 1u) & 7u);
     }
     wait_vblank();

@@ -15,6 +15,8 @@ static uint32_t color(int r, int g, int b) {
 
 static void decode_transport_packet(const unsigned char packet[16], visual_state_t *state) {
   int i;
+  int global_beat;
+  int band_beats;
 
   state->bands[0] = packet[2];
   state->bands[1] = packet[3];
@@ -24,7 +26,9 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
   state->bands[5] = packet[11];
   state->bands[6] = (packet[14] + packet[15]) & 255;
   state->bands[7] = (packet[14] * 2 + packet[15]) & 255;
-  state->beat = (packet[0] | packet[4] | packet[8] | packet[12]) & 3;
+  global_beat = ((packet[0] >> 7) & 0x01) | (packet[12] & 0x01);
+  band_beats = (packet[0] & 0x03) | (packet[4] & 0x03) | (packet[8] & 0x03);
+  state->beat = global_beat ? 3 : band_beats;
   state->scene = ((packet[12] >> 4) & 0x03) | (((packet[13] >> 4) & 0x03) << 2);
   state->palette = packet[13] & 0x0F;
   state->energy = packet[14];
@@ -38,7 +42,6 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
 
 static int read_joybus_packet(unsigned char packet[16]) {
   struct controller_data output;
-  int any = 0;
   int p;
 
   controller_scan();
@@ -49,10 +52,8 @@ static int read_joybus_packet(unsigned char packet[16]) {
     packet[p * 4 + 1] = (unsigned char)((data >> 16) & 0xFF);
     packet[p * 4 + 2] = (unsigned char)((data >> 8) & 0xFF);
     packet[p * 4 + 3] = (unsigned char)(data & 0xFF);
-    any |= packet[p * 4 + 0] | packet[p * 4 + 1] |
-           packet[p * 4 + 2] | packet[p * 4 + 3];
   }
-  return any != 0;
+  return get_controllers_present() != 0;
 }
 
 static void procedural_packet(int frame, unsigned char packet[16]) {
