@@ -31,6 +31,7 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertEqual(rom[0x7FD5], 0x20)
     self.assertEqual(rom[0x7FD7], 0x05)
     self.assertEqual(int.from_bytes(rom[0x7FFC:0x7FFE], "little"), 0x8000)
+    self.assertIn(bytes([0xA9, 0x00, 0x8D, 0x15, 0x21]), rom[:96])
     self.assertIn(bytes([0x8D, 0x22, 0x21]), rom[:64])
     self.assertIn(bytes([0x8D, 0x18, 0x21]), rom[:96])
 

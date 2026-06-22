@@ -86,7 +86,7 @@ def build_snes_sfc() -> bytes:
       0x8D, 0x22, 0x21,  # sta $2122
       0xA9, 0x0F,  # lda #$0f
       0x8D, 0x00, 0x21,  # sta $2100 (full brightness)
-      0xA9, 0x80,  # lda #$80
+      0xA9, 0x00,  # lda #$00 (VRAM increments after $2118 low-byte writes)
       0x8D, 0x15, 0x21,  # sta $2115 (VRAM increment)
       0xA9, 0x00,  # lda #$00
       0x8D, 0x16, 0x21,  # sta $2116
