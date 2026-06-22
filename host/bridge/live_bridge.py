@@ -59,6 +59,7 @@ def frame_from_bands(frame_index: int, bands: tuple[int, ...], midi_velocity: in
   if len(bands) < 8:
     raise ValueError("frame_from_bands requires at least 8 bands")
   midi_velocity = clamp_byte(midi_velocity)
+  bands = tuple(clamp_byte(value) for value in bands)
   bass = max(bands[0], bands[1])
   mid = max(bands[3], bands[4])
   treble = max(bands[6], bands[7])
@@ -91,14 +92,14 @@ def build_audio_frames(duration: float, sample_rate: int, fps: int, device: str 
     raise ValueError("audio fps must be at least 1")
   numpy = require_module("numpy", "numpy")
   sounddevice = require_module("sounddevice", "sounddevice")
+  samples_per_frame = max(1, sample_rate // fps)
   sample_count = int(duration * sample_rate)
-  if sample_count < fps:
-    raise ValueError("audio duration is too short for the requested frame rate")
+  if sample_count < samples_per_frame:
+    raise ValueError("audio duration is too short to produce a frame at the requested frame rate")
 
   recording = sounddevice.rec(sample_count, samplerate=sample_rate, channels=1, dtype="float32", device=device)
   sounddevice.wait()
   mono = numpy.asarray(recording, dtype=numpy.float32).reshape(-1)
-  samples_per_frame = max(1, sample_rate // fps)
   edges = band_edges(sample_rate, 8)
   frames = []
   for frame_index, offset in enumerate(range(0, len(mono) - samples_per_frame + 1, samples_per_frame)):

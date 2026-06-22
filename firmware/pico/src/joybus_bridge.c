@@ -87,6 +87,9 @@ int chipviz_joybus_serial_push(
   if (serial == 0 || bridge == 0) {
     return 0;
   }
+  if (serial->offset >= CHIPVIZ_JOYBUS_FRAME_SIZE) {
+    serial->offset = 0;
+  }
   serial->buffer[serial->offset] = byte;
   serial->offset++;
   if (serial->offset != CHIPVIZ_JOYBUS_FRAME_SIZE) {

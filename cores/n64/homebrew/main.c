@@ -36,6 +36,24 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
   }
 }
 
+static int read_joybus_packet(unsigned char packet[16]) {
+  int any = 0;
+  int p;
+
+  joypad_poll();
+  for (p = 0; p < JOYPAD_PORT_COUNT; p++) {
+    joypad_inputs_t inputs = joypad_get_inputs((joypad_port_t)p);
+    unsigned int buttons = inputs.btn.raw;
+    packet[p * 4 + 0] = (unsigned char)((buttons >> 8) & 0xFF);
+    packet[p * 4 + 1] = (unsigned char)(buttons & 0xFF);
+    packet[p * 4 + 2] = (unsigned char)(inputs.stick_x & 0xFF);
+    packet[p * 4 + 3] = (unsigned char)(inputs.stick_y & 0xFF);
+    any |= packet[p * 4 + 0] | packet[p * 4 + 1] |
+           packet[p * 4 + 2] | packet[p * 4 + 3];
+  }
+  return any != 0;
+}
+
 static void procedural_packet(int frame, unsigned char packet[16]) {
   int i;
 
@@ -73,6 +91,7 @@ static void draw_plane_grid(display_context_t disp, int frame, const visual_stat
 int main(void) {
   int frame = 0;
   debug_init_isviewer();
+  joypad_init();
   display_init(RESOLUTION_320x240, DEPTH_32_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE);
 
   while (1) {
@@ -82,7 +101,9 @@ int main(void) {
     unsigned char packet[16];
     visual_state_t state;
 
-    procedural_packet(frame, packet);
+    if (!read_joybus_packet(packet)) {
+      procedural_packet(frame, packet);
+    }
     decode_transport_packet(packet, &state);
 
     graphics_fill_screen(disp, color(0, 0, 12 + state.palette * 6 + (phase >> 5)));
