@@ -49,6 +49,8 @@ See [`shared/specs/control-frame-v0.md`](shared/specs/control-frame-v0.md),
 [`shared/specs/source-adapter-v0.md`](shared/specs/source-adapter-v0.md),
 [`shared/specs/music-source-v0.md`](shared/specs/music-source-v0.md), and
 [`shared/specs/chipsynth-source-v0.md`](shared/specs/chipsynth-source-v0.md).
+See [`shared/specs/interface-v0.md`](shared/specs/interface-v0.md) for the
+cross-target title/scene-select/auto/demo interface model.
 See [`docs/connections.md`](docs/connections.md) for the planned hardware,
 ESP32 bridge, and Raspberry Pi sender/audio-analysis paths.
 
