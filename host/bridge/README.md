@@ -54,10 +54,48 @@ See [`../../docs/connections.md`](../../docs/connections.md) for target-specific
 connection plans, including ESP32 and Raspberry Pi sender paths.
 
 `chipsynth_stream.py` parses the sibling ChipStation visualization stream
-(`CSV0`) and maps it into `control-frame-v0`:
+(`CSV0`) and maps it into `control-frame-v0`. It maps either a single packet or
+a multi-packet event log, and can emit a deterministic demo log for fixtures:
 
 ```sh
 python3 host/bridge/chipsynth_stream.py \
   --demo-packet build/chipsynth-viz-stream-v0.bin \
   --output build/chipsynth-derived.cvz
+
+python3 host/bridge/chipsynth_stream.py \
+  --stream host/fixtures/chipsynth/groove.csv0 \
+  --output build/chipsynth-log.cvz
 ```
+
+## Golden fixtures and the host encoder
+
+`chipviz_encode.py` is the host-side encoder that turns checked-in fixtures into
+deterministic raw `control-frame-v0` streams. The resulting `.cvz` files are
+plain sequences of 33-byte frames, so they replay directly through the N64, GBA,
+C64, and modern playback paths.
+
+It encodes two fixture kinds:
+
+- `music-source-v0` JSON, a generic musical timeline
+  (see [`../../shared/specs/music-source-v0.md`](../../shared/specs/music-source-v0.md)).
+- chipsynth event logs, concatenated `CSV0` packets.
+
+```sh
+# Encode a generic musical source into a raw frame stream.
+python3 host/bridge/chipviz_encode.py \
+  --music host/fixtures/musical/scale.musicsource.json \
+  --output build/scale.cvz
+
+# Encode a chipsynth event log into a raw frame stream.
+python3 host/bridge/chipviz_encode.py \
+  --chipsynth-log host/fixtures/chipsynth/groove.csv0 \
+  --output build/groove.cvz
+
+# Validate the encoder against the checked-in golden outputs (run by `make check`).
+python3 host/bridge/chipviz_encode.py --verify-fixtures
+```
+
+Inputs and their expected outputs live under
+[`../fixtures/`](../fixtures). Regenerate the golden outputs after an
+intentional encoder change with `--write-fixtures`.
+

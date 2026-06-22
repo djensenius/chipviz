@@ -20,3 +20,18 @@ also send frames over UDP for early transport experiments:
 python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz
 python3 host/bridge/chipviz_bridge.py --frames 120 --udp 127.0.0.1:6464
 ```
+
+## Golden fixtures and encoder
+
+`host/bridge/chipviz_encode.py` converts checked-in fixtures into deterministic
+raw `control-frame-v0` streams for repeatable demos. It encodes generic
+`music-source-v0` JSON timelines and chipsynth event logs, and validates the
+golden outputs under `host/fixtures/`:
+
+```sh
+python3 host/bridge/chipviz_encode.py \
+  --music host/fixtures/musical/scale.musicsource.json --output build/scale.cvz
+python3 host/bridge/chipviz_encode.py --verify-fixtures
+```
+
+`make check` runs `--verify-fixtures` so the encoder stays byte-for-byte stable.

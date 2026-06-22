@@ -6,7 +6,7 @@ modern_manifest := "renderers/modern/Cargo.toml"
 default:
     just --list
 
-check: scaffold-check build-sim simulate host-sample modern-check
+check: scaffold-check build-sim simulate host-sample host-fixtures modern-check
     @echo "chipviz check OK"
 
 scaffold-check:
@@ -19,6 +19,12 @@ scaffold-check:
     @test -f shared/include/chipviz/control_frame.h
     @test -f shared/include/chipviz/connection.h
     @test -f host/bridge/chipviz_bridge.py
+    @test -f host/bridge/chipviz_encode.py
+    @test -f shared/specs/music-source-v0.md
+    @test -f host/fixtures/musical/scale.musicsource.json
+    @test -f host/fixtures/musical/scale.cvz
+    @test -f host/fixtures/chipsynth/groove.csv0
+    @test -f host/fixtures/chipsynth/groove.cvz
     @test -f cores/n64/src/main.c
     @test -f cores/gba/src/main.c
     @test -f cores/c64/src/main.c
@@ -46,6 +52,9 @@ host-sample:
     @test -s build/chipsynth-viz-stream-v0.bin
     @test -s build/chipsynth-derived.cvz
     @echo "chipviz host bridge sample OK"
+
+host-fixtures:
+    @${PYTHON:-python3} host/bridge/chipviz_encode.py --verify-fixtures
 
 modern-check:
     @cargo check --manifest-path {{ modern_manifest }} --bins

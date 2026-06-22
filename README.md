@@ -25,6 +25,7 @@ shared/
   tools/    Asset conversion, palettes, MIDI/audio preprocessing.
 host/
   bridge/   Desktop bridge for frame generation, playback, and hardware transport.
+  fixtures/ Golden musical/chipsynth sample inputs and expected frame outputs.
 renderers/
   modern/   Rust + wgpu renderers for Raspberry Pi 5 and Apple Silicon.
 assets/
@@ -43,7 +44,8 @@ The first common interface is a compact frame that every platform can interpret 
 - notes: small event window for MIDI note-style triggers
 
 See [`shared/specs/control-frame-v0.md`](shared/specs/control-frame-v0.md),
-[`shared/specs/source-adapter-v0.md`](shared/specs/source-adapter-v0.md), and
+[`shared/specs/source-adapter-v0.md`](shared/specs/source-adapter-v0.md),
+[`shared/specs/music-source-v0.md`](shared/specs/music-source-v0.md), and
 [`shared/specs/chipsynth-source-v0.md`](shared/specs/chipsynth-source-v0.md).
 See [`docs/connections.md`](docs/connections.md) for the planned hardware,
 ESP32 bridge, and Raspberry Pi sender/audio-analysis paths.
@@ -67,6 +69,7 @@ mise run check
 just simulate
 just modern-m1 -- --udp 127.0.0.1:6464
 python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz
+python3 host/bridge/chipviz_encode.py --verify-fixtures
 ```
 
 Each platform entrypoint consumes the shared `control-frame-v0` shape through a

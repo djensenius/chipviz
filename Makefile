@@ -1,4 +1,4 @@
-.PHONY: help check scaffold-check build build-sim simulate host-sample modern-check modern-pi5 modern-m1 clean
+.PHONY: help check scaffold-check build build-sim simulate host-sample host-fixtures modern-check modern-pi5 modern-m1 clean
 
 JUST ?= mise exec -- just
 
@@ -21,6 +21,9 @@ simulate:
 
 host-sample:
 	@$(JUST) host-sample
+
+host-fixtures:
+	@$(JUST) host-fixtures
 
 modern-check:
 	@$(JUST) modern-check
