@@ -19,7 +19,7 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Set RELEASE_PLEASE_TOKEN to a fine-grained PAT with contents:write and pull-requests:write, or enable GitHub Actions pull request creation for GITHUB_TOKEN."
+            echo "::notice::Release Please is skipped until RELEASE_PLEASE_TOKEN is configured as a fine-grained PAT with contents:write and pull-requests:write."
           fi
       - uses: googleapis/release-please-action@v5
         if: steps.token.outputs.configured == 'true'
