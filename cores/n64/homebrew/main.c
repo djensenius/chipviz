@@ -7,10 +7,10 @@ static uint32_t color(int r, int g, int b) {
 int main(void) {
   int frame = 0;
   debug_init_isviewer();
-  display_init(RESOLUTION_320x240, DEPTH_32_BPP, 2, GAMMA_NONE, FILTERS_RESAMPLE);
+  display_init(RESOLUTION_320x240, DEPTH_32_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE);
 
   while (1) {
-    display_context_t disp = display_get();
+    display_context_t disp = display_lock();
     int i;
     int phase = frame & 255;
 
