@@ -275,7 +275,7 @@ def main() -> int:
     raise SystemExit("--frames must be at least 1")
   if args.rate < 1:
     raise SystemExit("--rate must be at least 1")
-  if args.audio_rate < 8000:
+  if args.audio_seconds is not None and args.audio_rate < 8000:
     raise SystemExit("--audio-rate must be at least 8000")
   if not args.output and not args.udp and not args.n64_serial:
     raise SystemExit("choose --output, --udp, --n64-serial, or a combination")

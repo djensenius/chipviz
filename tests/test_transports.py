@@ -93,6 +93,50 @@ class TransportTests(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "definitely_missing_chipviz_module"):
       live_bridge.require_module("definitely_missing_chipviz_module", "nothing")
 
+  def test_stream_frames_fans_out_to_every_sink_in_order(self) -> None:
+    frames = [b"a", b"b", b"c"]
+    first = _RecordingSink(paced=False)
+    second = _RecordingSink(paced=True)
+    live_bridge.stream_frames(frames, realtime=False, rate=60, sinks=[first, second])
+    self.assertEqual(first.received, frames)
+    self.assertEqual(second.received, frames)
+
+  def test_stream_frames_paces_non_realtime_sources_with_paced_sinks(self) -> None:
+    sleeps = self._run_stream_with_fake_clock([b"x", b"y"], realtime=False, sinks=[_RecordingSink(paced=True)])
+    self.assertEqual(len(sleeps), 2)
+    self.assertTrue(all(delay > 0 for delay in sleeps))
+
+  def test_stream_frames_skips_pacing_for_realtime_sources(self) -> None:
+    sleeps = self._run_stream_with_fake_clock([b"x", b"y"], realtime=True, sinks=[_RecordingSink(paced=True)])
+    self.assertEqual(sleeps, [])
+
+  def test_stream_frames_skips_pacing_for_unpaced_sinks_only(self) -> None:
+    sleeps = self._run_stream_with_fake_clock([b"x", b"y"], realtime=False, sinks=[_RecordingSink(paced=False)])
+    self.assertEqual(sleeps, [])
+
+  def _run_stream_with_fake_clock(self, frames, realtime, sinks):
+    sleeps: list[float] = []
+    clock = [0.0]
+    original_monotonic = live_bridge.time.monotonic
+    original_sleep = live_bridge.time.sleep
+    live_bridge.time.monotonic = lambda: clock[0]
+    live_bridge.time.sleep = lambda delay: sleeps.append(delay)
+    try:
+      live_bridge.stream_frames(frames, realtime=realtime, rate=60, sinks=sinks)
+    finally:
+      live_bridge.time.monotonic = original_monotonic
+      live_bridge.time.sleep = original_sleep
+    return sleeps
+
+
+class _RecordingSink:
+  def __init__(self, paced: bool) -> None:
+    self.paced = paced
+    self.received: list[bytes] = []
+
+  def send(self, frame: bytes) -> None:
+    self.received.append(frame)
+
   def test_cvz_to_c_renders_frame_array(self) -> None:
     header = cvz_to_c.render_header(self.wire, "chipviz_test_frames")
 

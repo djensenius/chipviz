@@ -42,6 +42,9 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
 
 static int read_joybus_packet(unsigned char packet[16]) {
   struct controller_data output;
+  const int all_ports =
+      CONTROLLER_1_INSERTED | CONTROLLER_2_INSERTED |
+      CONTROLLER_3_INSERTED | CONTROLLER_4_INSERTED;
   int p;
 
   controller_scan();
@@ -53,7 +56,7 @@ static int read_joybus_packet(unsigned char packet[16]) {
     packet[p * 4 + 2] = (unsigned char)((data >> 8) & 0xFF);
     packet[p * 4 + 3] = (unsigned char)(data & 0xFF);
   }
-  return get_controllers_present() != 0;
+  return (get_controllers_present() & all_ports) == all_ports;
 }
 
 static void procedural_packet(int frame, unsigned char packet[16]) {
