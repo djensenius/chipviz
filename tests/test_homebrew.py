@@ -21,6 +21,8 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertIn(bytes([build_homebrew.TOKEN_POKE]), prg)
     self.assertIn(bytes([build_homebrew.TOKEN_REM]), prg)
     self.assertIn(b"CHIPVIZ C64 HOMEBREW", prg)
+    self.assertIn(b"55296", prg)
+    self.assertIn(b"160+W", prg)
     self.assertTrue(prg.endswith(b"\x00\x00"))
 
   def test_snes_rom_has_lorom_header_and_reset_vector(self) -> None:
@@ -45,7 +47,7 @@ class HomebrewArtifactTests(unittest.TestCase):
       self.assertTrue((output / "chipviz-snes.sfc").exists())
       self.assertIs(status["generated"]["c64"]["hardwareBootable"], True)
       self.assertIs(status["generated"]["snes"]["hardwareBootable"], True)
-      self.assertEqual(status["generated"]["c64"]["status"], "tokenized-basic-homebrew-prg")
+      self.assertEqual(status["generated"]["c64"]["status"], "tokenized-basic-vic-ii-petscii-visualizer")
       self.assertIn("gba", status["sdkRequired"])
       self.assertIn("n64", status["sdkRequired"])
 

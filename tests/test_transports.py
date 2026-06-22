@@ -51,6 +51,25 @@ class TransportTests(unittest.TestCase):
 
     self.assertEqual(frames, [self.wire, self.wire])
 
+  def test_live_bridge_audio_band_normalization(self) -> None:
+    bands = live_bridge.normalize_bands([0.0, 1.0, 2.0, 4.0, 0.0, 8.0, 2.0, 1.0])
+
+    self.assertEqual(len(bands), 8)
+    self.assertEqual(bands[0], 0)
+    self.assertEqual(bands[5], 255)
+
+  def test_live_bridge_frame_from_bands_packs_notes(self) -> None:
+    wire = live_bridge.frame_from_bands(9, (255, 128, 64, 32, 16, 8, 4, 2), midi_velocity=90)
+    decoded = n64_joybus.decode_control_frame(wire)
+
+    self.assertEqual(decoded.frame, 9)
+    self.assertEqual(decoded.spectrum[0], 255)
+    self.assertEqual(decoded.note_velocities, (90,))
+
+  def test_live_bridge_rejects_missing_optional_dependency(self) -> None:
+    with self.assertRaisesRegex(RuntimeError, "definitely_missing_chipviz_module"):
+      live_bridge.require_module("definitely_missing_chipviz_module", "nothing")
+
   def test_cvz_to_c_renders_frame_array(self) -> None:
     header = cvz_to_c.render_header(self.wire, "chipviz_test_frames")
 

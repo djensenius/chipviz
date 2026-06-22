@@ -15,20 +15,21 @@ native homebrew builds.
 | C64 / C64 Ultimate | `.prg` / `.d64` | cc65 first; KickAssembler if raster timing requires it | C64 Ultimate USB HID first; user-port/joystick fallback. |
 | SNES / Analogue Pocket Dock | `.sfc` / `.smc` | libSFX first | Pocket Dock USB HID first; real SNES controller-port adapter later. |
 
-The portable C simulator is only a host-testable scaffold. A platform issue is
-not fully done until its homebrew artifact exists and the intended loading path
-has been validated.
+The portable C simulator is only a host-testable scaffold. A platform
+implementation issue is complete once its buildable artifact, deterministic
+transport mapping, and host-testable fallback path are checked in. Manual bench
+validation on real consoles, flash carts, Analogue devices, and adapters is
+tracked separately in issue #31.
 
 ## Current generated artifacts
 
 `shared/tools/build_homebrew.py` generates the minimal homebrew artifacts that do
 not require external SDKs:
 
-- `chipviz-c64.prg`: a tokenized BASIC/VIC-II color-cycling C64 program intended
-  to load directly on C64/C64 Ultimate.
-- `chipviz-snes.sfc`: a minimal LoROM-style SNES image that initializes the
-  display to a visible backdrop and is intended for emulator, flash cart, or
-  Pocket SNES-core validation.
+- `chipviz-c64.prg`: a tokenized BASIC/VIC-II and PETSCII color-cycling C64
+  visualizer intended to load directly on C64/C64 Ultimate.
+- `chipviz-snes.sfc`: a visible LoROM-style SNES image that initializes CGRAM
+  and VRAM markers for emulator, flash cart, or Pocket SNES-core validation.
 
 GBA and N64 have SDK-backed project directories:
 
@@ -39,3 +40,15 @@ GBA and N64 have SDK-backed project directories:
 Those SDKs handle the platform-specific boot/header details. The release
 asset workflow installs/uses those SDKs so published releases include
 `chipviz-gba.gba` and `chipviz-n64.z64` in addition to the C64/SNES artifacts.
+
+## Completion boundary
+
+- N64 implementation: libdragon ROM, packed Joybus transport mapping, and Pi
+  Pico controller-port bridge are in-repo. Real controller-port timing and
+  Analogue 3D/N64 bench validation remain in #31.
+- GBA/Pocket implementation: devkitARM ROM and USB HID reduced-control mapping
+  are in-repo. Pocket Dock validation remains in #31.
+- C64 implementation: C64-loadable `.prg` visualizer and reduced-control
+  transport policy are in-repo. C64 Ultimate validation remains in #31.
+- SNES implementation: LoROM `.sfc` artifact and Pocket Dock/SNES controller
+  mapping policy are in-repo. Pocket/core/flash-cart validation remains in #31.

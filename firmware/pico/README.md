@@ -2,10 +2,18 @@
 
 First N64 live transport firmware target.
 
-The production firmware will use the Pico SDK plus PIO Joybus state machines.
-The checked-in C module is the host-testable packet/buffer core: it accepts one
-16-byte N64 Joybus transport frame and exposes four controller state buffers
-that the PIO IRQ handlers can read without parsing.
+The firmware uses a small host-testable packet/buffer core plus Pico SDK build
+scaffolding. USB CDC serial feeds one raw 16-byte N64 Joybus transport frame at a
+time; each completed frame replaces four controller state buffers. PIO state
+machines then read those buffers and answer N64 controller status/poll requests
+without reparsing the upstream stream.
+
+Build with a normal Pico SDK checkout:
+
+```sh
+cmake -S firmware/pico -B build/pico -DPICO_SDK_PATH=/path/to/pico-sdk
+cmake --build build/pico
+```
 
 Hardware mapping:
 

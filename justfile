@@ -37,6 +37,9 @@ scaffold-check:
     @test -f shared/specs/n64-joybus-transport-v0.md
     @test -f shared/specs/usb-hid-transport-v0.md
     @test -f firmware/pico/src/joybus_bridge.c
+    @test -f firmware/pico/src/main.c
+    @test -f firmware/pico/src/joybus_bridge.pio
+    @test -f firmware/pico/CMakeLists.txt
     @test -f firmware/pico/README.md
     @test -f shared/specs/music-source-v0.md
     @test -f host/fixtures/musical/scale.musicsource.json
