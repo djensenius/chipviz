@@ -69,7 +69,7 @@ controller ports.
 
 1. Build and run the N64 ROM from a flashcart or Analogue 3D workflow.
 2. Wire Pico GPIOs to one or more N64 controller data lines, with common ground.
-   Use 3.3 V-safe signaling, do not drive 5 V into the ESP32, and keep the GPIO
+   Use 3.3 V-safe signaling, do not drive 5 V into the Pico, and keep the GPIO
    behavior close to open-drain/tri-state so the console and bridge do not fight
    the data line.
 3. Start with one controller port for scene/palette/intensity controls.

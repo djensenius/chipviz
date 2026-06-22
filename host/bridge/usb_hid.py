@@ -12,6 +12,8 @@ from pathlib import Path
 from n64_joybus import decode_control_frame
 from chipviz_bridge import WIRE_SIZE
 
+PALETTE_KEYS = ("Q", "W", "E", "R", "T", "Y", "U", "I")
+
 
 @dataclass(frozen=True)
 class HidState:
@@ -43,11 +45,11 @@ def map_frame(wire: bytes) -> HidState:
 
   keys = []
   keys.append(str((frame.scene & 0x07) + 1))
-  keys.append(chr(ord("Q") + (frame.palette & 0x07)))
+  keys.append(PALETTE_KEYS[frame.palette & 0x07])
   if frame.flags & 0x01:
     keys.append("Space")
   if frame.flags & 0x02:
-    keys.append("Enter")
+    keys.append("Return")
   if frame.flags & 0x0C:
     keys.append("F")
   if frame.flags & 0x10:

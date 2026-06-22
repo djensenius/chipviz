@@ -42,6 +42,7 @@ class TransportTests(unittest.TestCase):
 
     self.assertTrue(state.buttons & 0x01)
     self.assertIn("Space", state.keys)
+    self.assertIn("Q", state.keys)
     self.assertEqual(state.left_x, self.frame.energy - 128)
     self.assertEqual(state.left_y, -127)
 
@@ -72,6 +73,15 @@ class TransportTests(unittest.TestCase):
       self.assertEqual(len(joybus.read_bytes()), n64_joybus.JOYBUS_SIZE)
       self.assertEqual(json.loads(hid.read_text(encoding="utf-8"))[0]["keys"][0], "1")
       self.assertIn("static const uint8_t frames[]", header.read_text(encoding="utf-8"))
+
+  def test_cvz_to_c_rejects_empty_symbol(self) -> None:
+    with self.assertRaisesRegex(ValueError, "symbol"):
+      cvz_to_c.sanitize_symbol("")
+
+  def test_cvz_to_c_header_guard_uses_symbol(self) -> None:
+    header = cvz_to_c.render_header(self.wire, "custom_frames")
+
+    self.assertIn("CHIPVIZ_GENERATED_CUSTOM_FRAMES_H", header)
 
 
 if __name__ == "__main__":

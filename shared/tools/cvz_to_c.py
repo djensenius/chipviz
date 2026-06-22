@@ -11,7 +11,7 @@ WIRE_SIZE = 33
 
 
 def sanitize_symbol(symbol: str) -> str:
-  if not symbol.replace("_", "").isalnum() or symbol[0].isdigit():
+  if not symbol or not symbol.replace("_", "").isalnum() or symbol[0].isdigit():
     raise ValueError("symbol must be a C identifier-like name")
   return symbol
 
@@ -19,9 +19,10 @@ def sanitize_symbol(symbol: str) -> str:
 def render_header(data: bytes, symbol: str) -> str:
   if len(data) % WIRE_SIZE != 0:
     raise ValueError("input is not aligned to 33-byte control frames")
+  guard = f"CHIPVIZ_GENERATED_{symbol.upper()}_H"
   lines = [
-    "#ifndef CHIPVIZ_GENERATED_FRAMES_H",
-    "#define CHIPVIZ_GENERATED_FRAMES_H",
+    f"#ifndef {guard}",
+    f"#define {guard}",
     "",
     "#include <stddef.h>",
     "#include <stdint.h>",
