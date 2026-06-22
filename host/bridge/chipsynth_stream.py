@@ -29,6 +29,9 @@ KNOWN_VOICE_FLAGS = VOICE_ACTIVE | VOICE_GATE
 
 CHIP_IDS = range(0x00, 0x06)
 
+# Demo packets advertise a fixed 128.50 BPM (bpm_x100, little-endian u16).
+DEMO_BPM_X100 = 12850
+
 
 @dataclass(frozen=True)
 class Voice:
@@ -205,7 +208,7 @@ def pack_demo_packet(
   packet[4] = VERSION
   packet[5] = flags
   packet[6:8] = (sequence & 0xFFFF).to_bytes(2, "little")
-  packet[8:10] = (12850).to_bytes(2, "little")
+  packet[8:10] = DEMO_BPM_X100.to_bytes(2, "little")
   packet[10] = beat_phase & 0xFF
   packet[11:13] = (beat_count & 0xFFFF).to_bytes(2, "little")
   packet[13] = sum(1 for voice in voices if voice.flags & VOICE_ACTIVE)
@@ -238,7 +241,7 @@ def make_demo_packet() -> bytes:
   packet[4] = VERSION
   packet[5] = FLAG_PLAYING | FLAG_BEAT
   packet[6:8] = (42).to_bytes(2, "little")
-  packet[8:10] = (12850).to_bytes(2, "little")
+  packet[8:10] = DEMO_BPM_X100.to_bytes(2, "little")
   packet[10] = 96
   packet[11:13] = (7).to_bytes(2, "little")
   packet[13] = 2
