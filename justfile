@@ -1,6 +1,6 @@
 cflags := "-std=c99 -Wall -Wextra -Werror -pedantic -Ishared/include"
 sim_platforms := "n64 gba c64 snes"
-shared_srcs := "shared/src/control_frame.c shared/src/connection.c"
+shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/interface.c"
 modern_manifest := "renderers/modern/Cargo.toml"
 python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_host_bridge.py tests/test_transports.py"
 
@@ -26,6 +26,7 @@ scaffold-check:
     @test -f shared/specs/control-frame-v0.json
     @test -f shared/include/chipviz/control_frame.h
     @test -f shared/include/chipviz/connection.h
+    @test -f shared/include/chipviz/interface.h
     @test -f host/bridge/chipviz_bridge.py
     @test -f host/bridge/chipsynth_stream.py
     @test -f host/bridge/chipviz_encode.py
@@ -74,9 +75,11 @@ c-test:
     @mkdir -p build/tests
     @${CC:-cc} {{ cflags }} tests/control_frame_tests.c shared/src/control_frame.c -o build/tests/control_frame_tests
     @${CC:-cc} {{ cflags }} tests/connection_tests.c {{ shared_srcs }} -o build/tests/connection_tests
+    @${CC:-cc} {{ cflags }} tests/interface_tests.c shared/src/control_frame.c shared/src/interface.c -o build/tests/interface_tests
     @${CC:-cc} {{ cflags }} -Ifirmware/pico/include tests/pico_joybus_tests.c firmware/pico/src/joybus_bridge.c -o build/tests/pico_joybus_tests
     @build/tests/control_frame_tests
     @build/tests/connection_tests
+    @build/tests/interface_tests
     @build/tests/pico_joybus_tests
     @echo "chipviz C tests OK"
 

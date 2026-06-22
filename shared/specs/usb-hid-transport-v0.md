@@ -26,6 +26,8 @@ The HID path is low bandwidth and stateful. It carries:
 | North button | manual override |
 | Left shoulder | high energy bucket |
 | Right shoulder | treble/spectrum strobe |
+| Select + Start + both shoulders | enter auto mode |
+| Select + South + East + West | enter demo mode |
 | Left stick X | signed energy bucket |
 | Left stick Y | signed beat phase bucket |
 
