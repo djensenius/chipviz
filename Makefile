@@ -1,4 +1,4 @@
-.PHONY: help check lint test scaffold-check c-lint c-test python-lint python-test docs-lint rust-lint rust-test build build-sim simulate host-sample host-fixtures modern-check modern-pi5 modern-m1 clean
+.PHONY: help check lint test scaffold-check c-lint c-test python-lint python-test docs-lint rust-lint rust-test build build-sim simulate host-sample host-fixtures target-arrays modern-check modern-pi5 modern-m1 clean
 
 JUST ?= mise exec -- just
 
@@ -51,6 +51,9 @@ host-sample:
 
 host-fixtures:
 	@$(JUST) host-fixtures
+
+target-arrays:
+	@$(JUST) target-arrays
 
 modern-check:
 	@$(JUST) modern-check

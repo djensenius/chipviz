@@ -24,12 +24,12 @@ stub.
 
 ## Connection path
 
-Use the Commodore 64 Ultimate network path as the first live transport candidate:
-the host bridge or ESP32 sends the latest validated `control-frame-v0` over the
-LAN, and the C64-side program consumes a reduced frame for raster/PETSCII
-effects. If the Ultimate network service is not viable from a running C64
-program, fall back to user-port serial or baked `.prg`/`.d64` playback. See
-[`../../docs/connections.md`](../../docs/connections.md#commodore-64-ultimate-network-bridge).
+Use Raspberry Pi USB HID keyboard/joystick output as the first C64 Ultimate live
+transport candidate. The C64-side program consumes reduced scene, palette,
+energy, beat, and trigger state for raster/PETSCII effects. If USB HID is not
+viable from the exact Ultimate setup, fall back to Ultimate network, user-port
+serial, joystick-port adapter, or baked `.prg`/`.d64` playback. See
+[`../../shared/specs/usb-hid-transport-v0.md`](../../shared/specs/usb-hid-transport-v0.md).
 
 ## Constraints
 

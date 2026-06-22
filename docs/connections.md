@@ -62,19 +62,19 @@ without the upstream sender connected.
 
 ## N64 / Analogue 3D: wired controller-port bridge
 
-Preferred live path: an ESP32 emulates wired N64 controllers and plugs into the
-N64 or Analogue 3D controller ports. A Raspberry Pi can perform upstream audio
-analysis or chipsynth adaptation, then send frames to the ESP32 over USB serial
-or Wi-Fi UDP.
+Preferred live path: a Raspberry Pi performs upstream audio analysis or
+chipsynth adaptation, then sends 16-byte frames to a Pi Pico over USB serial. The
+Pico emulates wired N64 controllers and plugs into the N64 or Analogue 3D
+controller ports.
 
 1. Build and run the N64 ROM from a flashcart or Analogue 3D workflow.
-2. Wire ESP32 GPIOs to one or more N64 controller data lines, with common ground.
-   Use 3.3 V-safe signaling, do not drive 5 V into the ESP32, and keep the GPIO
+2. Wire Pico GPIOs to one or more N64 controller data lines, with common ground.
+   Use 3.3 V-safe signaling, do not drive 5 V into the Pico, and keep the GPIO
    behavior close to open-drain/tri-state so the console and bridge do not fight
    the data line.
 3. Start with one controller port for scene/palette/intensity controls.
 4. Expand to four controller ports for live frame transport. The N64 core polls
-   controller state through libdragon; the ESP32 encodes compact slices of
+   controller state through libdragon; the Pico exposes compact slices of
    `control-frame-v0` into button/stick state across those polls.
 5. Keep baked frame playback as the fallback for emulator, flashcart, and
    transport debugging.
@@ -85,19 +85,17 @@ graphic-looking objects arranged on 3D planes: from one camera angle they read a
 bass, and note events should drive camera moves, particles, Z-depth, and
 palette-lit geometry.
 
-## Analogue Pocket Dock / GBA: Bluetooth controller bridge
+## Analogue Pocket Dock / GBA: USB HID controller bridge
 
-Preferred low-bandwidth live path: the Analogue Pocket Dock receives a Bluetooth
-controller, and the GBA core treats that controller input as a control surface.
-An ESP32 can present as the Bluetooth HID device; a Raspberry Pi can do upstream
-audio analysis and forward compact frame/control state to the ESP32.
+Preferred low-bandwidth live path: the Raspberry Pi presents directly to the
+Analogue Pocket Dock as a USB HID controller, and the GBA core treats that
+controller input as a control surface.
 
-1. Pair a Bluetooth controller with the Analogue Pocket Dock.
+1. Plug the Pi USB gadget controller into the Analogue Pocket Dock.
 2. Run the `.gba` build through the Pocket's GBA path.
 3. Map buttons and D-pad to scene, palette, intensity, and mode flags.
-4. For an ESP32 bridge experiment, make the ESP32 present itself as a Bluetooth
-   HID gamepad to the Dock, then translate incoming `control-frame-v0` packets
-   into button-state patterns.
+4. Translate incoming `control-frame-v0` packets into the reduced HID mapping in
+   [`../shared/specs/usb-hid-transport-v0.md`](../shared/specs/usb-hid-transport-v0.md).
 5. Keep baked `.gba` frame playback as the deterministic fallback.
 
 This path is intentionally low bandwidth. It is best for scene changes,
@@ -127,3 +125,16 @@ serial forwarding.
 The C64 target should stay visually native: raster bars, PETSCII, character
 animation, sprites, fixed palettes, and SID/VIC-II timing tricks rather than a
 scaled-down copy of the N64 or GBA scenes.
+
+## SNES / Analogue Pocket Dock: USB HID controller bridge
+
+Preferred first path: run the SNES target through a Pocket Dock SNES core and
+use the same Raspberry Pi USB HID mapping as the GBA path. Real SNES hardware
+later uses a controller-port adapter and SNES controller extension cable.
+
+1. Run the `.sfc`/`.smc` once the libSFX build lands; until then, use the native
+   simulator target.
+2. Map buttons to beat/bar/fill/manual and scene/palette controls.
+3. Keep baked `control-frame-v0` arrays as the deterministic fallback.
+4. For real SNES, emulate the controller serial protocol instead of sending raw
+   audio or high-bandwidth data.

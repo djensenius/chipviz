@@ -24,11 +24,10 @@ build prints those values until the Butano or Tonc renderer replaces the stub.
 
 ## Connection path
 
-Use the Analogue Pocket Dock's Bluetooth controller support as the first live
-control path. A paired controller, or an ESP32 presenting as a Bluetooth HID
-gamepad, maps `control-frame-v0` state down to scene, palette, intensity, and
-trigger buttons. See
-[`../../docs/connections.md`](../../docs/connections.md#analogue-pocket-dock--gba-bluetooth-controller-bridge).
+Use Raspberry Pi USB HID through the Analogue Pocket Dock as the first live
+control path. The Pi maps `control-frame-v0` state down to scene, palette,
+intensity, and trigger buttons. See
+[`../../shared/specs/usb-hid-transport-v0.md`](../../shared/specs/usb-hid-transport-v0.md).
 
 ## Constraints
 

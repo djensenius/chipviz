@@ -28,11 +28,11 @@ orbit, and tilt changes that reveal the objects live on a 3D plane.
 
 ## Connection path
 
-Use an ESP32 as a wired controller-port bridge. The ESP32 receives
-`control-frame-v0` packets from the computer over USB serial first, then Wi-Fi
-UDP later, and exposes the current frame as emulated N64 controller state across
-one to four controller ports. See
-[`../../docs/connections.md`](../../docs/connections.md#n64--analogue-3d-wired-controller-port-bridge).
+Use a Raspberry Pi plus Pi Pico wired controller-port bridge. The Pi sends the
+16-byte N64 Joybus transport over USB serial, and the Pico exposes the current
+frame as emulated N64 controller state across one to four controller ports. See
+[`../../docs/n64-hardware.md`](../../docs/n64-hardware.md) and
+[`../../shared/specs/n64-joybus-transport-v0.md`](../../shared/specs/n64-joybus-transport-v0.md).
 
 ## Constraints
 
