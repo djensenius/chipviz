@@ -37,17 +37,18 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
 }
 
 static int read_joybus_packet(unsigned char packet[16]) {
+  struct controller_data output;
   int any = 0;
   int p;
 
-  joypad_poll();
-  for (p = 0; p < JOYPAD_PORT_COUNT; p++) {
-    joypad_inputs_t inputs = joypad_get_inputs((joypad_port_t)p);
-    unsigned int buttons = inputs.btn.raw;
-    packet[p * 4 + 0] = (unsigned char)((buttons >> 8) & 0xFF);
-    packet[p * 4 + 1] = (unsigned char)(buttons & 0xFF);
-    packet[p * 4 + 2] = (unsigned char)(inputs.stick_x & 0xFF);
-    packet[p * 4 + 3] = (unsigned char)(inputs.stick_y & 0xFF);
+  controller_scan();
+  controller_read(&output);
+  for (p = 0; p < 4; p++) {
+    unsigned int data = output.c[p].data;
+    packet[p * 4 + 0] = (unsigned char)((data >> 24) & 0xFF);
+    packet[p * 4 + 1] = (unsigned char)((data >> 16) & 0xFF);
+    packet[p * 4 + 2] = (unsigned char)((data >> 8) & 0xFF);
+    packet[p * 4 + 3] = (unsigned char)(data & 0xFF);
     any |= packet[p * 4 + 0] | packet[p * 4 + 1] |
            packet[p * 4 + 2] | packet[p * 4 + 3];
   }
@@ -91,7 +92,7 @@ static void draw_plane_grid(display_context_t disp, int frame, const visual_stat
 int main(void) {
   int frame = 0;
   debug_init_isviewer();
-  joypad_init();
+  controller_init();
   display_init(RESOLUTION_320x240, DEPTH_32_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE);
 
   while (1) {
