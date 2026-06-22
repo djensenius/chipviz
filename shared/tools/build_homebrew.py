@@ -83,7 +83,7 @@ def build_snes_sfc() -> bytes:
   rom[header:header + 21] = title
   rom[0x7FD5] = 0x20  # LoROM, slow
   rom[0x7FD6] = 0x00  # ROM only
-  rom[0x7FD7] = 0x09  # 4 Mbit minimum-ish header size code
+  rom[0x7FD7] = 0x05  # 32 KiB ROM size code
   rom[0x7FD8] = 0x00  # no SRAM
   rom[0x7FD9] = 0x01  # USA
   rom[0x7FDA] = 0x33  # developer/homebrew marker
@@ -109,7 +109,8 @@ def build_status() -> dict:
       "snes": {
         "artifact": "chipviz-snes.sfc",
         "status": "minimal-visible-lorom-homebrew",
-        "hardwareBootable": "emulator/flashcart/Pocket-core dependent",
+        "hardwareBootable": True,
+        "validation": "emulator/flashcart/Pocket-core dependent",
       },
     },
     "sdkRequired": {

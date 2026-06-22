@@ -28,6 +28,7 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertEqual(len(rom), 0x8000)
     self.assertEqual(rom[0x7FC0:0x7FC0 + 16].rstrip(), b"CHIPVIZ HOMEBREW")
     self.assertEqual(rom[0x7FD5], 0x20)
+    self.assertEqual(rom[0x7FD7], 0x05)
     self.assertEqual(int.from_bytes(rom[0x7FFC:0x7FFE], "little"), 0x8000)
     self.assertIn(bytes([0x8D, 0x22, 0x21]), rom[:64])
 
@@ -39,6 +40,8 @@ class HomebrewArtifactTests(unittest.TestCase):
 
       self.assertTrue((output / "chipviz-c64.prg").exists())
       self.assertTrue((output / "chipviz-snes.sfc").exists())
+      self.assertIs(status["generated"]["c64"]["hardwareBootable"], True)
+      self.assertIs(status["generated"]["snes"]["hardwareBootable"], True)
       self.assertEqual(status["generated"]["c64"]["status"], "tokenized-basic-homebrew-prg")
       self.assertIn("gba", status["sdkRequired"])
       self.assertIn("n64", status["sdkRequired"])
