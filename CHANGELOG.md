@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.3](https://github.com/djensenius/chipviz/compare/chipviz-v0.1.2...chipviz-v0.1.3) (2026-06-22)
+
+### Bug Fixes
+
+* enrich homebrew visual demos ([51c1c0d](https://github.com/djensenius/chipviz/commit/51c1c0d30e5e4b433487328a1f9c473fec719cc2))
+
 ## [0.1.2](https://github.com/djensenius/chipviz/compare/chipviz-v0.1.1...chipviz-v0.1.2) (2026-06-22)
 
 ### Bug Fixes
