@@ -72,9 +72,11 @@ class TransportTests(unittest.TestCase):
     self.assertEqual(decoded.spectrum[0], 255)
     self.assertEqual(decoded.note_velocities, (90,))
 
-  def test_live_bridge_frame_from_bands_rejects_too_few_bands(self) -> None:
-    with self.assertRaisesRegex(ValueError, "requires at least 8 bands"):
+  def test_live_bridge_frame_from_bands_requires_exactly_eight_bands(self) -> None:
+    with self.assertRaisesRegex(ValueError, "requires exactly 8 bands"):
       live_bridge.frame_from_bands(0, (1, 2, 3, 4))
+    with self.assertRaisesRegex(ValueError, "requires exactly 8 bands"):
+      live_bridge.frame_from_bands(0, (1, 2, 3, 4, 5, 6, 7, 8, 9))
 
   def test_live_bridge_frame_from_bands_clamps_midi_velocity(self) -> None:
     high_wire = live_bridge.frame_from_bands(0, (1, 2, 3, 4, 5, 6, 7, 8), midi_velocity=300)

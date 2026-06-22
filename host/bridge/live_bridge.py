@@ -58,8 +58,8 @@ def normalize_bands(values: list[float]) -> tuple[int, ...]:
 
 
 def frame_from_bands(frame_index: int, bands: tuple[int, ...], midi_velocity: int = 0) -> bytes:
-  if len(bands) < 8:
-    raise ValueError("frame_from_bands requires at least 8 bands")
+  if len(bands) != 8:
+    raise ValueError("frame_from_bands requires exactly 8 bands")
   midi_velocity = clamp_byte(midi_velocity)
   bands = tuple(clamp_byte(value) for value in bands)
   bass = max(bands[0], bands[1])

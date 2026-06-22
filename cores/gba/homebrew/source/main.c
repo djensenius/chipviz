@@ -36,7 +36,7 @@ int main(void) {
 
   REG_DISPCNT = MODE3 | BG2_ENABLE;
   for (;;) {
-    uint16_t keys = (uint16_t)(~REG_KEYINPUT);
+    uint16_t keys = (uint16_t)(~REG_KEYINPUT & 0x03FF);
     if (keys & KEY_RIGHT) {
       scene = (uint8_t)((scene + 1u) & 7u);
     }
