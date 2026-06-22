@@ -18,6 +18,21 @@ python3 host/bridge/chipviz_encode.py --chipsynth-log host/fixtures/chipsynth/gr
 python3 host/bridge/n64_joybus.py --input "$assets/scale.cvz" --output "$assets/scale.n64joybus"
 python3 host/bridge/usb_hid.py --input "$assets/scale.cvz" --output "$assets/scale-usb-hid.json"
 python3 shared/tools/cvz_to_c.py --input "$assets/scale.cvz" --symbol chipviz_scale_frames --output "$assets/scale_frames.h"
+python3 shared/tools/build_homebrew.py --output "$assets"
+
+if command -v gbafix >/dev/null 2>&1 && [ -n "${DEVKITARM:-}" ]; then
+  make -C cores/gba/homebrew
+  cp cores/gba/homebrew/chipviz-gba.gba "$assets/"
+else
+  echo "Skipping GBA SDK build; install devkitPro/devkitARM and tools-gba for chipviz-gba.gba"
+fi
+
+if [ -n "${N64_INST:-}" ] && [ -f "$N64_INST/include/n64.mk" ]; then
+  make -C cores/n64/homebrew
+  cp cores/n64/homebrew/chipviz-n64.z64 "$assets/"
+else
+  echo "Skipping N64 SDK build; install libdragon and set N64_INST for chipviz-n64.z64"
+fi
 
 cargo build --manifest-path renderers/modern/Cargo.toml --release --bins
 cp renderers/modern/target/release/chipviz-pi5 "$assets/"

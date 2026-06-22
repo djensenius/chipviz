@@ -1,10 +1,10 @@
 # chipviz-c64
 
-Commodore 64 visualizer core for Commodore 64 Ultimate and real C64-style workflows.
+Commodore 64 homebrew visualizer for Commodore 64 Ultimate and real C64-style workflows.
 
-## Planned stack
+## Homebrew stack
 
-- cc65 for portable C/assembly builds, or KickAssembler if raster timing becomes the priority.
+- cc65 for the first homebrew C/assembly build, or KickAssembler if raster timing becomes the priority.
 - VIC-II raster bars, PETSCII patterns, character animation, sprites, and SID-driven timing experiments.
 
 ## First demo
@@ -21,6 +21,11 @@ a minimal C64-style visualization model: beat phase selects a raster position,
 scene and palette choose color, and energy chooses a PETSCII cell. The native
 simulator build prints those values until the cc65 VIC-II renderer replaces the
 stub.
+The simulator is not the product; the target artifact is a loadable homebrew
+`.prg` and/or `.d64`.
+`just homebrew-artifacts` currently produces a minimal tokenized BASIC
+`chipviz-c64.prg` that can be loaded directly while the cc65 raster demo is
+being built.
 
 ## Connection path
 

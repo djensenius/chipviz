@@ -1,0 +1,33 @@
+name: Homebrew ROMs
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  gba:
+    name: GBA ROM
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build GBA ROM
+        run: make -C cores/gba/homebrew
+      - name: Verify GBA ROM
+        run: test -s cores/gba/homebrew/chipviz-gba.gba
+
+  n64:
+    name: N64 ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build N64 ROM
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace/cores/n64/homebrew \
+            anacierdem/libdragon:latest \
+            make
+      - name: Verify N64 ROM
+        run: test -s cores/n64/homebrew/chipviz-n64.z64

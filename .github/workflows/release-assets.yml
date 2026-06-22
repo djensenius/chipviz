@@ -19,6 +19,33 @@ jobs:
         run: mise exec -- rustup component add rustfmt clippy
       - name: Build release assets
         run: scripts/package-release.sh
+      - name: Build GBA ROM asset
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace/cores/gba/homebrew \
+            devkitpro/devkitarm:latest \
+            make
+          cp cores/gba/homebrew/chipviz-gba.gba dist/assets/
+      - name: Build N64 ROM asset
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace/cores/n64/homebrew \
+            anacierdem/libdragon:latest \
+            make
+          cp cores/n64/homebrew/chipviz-n64.z64 dist/assets/
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+          assets = Path("dist/assets")
+          zip_path = Path("dist/chipviz-assets.zip")
+          if zip_path.exists():
+            zip_path.unlink()
+          with ZipFile(zip_path, "w", ZIP_DEFLATED) as archive:
+            for path in sorted(assets.iterdir()):
+              archive.write(path, path.name)
+          PY
       - name: Upload individual assets
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,10 +1,10 @@
 # chipviz-gba
 
-GBA visualizer core for Analogue Pocket and GBA-compatible hardware.
+GBA homebrew visualizer for Analogue Pocket and GBA-compatible hardware.
 
-## Planned stack
+## Homebrew stack
 
-- Butano for a batteries-included C++ GBA path, or Tonc for lower-level C examples.
+- Butano for the first batteries-included C++ GBA homebrew path, or Tonc for lower-level C examples.
 - Tile, sprite, palette, affine, and bitmap-mode effects.
 
 ## First demo
@@ -21,6 +21,9 @@ GBA visualizer core for Analogue Pocket and GBA-compatible hardware.
 a minimal GBA-style visualization model: beat phase scrolls tiles, mid energy
 sets sprite count, and total energy drives affine scale. The native simulator
 build prints those values until the Butano or Tonc renderer replaces the stub.
+The simulator is not the product; the target artifact is a bootable homebrew
+`.gba`.
+`cores/gba/homebrew` contains the devkitARM project for `chipviz-gba.gba`.
 
 ## Connection path
 

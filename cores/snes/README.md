@@ -1,6 +1,6 @@
 # chipviz-snes
 
-SNES visualizer target for Analogue Pocket Dock SNES-core workflows first, with
+SNES homebrew visualizer target for Analogue Pocket Dock SNES-core workflows first, with
 real SNES controller-port hardware later.
 
 ## Stack choice
@@ -17,6 +17,11 @@ simulator builds the same control-frame mapping.
 a SNES-style model: beat phase drives a Mode-7-style angle, energy drives sprite
 count, palette selects CGRAM banks, and flags trigger HDMA/raster-like pulses.
 The simulator prints those values until the libSFX renderer replaces the stub.
+The simulator is not the product; the target artifact is a bootable homebrew
+`.sfc`/`.smc`.
+`just homebrew-artifacts` currently produces a minimal visible LoROM
+`chipviz-snes.sfc` for emulator/flash-cart/Pocket-core validation while the
+libSFX visualizer demo is being built.
 
 ## Pocket Dock live path
 
