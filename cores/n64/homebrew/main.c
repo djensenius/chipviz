@@ -12,6 +12,5 @@ int main(void) {
   printf("Pi -> Pico -> Joybus comes next.\n");
   console_render();
   while (1) {
-  while (1) {
   }
 }
