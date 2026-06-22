@@ -12,6 +12,8 @@ jobs:
     container: devkitpro/devkitarm:latest
     steps:
       - uses: actions/checkout@v7
+      - name: Install GBA libraries
+        run: dkp-pacman -Syu --noconfirm gba-dev
       - name: Build GBA ROM
         run: make -C cores/gba/homebrew
       - name: Verify GBA ROM
@@ -20,7 +22,7 @@ jobs:
   n64:
     name: N64 ROM
     runs-on: ubuntu-latest
-    container: dragonminded/libdragon:latest
+    container: anacierdem/libdragon:latest
     steps:
       - uses: actions/checkout@v7
       - name: Build N64 ROM

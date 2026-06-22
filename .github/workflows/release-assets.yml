@@ -25,14 +25,14 @@ jobs:
             -v "$PWD":/workspace \
             -w /workspace/cores/gba/homebrew \
             devkitpro/devkitarm:latest \
-            make
+            sh -c 'dkp-pacman -Syu --noconfirm gba-dev && make'
           cp cores/gba/homebrew/chipviz-gba.gba dist/assets/
       - name: Build N64 ROM asset
         run: |
           docker run --rm \
             -v "$PWD":/workspace \
             -w /workspace/cores/n64/homebrew \
-            dragonminded/libdragon:latest \
+            anacierdem/libdragon:latest \
             make
           cp cores/n64/homebrew/chipviz-n64.z64 dist/assets/
           python3 - <<'PY'
