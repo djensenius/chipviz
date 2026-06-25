@@ -21,6 +21,9 @@ Reset:
 WaitVBlank1:
   bit $2002
   bpl WaitVBlank1
+WaitVBlankEnd:
+  bit $2002
+  bmi WaitVBlankEnd
 WaitVBlank2:
   bit $2002
   bpl WaitVBlank2

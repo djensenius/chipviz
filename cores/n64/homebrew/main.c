@@ -74,10 +74,11 @@ static void decode_transport_packet(const uint8_t packet[16], visual_state_t *st
 }
 
 static bool read_joybus_packet(uint8_t packet[16]) {
-  bool has_data = false;
+  bool has_controller = false;
 
   joypad_poll();
   for (int p = 0; p < 4; p++) {
+    joypad_port_t port = (joypad_port_t)p;
     joypad_inputs_t inputs = joypad_get_inputs((joypad_port_t)p);
     uint8_t buttons_a = 0;
     uint8_t buttons_b = 0;
@@ -103,11 +104,11 @@ static bool read_joybus_packet(uint8_t packet[16]) {
     packet[p * 4 + 1] = buttons_b;
     packet[p * 4 + 2] = (uint8_t)inputs.stick_x;
     packet[p * 4 + 3] = (uint8_t)inputs.stick_y;
-    if (buttons_a != 0 || buttons_b != 0 || inputs.stick_x != 0 || inputs.stick_y != 0) {
-      has_data = true;
+    if (joypad_is_connected(port)) {
+      has_controller = true;
     }
   }
-  return has_data;
+  return has_controller;
 }
 
 static void procedural_packet(int frame, uint8_t packet[16]) {

@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
+CORE_EXT = ".dll" if sys.platform == "win32" else ".dylib" if sys.platform == "darwin" else ".so"
+
 TESTS = [
-  ("gba", "mgba_libretro.dylib", "cores/gba/homebrew/chipviz-gba.gba"),
-  ("gb", "sameboy_libretro.dylib", "cores/gb/homebrew/chipviz-gb.gb"),
-  ("n64", "mupen64plus_next_libretro.dylib", "cores/n64/homebrew/chipviz-n64.z64"),
-  ("snes", "snes9x_libretro.dylib", "cores/snes/homebrew/chipviz-snes.sfc"),
-  ("c64", "vice_x64sc_libretro.dylib", str(Path("cores/c64/homebrew/chipviz-c64.prg").resolve())),
-  ("genesis", "genesis_plus_gx_libretro.dylib", "cores/genesis/homebrew/chipviz-genesis.md"),
-  ("nes", "mesen_libretro.dylib", "cores/nes/homebrew/chipviz-nes.nes"),
-  ("sms", "genesis_plus_gx_libretro.dylib", "cores/sms/homebrew/chipviz-sms.sms"),
+  ("gba", "mgba_libretro", "cores/gba/homebrew/chipviz-gba.gba"),
+  ("gb", "sameboy_libretro", "cores/gb/homebrew/chipviz-gb.gb"),
+  ("n64", "mupen64plus_next_libretro", "cores/n64/homebrew/chipviz-n64.z64"),
+  ("snes", "snes9x_libretro", "cores/snes/homebrew/chipviz-snes.sfc"),
+  ("c64", "vice_x64sc_libretro", str(Path("cores/c64/homebrew/chipviz-c64.prg").resolve())),
+  ("genesis", "genesis_plus_gx_libretro", "cores/genesis/homebrew/chipviz-genesis.md"),
+  ("nes", "mesen_libretro", "cores/nes/homebrew/chipviz-nes.nes"),
+  ("sms", "genesis_plus_gx_libretro", "cores/sms/homebrew/chipviz-sms.sms"),
 ]
 
 
@@ -33,9 +36,10 @@ def main() -> int:
       print(f"missing rom: {rom}")
       continue
 
+    core_path = cores / f"{core}{CORE_EXT}"
     with log.open("wb") as output:
       process = subprocess.Popen(
-        [str(retroarch), "-L", str(cores / core), rom, "--verbose"],
+        [str(retroarch), "-L", str(core_path), rom, "--verbose"],
         stdout=output,
         stderr=subprocess.STDOUT,
       )

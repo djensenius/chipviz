@@ -115,6 +115,8 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertEqual(len(rom), 0x8000)
     self.assertEqual(rom[0x7FF0:0x7FF8], b"TMR SEGA")
     self.assertIn(bytes([0xD3, 0xBF]), rom[:48])
+    checksum = (sum(rom[:0x7FFA]) + sum(rom[0x7FFC:])) & 0xFFFF
+    self.assertEqual(int.from_bytes(rom[0x7FFA:0x7FFC], "little"), checksum)
 
   def test_sdk_homebrew_projects_are_present(self) -> None:
     self.assertTrue((ROOT / "cores" / "c64" / "homebrew" / "Makefile").exists())

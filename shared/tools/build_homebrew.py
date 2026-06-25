@@ -227,7 +227,7 @@ def build_sms_rom() -> bytes:
   rom[0x7FF8:0x7FFA] = b"\x00\x00"
   rom[0x7FFA:0x7FFC] = b"\x00\x00"
   rom[0x7FFC:0x7FFE] = b"\x00\x4A"
-  checksum = sum(rom[:0x7FF0]) & 0xFFFF
+  checksum = (sum(rom[:0x7FFA]) + sum(rom[0x7FFC:])) & 0xFFFF
   rom[0x7FFA:0x7FFC] = checksum.to_bytes(2, "little")
   return bytes(rom)
 

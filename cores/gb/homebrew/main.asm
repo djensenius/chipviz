@@ -30,9 +30,14 @@ Loop:
   jr Loop
 
 WaitVBlank:
+.waitVisible
   ldh a, [$ff44]
   cp 144
-  jr c, WaitVBlank
+  jr nc, .waitVisible
+.waitVBlank
+  ldh a, [$ff44]
+  cp 144
+  jr c, .waitVBlank
   ret
 
 LoadTiles:
