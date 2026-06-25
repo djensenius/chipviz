@@ -41,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bison cmake flex
-          git clone --depth 1 https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          git clone --depth 1 --recurse-submodules https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
           make -C "$RUNNER_TEMP/pvsneslib/compiler"
           make -C "$RUNNER_TEMP/pvsneslib/compiler" install
           make -C "$RUNNER_TEMP/pvsneslib/tools"
@@ -52,7 +52,10 @@ jobs:
       - name: Build chipsynth-era ROM assets
         run: |
           sudo apt-get update
-          sudo apt-get install -y cc65 rgbds
+          sudo apt-get install -y bison build-essential cc65 libpng-dev pkg-config
+          git clone --depth 1 --branch v1.0.1 https://github.com/gbdev/rgbds.git "$RUNNER_TEMP/rgbds"
+          make -C "$RUNNER_TEMP/rgbds"
+          sudo make -C "$RUNNER_TEMP/rgbds" install
           make -C cores/gb/homebrew
           cp cores/gb/homebrew/chipviz-gb.gb dist/assets/
           make -C cores/genesis/homebrew

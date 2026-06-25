@@ -48,7 +48,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bison cmake flex
-          git clone --depth 1 https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          git clone --depth 1 --recurse-submodules https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
           make -C "$RUNNER_TEMP/pvsneslib/compiler"
           make -C "$RUNNER_TEMP/pvsneslib/compiler" install
           make -C "$RUNNER_TEMP/pvsneslib/tools"
@@ -66,7 +66,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install RGBDS
-        run: sudo apt-get update && sudo apt-get install -y rgbds
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison build-essential libpng-dev pkg-config
+          git clone --depth 1 --branch v1.0.1 https://github.com/gbdev/rgbds.git "$RUNNER_TEMP/rgbds"
+          make -C "$RUNNER_TEMP/rgbds"
+          sudo make -C "$RUNNER_TEMP/rgbds" install
       - name: Build Game Boy ROM
         run: make -C cores/gb/homebrew
       - name: Verify Game Boy ROM
