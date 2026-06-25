@@ -196,7 +196,9 @@ def build_genesis_md() -> bytes:
     ]
   )
   rom[0x200:0x200 + len(code)] = code
-  checksum = sum(rom[0x200:]) & 0xFFFF
+  checksum = 0
+  for offset in range(0x200, len(rom), 2):
+    checksum = (checksum + int.from_bytes(rom[offset:offset + 2], "big")) & 0xFFFF
   rom[0x18E:0x190] = checksum.to_bytes(2, "big")
   return bytes(rom)
 

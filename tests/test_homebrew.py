@@ -81,6 +81,10 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertEqual(rom[0x100:0x110].rstrip(), b"SEGA MEGA DRIVE")
     self.assertIn(b"CHIPVIZ GENESIS", rom[0x120:0x150])
     self.assertIn(bytes([0x33, 0xFC, 0x81, 0x74]), rom[0x200:0x240])
+    checksum = 0
+    for offset in range(0x200, len(rom), 2):
+      checksum = (checksum + int.from_bytes(rom[offset:offset + 2], "big")) & 0xFFFF
+    self.assertEqual(int.from_bytes(rom[0x18E:0x190], "big"), checksum)
 
   def test_generated_nes_rom_has_ines_header_and_vectors(self) -> None:
     rom = build_homebrew.build_nes_nrom()
