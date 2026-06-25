@@ -90,12 +90,14 @@ static bool read_joybus_packet(uint8_t packet[16]) {
     buttons_a |= inputs.btn.d_down ? 0x04 : 0;
     buttons_a |= inputs.btn.d_left ? 0x02 : 0;
     buttons_a |= inputs.btn.d_right ? 0x01 : 0;
-    buttons_b |= inputs.btn.l ? 0x20 : 0;
-    buttons_b |= inputs.btn.r ? 0x10 : 0;
-    buttons_b |= inputs.btn.c_up ? 0x08 : 0;
-    buttons_b |= inputs.btn.c_down ? 0x04 : 0;
-    buttons_b |= inputs.btn.c_left ? 0x02 : 0;
-    buttons_b |= inputs.btn.c_right ? 0x01 : 0;
+    if (p == 3) {
+      buttons_b |= inputs.btn.l ? 0x20 : 0;
+      buttons_b |= inputs.btn.r ? 0x10 : 0;
+      buttons_b |= inputs.btn.c_up ? 0x08 : 0;
+      buttons_b |= inputs.btn.c_down ? 0x04 : 0;
+      buttons_b |= inputs.btn.c_left ? 0x02 : 0;
+      buttons_b |= inputs.btn.c_right ? 0x01 : 0;
+    }
 
     packet[p * 4 + 0] = buttons_a;
     packet[p * 4 + 1] = buttons_b;

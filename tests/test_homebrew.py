@@ -82,6 +82,7 @@ class HomebrewArtifactTests(unittest.TestCase):
       self.assertTrue((output / "chipviz-genesis.md").exists())
       self.assertFalse((output / "chipviz-c64.prg").exists())
       self.assertEqual(set(status["generated"]), {"genesisFallback"})
+      self.assertEqual(set(status["sdkRequired"]), {"genesis"})
       self.assertEqual(status["generated"]["genesisFallback"]["artifact"], "chipviz-genesis.md")
 
   def test_generated_genesis_rom_has_header_and_reset_vector(self) -> None:
