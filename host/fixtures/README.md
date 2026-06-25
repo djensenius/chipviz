@@ -6,7 +6,8 @@ host encoder (`host/bridge/chipviz_encode.py`) re-encodes each input and
 encoder path stays repeatable for tests, emulator runs, and hardware debugging.
 
 Each `.cvz` file is a raw stream of 33-byte `control-frame-v0` records and can be
-replayed directly by the N64, GBA, C64, and modern renderers.
+replayed directly by the N64, GBA, C64, SNES, Game Boy, Genesis, NES, Master
+System, and modern renderers.
 
 ## Layout
 

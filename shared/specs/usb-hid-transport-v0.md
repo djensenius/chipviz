@@ -2,7 +2,8 @@
 
 This transport maps a reduced `control-frame-v0` into ordinary USB HID
 keyboard/gamepad state for devices such as Raspberry Pi USB gadget mode,
-Analogue Pocket Dock, C64 Ultimate, and SNES-on-Pocket-Dock cores.
+Analogue Pocket Dock, C64 Ultimate, SNES-on-Pocket-Dock cores, and other
+controller-oriented retro loading paths.
 
 ## Reduced fields
 
@@ -34,7 +35,7 @@ The HID path is low bandwidth and stateful. It carries:
 
 ## Keyboard mapping
 
-For C64 Ultimate keyboard-style input, use ASCII-ish keys:
+For C64 Ultimate and other keyboard-style input paths, use ASCII-ish keys:
 
 | Key | chipviz meaning |
 | --- | --- |
