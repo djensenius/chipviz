@@ -27,6 +27,7 @@ target/
 *.ps
 *.asp
 cores/snes/homebrew/linkfile
+cores/snes/homebrew/hdr.asm
 
 # Tooling caches
 .cache/

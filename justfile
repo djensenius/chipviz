@@ -138,19 +138,19 @@ homebrew-artifacts:
     @echo "chipviz homebrew artifacts OK"
 
 gba-rom:
-    @cd cores/gba/homebrew && $(MAKE)
+    @make -C cores/gba/homebrew
 
 n64-rom:
     @test -n "$${N64_INST:-}" || (echo "N64_INST is required; install libdragon" >&2; exit 1)
-    @cd cores/n64/homebrew && $(MAKE)
+    @make -C cores/n64/homebrew
 
 c64-rom:
     @command -v cl65 >/dev/null 2>&1 || (echo "cl65 is required; install cc65" >&2; exit 1)
-    @cd cores/c64/homebrew && $(MAKE)
+    @make -C cores/c64/homebrew
 
 snes-rom:
     @test -n "$${PVSNESLIB_HOME:-}" || (echo "PVSNESLIB_HOME is required; install PVSnesLib" >&2; exit 1)
-    @cd cores/snes/homebrew && $(MAKE)
+    @make -C cores/snes/homebrew
 
 sdk-roms:
     @just gba-rom

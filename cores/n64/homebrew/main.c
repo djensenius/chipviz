@@ -6,6 +6,7 @@ typedef struct {
   int scene;
   int palette;
   int energy;
+  int bass;
   int midi;
 } visual_state_t;
 
@@ -47,6 +48,7 @@ static void decode_transport_packet(const unsigned char packet[16], visual_state
   state->scene = ((packet[12] >> 4) & 0x03) | (((packet[13] >> 4) & 0x03) << 2);
   state->palette = packet[13] & 0x0F;
   state->energy = packet[14];
+  state->bass = state->bands[0];
   state->midi = packet[15];
   for (i = 0; i < 8; i++) {
     if (state->bands[i] < 20) {

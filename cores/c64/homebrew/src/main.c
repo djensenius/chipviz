@@ -1,11 +1,11 @@
 #include <conio.h>
 #include <stdint.h>
 
-#define BORDER_COLOR (*(volatile uint8_t *)0xD020)
-#define BACKGROUND_COLOR (*(volatile uint8_t *)0xD021)
-#define RASTER_LINE (*(volatile uint8_t *)0xD012)
-#define SCREEN_RAM ((volatile uint8_t *)0x0400)
-#define COLOR_RAM ((volatile uint8_t *)0xD800)
+#define CHIPVIZ_BORDER_COLOR (*(volatile uint8_t *)0xD020)
+#define CHIPVIZ_BACKGROUND_COLOR (*(volatile uint8_t *)0xD021)
+#define CHIPVIZ_RASTER_LINE (*(volatile uint8_t *)0xD012)
+#define CHIPVIZ_SCREEN_RAM ((volatile uint8_t *)0x0400)
+#define CHIPVIZ_COLOR_RAM ((volatile uint8_t *)0xD800)
 
 typedef struct {
   uint8_t spectrum[8];
@@ -40,9 +40,9 @@ static void draw_title(void) {
 }
 
 static void wait_frame(void) {
-  while (RASTER_LINE != 0xFFu) {
+  while (CHIPVIZ_RASTER_LINE != 0xFFu) {
   }
-  while (RASTER_LINE == 0xFFu) {
+  while (CHIPVIZ_RASTER_LINE == 0xFFu) {
   }
 }
 
@@ -58,8 +58,8 @@ static void draw_petscii_grid(uint16_t frame, const demo_state_t *state) {
       if (((x * 3u + y * 5u + frame + band) & 31u) < (state->beat ? 8u : 4u)) {
         cell = (uint8_t)(81u + (state->note & 7u));
       }
-      SCREEN_RAM[offset] = cell;
-      COLOR_RAM[offset] = (uint8_t)(1u + ((band / 16u + state->palette + y) & 15u));
+      CHIPVIZ_SCREEN_RAM[offset] = cell;
+      CHIPVIZ_COLOR_RAM[offset] = (uint8_t)(1u + ((band / 16u + state->palette + y) & 15u));
     }
   }
 }
@@ -72,10 +72,10 @@ static void draw_channel_meters(const demo_state_t *state) {
     uint8_t height = (uint8_t)(1u + (state->spectrum[band] >> 5));
     for (y = 0; y < 5u; y++) {
       uint16_t offset = (uint16_t)(23u - y) * 40u + 2u + band * 4u;
-      SCREEN_RAM[offset] = y < height ? 102u : 32u;
-      SCREEN_RAM[offset + 1u] = y < height ? 102u : 32u;
-      COLOR_RAM[offset] = (uint8_t)(1u + ((band + state->palette) & 15u));
-      COLOR_RAM[offset + 1u] = COLOR_RAM[offset];
+      CHIPVIZ_SCREEN_RAM[offset] = y < height ? 102u : 32u;
+      CHIPVIZ_SCREEN_RAM[offset + 1u] = y < height ? 102u : 32u;
+      CHIPVIZ_COLOR_RAM[offset] = (uint8_t)(1u + ((band + state->palette) & 15u));
+      CHIPVIZ_COLOR_RAM[offset + 1u] = CHIPVIZ_COLOR_RAM[offset];
     }
   }
 }
@@ -88,10 +88,11 @@ int main(void) {
   for (;;) {
     wait_frame();
     make_demo_state(frame, &state);
-    BORDER_COLOR = (uint8_t)((state.palette + state.beat * 8u) & 15u);
-    BACKGROUND_COLOR = (uint8_t)((state.scene * 2u + state.energy / 32u) & 15u);
+    CHIPVIZ_BORDER_COLOR = (uint8_t)((state.palette + state.beat * 8u) & 15u);
+    CHIPVIZ_BACKGROUND_COLOR = (uint8_t)((state.scene * 2u + state.energy / 32u) & 15u);
     draw_petscii_grid(frame, &state);
     draw_channel_meters(&state);
     ++frame;
   }
+  return 0;
 }

@@ -8,6 +8,10 @@ export ROMNAME := chipviz-snes
 
 .PHONY: all clean
 
-all: $(ROMNAME).sfc
+all: hdr.asm $(ROMNAME).sfc
+
+hdr.asm: $(PVSNESLIB_HOME)/devkitsnes/include/hdr.asm
+	cp $< $@
 
 clean: cleanBuildRes cleanRom cleanGfx
+	rm -f hdr.asm
