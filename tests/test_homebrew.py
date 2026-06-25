@@ -73,6 +73,17 @@ class HomebrewArtifactTests(unittest.TestCase):
       self.assertIn("nes", status["sdkRequired"])
       self.assertIn("sms", status["sdkRequired"])
 
+  def test_targeted_build_writes_matching_status(self) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+      output = pathlib.Path(temp_dir)
+      build_homebrew.build(output, targets={"genesis"})
+      status = json.loads((output / "homebrew-status.json").read_text(encoding="utf-8"))
+
+      self.assertTrue((output / "chipviz-genesis.md").exists())
+      self.assertFalse((output / "chipviz-c64.prg").exists())
+      self.assertEqual(set(status["generated"]), {"genesisFallback"})
+      self.assertEqual(status["generated"]["genesisFallback"]["artifact"], "chipviz-genesis.md")
+
   def test_generated_genesis_rom_has_header_and_reset_vector(self) -> None:
     rom = build_homebrew.build_genesis_md()
 

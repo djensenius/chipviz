@@ -84,12 +84,12 @@ static bool read_joybus_packet(uint8_t packet[16]) {
 
     buttons_a |= inputs.btn.a ? 0x80 : 0;
     buttons_a |= inputs.btn.b ? 0x40 : 0;
-    buttons_a |= inputs.btn.d_up ? 0x20 : 0;
-    buttons_a |= inputs.btn.d_down ? 0x10 : 0;
-    buttons_a |= inputs.btn.d_left ? 0x08 : 0;
-    buttons_a |= inputs.btn.d_right ? 0x04 : 0;
-    buttons_b |= inputs.btn.start ? 0x80 : 0;
-    buttons_b |= inputs.btn.z ? 0x40 : 0;
+    buttons_a |= inputs.btn.z ? 0x20 : 0;
+    buttons_a |= inputs.btn.start ? 0x10 : 0;
+    buttons_a |= inputs.btn.d_up ? 0x08 : 0;
+    buttons_a |= inputs.btn.d_down ? 0x04 : 0;
+    buttons_a |= inputs.btn.d_left ? 0x02 : 0;
+    buttons_a |= inputs.btn.d_right ? 0x01 : 0;
     buttons_b |= inputs.btn.l ? 0x20 : 0;
     buttons_b |= inputs.btn.r ? 0x10 : 0;
     buttons_b |= inputs.btn.c_up ? 0x08 : 0;
@@ -99,8 +99,8 @@ static bool read_joybus_packet(uint8_t packet[16]) {
 
     packet[p * 4 + 0] = buttons_a;
     packet[p * 4 + 1] = buttons_b;
-    packet[p * 4 + 2] = (uint8_t)(inputs.stick_x + 128);
-    packet[p * 4 + 3] = (uint8_t)(inputs.stick_y + 128);
+    packet[p * 4 + 2] = (uint8_t)inputs.stick_x;
+    packet[p * 4 + 3] = (uint8_t)inputs.stick_y;
     if (buttons_a != 0 || buttons_b != 0 || inputs.stick_x != 0 || inputs.stick_y != 0) {
       has_data = true;
     }
