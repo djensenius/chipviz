@@ -1,8 +1,10 @@
+set dotenv-load := true
+
 cflags := "-std=c99 -Wall -Wextra -Werror -pedantic -Ishared/include"
 sim_platforms := "n64 gba c64 snes"
 shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/interface.c"
 modern_manifest := "renderers/modern/Cargo.toml"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py shared/tools/build_homebrew.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py"
 
 default:
     just --list
@@ -34,6 +36,7 @@ scaffold-check:
     @test -f host/bridge/live_bridge.py
     @test -f host/bridge/n64_joybus.py
     @test -f host/bridge/usb_hid.py
+    @test -f scripts/retroarch_smoke.py
     @test -f shared/specs/n64-joybus-transport-v0.md
     @test -f shared/specs/usb-hid-transport-v0.md
     @test -f firmware/pico/src/joybus_bridge.c
@@ -140,23 +143,68 @@ homebrew-artifacts:
 gba-rom:
     @make -C cores/gba/homebrew
 
+gba-rom-docker:
+    @command -v docker >/dev/null 2>&1 || (echo "docker is required for gba-rom-docker" >&2; exit 1)
+    @docker run --rm -v "$$PWD":/workspace -w /workspace/cores/gba/homebrew devkitpro/devkitarm:latest make
+
 n64-rom:
     @test -n "$${N64_INST:-}" || (echo "N64_INST is required; install libdragon" >&2; exit 1)
     @make -C cores/n64/homebrew
+
+n64-rom-docker:
+    @command -v docker >/dev/null 2>&1 || (echo "docker is required for n64-rom-docker" >&2; exit 1)
+    @docker run --rm -v "$$PWD":/workspace -w /workspace/cores/n64/homebrew anacierdem/libdragon:latest make
 
 c64-rom:
     @command -v cl65 >/dev/null 2>&1 || (echo "cl65 is required; install cc65" >&2; exit 1)
     @make -C cores/c64/homebrew
 
 snes-rom:
-    @test -n "$${PVSNESLIB_HOME:-}" || (echo "PVSNESLIB_HOME is required; install PVSnesLib" >&2; exit 1)
-    @make -C cores/snes/homebrew
+    @test -n "${PVSNESLIB_HOME:-}" || (echo "PVSNESLIB_HOME is required; install PVSnesLib" >&2; exit 1)
+    @sed_bin="${GNU_SED_BIN:-}"; \
+      if [ -z "$sed_bin" ] && command -v brew >/dev/null 2>&1; then sed_bin="$(brew --prefix)/opt/gnu-sed/libexec/gnubin"; fi; \
+      if [ -d "$sed_bin" ]; then PATH="$sed_bin:$PATH" make -C cores/snes/homebrew; else make -C cores/snes/homebrew; fi
 
 sdk-roms:
     @just gba-rom
     @just n64-rom
     @just c64-rom
     @just snes-rom
+
+debug-env:
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; \
+      cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      echo "RETROARCH_BIN=$ra"; test -x "$ra" || (echo "RetroArch binary not found or not executable" >&2; exit 1); \
+      echo "RETROARCH_CORES=$cores"; test -d "$cores" || (echo "RetroArch cores directory not found" >&2; exit 1); \
+      for core in mgba_libretro.dylib mupen64plus_next_libretro.dylib snes9x_libretro.dylib vice_x64sc_libretro.dylib; do test -f "$cores/$core" || (echo "Missing RetroArch core: $core" >&2; exit 1); done; \
+      echo "RetroArch debug environment OK"
+
+gba-debug:
+    @if [ -n "${DEVKITARM:-}" ]; then just gba-rom; else just gba-rom-docker; fi
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      "$ra" -L "$cores/mgba_libretro.dylib" cores/gba/homebrew/chipviz-gba.gba --verbose 2>&1 | tee build/retroarch-smoke/gba.log
+
+n64-debug:
+    @if [ -n "${N64_INST:-}" ]; then just n64-rom; else just n64-rom-docker; fi
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      "$ra" -L "$cores/mupen64plus_next_libretro.dylib" cores/n64/homebrew/chipviz-n64.z64 --verbose 2>&1 | tee build/retroarch-smoke/n64.log
+
+c64-debug: c64-rom
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; rom="$(pwd)/cores/c64/homebrew/chipviz-c64.prg"; \
+      "$ra" -L "$cores/vice_x64sc_libretro.dylib" "$rom" --verbose 2>&1 | tee build/retroarch-smoke/c64.log
+
+snes-debug: snes-rom
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      "$ra" -L "$cores/snes9x_libretro.dylib" cores/snes/homebrew/chipviz-snes.sfc --verbose 2>&1 | tee build/retroarch-smoke/snes.log
+
+retroarch-smoke:
+    @just debug-env
+    @mkdir -p build/retroarch-smoke
+    @python3 scripts/retroarch_smoke.py
 
 rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check
