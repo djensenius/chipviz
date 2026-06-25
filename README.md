@@ -10,6 +10,10 @@ Original homebrew visualization software for real retro hardware and FPGA consol
 | GBA / Analogue Pocket | homebrew `.gba` | GBA cartridge, flashcart, or Pocket adapter path | Portable 2D sketchpad with palettes, sprites, and affine effects. |
 | Commodore 64 / THEC64 | homebrew `.prg` / `.d64` | THEC64 USB media or real C64 storage | VIC-II/SID/raster/PETSCII visual personality. |
 | SNES / Analogue Pocket Dock | homebrew `.sfc` / `.smc` | Pocket Dock SNES core first, real SNES later | Tile/sprite/Mode-7-style visualizer. |
+| Game Boy / Analogue Pocket | homebrew `.gb` | Pocket GB core, flashcart, or real DMG/GBC | Four-shade tile/sprite visualizer for Game Boy APU telemetry. |
+| Sega Genesis / Mega Drive | homebrew `.md` | Genesis Plus GX, flashcart, or real Genesis | YM2612 FM voice planes with PSG accents. |
+| NES | homebrew `.nes` | NES emulator/core, flashcart, or real NES | 2A03 pulse/triangle/noise tile visualizer. |
+| Sega Master System / Game Gear | homebrew `.sms` | SMS emulator/core, flashcart, or real SMS/GG | SN76489 PSG tile/channel visualizer. |
 | Modern 4K | native app | Raspberry Pi 5 HDMI or Apple Silicon Mac | Dense 3D data-field visualizer rendered with Rust + wgpu. |
 
 ## Project layout
@@ -20,6 +24,10 @@ cores/
   gba/      GBA homebrew target, likely Butano or Tonc.
   c64/      C64 target, likely cc65 or KickAssembler.
   snes/     SNES target, PVSnesLib for the production SDK path.
+  gb/       Original Game Boy target, RGBDS for the production SDK path.
+  genesis/  Sega Genesis/Mega Drive target for YM2612 + SN76489 visuals.
+  nes/      NES target, ca65/cc65 for the first NROM SDK path.
+  sms/      Sega Master System target for SN76489 visuals.
 shared/
   include/  Tiny C interface for control frames and platform connection polling.
   specs/    Cross-platform control protocol and scene model.
@@ -54,7 +62,8 @@ cross-target title/scene-select/auto/demo interface model.
 See [`docs/connections.md`](docs/connections.md) for the planned hardware,
 ESP32 bridge, and Raspberry Pi sender/audio-analysis paths.
 See [`docs/homebrew-targets.md`](docs/homebrew-targets.md) for the target policy:
-N64, GBA, C64, and SNES are real homebrew builds.
+N64, GBA, C64, SNES, Game Boy, Genesis, NES, and Master System are tracked as
+homebrew builds.
 
 ## First milestone
 
@@ -64,7 +73,11 @@ Build one self-running demo per platform before live input:
 2. `chipviz-gba`: sprite/tile/affine visualizer with beat simulation.
 3. `chipviz-c64`: raster bars, PETSCII patterning, SID/noise-reactive fake input loop.
 4. `chipviz-snes`: tile/sprite/Mode-7-style visualizer with Pocket Dock control input.
-5. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets.
+5. `chipviz-gb`: DMG four-shade scroll/tile visualizer for Game Boy APU telemetry.
+6. `chipviz-genesis`: VDP plane and palette visualizer for YM2612 plus SN76489.
+7. `chipviz-nes`: NROM tile/palette visualizer for 2A03 telemetry.
+8. `chipviz-sms`: SMS VDP channel-meter visualizer for SN76489 telemetry.
+9. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets.
 
 ## Releases
 
@@ -72,9 +85,10 @@ Merges to `main` run release-please. Published releases build individual assets:
 modern renderer binaries, `.cvz` demos, N64 Joybus and USB HID mapped streams,
 generated C arrays, and current homebrew artifacts. The release asset workflow
 builds `chipviz-gba.gba` with devkitPro, `chipviz-n64.z64` with libdragon,
-`chipviz-c64.prg` with cc65, and `chipviz-snes.sfc` with PVSnesLib. Generated
-C64/SNES assets remain SDK-free fallbacks for local packaging when those
-toolchains are not installed.
+`chipviz-c64.prg` with cc65, `chipviz-snes.sfc` with PVSnesLib,
+`chipviz-gb.gb` with RGBDS, and `chipviz-nes.nes` with ca65. Generated
+C64/SNES/Genesis/NES/SMS assets remain SDK-free fallbacks for local packaging
+when those toolchains are not installed.
 
 ## Current scaffold
 

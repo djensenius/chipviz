@@ -59,3 +59,47 @@ jobs:
         run: make -C cores/snes/homebrew
       - name: Verify SNES ROM
         run: test -s cores/snes/homebrew/chipviz-snes.sfc
+
+  gb:
+    name: Game Boy ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install RGBDS
+        run: sudo apt-get update && sudo apt-get install -y rgbds
+      - name: Build Game Boy ROM
+        run: make -C cores/gb/homebrew
+      - name: Verify Game Boy ROM
+        run: test -s cores/gb/homebrew/chipviz-gb.gb
+
+  genesis:
+    name: Genesis ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Genesis ROM
+        run: make -C cores/genesis/homebrew
+      - name: Verify Genesis ROM
+        run: test -s cores/genesis/homebrew/chipviz-genesis.md
+
+  nes:
+    name: NES ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cc65
+        run: sudo apt-get update && sudo apt-get install -y cc65
+      - name: Build NES ROM
+        run: make -C cores/nes/homebrew
+      - name: Verify NES ROM
+        run: test -s cores/nes/homebrew/chipviz-nes.nes
+
+  sms:
+    name: Master System ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Master System ROM
+        run: make -C cores/sms/homebrew
+      - name: Verify Master System ROM
+        run: test -s cores/sms/homebrew/chipviz-sms.sms

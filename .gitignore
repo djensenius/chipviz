@@ -19,10 +19,13 @@ target/
 *.gba
 *.gb
 *.gbc
+*.nes
 *.prg
 *.d64
 *.sfc
 *.smc
+*.sms
+cores/genesis/homebrew/*.md
 
 # Toolchain intermediates
 *.obj

@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlparse
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 IGNORED_DIRS = {".cache", ".git", ".venv", "build", "dist", "node_modules", "target"}
+IGNORED_MARKDOWN_ROM_DIRS = {("cores", "genesis", "homebrew")}
 
 
 def iter_markdown_files() -> list[pathlib.Path]:
@@ -19,6 +20,7 @@ def iter_markdown_files() -> list[pathlib.Path]:
     path
     for path in ROOT.rglob("*.md")
     if IGNORED_DIRS.isdisjoint(path.parts)
+    and tuple(path.relative_to(ROOT).parts[:-1]) not in IGNORED_MARKDOWN_ROM_DIRS
   )
 
 

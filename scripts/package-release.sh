@@ -48,6 +48,26 @@ else
   echo "Keeping generated SNES fallback; install PVSnesLib and set PVSNESLIB_HOME for SDK-built chipviz-snes.sfc"
 fi
 
+if command -v rgbasm >/dev/null 2>&1 && command -v rgblink >/dev/null 2>&1 && command -v rgbfix >/dev/null 2>&1; then
+  make -C cores/gb/homebrew
+  cp cores/gb/homebrew/chipviz-gb.gb "$assets/"
+else
+  echo "Skipping Game Boy SDK build; install RGBDS for chipviz-gb.gb"
+fi
+
+make -C cores/genesis/homebrew
+cp cores/genesis/homebrew/chipviz-genesis.md "$assets/"
+
+if command -v ca65 >/dev/null 2>&1 && command -v ld65 >/dev/null 2>&1; then
+  make -C cores/nes/homebrew
+  cp cores/nes/homebrew/chipviz-nes.nes "$assets/"
+else
+  echo "Keeping generated NES fallback; install cc65/ca65 for SDK-built chipviz-nes.nes"
+fi
+
+make -C cores/sms/homebrew
+cp cores/sms/homebrew/chipviz-sms.sms "$assets/"
+
 cargo build --manifest-path renderers/modern/Cargo.toml --release --bins
 cp renderers/modern/target/release/chipviz-pi5 "$assets/"
 cp renderers/modern/target/release/chipviz-m1 "$assets/"

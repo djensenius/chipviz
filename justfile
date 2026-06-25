@@ -1,7 +1,7 @@
 set dotenv-load := true
 
 cflags := "-std=c99 -Wall -Wextra -Werror -pedantic -Ishared/include"
-sim_platforms := "n64 gba c64 snes"
+sim_platforms := "n64 gba c64 snes gb genesis nes sms"
 shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/interface.c"
 modern_manifest := "renderers/modern/Cargo.toml"
 python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py"
@@ -67,6 +67,16 @@ scaffold-check:
     @test -f cores/c64/homebrew/src/main.c
     @test -f cores/snes/homebrew/Makefile
     @test -f cores/snes/homebrew/chipviz-snes.c
+    @test -f cores/gb/src/main.c
+    @test -f cores/gb/homebrew/Makefile
+    @test -f cores/gb/homebrew/main.asm
+    @test -f cores/genesis/src/main.c
+    @test -f cores/genesis/homebrew/Makefile
+    @test -f cores/nes/src/main.c
+    @test -f cores/nes/homebrew/Makefile
+    @test -f cores/nes/homebrew/src/main.s
+    @test -f cores/sms/src/main.c
+    @test -f cores/sms/homebrew/Makefile
     @test -f cores/c64/src/main.c
     @test -f cores/snes/src/main.c
     @test -f renderers/modern/Cargo.toml
@@ -137,6 +147,9 @@ homebrew-artifacts:
     @${PYTHON:-python3} shared/tools/build_homebrew.py --output build/homebrew
     @test -s build/homebrew/chipviz-c64.prg
     @test -s build/homebrew/chipviz-snes.sfc
+    @test -s build/homebrew/chipviz-genesis.md
+    @test -s build/homebrew/chipviz-nes.nes
+    @test -s build/homebrew/chipviz-sms.sms
     @test -s build/homebrew/homebrew-status.json
     @echo "chipviz homebrew artifacts OK"
 
@@ -165,18 +178,39 @@ snes-rom:
       if [ -z "$sed_bin" ] && command -v brew >/dev/null 2>&1; then sed_bin="$(brew --prefix)/opt/gnu-sed/libexec/gnubin"; fi; \
       if [ -d "$sed_bin" ]; then PATH="$sed_bin:$PATH" make -C cores/snes/homebrew; else make -C cores/snes/homebrew; fi
 
+gb-rom:
+    @command -v rgbasm >/dev/null 2>&1 || (echo "rgbasm is required; install RGBDS" >&2; exit 1)
+    @command -v rgblink >/dev/null 2>&1 || (echo "rgblink is required; install RGBDS" >&2; exit 1)
+    @command -v rgbfix >/dev/null 2>&1 || (echo "rgbfix is required; install RGBDS" >&2; exit 1)
+    @make -C cores/gb/homebrew
+
+genesis-rom:
+    @make -C cores/genesis/homebrew
+
+nes-rom:
+    @command -v ca65 >/dev/null 2>&1 || (echo "ca65 is required; install cc65" >&2; exit 1)
+    @command -v ld65 >/dev/null 2>&1 || (echo "ld65 is required; install cc65" >&2; exit 1)
+    @make -C cores/nes/homebrew
+
+sms-rom:
+    @make -C cores/sms/homebrew
+
 sdk-roms:
     @just gba-rom
     @just n64-rom
     @just c64-rom
     @just snes-rom
+    @just gb-rom
+    @just genesis-rom
+    @just nes-rom
+    @just sms-rom
 
 debug-env:
     @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; \
       cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
       echo "RETROARCH_BIN=$ra"; test -x "$ra" || (echo "RetroArch binary not found or not executable" >&2; exit 1); \
       echo "RETROARCH_CORES=$cores"; test -d "$cores" || (echo "RetroArch cores directory not found" >&2; exit 1); \
-      for core in mgba_libretro.dylib mupen64plus_next_libretro.dylib snes9x_libretro.dylib vice_x64sc_libretro.dylib; do test -f "$cores/$core" || (echo "Missing RetroArch core: $core" >&2; exit 1); done; \
+      for core in mgba_libretro.dylib mupen64plus_next_libretro.dylib snes9x_libretro.dylib vice_x64sc_libretro.dylib sameboy_libretro.dylib genesis_plus_gx_libretro.dylib mesen_libretro.dylib; do test -f "$cores/$core" || (echo "Missing RetroArch core: $core" >&2; exit 1); done; \
       echo "RetroArch debug environment OK"
 
 gba-debug:
@@ -210,6 +244,26 @@ snes-debug: snes-rom
     @mkdir -p build/retroarch-smoke
     @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
       "$ra" -L "$cores/snes9x_libretro.dylib" cores/snes/homebrew/chipviz-snes.sfc --verbose 2>&1 | tee build/retroarch-smoke/snes.log
+
+gb-debug: gb-rom
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      "$ra" -L "$cores/sameboy_libretro.dylib" cores/gb/homebrew/chipviz-gb.gb --verbose 2>&1 | tee build/retroarch-smoke/gb.log
+
+genesis-debug: genesis-rom
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      "$ra" -L "$cores/genesis_plus_gx_libretro.dylib" cores/genesis/homebrew/chipviz-genesis.md --verbose 2>&1 | tee build/retroarch-smoke/genesis.log
+
+nes-debug: nes-rom
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      "$ra" -L "$cores/mesen_libretro.dylib" cores/nes/homebrew/chipviz-nes.nes --verbose 2>&1 | tee build/retroarch-smoke/nes.log
+
+sms-debug: sms-rom
+    @mkdir -p build/retroarch-smoke
+    @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
+      "$ra" -L "$cores/genesis_plus_gx_libretro.dylib" cores/sms/homebrew/chipviz-sms.sms --verbose 2>&1 | tee build/retroarch-smoke/sms.log
 
 retroarch-smoke:
     @just debug-env
