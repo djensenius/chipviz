@@ -153,7 +153,7 @@ n64-rom:
 
 n64-rom-docker:
     @command -v docker >/dev/null 2>&1 || (echo "docker is required for n64-rom-docker" >&2; exit 1)
-    @docker run --rm -v "$PWD":/workspace -w /workspace/cores/n64/homebrew anacierdem/libdragon:latest make
+    @scripts/n64-docker-build.sh
 
 c64-rom:
     @command -v cl65 >/dev/null 2>&1 || (echo "cl65 is required; install cc65" >&2; exit 1)
@@ -187,6 +187,16 @@ gba-debug:
 
 n64-debug:
     @if [ -n "${N64_INST:-}" ]; then just n64-rom; else just n64-rom-docker; fi
+    @ares="${ARES_BIN:-}"; \
+      if [ -z "$ares" ] && [ -x /Applications/ares.app/Contents/MacOS/ares ]; then ares=/Applications/ares.app/Contents/MacOS/ares; fi; \
+      if [ -z "$ares" ]; then ares="$(command -v ares 2>/dev/null || true)"; fi; \
+      if [ -n "$ares" ] && [ -x "$ares" ]; then "$ares" cores/n64/homebrew/chipviz-n64.z64; else just _n64-launch-retroarch; fi
+
+n64-debug-retroarch:
+    @if [ -n "${N64_INST:-}" ]; then just n64-rom; else just n64-rom-docker; fi
+    @just _n64-launch-retroarch
+
+_n64-launch-retroarch:
     @mkdir -p build/retroarch-smoke
     @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; \
       "$ra" -L "$cores/mupen64plus_next_libretro.dylib" cores/n64/homebrew/chipviz-n64.z64 --verbose 2>&1 | tee build/retroarch-smoke/n64.log

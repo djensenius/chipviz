@@ -35,12 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build N64 ROM
-        run: |
-          docker run --rm \
-            -v "$PWD":/workspace \
-            -w /workspace/cores/n64/homebrew \
-            anacierdem/libdragon:latest \
-            make
+        run: scripts/n64-docker-build.sh
       - name: Verify N64 ROM
         run: test -s cores/n64/homebrew/chipviz-n64.z64
 

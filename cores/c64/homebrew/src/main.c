@@ -39,6 +39,19 @@ static void draw_title(void) {
   cputsxy(1, 1, "CC65 VIC-II / PETSCII");
 }
 
+static void seed_petscii_grid(void) {
+  uint8_t x;
+  uint8_t y;
+
+  for (y = 0; y < 18u; y++) {
+    for (x = 0; x < 40u; x++) {
+      uint16_t offset = (uint16_t)(y + 4u) * 40u + x;
+      CHIPVIZ_SCREEN_RAM[offset] = (uint8_t)(160u + ((x + y) & 15u));
+      CHIPVIZ_COLOR_RAM[offset] = (uint8_t)(1u + ((x / 5u + y) & 15u));
+    }
+  }
+}
+
 static void wait_frame(void) {
   while (CHIPVIZ_RASTER_LINE != 0xFFu) {
   }
@@ -46,11 +59,15 @@ static void wait_frame(void) {
   }
 }
 
-static void draw_petscii_grid(uint16_t frame, const demo_state_t *state) {
+static void update_petscii_rows(uint16_t frame, const demo_state_t *state) {
   uint8_t x;
   uint8_t y;
+  uint8_t pass = (uint8_t)(frame & 3u);
 
   for (y = 0; y < 18u; y++) {
+    if ((y & 3u) != pass) {
+      continue;
+    }
     for (x = 0; x < 40u; x++) {
       uint16_t offset = (uint16_t)(y + 4u) * 40u + x;
       uint8_t band = state->spectrum[(x / 5u) & 7u];
@@ -85,12 +102,13 @@ int main(void) {
   demo_state_t state;
 
   draw_title();
+  seed_petscii_grid();
   for (;;) {
     wait_frame();
     make_demo_state(frame, &state);
     CHIPVIZ_BORDER_COLOR = (uint8_t)((state.palette + state.beat * 8u) & 15u);
     CHIPVIZ_BACKGROUND_COLOR = (uint8_t)((state.scene * 2u + state.energy / 32u) & 15u);
-    draw_petscii_grid(frame, &state);
+    update_petscii_rows(frame, &state);
     draw_channel_meters(&state);
     ++frame;
   }

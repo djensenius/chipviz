@@ -35,11 +35,7 @@ jobs:
           cp cores/gba/homebrew/chipviz-gba.gba dist/assets/
       - name: Build N64 ROM asset
         run: |
-          docker run --rm \
-            -v "$PWD":/workspace \
-            -w /workspace/cores/n64/homebrew \
-            anacierdem/libdragon:latest \
-            make
+          scripts/n64-docker-build.sh
           cp cores/n64/homebrew/chipviz-n64.z64 dist/assets/
       - name: Build SNES ROM asset
         run: |

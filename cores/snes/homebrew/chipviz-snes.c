@@ -87,6 +87,9 @@ int main(void) {
     unsigned short bg;
 
     make_demo_state(frame, &state);
+    update_tilemap(frame, &state);
+
+    WaitForVBlank();
     bg = rgb5(
         (unsigned char)((state.energy >> 3) + state.beat * 8u),
         (unsigned char)((state.palette * 3u + state.scene * 4u) & 31u),
@@ -102,9 +105,6 @@ int main(void) {
               (unsigned char)((state.palette * 4u + level) & 31u),
               (unsigned char)(31u - ((level + state.scene * 3u) & 31u))));
     }
-
-    update_tilemap(frame, &state);
-    WaitForVBlank();
     dmaCopyVram((unsigned char *)tilemap, 0x6800, sizeof(tilemap));
     ++frame;
   }

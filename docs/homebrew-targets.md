@@ -10,7 +10,7 @@ native homebrew builds.
 
 | Platform | Homebrew artifact | First toolchain | Runtime input path |
 | --- | --- | --- | --- |
-| N64 / Analogue 3D | `.z64` | libdragon + OpenGL 1.1 / RSP path | Four controller ports via Pi Pico Joybus. |
+| N64 / Analogue 3D | `.z64` | current libdragon + RDPQ path | Four controller ports via Pi Pico Joybus. |
 | GBA / Analogue Pocket | `.gba` | Butano first unless Tonc proves simpler | Pocket Dock USB HID first; link cable later if needed. |
 | C64 / C64 Ultimate | `.prg` / `.d64` | cc65 first; KickAssembler if raster timing requires it | C64 Ultimate USB HID first; user-port/joystick fallback. |
 | SNES / Analogue Pocket Dock | `.sfc` / `.smc` | PVSnesLib first | Pocket Dock USB HID first; real SNES controller-port adapter later. |
@@ -25,7 +25,7 @@ tracked separately in issue #31.
 
 Every target now has a first-class SDK/toolchain path:
 
-- `cores/n64/homebrew`: builds `chipviz-n64.z64` with libdragon via `N64_INST`.
+- `cores/n64/homebrew`: builds `chipviz-n64.z64` with libdragon via `N64_INST`; `just n64-rom-docker` uses the official libdragon toolchain image and caches a current SDK under `.cache/libdragon`.
 - `cores/gba/homebrew`: builds `chipviz-gba.gba` with devkitPro/devkitARM and
   `gbafix`.
 - `cores/c64/homebrew`: builds `chipviz-c64.prg` with cc65/cl65.
