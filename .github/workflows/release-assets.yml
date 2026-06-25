@@ -42,12 +42,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential bison cmake flex
           git clone --depth 1 --recurse-submodules https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          export PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib"
           make -C "$RUNNER_TEMP/pvsneslib/compiler"
           make -C "$RUNNER_TEMP/pvsneslib/compiler" install
           make -C "$RUNNER_TEMP/pvsneslib/tools"
           make -C "$RUNNER_TEMP/pvsneslib/tools" install
           make -C "$RUNNER_TEMP/pvsneslib/pvsneslib"
-          PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib" make -C cores/snes/homebrew
+          PVSNESLIB_HOME="$PVSNESLIB_HOME" make -C cores/snes/homebrew
           cp cores/snes/homebrew/chipviz-snes.sfc dist/assets/
       - name: Build chipsynth-era ROM assets
         run: |

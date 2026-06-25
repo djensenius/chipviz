@@ -49,12 +49,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential bison cmake flex
           git clone --depth 1 --recurse-submodules https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          export PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib"
           make -C "$RUNNER_TEMP/pvsneslib/compiler"
           make -C "$RUNNER_TEMP/pvsneslib/compiler" install
           make -C "$RUNNER_TEMP/pvsneslib/tools"
           make -C "$RUNNER_TEMP/pvsneslib/tools" install
           make -C "$RUNNER_TEMP/pvsneslib/pvsneslib"
-          echo "PVSNESLIB_HOME=$RUNNER_TEMP/pvsneslib" >> "$GITHUB_ENV"
+          echo "PVSNESLIB_HOME=$PVSNESLIB_HOME" >> "$GITHUB_ENV"
       - name: Build SNES ROM
         run: make -C cores/snes/homebrew
       - name: Verify SNES ROM
