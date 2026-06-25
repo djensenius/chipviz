@@ -145,15 +145,15 @@ gba-rom:
 
 gba-rom-docker:
     @command -v docker >/dev/null 2>&1 || (echo "docker is required for gba-rom-docker" >&2; exit 1)
-    @docker run --rm -v "$$PWD":/workspace -w /workspace/cores/gba/homebrew devkitpro/devkitarm:latest make
+    @docker run --rm -v "$PWD":/workspace -w /workspace/cores/gba/homebrew devkitpro/devkitarm:latest make
 
 n64-rom:
-    @test -n "$${N64_INST:-}" || (echo "N64_INST is required; install libdragon" >&2; exit 1)
+    @test -n "${N64_INST:-}" || (echo "N64_INST is required; install libdragon" >&2; exit 1)
     @make -C cores/n64/homebrew
 
 n64-rom-docker:
     @command -v docker >/dev/null 2>&1 || (echo "docker is required for n64-rom-docker" >&2; exit 1)
-    @docker run --rm -v "$$PWD":/workspace -w /workspace/cores/n64/homebrew anacierdem/libdragon:latest make
+    @docker run --rm -v "$PWD":/workspace -w /workspace/cores/n64/homebrew anacierdem/libdragon:latest make
 
 c64-rom:
     @command -v cl65 >/dev/null 2>&1 || (echo "cl65 is required; install cc65" >&2; exit 1)
