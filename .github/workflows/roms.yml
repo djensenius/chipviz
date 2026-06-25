@@ -6,6 +6,18 @@ on:
     branches: [main]
 
 jobs:
+  c64:
+    name: C64 PRG
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cc65
+        run: sudo apt-get update && sudo apt-get install -y cc65
+      - name: Build C64 PRG
+        run: make -C cores/c64/homebrew
+      - name: Verify C64 PRG
+        run: test -s cores/c64/homebrew/chipviz-c64.prg
+
   gba:
     name: GBA ROM
     runs-on: ubuntu-latest
@@ -23,11 +35,77 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build N64 ROM
-        run: |
-          docker run --rm \
-            -v "$PWD":/workspace \
-            -w /workspace/cores/n64/homebrew \
-            anacierdem/libdragon:latest \
-            make
+        run: scripts/n64-docker-build.sh
       - name: Verify N64 ROM
         run: test -s cores/n64/homebrew/chipviz-n64.z64
+
+  snes:
+    name: SNES ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install PVSnesLib
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison cmake flex
+          git clone --depth 1 --recurse-submodules https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          export PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler" install
+          make -C "$RUNNER_TEMP/pvsneslib/tools"
+          make -C "$RUNNER_TEMP/pvsneslib/tools" install
+          make -C "$RUNNER_TEMP/pvsneslib/pvsneslib"
+          echo "PVSNESLIB_HOME=$PVSNESLIB_HOME" >> "$GITHUB_ENV"
+      - name: Build SNES ROM
+        run: make -C cores/snes/homebrew
+      - name: Verify SNES ROM
+        run: test -s cores/snes/homebrew/chipviz-snes.sfc
+
+  gb:
+    name: Game Boy ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install RGBDS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison build-essential libpng-dev pkg-config
+          git clone --depth 1 --branch v1.0.1 https://github.com/gbdev/rgbds.git "$RUNNER_TEMP/rgbds"
+          make -C "$RUNNER_TEMP/rgbds"
+          sudo make -C "$RUNNER_TEMP/rgbds" install
+      - name: Build Game Boy ROM
+        run: make -C cores/gb/homebrew
+      - name: Verify Game Boy ROM
+        run: test -s cores/gb/homebrew/chipviz-gb.gb
+
+  genesis:
+    name: Genesis ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Genesis ROM
+        run: make -C cores/genesis/homebrew
+      - name: Verify Genesis ROM
+        run: test -s cores/genesis/homebrew/chipviz-genesis.md
+
+  nes:
+    name: NES ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cc65
+        run: sudo apt-get update && sudo apt-get install -y cc65
+      - name: Build NES ROM
+        run: make -C cores/nes/homebrew
+      - name: Verify NES ROM
+        run: test -s cores/nes/homebrew/chipviz-nes.nes
+
+  sms:
+    name: Master System ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Master System ROM
+        run: make -C cores/sms/homebrew
+      - name: Verify Master System ROM
+        run: test -s cores/sms/homebrew/chipviz-sms.sms

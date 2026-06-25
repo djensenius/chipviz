@@ -4,7 +4,8 @@
 musical performance. It is the generic source fixture format used to bake
 repeatable demos before live hardware or live audio is connected. The host
 encoder converts a music source into a raw `control-frame-v0` stream that the
-N64, GBA, C64, and modern renderers can all play back.
+N64, GBA, C64, SNES, Game Boy, Genesis, NES, Master System, and modern renderers
+can all play back.
 
 A music source is intentionally higher level than `control-frame-v0`: it
 describes notes on a timeline plus a fixed tempo, and the encoder derives the

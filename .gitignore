@@ -1,4 +1,7 @@
 .DS_Store
+.env
+.env.*
+!.env.example
 
 # Build output
 build/
@@ -16,8 +19,21 @@ target/
 *.gba
 *.gb
 *.gbc
+*.nes
 *.prg
 *.d64
+*.sfc
+*.smc
+*.sms
+cores/genesis/homebrew/*.md
+
+# Toolchain intermediates
+*.obj
+*.sym
+*.ps
+*.asp
+cores/snes/homebrew/linkfile
+cores/snes/homebrew/hdr.asm
 
 # Tooling caches
 .cache/

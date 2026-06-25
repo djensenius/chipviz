@@ -11,13 +11,16 @@ from urllib.parse import unquote, urlparse
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+IGNORED_DIRS = {".cache", ".git", ".venv", "build", "dist", "node_modules", "target"}
+IGNORED_MARKDOWN_ROM_DIRS = {("cores", "genesis", "homebrew")}
 
 
 def iter_markdown_files() -> list[pathlib.Path]:
   return sorted(
     path
     for path in ROOT.rglob("*.md")
-    if ".git" not in path.parts and "target" not in path.parts
+    if IGNORED_DIRS.isdisjoint(path.parts)
+    and tuple(path.relative_to(ROOT).parts[:-1]) not in IGNORED_MARKDOWN_ROM_DIRS
   )
 
 

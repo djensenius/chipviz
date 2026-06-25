@@ -19,6 +19,12 @@ jobs:
         run: mise exec -- rustup component add rustfmt clippy
       - name: Build release assets
         run: scripts/package-release.sh
+      - name: Build C64 PRG asset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cc65
+          make -C cores/c64/homebrew
+          cp cores/c64/homebrew/chipviz-c64.prg dist/assets/
       - name: Build GBA ROM asset
         run: |
           docker run --rm \
@@ -29,12 +35,38 @@ jobs:
           cp cores/gba/homebrew/chipviz-gba.gba dist/assets/
       - name: Build N64 ROM asset
         run: |
-          docker run --rm \
-            -v "$PWD":/workspace \
-            -w /workspace/cores/n64/homebrew \
-            anacierdem/libdragon:latest \
-            make
+          scripts/n64-docker-build.sh
           cp cores/n64/homebrew/chipviz-n64.z64 dist/assets/
+      - name: Build SNES ROM asset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison cmake flex
+          git clone --depth 1 --recurse-submodules https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          export PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler" install
+          make -C "$RUNNER_TEMP/pvsneslib/tools"
+          make -C "$RUNNER_TEMP/pvsneslib/tools" install
+          make -C "$RUNNER_TEMP/pvsneslib/pvsneslib"
+          PVSNESLIB_HOME="$PVSNESLIB_HOME" make -C cores/snes/homebrew
+          cp cores/snes/homebrew/chipviz-snes.sfc dist/assets/
+      - name: Build chipsynth-era ROM assets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison build-essential cc65 libpng-dev pkg-config
+          git clone --depth 1 --branch v1.0.1 https://github.com/gbdev/rgbds.git "$RUNNER_TEMP/rgbds"
+          make -C "$RUNNER_TEMP/rgbds"
+          sudo make -C "$RUNNER_TEMP/rgbds" install
+          make -C cores/gb/homebrew
+          cp cores/gb/homebrew/chipviz-gb.gb dist/assets/
+          make -C cores/genesis/homebrew
+          cp cores/genesis/homebrew/chipviz-genesis.md dist/assets/
+          make -C cores/nes/homebrew
+          cp cores/nes/homebrew/chipviz-nes.nes dist/assets/
+          make -C cores/sms/homebrew
+          cp cores/sms/homebrew/chipviz-sms.sms dist/assets/
+      - name: Rebuild combined archive
+        run: |
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZIP_DEFLATED, ZipFile

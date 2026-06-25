@@ -37,7 +37,12 @@ implementations choose the same scene and palette hints.
 ## Native rendering hints
 
 - N64: map voices to 3D emitters and chip/channel-colored planes.
-- Pocket/GBA/SNES: map channel activity to tile/sprite groups.
+- Pocket/GBA/SNES/Game Boy: map channel activity to tile/sprite groups.
 - C64: map channel levels and chip IDs to raster/PETSCII regions.
+- Genesis: map YM2612 voices to VDP plane meters and SN76489 activity to PSG
+  flash accents.
+- NES: map 2A03 pulse/triangle/noise activity to nametable bars, palette pulses,
+  and sparse sprites.
+- Master System: map SN76489 tone/noise channels to VDP tile/channel meters.
 - Modern 4K: map voices and channels to dense 3D data fields and spectrum
   volumes.

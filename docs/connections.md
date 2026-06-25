@@ -133,9 +133,78 @@ Preferred first path: run the SNES target through a Pocket Dock SNES core and
 use the same Raspberry Pi USB HID mapping as the GBA path. Real SNES hardware
 later uses a controller-port adapter and SNES controller extension cable.
 
-1. Run the `.sfc`/`.smc` once the libSFX build lands; until then, use the native
+1. Run the PVSnesLib-built `.sfc`/`.smc`; use the native
    simulator target.
 2. Map buttons to beat/bar/fill/manual and scene/palette controls.
 3. Keep baked `control-frame-v0` arrays as the deterministic fallback.
 4. For real SNES, emulate the controller serial protocol instead of sending raw
    audio or high-bandwidth data.
+
+## Game Boy / Analogue Pocket: Pocket Dock first, link cable later
+
+Preferred first path: run the RGBDS-built `.gb` through the Pocket's Game Boy
+core or a flashcart, and use the Pocket Dock controller path for low-bandwidth
+scene, palette, beat, and mode controls.
+
+1. Build `chipviz-gb.gb` with RGBDS/rgbfix; rgbfix writes the required Game Boy
+   header/logo during the build.
+2. Map Dock controller buttons through the reduced HID mapping when running on
+   Pocket.
+3. Keep baked `control-frame-v0` playback as the deterministic fallback for
+   emulator, flashcart, and core testing.
+4. Add a Game Boy link-cable bridge later if richer live data is needed. That
+   bridge should still reduce incoming telemetry to the same scene/palette/beat
+   model before it reaches tight DMG code.
+
+The Game Boy target should stay DMG-native: four shades, tile maps, cheap
+scrolling, sparse sprites, and Game Boy APU channel hints rather than a generic
+framebuffer visualizer.
+
+## Genesis / Mega Drive: YM2612 planes plus PSG accents
+
+Preferred first path: baked playback in an emulator or flashcart/devcart, with a
+later controller-port or devcart-side bridge for live ChipStation telemetry.
+
+1. Use the generated `chipviz-genesis.md` seed for smoke tests until an SGDK or
+   68000/Z80 assembly SDK path is selected.
+2. Map YM2612 channels to six FM voice planes/meters and SN76489 activity to PSG
+   flash accents.
+3. Keep the generated ROM and host simulator as the deterministic fallback.
+4. For live hardware, prefer a transport that behaves like controller/devcart
+   state and never requires raw audio-rate data on the Genesis side.
+
+The Genesis target should lean on VDP planes, CRAM palette changes, sprites, and
+the distinct YM2612/SN76489 channel layout.
+
+## NES: NROM/PPU visualizer for 2A03 telemetry
+
+Preferred first path: the ca65-built `chipviz-nes.nes` NROM demo in an emulator,
+flashcart, or NES-compatible core. Live input comes later through controller-port
+or devcart-style reduced controls.
+
+1. Build the `.nes` with cc65/ca65.
+2. Map 2A03 pulse/triangle/noise activity to nametable bars, palette pulses, and
+   sparse sprite/OAM-style effects.
+3. Keep the generated iNES fallback for local packaging when ca65 is unavailable.
+4. For live hardware, reduce incoming telemetry to scene, palette, beat, energy,
+   and a few channel buckets before it reaches the NES program.
+
+The NES target should stay inside NROM-style limits first: fixed CHR/tile data,
+small palette changes, nametable animation, and no framebuffer assumptions.
+
+## Master System / Game Gear: SN76489 VDP channel meters
+
+Preferred first path: baked playback in Genesis Plus GX or an SMS-compatible
+flashcart/core, with a later controller-port/devcart bridge for live PSG
+telemetry.
+
+1. Use the generated `chipviz-sms.sms` seed for smoke tests until a devkitSMS,
+   SDCC, or small Z80 assembly SDK path is selected.
+2. Map SN76489 tone/noise channel levels to VDP tile/channel meters and CRAM
+   palette pulses.
+3. Keep the generated ROM and host simulator as the deterministic fallback.
+4. For live hardware, use reduced latest-state input; do not attempt to stream
+   raw audio or full-resolution frames.
+
+The SMS target should share the SN76489 visual vocabulary with Genesis PSG
+accents while staying native to SMS VDP tile and palette constraints.

@@ -11,10 +11,11 @@ Commodore 64 homebrew visualizer for Commodore 64 Ultimate and real C64-style wo
 
 - Raster bar and PETSCII scene.
 - Keyboard/joystick scene switching.
-- Later: generated playback tables from the shared control protocol.
+- Deterministic baked/procedural control-frame-style playback for self-running
+  release assets.
 - Later: live bridge input through Commodore 64 Ultimate networking features or a user-port serial adapter.
 
-## Current scaffold
+## Current implementation
 
 `src/main.c` consumes the shared chipviz connection layer and maps each frame to
 a minimal C64-style visualization model: beat phase selects a raster position,
@@ -23,9 +24,10 @@ simulator build prints those values until the cc65 VIC-II renderer replaces the
 stub.
 The simulator is not the product; the target artifact is a loadable homebrew
 `.prg` and/or `.d64`.
-`just homebrew-artifacts` currently produces a minimal tokenized BASIC
-`chipviz-c64.prg` that can be loaded directly while the cc65 raster demo is
-being built.
+`cores/c64/homebrew` contains the cc65 project for `chipviz-c64.prg`. It writes
+directly to border/background color, screen RAM, and color RAM for a self-running
+VIC-II/PETSCII/channel-meter demo. `just homebrew-artifacts` still produces an
+SDK-free tokenized BASIC fallback when cc65 is not installed.
 
 ## Connection path
 
