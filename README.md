@@ -19,7 +19,7 @@ cores/
   n64/      N64 homebrew target, likely libdragon + tiny3d.
   gba/      GBA homebrew target, likely Butano or Tonc.
   c64/      C64 target, likely cc65 or KickAssembler.
-  snes/     SNES target, likely libSFX.
+  snes/     SNES target, PVSnesLib for the production SDK path.
 shared/
   include/  Tiny C interface for control frames and platform connection polling.
   specs/    Cross-platform control protocol and scene model.
@@ -70,10 +70,11 @@ Build one self-running demo per platform before live input:
 
 Merges to `main` run release-please. Published releases build individual assets:
 modern renderer binaries, `.cvz` demos, N64 Joybus and USB HID mapped streams,
-generated C arrays, and current homebrew-style artifacts. Today that includes a
-C64 `.prg` intended for C64/C64 Ultimate and a minimal SNES `.sfc` intended for
-emulator/flash-cart/Pocket-core validation. The release asset workflow also
-builds `chipviz-gba.gba` with devkitPro and `chipviz-n64.z64` with libdragon.
+generated C arrays, and current homebrew artifacts. The release asset workflow
+builds `chipviz-gba.gba` with devkitPro, `chipviz-n64.z64` with libdragon,
+`chipviz-c64.prg` with cc65, and `chipviz-snes.sfc` with PVSnesLib. Generated
+C64/SNES assets remain SDK-free fallbacks for local packaging when those
+toolchains are not installed.
 
 ## Current scaffold
 

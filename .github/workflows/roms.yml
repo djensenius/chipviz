@@ -6,6 +6,18 @@ on:
     branches: [main]
 
 jobs:
+  c64:
+    name: C64 PRG
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cc65
+        run: sudo apt-get update && sudo apt-get install -y cc65
+      - name: Build C64 PRG
+        run: make -C cores/c64/homebrew
+      - name: Verify C64 PRG
+        run: test -s cores/c64/homebrew/chipviz-c64.prg
+
   gba:
     name: GBA ROM
     runs-on: ubuntu-latest
@@ -31,3 +43,24 @@ jobs:
             make
       - name: Verify N64 ROM
         run: test -s cores/n64/homebrew/chipviz-n64.z64
+
+  snes:
+    name: SNES ROM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install PVSnesLib
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison cmake flex
+          git clone --depth 1 https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler" install
+          make -C "$RUNNER_TEMP/pvsneslib/tools"
+          make -C "$RUNNER_TEMP/pvsneslib/tools" install
+          make -C "$RUNNER_TEMP/pvsneslib/pvsneslib"
+          echo "PVSNESLIB_HOME=$RUNNER_TEMP/pvsneslib" >> "$GITHUB_ENV"
+      - name: Build SNES ROM
+        run: make -C cores/snes/homebrew
+      - name: Verify SNES ROM
+        run: test -s cores/snes/homebrew/chipviz-snes.sfc

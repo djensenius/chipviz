@@ -39,9 +39,9 @@ class HomebrewArtifactTests(unittest.TestCase):
     self.assertEqual(rom[0x7FD5], 0x20)
     self.assertEqual(rom[0x7FD7], 0x05)
     self.assertEqual(int.from_bytes(rom[0x7FFC:0x7FFE], "little"), 0x8000)
-    self.assertIn(bytes([0xA9, 0x00, 0x8D, 0x15, 0x21]), rom[:96])
-    self.assertIn(bytes([0x8D, 0x22, 0x21]), rom[:64])
-    self.assertIn(bytes([0x8D, 0x18, 0x21]), rom[:96])
+    self.assertIn(bytes([0xAD, 0x12, 0x42, 0x10, 0xFB]), rom[:96])
+    self.assertIn(bytes([0xEE, 0x00, 0x00]), rom[:96])
+    self.assertIn(bytes([0x8D, 0x22, 0x21]), rom[:96])
 
   def test_build_writes_artifacts_and_status(self) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -51,11 +51,20 @@ class HomebrewArtifactTests(unittest.TestCase):
 
       self.assertTrue((output / "chipviz-c64.prg").exists())
       self.assertTrue((output / "chipviz-snes.sfc").exists())
-      self.assertIs(status["generated"]["c64"]["hardwareBootable"], True)
-      self.assertIs(status["generated"]["snes"]["hardwareBootable"], True)
-      self.assertEqual(status["generated"]["c64"]["status"], "tokenized-basic-vic-ii-petscii-visualizer")
+      self.assertIs(status["generated"]["c64Fallback"]["hardwareBootable"], True)
+      self.assertIs(status["generated"]["snesFallback"]["hardwareBootable"], True)
+      self.assertEqual(status["generated"]["c64Fallback"]["status"], "tokenized-basic-vic-ii-petscii-fallback")
+      self.assertEqual(status["generated"]["snesFallback"]["status"], "visible-lorom-cgram-color-cycle-fallback")
       self.assertIn("gba", status["sdkRequired"])
       self.assertIn("n64", status["sdkRequired"])
+      self.assertIn("c64", status["sdkRequired"])
+      self.assertIn("snes", status["sdkRequired"])
+
+  def test_sdk_homebrew_projects_are_present(self) -> None:
+    self.assertTrue((ROOT / "cores" / "c64" / "homebrew" / "Makefile").exists())
+    self.assertTrue((ROOT / "cores" / "c64" / "homebrew" / "src" / "main.c").exists())
+    self.assertTrue((ROOT / "cores" / "snes" / "homebrew" / "Makefile").exists())
+    self.assertTrue((ROOT / "cores" / "snes" / "homebrew" / "chipviz-snes.c").exists())
 
 
 if __name__ == "__main__":

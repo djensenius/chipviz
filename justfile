@@ -60,6 +60,10 @@ scaffold-check:
     @test -f cores/gba/src/main.c
     @test -f cores/gba/homebrew/Makefile
     @test -f cores/gba/homebrew/source/main.c
+    @test -f cores/c64/homebrew/Makefile
+    @test -f cores/c64/homebrew/src/main.c
+    @test -f cores/snes/homebrew/Makefile
+    @test -f cores/snes/homebrew/chipviz-snes.c
     @test -f cores/c64/src/main.c
     @test -f cores/snes/src/main.c
     @test -f renderers/modern/Cargo.toml
@@ -140,9 +144,19 @@ n64-rom:
     @test -n "$${N64_INST:-}" || (echo "N64_INST is required; install libdragon" >&2; exit 1)
     @cd cores/n64/homebrew && $(MAKE)
 
+c64-rom:
+    @command -v cl65 >/dev/null 2>&1 || (echo "cl65 is required; install cc65" >&2; exit 1)
+    @cd cores/c64/homebrew && $(MAKE)
+
+snes-rom:
+    @test -n "$${PVSNESLIB_HOME:-}" || (echo "PVSNESLIB_HOME is required; install PVSnesLib" >&2; exit 1)
+    @cd cores/snes/homebrew && $(MAKE)
+
 sdk-roms:
     @just gba-rom
     @just n64-rom
+    @just c64-rom
+    @just snes-rom
 
 rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check

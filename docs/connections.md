@@ -133,7 +133,7 @@ Preferred first path: run the SNES target through a Pocket Dock SNES core and
 use the same Raspberry Pi USB HID mapping as the GBA path. Real SNES hardware
 later uses a controller-port adapter and SNES controller extension cable.
 
-1. Run the `.sfc`/`.smc` once the libSFX build lands; until then, use the native
+1. Run the PVSnesLib-built `.sfc`/`.smc`; use the native
    simulator target.
 2. Map buttons to beat/bar/fill/manual and scene/palette controls.
 3. Keep baked `control-frame-v0` arrays as the deterministic fallback.

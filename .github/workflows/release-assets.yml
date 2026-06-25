@@ -19,6 +19,12 @@ jobs:
         run: mise exec -- rustup component add rustfmt clippy
       - name: Build release assets
         run: scripts/package-release.sh
+      - name: Build C64 PRG asset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cc65
+          make -C cores/c64/homebrew
+          cp cores/c64/homebrew/chipviz-c64.prg dist/assets/
       - name: Build GBA ROM asset
         run: |
           docker run --rm \
@@ -35,6 +41,20 @@ jobs:
             anacierdem/libdragon:latest \
             make
           cp cores/n64/homebrew/chipviz-n64.z64 dist/assets/
+      - name: Build SNES ROM asset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison cmake flex
+          git clone --depth 1 https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler"
+          make -C "$RUNNER_TEMP/pvsneslib/compiler" install
+          make -C "$RUNNER_TEMP/pvsneslib/tools"
+          make -C "$RUNNER_TEMP/pvsneslib/tools" install
+          make -C "$RUNNER_TEMP/pvsneslib/pvsneslib"
+          PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib" make -C cores/snes/homebrew
+          cp cores/snes/homebrew/chipviz-snes.sfc dist/assets/
+      - name: Rebuild combined archive
+        run: |
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZIP_DEFLATED, ZipFile

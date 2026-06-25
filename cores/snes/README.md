@@ -5,23 +5,23 @@ real SNES controller-port hardware later.
 
 ## Stack choice
 
-Use **libSFX** for the first production SNES homebrew path. It is C-friendly,
-modern enough for repeatable builds, and a better fit for this repo's portable C
-scaffold than starting with assembly-only examples. The first hardware milestone
-is a `.sfc`/`.smc` ROM once the SNES SDK is installed; until then, the native
-simulator builds the same control-frame mapping.
+Use **PVSnesLib** for the first production SNES homebrew path. It is a known
+C-based SNES homebrew SDK and a better completion target than a hand-generated
+LoROM placeholder. The first hardware milestone is a `.sfc`/`.smc` ROM built
+from the PVSnesLib project.
 
 ## Current scaffold
 
 `src/main.c` consumes the shared chipviz connection layer and maps each frame to
 a SNES-style model: beat phase drives a Mode-7-style angle, energy drives sprite
 count, palette selects CGRAM banks, and flags trigger HDMA/raster-like pulses.
-The simulator prints those values until the libSFX renderer replaces the stub.
+The simulator prints those values for host tests.
 The simulator is not the product; the target artifact is a bootable homebrew
 `.sfc`/`.smc`.
-`just homebrew-artifacts` currently produces a minimal visible LoROM
-`chipviz-snes.sfc` for emulator/flash-cart/Pocket-core validation while the
-libSFX visualizer demo is being built.
+`cores/snes/homebrew` contains the PVSnesLib project for `chipviz-snes.sfc`. It
+currently runs a self-contained CGRAM/channel-meter color demo, and the
+generated LoROM from `just homebrew-artifacts` remains only an SDK-free fallback
+for local smoke tests.
 
 ## Pocket Dock live path
 

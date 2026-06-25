@@ -18,6 +18,15 @@ target/
 *.gbc
 *.prg
 *.d64
+*.sfc
+*.smc
+
+# Toolchain intermediates
+*.obj
+*.sym
+*.ps
+*.asp
+cores/snes/homebrew/linkfile
 
 # Tooling caches
 .cache/
