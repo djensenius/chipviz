@@ -5,6 +5,13 @@
   .byte $00, $00
   .byte $00, $00, $00, $00, $00, $00, $00, $00
 
+.segment "BSS"
+; RAM starts on a page boundary for OAM DMA; the stack uses $0100-$01ff.
+Oam:
+  .res $100
+Frame:
+  .res 1
+
 .segment "CODE"
 Reset:
   sei
@@ -17,6 +24,12 @@ Reset:
   stx $2000
   stx $2001
   stx $4010
+  stx Frame
+  lda #$ff
+HideSprites:
+  sta Oam,x
+  inx
+  bne HideSprites
   bit $2002
 WaitVBlank1:
   bit $2002
@@ -28,7 +41,22 @@ WaitVBlank2:
   bit $2002
   bpl WaitVBlank2
   jsr LoadPalette
+  ; Horizontal mirroring: $2000/$2400 and $2800/$2c00 are aliases.
+  lda #$20
   jsr LoadNameTable
+  lda #$28
+  jsr LoadNameTable
+  ; Finish setup in a fresh vblank. The status read also clears pending NMI
+  ; and the address/scroll latch before enabling NMI and rendering.
+  bit $2002
+WaitStart:
+  bit $2002
+  bpl WaitStart
+  jsr LoadOam
+  lda #$00
+  sta $2005
+  sta $2005
+  ; Restore nametable 0 after the palette/nametable address writes.
   lda #%10000000
   sta $2000
   lda #%00011110
@@ -37,27 +65,55 @@ Forever:
   jmp Forever
 
 Nmi:
+  pha
+  txa
+  pha
   inc Frame
+  bit $2002
+  jsr LoadOam
+  ; Keep $3f00 (the universal background) fixed. Only one foreground
+  ; color changes, every 32 frames, without cycling brightness levels.
+  lda Frame
+  and #$1f
+  bne NmiScroll
   lda #$3f
   sta $2006
-  lda #$00
+  lda #$01
   sta $2006
   lda Frame
-  and #$0f
+  lsr a
+  lsr a
+  lsr a
+  lsr a
+  lsr a
   tax
-  lda Palettes,x
+  lda ForegroundColors,x
   sta $2007
+NmiScroll:
+  lda #%10000000
+  sta $2000
   lda #$00
   sta $2005
   lda Frame
   lsr a
   sta $2005
+  pla
+  tax
+  pla
   rti
 
 Irq:
   rti
 
+LoadOam:
+  lda #$00
+  sta $2003
+  lda #>Oam
+  sta $4014
+  rts
+
 LoadPalette:
+  bit $2002
   lda #$3f
   sta $2006
   lda #$00
@@ -72,16 +128,20 @@ PaletteLoop:
   rts
 
 LoadNameTable:
-  lda #$20
+  ; A selects the nametable. Fill 960 tiles followed by 64 attributes.
+  bit $2002
   sta $2006
   lda #$00
   sta $2006
   ldx #$00
+  ldy #$03
 NameLoopA:
   txa
   and #$03
   sta $2007
   inx
+  bne NameLoopA
+  dey
   bne NameLoopA
 NameLoopB:
   txa
@@ -89,6 +149,7 @@ NameLoopB:
   and #$03
   sta $2007
   inx
+  cpx #$c0
   bne NameLoopB
   ldx #$40
 AttrLoop:
@@ -98,8 +159,8 @@ AttrLoop:
   bne AttrLoop
   rts
 
-Frame:
-  .byte $00
+ForegroundColors:
+  .byte $11,$12,$13,$14,$15,$14,$13,$12
 
 Palettes:
   .byte $0f,$11,$21,$31, $0f,$05,$15,$25, $0f,$09,$19,$29, $0f,$0c,$1c,$2c
