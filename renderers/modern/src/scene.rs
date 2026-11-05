@@ -121,7 +121,9 @@ pub fn build_uniforms(
     let projection = perspective(52.0_f32.to_radians(), aspect, 0.1, 100.0);
 
     Uniforms {
-        view_projection: transpose4(multiply4(projection, view)),
+        // Row-indexed multiplication of column-major storage reverses the order:
+        // this uploads projection * view as columns for WGSL.
+        view_projection: multiply4(view, projection),
         time: elapsed,
         energy,
         beat,
@@ -330,15 +332,6 @@ fn multiply4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-fn transpose4(matrix: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    [
-        [matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0]],
-        [matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1]],
-        [matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2]],
-        [matrix[0][3], matrix[1][3], matrix[2][3], matrix[3][3]],
-    ]
-}
-
 fn normalize(value: [f32; 3]) -> [f32; 3] {
     let length = dot(value, value).sqrt().max(f32::EPSILON);
     [value[0] / length, value[1] / length, value[2] / length]
@@ -354,4 +347,129 @@ fn cross(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
 
 fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
     left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_projection(uniforms: &Uniforms, world: [f32; 3], camera: [f32; 3], aspect: f32) {
+        // Interpret the uploaded columns as WGSL's matrix * world position.
+        let columns = uniforms.view_projection;
+        let clip: [f32; 4] = std::array::from_fn(|row| {
+            columns[0][row] * world[0]
+                + columns[1][row] * world[1]
+                + columns[2][row] * world[2]
+                + columns[3][row]
+        });
+        // Scalar pinhole projection: positive depth is ahead of the camera,
+        // and wgpu maps the near/far planes to NDC depths 0/1.
+        let [horizontal, vertical, depth] = camera;
+        let half_fov_tan = 26.0_f32.to_radians().tan();
+        let expected = [
+            horizontal / (half_fov_tan * aspect),
+            vertical / half_fov_tan,
+            (depth - 0.1) * 100.0 / (100.0 - 0.1),
+            depth,
+        ];
+        for (component, (actual, expected)) in clip.into_iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 2.0e-5 * expected.abs().max(1.0),
+                "world {world:?}, clip component {component}: got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn uniforms_project_origin_in_front_of_camera() {
+        let frame = ControlFrame {
+            energy: 0,
+            ..ControlFrame::procedural(0)
+        };
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let aspect = profile.target_width as f32 / profile.target_height as f32;
+            let uniforms = build_uniforms(&profile, frame, 0.0, aspect);
+            // At zero phase/time/drift the eye is (radius, 1.8, 0),
+            // looking directly at the origin.
+            let distance = profile.camera_radius.hypot(1.8);
+            assert_projection(&uniforms, [0.0; 3], [0.0, 0.0, distance], aspect);
+        }
+    }
+
+    #[test]
+    fn uniforms_project_off_axis_points_with_camera_basis() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for energy in [0, 255] {
+                let frame = ControlFrame {
+                    energy,
+                    ..ControlFrame::procedural(0)
+                };
+                let radius = profile.camera_radius - f32::from(energy) / 255.0 * 1.8;
+                let height = 1.8 + f32::from(energy) / 255.0 * 2.2;
+                let distance = radius.hypot(height);
+                for aspect in [16.0 / 9.0, 9.0 / 16.0] {
+                    let uniforms = build_uniforms(&profile, frame, 0.0, aspect);
+                    for [x, y, z] in [
+                        [0.0, 0.0, -1.0],
+                        [0.0, 0.0, 1.0],
+                        [0.0, 1.0, 0.0],
+                        [1.0, -0.5, 2.0],
+                    ] {
+                        // Looking from +X: right is -Z, up is (-height, radius, 0)
+                        // normalized, and forward is (-radius, -height, 0) normalized.
+                        let camera = [
+                            -z,
+                            (radius * y - height * x) / distance,
+                            distance - (radius * x + height * y) / distance,
+                        ];
+                        assert_projection(&uniforms, [x, y, z], camera, aspect);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniforms_project_orbiting_camera_depth_and_beat_drift() {
+        let frame = ControlFrame {
+            energy: 255,
+            bpm: 180,
+            beat_phase: 32,
+            beat_count: 37,
+            ..ControlFrame::procedural(0)
+        };
+        let drift = (f32::from(frame.beat_count) * 0.015).sin() * f32::from(frame.bpm) / 255.0;
+        let target_y = drift * 0.5;
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            // Choose elapsed time so the orbit is a quarter turn: eye = (0, 4, radius).
+            let elapsed = (std::f32::consts::FRAC_PI_2
+                - f32::from(frame.beat_phase) / 255.0 * std::f32::consts::TAU
+                - drift)
+                / profile.camera_speed;
+            let radius = profile.camera_radius - 1.8;
+            let height = 4.0 - target_y;
+            let distance = radius.hypot(height);
+            let aspect = 4.0 / 3.0;
+            let uniforms = build_uniforms(&profile, frame, elapsed, aspect);
+            assert_projection(
+                &uniforms,
+                [0.0, target_y, 0.0],
+                [0.0, 0.0, distance],
+                aspect,
+            );
+            for depth in [0.1, 2.0, 100.0, -1.0] {
+                // Right is +X; up = (0, radius, -height) / distance;
+                // forward = (0, -height, -radius) / distance.
+                // Place an off-axis point at near, interior, far, and behind-eye depths.
+                let horizontal = 0.02;
+                let vertical = -0.03;
+                let world = [
+                    horizontal,
+                    4.0 + (vertical * radius - depth * height) / distance,
+                    radius - (vertical * height + depth * radius) / distance,
+                ];
+                assert_projection(&uniforms, world, [horizontal, vertical, depth], aspect);
+            }
+        }
+    }
 }
