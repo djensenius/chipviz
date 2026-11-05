@@ -106,10 +106,12 @@ c-test:
     @${CC:-cc} {{ cflags }} tests/connection_tests.c {{ shared_srcs }} -o build/tests/connection_tests
     @${CC:-cc} {{ cflags }} tests/interface_tests.c shared/src/control_frame.c shared/src/interface.c -o build/tests/interface_tests
     @${CC:-cc} {{ cflags }} -Ifirmware/pico/include tests/pico_joybus_tests.c firmware/pico/src/joybus_bridge.c -o build/tests/pico_joybus_tests
+    @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_input_tests.c -o build/tests/gba_input_tests
     @build/tests/control_frame_tests
     @build/tests/connection_tests
     @build/tests/interface_tests
     @build/tests/pico_joybus_tests
+    @build/tests/gba_input_tests
     @echo "chipviz C tests OK"
 
 python-lint:
