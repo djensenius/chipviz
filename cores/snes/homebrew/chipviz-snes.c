@@ -10,6 +10,7 @@ typedef struct {
 
 static unsigned char solid_tiles[9u * 32u];
 static unsigned short tilemap[32u * 32u];
+static unsigned short palette[9u];
 
 static unsigned short rgb5(unsigned char r, unsigned char g, unsigned char b) {
   return (unsigned short)((r & 31u) | ((g & 31u) << 5) | ((b & 31u) << 10));
@@ -84,27 +85,26 @@ int main(void) {
 
   while (1) {
     unsigned char band;
-    unsigned short bg;
 
     make_demo_state(frame, &state);
     update_tilemap(frame, &state);
 
-    WaitForVBlank();
-    bg = rgb5(
+    palette[0] = rgb5(
         (unsigned char)((state.energy >> 3) + state.beat * 8u),
         (unsigned char)((state.palette * 3u + state.scene * 4u) & 31u),
         (unsigned char)((frame >> 3) & 31u));
-    setPaletteColor(0x00, bg);
 
     for (band = 0; band < 8u; band++) {
       unsigned char level = (unsigned char)(state.spectrum[band] >> 3);
-      setPaletteColor(
-          (unsigned char)(1u + band),
-          rgb5(
-              (unsigned char)((level + band * 2u) & 31u),
-              (unsigned char)((state.palette * 4u + level) & 31u),
-              (unsigned char)(31u - ((level + state.scene * 3u) & 31u))));
+      palette[1u + band] = rgb5(
+          (unsigned char)((level + band * 2u) & 31u),
+          (unsigned char)((state.palette * 4u + level) & 31u),
+          (unsigned char)(31u - ((level + state.scene * 3u) & 31u)));
     }
+
+    /* Keep the VBlank window to two immediate DMAs: 18 + 2048 bytes. */
+    WaitForVBlank();
+    dmaCopyCGram((unsigned char *)palette, 0x00, sizeof(palette));
     dmaCopyVram((unsigned char *)tilemap, 0x6800, sizeof(tilemap));
     ++frame;
   }
