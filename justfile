@@ -4,6 +4,8 @@ cflags := "-std=c99 -Wall -Wextra -Werror -pedantic -Ishared/include"
 sim_platforms := "n64 gba c64 snes gb genesis nes sms"
 shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/interface.c"
 modern_manifest := "renderers/modern/Cargo.toml"
+pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
+picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
 python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
 
 default:
@@ -152,6 +154,24 @@ homebrew-artifacts:
     @test -s build/homebrew/chipviz-sms.sms
     @test -s build/homebrew/homebrew-status.json
     @echo "chipviz homebrew artifacts OK"
+
+pico-firmware:
+    @test -n "${PICO_SDK_PATH:-}" || (echo "PICO_SDK_PATH is required; see firmware/pico/README.md" >&2; exit 1)
+    @test "$(git -C "$PICO_SDK_PATH" rev-parse HEAD)" = "{{ pico_sdk_revision }}" || (echo "Pico SDK must be at {{ pico_sdk_revision }}" >&2; exit 1)
+    @git -C "$PICO_SDK_PATH" diff --quiet --ignore-submodules=untracked HEAD || (echo "Pico SDK tracked sources must be clean" >&2; exit 1)
+    @submodules="$(git -C "$PICO_SDK_PATH" submodule status --recursive)" && \
+      if printf '%s\n' "$submodules" | grep -Eq '^[-+U]'; then echo "Initialize Pico SDK submodules at their pinned commits" >&2; exit 1; fi
+    @arm-none-eabi-gcc --version
+    @cmake --fresh -S firmware/pico -B build/pico -G Ninja \
+      -DPICO_SDK_PATH="$(cd "$PICO_SDK_PATH" && pwd)" \
+      -DPICO_BOARD=pico -DPICO_PLATFORM=rp2040 -DCMAKE_BUILD_TYPE=Release \
+      -DPICOTOOL_FETCH_FROM_GIT_PATH="$PWD/build/pico/_deps" \
+      -DPICOTOOL_FORCE_FETCH_FROM_GIT=ON -DPICOTOOL_GIT_BRANCH={{ picotool_revision }}
+    @CMAKE_BUILD_PARALLEL_LEVEL=2 cmake --build build/pico
+    @test -s build/pico/chipviz_pico_joybus.elf
+    @test -s build/pico/chipviz_pico_joybus.uf2
+    @arm-none-eabi-readelf -h build/pico/chipviz_pico_joybus.elf | grep -E 'Machine:[[:space:]]+ARM$'
+    @echo "chipviz Pico compile-only build OK"
 
 gba-rom:
     @make -C cores/gba/homebrew
