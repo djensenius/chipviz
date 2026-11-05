@@ -53,6 +53,11 @@ a selected SDK path.
 
 ## Pinned SDK builds
 
+The ARM compiler in `mise.toml` explicitly uses the registered asdf backend:
+the default vfox backend does not list `15.2.Rel1` and fails fresh installs.
+The asdf installer requires Bash 4 or newer, `curl`, and `tar`; on macOS, put
+a current Homebrew Bash on `PATH` before installing the toolchain.
+
 `mise exec -- just n64-rom-docker` uses Docker's `linux/amd64` platform on both
 Linux and Apple Silicon. It builds `chipviz-libdragon-toolchain:local` using
 [`scripts/n64-toolchain.Dockerfile`](../scripts/n64-toolchain.Dockerfile): a
