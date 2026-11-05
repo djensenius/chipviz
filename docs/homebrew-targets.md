@@ -30,7 +30,9 @@ tracked separately in issue #31.
 
 Every target now has a first-class SDK/toolchain path:
 
-- `cores/n64/homebrew`: builds `chipviz-n64.z64` with libdragon via `N64_INST`; `just n64-rom-docker` uses the official libdragon toolchain image and caches a current SDK under `.cache/libdragon`.
+- `cores/n64/homebrew`: builds `chipviz-n64.z64` with libdragon via `N64_INST`;
+  `just n64-rom-docker` builds a local compiler image from the official prebuilt
+  toolchain and caches a pinned SDK under `.cache/libdragon`.
 - `cores/gba/homebrew`: builds `chipviz-gba.gba` with devkitPro/devkitARM and
   `gbafix`.
 - `cores/c64/homebrew`: builds `chipviz-c64.prg` with cc65/cl65.
@@ -48,6 +50,43 @@ Every target now has a first-class SDK/toolchain path:
 fallback artifacts for local smoke tests and packaging when full SDKs are not
 installed. Those fallbacks are not the completion target for platforms that have
 a selected SDK path.
+
+## Pinned SDK builds
+
+The ARM compiler in `mise.toml` explicitly uses the registered asdf backend:
+the default vfox backend does not list `15.2.Rel1` and fails fresh installs.
+The asdf installer requires Bash 4 or newer, `curl`, and `tar`; on macOS, put
+a current Homebrew Bash on `PATH` before installing the toolchain.
+
+`mise exec -- just n64-rom-docker` uses Docker's `linux/amd64` platform on both
+Linux and Apple Silicon. It builds `chipviz-libdragon-toolchain:local` using
+[`scripts/n64-toolchain.Dockerfile`](../scripts/n64-toolchain.Dockerfile): a
+digest-pinned Ubuntu base and DragonMinded's prebuilt compiler with a pinned
+SHA-256. It does not compile GCC or require the upstream GHCR image.
+
+The default libdragon source revision is
+`e356bf3f56f7afbf7e5246329562f145965cfdfc`. The official compiler download comes
+from a rolling release: if its bytes change, the Docker build fails the checksum
+check rather than accepting a new compiler. This protects the pin, but does not
+guarantee that upstream will retain the old download. Update the source/compiler
+pins deliberately together, then perform a clean ROM build and emulator check.
+
+Existing overrides remain available: `LIBDRAGON_DOCKER_IMAGE` skips the default
+image build, `LIBDRAGON_BRANCH` selects a source branch/tag/SHA, and
+`LIBDRAGON_DOCKER_CACHE` selects the cache directory. A custom image must expose
+the toolchain at `/n64_toolchain`. Modified tracked SDK sources are rejected.
+Each source revision/compiler image ID gets a separate source-only checkout and
+installed SDK under `builds/` in the cache. Build outputs are not copied between
+them. The N64 ROM records that identity separately, so switching to another
+populated SDK cache also cleans the ROM's object files before compiling.
+
+Both automated SNES build paths pin PVSnesLib to
+`d0bd46bc70c16a4cb9c8d40a90468e18a6de9b1c`, including its recorded submodules.
+For local builds, check out that revision, run
+`git submodule update --init --recursive`, and set `PVSNESLIB_HOME` to its path.
+Build and install its `compiler` and `tools`, then build `pvsneslib`, before
+running `mise exec -- just snes-rom`. This compatible pin retains the current
+SNES Makefile; it does not repair the separate rendering/timing defects.
 
 ## Completion boundary
 
