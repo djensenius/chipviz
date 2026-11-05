@@ -35,5 +35,7 @@ $(BUILD)/$(TARGET).elf: $(addprefix $(BUILD)/,$(OFILES))
 $(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/main.o: source/input.h
+
 clean:
 	rm -rf $(BUILD) $(TARGET).gba

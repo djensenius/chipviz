@@ -1,5 +1,7 @@
 #include <stdint.h>
 
+#include "input.h"
+
 #define REG_DISPCNT (*(volatile uint16_t *)0x04000000)
 #define REG_VCOUNT (*(volatile uint16_t *)0x04000006)
 #define REG_KEYINPUT (*(volatile uint16_t *)0x04000130)
@@ -10,10 +12,6 @@
 #define KEY_B 0x0002
 #define KEY_SELECT 0x0004
 #define KEY_START 0x0008
-#define KEY_RIGHT 0x0010
-#define KEY_LEFT 0x0020
-#define KEY_UP 0x0040
-#define KEY_DOWN 0x0080
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 160
 #define HALFWORDS_PER_ROW (SCREEN_WIDTH / 2)
@@ -231,14 +229,7 @@ int main(void) {
   REG_DISPCNT = MODE4 | BG2_ENABLE;
   for (;;) {
     uint16_t keys = (uint16_t)(~REG_KEYINPUT & 0x03FF);
-    uint16_t pressed = (uint16_t)(keys & ~prev_keys);
-    prev_keys = keys;
-    if (pressed & KEY_RIGHT) {
-      scene = (uint8_t)((scene + 1u) & 7u);
-    }
-    if (pressed & KEY_LEFT) {
-      palette = (uint8_t)((palette + 1u) & 7u);
-    }
+    update_input(keys, &prev_keys, &scene, &palette);
     {
       demo_state_t state;
       volatile uint16_t *draw_target;
