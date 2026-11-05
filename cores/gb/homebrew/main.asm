@@ -9,6 +9,7 @@ Main:
   ld sp, $fffe
   call WaitVBlank
   xor a
+  ld [Frame], a
   ldh [$ff40], a
   call LoadTiles
   call LoadMap
