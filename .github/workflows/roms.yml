@@ -48,7 +48,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bison cmake flex
-          git clone --depth 1 --recurse-submodules https://github.com/alekmaul/pvsneslib.git "$RUNNER_TEMP/pvsneslib"
+          git init "$RUNNER_TEMP/pvsneslib"
+          git -C "$RUNNER_TEMP/pvsneslib" remote add origin https://github.com/alekmaul/pvsneslib.git
+          git -C "$RUNNER_TEMP/pvsneslib" fetch --depth 1 origin d0bd46bc70c16a4cb9c8d40a90468e18a6de9b1c
+          git -C "$RUNNER_TEMP/pvsneslib" checkout --detach FETCH_HEAD
+          git -C "$RUNNER_TEMP/pvsneslib" submodule update --init --recursive --depth 1
           export PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib"
           make -C "$RUNNER_TEMP/pvsneslib/compiler"
           make -C "$RUNNER_TEMP/pvsneslib/compiler" install
