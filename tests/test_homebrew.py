@@ -90,14 +90,68 @@ class HomebrewArtifactTests(unittest.TestCase):
     rom = build_homebrew.build_genesis_md()
 
     self.assertEqual(len(rom), 0x40000)
+    self.assertEqual(int.from_bytes(rom[:4], "big"), 0x00FF0000)
     self.assertEqual(int.from_bytes(rom[4:8], "big"), 0x00000200)
     self.assertEqual(rom[0x100:0x110].rstrip(), b"SEGA MEGA DRIVE")
     self.assertIn(b"CHIPVIZ GENESIS", rom[0x120:0x150])
-    self.assertIn(bytes([0x33, 0xFC, 0x81, 0x74]), rom[0x200:0x240])
+    self.assertEqual(int.from_bytes(rom[0x1A0:0x1A4], "big"), 0)
+    self.assertEqual(int.from_bytes(rom[0x1A4:0x1A8], "big"), len(rom) - 1)
+    self.assertEqual(rom[0x1F0:0x200].rstrip(), b"JUE")
     checksum = 0
     for offset in range(0x200, len(rom), 2):
       checksum = (checksum + int.from_bytes(rom[offset:offset + 2], "big")) & 0xFFFF
     self.assertEqual(int.from_bytes(rom[0x18E:0x190], "big"), checksum)
+
+  def test_generated_genesis_tmss_precedes_vdp_access(self) -> None:
+    rom = build_homebrew.build_genesis_md()
+    pc = int.from_bytes(rom[4:8], "big")
+
+    # SGDK src/boot/sega.s: low version nibble at $A10001, skip on zero.
+    # https://github.com/Stephane-D/SGDK/tree/9a78a44143a867cd8c5053b95cd061a21f0b73c2
+    self.assertEqual(rom[pc:pc + 6], bytes.fromhex("1039 00a1 0001"))  # move.b abs.l,d0
+    pc += 6
+    self.assertEqual(rom[pc:pc + 4], bytes.fromhex("0200 000f"))  # andi.b #$0f,d0
+    pc += 4
+    self.assertEqual(rom[pc], 0x67)  # BEQ: Z set by ANDI, not region bits.
+    # M68000 PRM (1992), Bcc: signed byte displacement relative to opcode+2.
+    displacement = int.from_bytes(rom[pc + 1:pc + 2], "big", signed=True)
+    target = pc + 2 + displacement
+    pc += 2
+    self.assertEqual(rom[pc:pc + 10], bytes.fromhex("23fc 5345 4741 00a1 4000"))
+    pc += 10  # move.l #$53454741,$a14000 ("SEGA"), only for nonzero version.
+    self.assertEqual(target, pc)  # Skip exactly the entire TMSS write.
+    self.assertEqual(pc, 0x216)
+    self.assertEqual(rom[pc:pc + 8], bytes.fromhex("33fc 8004 00c0 0004"))
+
+  def test_generated_genesis_sequential_palette_and_static_loop(self) -> None:
+    rom = build_homebrew.build_genesis_md()
+    # Both TMSS paths converge here; the preceding test checks reachability.
+    pc = int.from_bytes(rom[4:8], "big") + 22
+
+    # Sega Retro VDP registers: reg $0F increments the byte address after
+    # each data-port access; two bytes per color, set BEFORE the CRAM transfer.
+    # https://segaretro.org/index.php?title=Sega_Mega_Drive/VDP_registers&oldid=743918
+    for register_word in (0x8004, 0x8174, 0x8230, 0x8407, 0x8700, 0x8F02):
+      with self.subTest(register=hex(register_word)):
+        self.assertEqual(int.from_bytes(rom[pc:pc + 2], "big"), 0x33FC)
+        self.assertEqual(int.from_bytes(rom[pc + 2:pc + 4], "big"), register_word)
+        self.assertEqual(int.from_bytes(rom[pc + 4:pc + 8], "big"), 0xC00004)
+      pc += 8
+    # Long control-port command selects CRAM byte address zero.
+    self.assertEqual(rom[pc:pc + 10], bytes.fromhex("23fc c000 0000 00c0 0004"))
+    pc += 10
+    # SGDK inc/pal.h: xxxxBBBxGGGxRRRx; white backdrop and unchanged accents.
+    # Consecutive word writes now reach CRAM byte addresses 0, 2 and 4.
+    for rgb in ((7, 7, 7), (7, 1, 1), (0, 1, 7)):
+      with self.subTest(rgb=rgb):
+        self.assertEqual(int.from_bytes(rom[pc:pc + 2], "big"), 0x33FC)
+        color = int.from_bytes(rom[pc + 2:pc + 4], "big")
+        self.assertEqual(color & ~0x0EEE, 0)
+        self.assertEqual(((color >> 1) & 7, (color >> 5) & 7, (color >> 9) & 7), rgb)
+        self.assertEqual(int.from_bytes(rom[pc + 4:pc + 8], "big"), 0xC00000)
+      pc += 8
+    self.assertEqual(rom[pc:pc + 2], bytes.fromhex("60fe"))  # BRA.S, not animation.
+    self.assertEqual(pc + 2 + int.from_bytes(rom[pc + 1:pc + 2], "big", signed=True), pc)
 
   def test_generated_nes_rom_has_ines_header_and_vectors(self) -> None:
     rom = build_homebrew.build_nes_nrom()
