@@ -5,10 +5,11 @@ use winit::dpi::PhysicalSize;
 
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
-use crate::scene::{Instance, QUAD_VERTICES, Vertex, build_instances, build_uniforms};
+use crate::scene::{Camera, Instance, QUAD_VERTICES, Vertex, build_instances};
 
 pub struct Renderer {
     profile: RenderProfile,
+    camera: Camera,
     window: Arc<winit::window::Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -117,7 +118,13 @@ impl Renderer {
             label: Some("chipviz modern shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let uniform = build_uniforms(&profile, ControlFrame::procedural(0), 0.0, aspect(size));
+        // Buffer initialization must not seed the live camera before its first frame.
+        let uniform = Camera::default().build_uniforms(
+            &profile,
+            ControlFrame::procedural(0),
+            0.0,
+            aspect(size),
+        );
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chipviz uniforms"),
             contents: bytemuck::bytes_of(&uniform),
@@ -193,6 +200,7 @@ impl Renderer {
 
         Ok(Self {
             profile,
+            camera: Camera::default(),
             window,
             surface,
             device,
@@ -234,7 +242,7 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&instances[..instance_count]),
         );
-        let uniforms = build_uniforms(
+        let uniforms = self.camera.build_uniforms(
             &self.profile,
             frame,
             elapsed,

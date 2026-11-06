@@ -98,36 +98,60 @@ pub fn build_instances(
     instances
 }
 
-pub fn build_uniforms(
-    profile: &RenderProfile,
-    frame: ControlFrame,
-    elapsed: f32,
-    aspect: f32,
-) -> Uniforms {
-    let energy = frame.energy as f32 / 255.0;
-    let beat = if frame.beat_onset() { 1.0 } else { 0.0 };
-    let phase = frame.beat_phase as f32 / 255.0;
-    let tempo = frame.bpm as f32 / 255.0;
-    let beat_drift = (frame.beat_count as f32 * 0.015).sin() * tempo;
-    let angle = elapsed * profile.camera_speed + phase * std::f32::consts::TAU + beat_drift;
-    let radius = profile.camera_radius - energy * 1.8;
-    let eye = [
-        angle.cos() * radius,
-        1.8 + energy * 2.2,
-        angle.sin() * radius,
-    ];
-    let target = [0.0, beat_drift * 0.5, 0.0];
-    let view = look_at(eye, target, [0.0, 1.0, 0.0]);
-    let projection = perspective(52.0_f32.to_radians(), aspect, 0.1, 100.0);
+#[derive(Default)]
+pub struct Camera {
+    energy: f32,
+    drift: f32,
+    last_elapsed: Option<f32>,
+}
 
-    Uniforms {
-        // Row-indexed multiplication of column-major storage reverses the order:
-        // this uploads projection * view as columns for WGSL.
-        view_projection: multiply4(view, projection),
-        time: elapsed,
-        energy,
-        beat,
-        _padding: 0.0,
+impl Camera {
+    pub fn build_uniforms(
+        &mut self,
+        profile: &RenderProfile,
+        frame: ControlFrame,
+        elapsed: f32,
+        aspect: f32,
+    ) -> Uniforms {
+        let energy = frame.energy as f32 / 255.0;
+        let beat = if frame.beat_onset() { 1.0 } else { 0.0 };
+        let previous = self.last_elapsed.unwrap_or(elapsed);
+        if self.last_elapsed.is_none() {
+            // Seed energy from the first rendered frame; angular drift starts neutral.
+            self.energy = energy;
+        } else {
+            // A 0.5 s exponential response stays within [0, 1] without overshoot.
+            // Equal/backward timestamps cannot advance or rewind this envelope.
+            let delta = (elapsed - previous).max(0.0);
+            let blend = -(-delta / 0.5).exp_m1();
+            self.energy += (energy - self.energy) * blend;
+            let drift = (frame.beat_count as f32 * 0.015).sin() * (frame.bpm as f32 / 255.0) * 0.04;
+            self.drift += (drift - self.drift) * blend;
+        }
+        self.last_elapsed = Some(previous.max(elapsed));
+
+        // Elapsed time drives the orbit. Drift is at most +/-0.04 rad and changes
+        // at most 0.16 rad/s, below either profile's base speed. Phase is not an
+        // angle; counter wraps and coupled energy resets are both smoothed.
+        let angle = elapsed * profile.camera_speed + self.drift;
+        let radius = profile.camera_radius - self.energy * 1.8;
+        let eye = [
+            angle.cos() * radius,
+            1.8 + self.energy * 2.2,
+            angle.sin() * radius,
+        ];
+        let view = look_at(eye, [0.0; 3], [0.0, 1.0, 0.0]);
+        let projection = perspective(52.0_f32.to_radians(), aspect, 0.1, 100.0);
+
+        Uniforms {
+            // Row-indexed multiplication of column-major storage reverses the order:
+            // this uploads projection * view as columns for WGSL.
+            view_projection: multiply4(view, projection),
+            time: elapsed,
+            energy,
+            beat,
+            _padding: 0.0,
+        }
     }
 }
 
@@ -353,6 +377,251 @@ fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
 mod tests {
     use super::*;
 
+    fn projected_position(uniforms: &Uniforms, world: [f32; 3]) -> [f32; 2] {
+        let columns = uniforms.view_projection;
+        let clip: [f32; 4] = std::array::from_fn(|row| {
+            columns[0][row] * world[0]
+                + columns[1][row] * world[1]
+                + columns[2][row] * world[2]
+                + columns[3][row]
+        });
+        assert!(clip.iter().all(|value| value.is_finite()));
+        assert!(clip[3] > 0.0 && (0.0..=clip[3]).contains(&clip[2]));
+        [clip[0] / clip[3], clip[1] / clip[3]]
+    }
+
+    fn projected_motion(before: &Uniforms, after: &Uniforms) -> f32 {
+        // Fixed world landmarks isolate the camera from animated instances.
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, -0.5, 2.0],
+        ]
+        .into_iter()
+        .map(|world| {
+            let before = projected_position(before, world);
+            let after = projected_position(after, world);
+            (after[0] - before[0]).hypot(after[1] - before[1])
+        })
+        .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn camera_equal_elapsed_has_no_phase_or_initial_counter_jump() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let frame = ControlFrame::procedural(0);
+            let reference = Camera::default().build_uniforms(&profile, frame, 3.0, 16.0 / 9.0);
+            for beat_phase in [0, 17, 32, 128, 239, 255] {
+                for beat_count in [0, 37, u16::MAX] {
+                    let frame = ControlFrame {
+                        beat_phase,
+                        beat_count,
+                        ..frame
+                    };
+                    let mut camera = Camera::default();
+                    let actual = camera.build_uniforms(&profile, frame, 3.0, 16.0 / 9.0);
+                    let motion = projected_motion(&reference, &actual);
+                    assert!(
+                        motion < 1.0e-6,
+                        "{} phase {beat_phase}, count {beat_count}: {motion} NDC",
+                        profile.name
+                    );
+                    // Phase also has no influence after the envelope has advanced.
+                    let unphased = ControlFrame {
+                        beat_phase: 0,
+                        ..frame
+                    };
+                    let mut reference = Camera::default();
+                    reference.build_uniforms(&profile, unphased, 3.0, 16.0 / 9.0);
+                    let expected = reference.build_uniforms(&profile, unphased, 3.1, 16.0 / 9.0);
+                    let actual = camera.build_uniforms(&profile, frame, 3.1, 16.0 / 9.0);
+                    assert!(projected_motion(&expected, &actual) < 1.0e-6);
+                }
+            }
+        }
+    }
+
+    fn assert_camera_sequence(phase_step: u64) {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for aspect in [16.0 / 9.0, 9.0 / 16.0] {
+                let mut camera = Camera::default();
+                let mut previous = None;
+                let mut peak_motion = 0.0_f32;
+                for index in 0..160 {
+                    let phase = (index * phase_step) as u8;
+                    let frame = ControlFrame {
+                        beat_phase: phase,
+                        energy: 80 + phase / 2,
+                        beat_count: (u16::MAX - 5).wrapping_add((index / 16) as u16),
+                        ..ControlFrame::procedural(index)
+                    };
+                    let uniforms =
+                        camera.build_uniforms(&profile, frame, index as f32 / 60.0, aspect);
+                    if let Some(previous) = previous {
+                        peak_motion = peak_motion.max(projected_motion(&previous, &uniforms));
+                    }
+                    previous = Some(uniforms);
+                }
+                // At 60 Hz no landmark may jump more than 1% of the viewport,
+                // including phase/energy resets and the u16 beat-counter wrap.
+                assert!(
+                    peak_motion < 0.02,
+                    "{} step {phase_step}, aspect {aspect}: {peak_motion} NDC",
+                    profile.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn camera_procedural_phase_steps_and_wraps_are_readable() {
+        assert_camera_sequence(17);
+    }
+
+    #[test]
+    fn camera_fixture_phase_steps_and_wraps_are_readable() {
+        assert_camera_sequence(32);
+    }
+
+    #[test]
+    fn camera_energy_response_is_smooth_bounded_and_nonzero() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let quiet = ControlFrame {
+                energy: 0,
+                ..ControlFrame::procedural(0)
+            };
+            let loud = ControlFrame {
+                energy: 255,
+                ..quiet
+            };
+            let aspect = 16.0 / 9.0;
+            let mut camera = Camera::default();
+            let _initial = camera.build_uniforms(&profile, quiet, 0.0, aspect);
+            let response = camera.build_uniforms(&profile, loud, 1.0 / 60.0, aspect);
+            let unmodulated = Camera::default().build_uniforms(&profile, quiet, 1.0 / 60.0, aspect);
+            let motion = projected_motion(&unmodulated, &response);
+            assert!(motion < 0.02, "{} energy step: {motion} NDC", profile.name);
+            assert_eq!(response.time, 1.0 / 60.0);
+            assert_eq!(response.energy, 1.0);
+            assert_eq!(response.beat, 1.0);
+
+            let settled = camera.build_uniforms(&profile, loud, 5.0, aspect);
+            let unmodulated = Camera::default().build_uniforms(&profile, quiet, 5.0, aspect);
+            let fully_modulated = Camera::default().build_uniforms(&profile, loud, 5.0, aspect);
+            let response = projected_motion(&unmodulated, &settled);
+            assert!((0.03..0.35).contains(&response), "{response} NDC");
+            assert!(projected_motion(&fully_modulated, &settled) < 2.0e-5);
+        }
+    }
+
+    #[test]
+    fn camera_beat_drift_stays_bounded_through_counter_wrap() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let frame = ControlFrame {
+                bpm: 255,
+                ..ControlFrame::procedural(0)
+            };
+            let mut camera = Camera::default();
+            let mut peak_response = 0.0_f32;
+            for index in 0..600 {
+                let elapsed = index as f32 / 60.0;
+                let modulated = ControlFrame {
+                    beat_count: [105, 314, u16::MAX, 0, 157][index / 120],
+                    ..frame
+                };
+                let reference =
+                    Camera::default().build_uniforms(&profile, frame, elapsed, 16.0 / 9.0);
+                let actual = camera.build_uniforms(&profile, modulated, elapsed, 16.0 / 9.0);
+                peak_response = peak_response.max(projected_motion(&reference, &actual));
+            }
+            // Even extreme tempo/counter changes move landmarks by less than
+            // 2% of the viewport relative to the elapsed-only orbit.
+            assert!(
+                (0.001..0.04).contains(&peak_response),
+                "{peak_response} NDC"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_response_is_independent_of_render_interval() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let quiet = ControlFrame {
+                energy: 0,
+                ..ControlFrame::procedural(0)
+            };
+            let loud = ControlFrame {
+                energy: 255,
+                bpm: 255,
+                beat_count: 105,
+                ..quiet
+            };
+            let mut reference = None;
+            for rate in [30, 60, 144] {
+                let mut camera = Camera::default();
+                let mut actual = camera.build_uniforms(&profile, quiet, 0.0, 16.0 / 9.0);
+                for index in 1..=2 * rate {
+                    let elapsed = index as f32 / rate as f32;
+                    actual = camera.build_uniforms(&profile, loud, elapsed, 16.0 / 9.0);
+                    if index == 1 {
+                        let unmodulated =
+                            Camera::default().build_uniforms(&profile, quiet, elapsed, 16.0 / 9.0);
+                        assert!(projected_motion(&unmodulated, &actual) < 0.02);
+                    }
+                }
+                if let Some(reference) = &reference {
+                    assert!(projected_motion(reference, &actual) < 2.0e-6);
+                }
+                reference = Some(actual);
+            }
+        }
+    }
+
+    #[test]
+    fn camera_initial_and_repeated_times_do_not_integrate_spurious_motion() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let frame = ControlFrame {
+                energy: 255,
+                beat_count: u16::MAX,
+                beat_phase: 255,
+                ..ControlFrame::procedural(0)
+            };
+            let elapsed = std::f32::consts::FRAC_PI_2 / profile.camera_speed;
+            let mut camera = Camera::default();
+            let initial = camera.build_uniforms(&profile, frame, elapsed, 16.0 / 9.0);
+            assert_projection(
+                &initial,
+                [0.0; 3],
+                [0.0, 0.0, (profile.camera_radius - 1.8).hypot(4.0)],
+                16.0 / 9.0,
+            );
+            let reset = ControlFrame {
+                energy: 0,
+                bpm: 0,
+                beat_count: 0,
+                beat_phase: 0,
+                flags: 0,
+                ..frame
+            };
+            for time in [elapsed, elapsed - 1.0, elapsed, elapsed] {
+                let actual = camera.build_uniforms(&profile, reset, time, 16.0 / 9.0);
+                if time == elapsed {
+                    assert_eq!(initial.view_projection, actual.view_projection);
+                }
+                assert_eq!(actual.time, time);
+                assert_eq!(actual.energy, 0.0);
+                assert_eq!(actual.beat, 0.0);
+            }
+            let next_time = elapsed + 1.0 / 60.0;
+            let next = camera.build_uniforms(&profile, reset, next_time, 16.0 / 9.0);
+            let held = Camera::default().build_uniforms(&profile, frame, next_time, 16.0 / 9.0);
+            let motion = projected_motion(&held, &next);
+            assert!((1.0e-6..0.02).contains(&motion), "{motion} NDC");
+        }
+    }
+
     fn assert_projection(uniforms: &Uniforms, world: [f32; 3], camera: [f32; 3], aspect: f32) {
         // Interpret the uploaded columns as WGSL's matrix * world position.
         let columns = uniforms.view_projection;
@@ -388,8 +657,8 @@ mod tests {
         };
         for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
             let aspect = profile.target_width as f32 / profile.target_height as f32;
-            let uniforms = build_uniforms(&profile, frame, 0.0, aspect);
-            // At zero phase/time/drift the eye is (radius, 1.8, 0),
+            let uniforms = Camera::default().build_uniforms(&profile, frame, 0.0, aspect);
+            // At zero time/energy the eye is (radius, 1.8, 0),
             // looking directly at the origin.
             let distance = profile.camera_radius.hypot(1.8);
             assert_projection(&uniforms, [0.0; 3], [0.0, 0.0, distance], aspect);
@@ -408,7 +677,7 @@ mod tests {
                 let height = 1.8 + f32::from(energy) / 255.0 * 2.2;
                 let distance = radius.hypot(height);
                 for aspect in [16.0 / 9.0, 9.0 / 16.0] {
-                    let uniforms = build_uniforms(&profile, frame, 0.0, aspect);
+                    let uniforms = Camera::default().build_uniforms(&profile, frame, 0.0, aspect);
                     for [x, y, z] in [
                         [0.0, 0.0, -1.0],
                         [0.0, 0.0, 1.0],
@@ -430,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_project_orbiting_camera_depth_and_beat_drift() {
+    fn uniforms_project_orbiting_camera_depth() {
         let frame = ControlFrame {
             energy: 255,
             bpm: 180,
@@ -438,25 +707,15 @@ mod tests {
             beat_count: 37,
             ..ControlFrame::procedural(0)
         };
-        let drift = (f32::from(frame.beat_count) * 0.015).sin() * f32::from(frame.bpm) / 255.0;
-        let target_y = drift * 0.5;
         for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
             // Choose elapsed time so the orbit is a quarter turn: eye = (0, 4, radius).
-            let elapsed = (std::f32::consts::FRAC_PI_2
-                - f32::from(frame.beat_phase) / 255.0 * std::f32::consts::TAU
-                - drift)
-                / profile.camera_speed;
+            let elapsed = std::f32::consts::FRAC_PI_2 / profile.camera_speed;
             let radius = profile.camera_radius - 1.8;
-            let height = 4.0 - target_y;
+            let height = 4.0;
             let distance = radius.hypot(height);
             let aspect = 4.0 / 3.0;
-            let uniforms = build_uniforms(&profile, frame, elapsed, aspect);
-            assert_projection(
-                &uniforms,
-                [0.0, target_y, 0.0],
-                [0.0, 0.0, distance],
-                aspect,
-            );
+            let uniforms = Camera::default().build_uniforms(&profile, frame, elapsed, aspect);
+            assert_projection(&uniforms, [0.0; 3], [0.0, 0.0, distance], aspect);
             for depth in [0.1, 2.0, 100.0, -1.0] {
                 // Right is +X; up = (0, radius, -height) / distance;
                 // forward = (0, -height, -radius) / distance.
