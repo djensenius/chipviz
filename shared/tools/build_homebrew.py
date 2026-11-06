@@ -226,8 +226,9 @@ def build_sms_rom() -> bytes:
   rom[header:header + 8] = b"TMR SEGA"
   rom[0x7FF8:0x7FFA] = b"\x00\x00"
   rom[0x7FFA:0x7FFC] = b"\x00\x00"
-  rom[0x7FFC:0x7FFE] = b"\x00\x4A"
-  checksum = (sum(rom[:0x7FFA]) + sum(rom[0x7FFC:])) & 0xFFFF
+  rom[0x7FFF] = 0x4C  # Export SMS (4), 32 KiB (C).
+  # For 32 KiB, sum $0000-$7FEF; exclude the entire 16-byte header.
+  checksum = sum(rom[:header]) & 0xFFFF
   rom[0x7FFA:0x7FFC] = checksum.to_bytes(2, "little")
   return bytes(rom)
 
