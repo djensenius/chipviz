@@ -4,6 +4,7 @@
 #define CHIPVIZ_BORDER_COLOR (*(volatile uint8_t *)0xD020)
 #define CHIPVIZ_BACKGROUND_COLOR (*(volatile uint8_t *)0xD021)
 #define CHIPVIZ_RASTER_LINE (*(volatile uint8_t *)0xD012)
+#define CHIPVIZ_MEMORY_POINTERS (*(volatile uint8_t *)0xD018)
 #define CHIPVIZ_SCREEN_RAM ((volatile uint8_t *)0x0400)
 #define CHIPVIZ_COLOR_RAM ((volatile uint8_t *)0xD800)
 
@@ -33,10 +34,11 @@ static void make_demo_state(uint16_t frame, demo_state_t *state) {
 
 static void draw_title(void) {
   clrscr();
+  /* cc65 lowercase literals encode unshifted PETSCII: uppercase in graphics mode. */
   textcolor(COLOR_LIGHTGREEN);
-  cputsxy(1, 0, "CHIPVIZ C64 SDK DEMO");
+  cputsxy(1, 0, "chipviz c64 sdk demo");
   textcolor(COLOR_CYAN);
-  cputsxy(1, 1, "CC65 VIC-II / PETSCII");
+  cputsxy(1, 1, "cc65 vic-ii / petscii");
 }
 
 static void seed_petscii_grid(void) {
@@ -46,7 +48,8 @@ static void seed_petscii_grid(void) {
   for (y = 0; y < 18u; y++) {
     for (x = 0; x < 40u; x++) {
       uint16_t offset = (uint16_t)(y + 4u) * 40u + x;
-      CHIPVIZ_SCREEN_RAM[offset] = (uint8_t)(160u + ((x + y) & 15u));
+      /* Screen codes 96-111 are PETSCII graphics 160-175, not reverse punctuation. */
+      CHIPVIZ_SCREEN_RAM[offset] = (uint8_t)(96u + ((x + y) & 15u));
       CHIPVIZ_COLOR_RAM[offset] = (uint8_t)(1u + ((x / 5u + y) & 15u));
     }
   }
@@ -71,7 +74,7 @@ static void update_petscii_rows(uint16_t frame, const demo_state_t *state) {
     for (x = 0; x < 40u; x++) {
       uint16_t offset = (uint16_t)(y + 4u) * 40u + x;
       uint8_t band = state->spectrum[(x / 5u) & 7u];
-      uint8_t cell = (uint8_t)(160u + ((x + y + frame / 4u + state->scene * 3u) & 15u));
+      uint8_t cell = (uint8_t)(96u + ((x + y + frame / 4u + state->scene * 3u) & 15u));
       if (((x * 3u + y * 5u + frame + band) & 31u) < (state->beat ? 8u : 4u)) {
         cell = (uint8_t)(81u + (state->note & 7u));
       }
@@ -101,6 +104,8 @@ int main(void) {
   uint16_t frame = 0;
   demo_state_t state;
 
+  /* D018 bits 1-3: uppercase/graphics ROM at $1000; keep screen pointer bits. */
+  CHIPVIZ_MEMORY_POINTERS = (uint8_t)((CHIPVIZ_MEMORY_POINTERS & 0xF1u) | 0x04u);
   draw_title();
   seed_petscii_grid();
   for (;;) {
