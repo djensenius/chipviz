@@ -3,6 +3,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -112,11 +113,38 @@ class HomebrewArtifactTests(unittest.TestCase):
   def test_generated_sms_rom_has_header(self) -> None:
     rom = build_homebrew.build_sms_rom()
 
+    # https://segaretro.org/ROM_header#Mark_III/Master_System_and_Game_Gear
     self.assertEqual(len(rom), 0x8000)
     self.assertEqual(rom[0x7FF0:0x7FF8], b"TMR SEGA")
     self.assertIn(bytes([0xD3, 0xBF]), rom[:48])
-    checksum = (sum(rom[:0x7FFA]) + sum(rom[0x7FFC:])) & 0xFFFF
-    self.assertEqual(int.from_bytes(rom[0x7FFA:0x7FFC], "little"), checksum)
+    with self.subTest(field="region"):
+      self.assertEqual(rom[0x7FFF] >> 4, 4)  # Export Master System.
+    with self.subTest(field="size"):
+      self.assertEqual(rom[0x7FFF] & 0x0F, 0xC)  # 32 KiB.
+    with self.subTest(field="product/revision"):
+      self.assertEqual(rom[0x7FFC:0x7FFF], b"\x00\x00\x00")
+
+  def test_generated_sms_checksum_excludes_entire_header(self) -> None:
+    rom = build_homebrew.build_sms_rom()
+
+    # devkitSMS tools/makesms/src/makesms.c: sum bytes before 0x7FF0,
+    # store low byte at header+10, high byte at header+11.
+    # https://github.com/sverx/devkitSMS/tree/533ae572c897cf44f1da865013ebf690134301a3
+    checksum = (sum(rom) - sum(rom[0x7FF0:0x8000])) % 65536
+    self.assertEqual(rom[0x7FFA:0x7FFC], checksum.to_bytes(2, "little"))
+    self.assertEqual(rom[0x7FFA:0x7FFC], b"\xDE\x1E")  # Static seed body.
+
+  def test_generated_sms_checksum_covers_padding_and_wraps(self) -> None:
+    # Nonzero fill exposes truncated coverage hidden by the seed's zero padding.
+    # It also exercises 16-bit overflow and nonzero excluded header bytes.
+    filled = bytearray([0xFF] * 0x8000)
+    with mock.patch.object(build_homebrew, "bytearray", return_value=filled, create=True):
+      rom = build_homebrew.build_sms_rom()
+
+    self.assertEqual(rom[0x7FEF], 0xFF)
+    checksum = sum(rom) - sum(rom[0x7FF0:0x8000])
+    self.assertGreater(checksum, 0xFFFF)
+    self.assertEqual(rom[0x7FFA:0x7FFC], (checksum % 65536).to_bytes(2, "little"))
 
   def test_sdk_homebrew_projects_are_present(self) -> None:
     self.assertTrue((ROOT / "cores" / "c64" / "homebrew" / "Makefile").exists())
