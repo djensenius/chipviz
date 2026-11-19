@@ -18,8 +18,8 @@
 //!   bin) outside that endpoint, so hop jitter cannot fold 60 or 200 BPM to
 //!   120 or 100; longer gaps fold strictly so they reinforce the shorter
 //!   period. The beat period is the weighted centroid of the strongest
-//!   three-bin neighbourhood. Folding makes steady eighths read as the
-//!   quarter-note tempo and keeps off-beats from doubling it;
+//!   three-bin neighbourhood. Folding makes eighths faster than 200 per
+//!   minute read as the quarter-note tempo and keeps off-beats from doubling it;
 //! - a forward-only beat clock ([`BeatTracker`]): `beat_phase` advances at the
 //!   estimated tempo and `beat_count` increments exactly when the phase wraps,
 //!   so `beat_count * 256 + beat_phase` never decreases. Onsets within a
@@ -30,7 +30,8 @@
 //!   two beats), in which case the next onset re-anchors the beat.
 //!
 //! Known limits: tempos outside 60-200 BPM are folded into that range (tempos
-//! within about one hop of either end are pinned to it), the
+//! within about one hop of either end are pinned to it), very fast tempos
+//! (about 180 BPM and up) with loose timing can read at half tempo, the
 //! tracker cannot tell a 3/4 or swung feel from straight time, and a pattern
 //! of only off-beats ends up treated as the beat.
 //!

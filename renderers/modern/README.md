@@ -87,8 +87,11 @@ The beat clock only moves forward: `beat_count` increments exactly when
 `beat_phase` wraps, and `beat_count * 256 + beat_phase` never decreases. Onsets
 near the expected beat nudge the clock (jumping forward, or briefly slowing
 down) instead of rewinding it; off-beat onsets are ignored. Tempo comes from
-onset gaps folded into 60-200 BPM, so steady eighths read as the quarter-note
-tempo. Known limits: tempos outside 60-200 BPM are folded into that range, 3/4
+onset gaps folded into 60-200 BPM, so eighths faster than 200 per minute read as
+the quarter-note tempo. Known limits: tempos outside 60-200 BPM are folded into
+that range (tempos within about one analysis hop of either end are pinned to
+it), very fast tempos (about 180 BPM and up) with loose timing can read at half
+tempo, 3/4
 and swung feels are not distinguished from straight time, and music with only
 off-beat accents is tracked on those accents.
 
