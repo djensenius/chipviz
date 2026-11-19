@@ -204,6 +204,7 @@ wOpPin:     ds 1
 wWarnP:     ds 1
 wWarnLo:    ds 1
 wWarnHi:    ds 1
+wWarnVis:   ds 1      ; the warning was on screen at the previous step's VBlank
 wN:         ds 1
 wStateEnd:
 ASSERT wStateEnd <= $C200
@@ -531,9 +532,11 @@ ENDC
 ; incoming scene unchanged for P_STABLE steps, and at least CUT_MIN steps
 ; since the last entry or exit. Operator role: local Up/Down scene inputs are
 ; exempt and take effect at once. The DMG has no wire or link-cable scene
-; source today, so the floor never binds (P_STABLE > CUT_MIN). A future
-; debounced source on the operator build must take the gated path below, so
-; that wSinceScene spaces it after an exempt local change.
+; source today, so the floor never binds (P_STABLE > CUT_MIN). The
+; P_STABLE and CUT_MIN checks below are assembled only outside the operator
+; role. A future debounced source on the operator build would need its own
+; copy of both checks (only local presses may skip them), so that
+; wSinceScene spaces it after an exempt local change.
 SceneDebounce:
   INCSAT wSinceScene
   ld a, [wSceneIn]
@@ -1819,6 +1822,7 @@ StartWarning:
   xor a
   ld [wWarnLo], a
   ld [wWarnHi], a
+  ld [wWarnVis], a
   ld a, SHOW_WARN
   ld [wShowMode], a
   ret
@@ -1836,16 +1840,29 @@ ShowWarning:
   ld [wTraceShow], a
   ret
 
+; The pad is read just after VBlank, so a new edge was pressed during the
+; previous frame. Start confirms only if the warning was already on screen at
+; the previous step's VBlank, so it was visible for that whole frame. An
+; earlier Start edge is ignored, and holding it never confirms (edges only).
 WarnStep:
+  ld a, [wWarnVis]
+  ld d, a                ; d: the warning was visible all last frame
+  ld a, [wShownShow]
+  sub SHOW_WARN
+  jr z, .visible
+  ld a, $FF
+.visible
+  inc a                  ; 1 if shown at this VBlank, else 0
+  ld [wWarnVis], a
   ld a, [wPadNew]
   or a
   jr z, .timer
   ld c, 0
   cp PAD_START
   jr nz, .leave          ; any other input cancels: unarmed, runs as mode 2
-  ld a, [wShownShow]     ; Start before the warning reached the display:
-  cp SHOW_WARN           ; ignored, it cannot confirm unseen text
-  jr nz, .timer
+  ld a, d                ; Start pressed before the warning was visible for
+  or a                   ; a whole frame: ignored, it cannot confirm
+  jr z, .timer           ; unseen text
   inc c                  ; Start: armed request, applied under the budget
   jr .leave
 .timer

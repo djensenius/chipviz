@@ -100,8 +100,10 @@ class Rom:
           self.symbols[name] = int(address, 16)
 
   def boot(self):
-    self.gb.write(READY, b"\0")
+    # Reset fills WRAM with noise, which can already hold the ready byte:
+    # clear it after the reset, before the ROM runs.
     self.gb.reset()
+    self.gb.write(READY, b"\0")
     for _ in range(600):
       self.gb.run_frame()
       if self.gb.read(READY)[0] == 0xA5:
@@ -489,7 +491,8 @@ class Pad(Rom):
     """trace[t] is step t's trace; shown[t] and frames[t] are the shown
     trace (copied at VBlank with the registers) and the frame drawn with it.
     probe names WRAM variables recorded with each trace in self.probes."""
-    self.gb.reset()  # the core may fill WRAM; Main clears it before step 0
+    self.gb.reset()  # the core fills WRAM with noise; Main clears it before step 0
+    self.gb.write(STEP, b"\0\0")  # so a noise step count cannot pass for step 1
     for _ in range(600):
       self.gb.run_frame()
       if self.step() == 1:
@@ -651,16 +654,27 @@ class GbColourFieldCaptures(unittest.TestCase):
     self.assertTrue(all(s[1] == 3 for s in trace[warning[-1] + 10:]))
 
   def test_operator_start_before_warning_shown(self):
-    # A fresh Start on the step after mode 3 is chosen comes before the
-    # warning reaches the display: it must not confirm unseen text.
+    # Right at step 30 chooses unarmed mode 3; Start is then held for one
+    # frame at step 31 + d. The ROM reads a press just after the VBlank that
+    # ends its frame, so Start may confirm only once the warning has been
+    # drawn before the frame it was pressed in. d = 0 must never arm.
     rom = self.start("operator")
-    press = {10: "up", 14: "b", 20: "right", 24: "right", 28: "right", 29: ("right", "start"), 30: "start"}
-    rom.run(120, held(press))
-    self.assertNotIn(3, {s[1] for s in rom.trace})
-    warning = [t for t, s in enumerate(rom.trace) if s[0] == 2]
-    self.assertTrue(warning)
-    self.assertEqual(warning, list(range(warning[0], 120)))
-    self.assertTrue(any(s[0] == 2 for s in rom.shown))
+    base = held({10: "up", 14: "b", 20: "right", 24: "right", 30: "right"})
+    armed = {}
+    for d in range(4):
+      rom.run(80, lambda t: base(t) + (("start",) if t == 31 + d else ()))
+      # buttons(t) are pressed during the frame stored at index t - 1.
+      drawn = sum(1 for s in rom.shown[:30 + d] if s[0] == 2)
+      armed[d] = 3 in {s[1] for s in rom.trace}
+      if not drawn:
+        self.assertFalse(armed[d], f"d={d}: armed with no warning frame drawn before the press")
+      if armed[d]:
+        self.assertGreaterEqual(drawn, 1, f"d={d}")
+      else:
+        warning = [t for t, s in enumerate(rom.trace) if s[0] == 2]
+        self.assertEqual(warning, list(range(warning[0], 80)), f"d={d}")
+    self.assertFalse(armed[0])
+    self.assertTrue(armed[3])
 
   def press_on_entry(self, rom, button, bit, setup=None, steps=60):
     """Up at step 20, then button a few steps later: the pad reaches the ROM
@@ -677,11 +691,13 @@ class GbColourFieldCaptures(unittest.TestCase):
     self.fail(f"{button} never landed on the entry step")
 
   def test_operator_entry_step_select(self):
-    # Select on the scene-entry step pins the layout (auto -> V2) for the entry.
+    # Select in the native scene pins V2 at once; Select on the scene-entry
+    # step moves the pin to H2, and the entry step itself is drawn as H2.
     rom = self.start("operator")
-    self.press_on_entry(rom, "select", PAD_SELECT)
-    self.assertEqual(rom.gb.read(rom.symbols["wPin"])[0], V2)
-    self.assertEqual(rom.gb.read(rom.symbols["wPinReq"])[0], V2)
+    entry = self.press_on_entry(rom, "select", PAD_SELECT, held({10: "select"}))
+    self.assertEqual(rom.trace[entry][3], H2)
+    self.assertEqual(rom.gb.read(rom.symbols["wPin"])[0], H2)
+    self.assertEqual(rom.gb.read(rom.symbols["wPinReq"])[0], H2)
 
   def test_operator_entry_step_mode3(self):
     # Palette 2 in the native scene, Up, then Right on the entry step: the
