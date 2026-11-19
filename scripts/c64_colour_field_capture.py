@@ -66,6 +66,10 @@ CORE_OPTIONS = {
 }
 
 MODELS = {"pal": "C64 PAL auto", "ntsc": "C64 NTSC auto"}
+# KERNAL PAL/NTSC flag ($02A6) that each model must set: the program picks
+# its raster IRQ line from it.
+KERNAL_PALNTSC = 0x02A6
+PALNTSC_FLAG = {"pal": 1, "ntsc": 0}
 NATIVE_FRAMES = 60  # frames sampled to check the native demo animates
 
 # Pepto PAL palette (VICE pepto-pal.vpl), indexed by C64 colour number.
@@ -351,6 +355,10 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     assert emu.frame is not None
     origin = find_window(*emu.frame)
+    palntsc = emu.peek(KERNAL_PALNTSC)
+    if palntsc != PALNTSC_FLAG[args.model]:
+      print(f"$02A6 is {palntsc}, expected {PALNTSC_FLAG[args.model]} for {args.model}", file=sys.stderr)
+      return 1
     native_frames = set()
     for _ in range(NATIVE_FRAMES):
       emu.run(1)
@@ -458,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     write_png(args.output / f"{prefix}native-after-exit.png", *native)
     failed = [r for r in results if r["failures"]]
     report = {"core": str(args.core), "prg_sha256": hashlib.sha256(args.prg.read_bytes()).hexdigest(),
-              "model": args.model, "core_options": CORE_OPTIONS, "boot_frames": BOOT,
+              "model": args.model, "palntsc_flag": palntsc, "core_options": CORE_OPTIONS, "boot_frames": BOOT,
               "window_origin": origin, "native_distinct_frames": len(native_frames),
               "native_after_exit_colours": colour_count(native), "timing": timing, "unarmed_r": unarmed,
               "captures": results}
