@@ -359,6 +359,26 @@ class NesColourFieldTests(unittest.TestCase):
     self.assertEqual(run.at(399, "Pin"), 3)
     self.assert_capture(run, 390, shots[390], "operator-pinned-H3")
 
+  def test_operator_warning_after_layout_cut_reuploads_attributes(self):
+    run = self.start("operator")
+    table = {0: ("b",), 1: ("up",), 3: ("right",), 5: ("right",)}  # entry on 2, cuts from 23
+    table.update({step: ("b",) for step in (48, 68, 88)})
+    table.update({108: ("right", "b"), 120: ("a",)})  # layout cut and the warning on one step
+    shots = run.run(140, presses(table), {130})
+    self.assertEqual([run.trace(s)[2] for s in (107, 108)], [0, 1])
+    self.assertEqual(run.at(108, "ShowMode"), 2)
+    self.assertEqual(run.at(120, "ShowMode"), 1)  # cancelled
+    self.assertEqual(run.trace(130)[0:3], (2, 0, 1))
+    self.assert_capture(run, 130, shots[130], "operator-warning-cancel-H2")
+
+  def test_operator_no_warning_on_exit_step(self):
+    run = self.start("operator")
+    table = {0: ("b",), 1: ("up",), 3: ("right",), 5: ("right",), 40: ("down", "right")}
+    run.run(80, presses(table))
+    self.assertEqual(run.at(40, "PalSel"), 3)
+    self.assertEqual([run.at(s, "ShowMode") for s in (40, 41)], [1, 0])
+    self.assertNotIn(2, [run.at(s, "ShowMode") for s in range(40, 80)])
+
   def test_operator_pin_on_entry_step(self):
     run = self.start("operator")
     run.run(10, presses({0: ("b",), 1: ("up",), 2: ("select",)}))  # entry on step 2

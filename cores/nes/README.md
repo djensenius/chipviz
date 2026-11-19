@@ -75,7 +75,9 @@ After that the pad is a digital-only source: energy and every band are fixed at
   scene presses apply at once; palette presses are operator pulses. Choosing
   3 or 7 while unarmed shows the photosensitivity warning: Start arms, any
   other press cancels (runs unarmed as mode 2/6), and it times out after 600
-  steps. The text starts 16 px down, inside the NTSC safe area. Pulses last
+  steps (a press that also leaves scene 7 shows no warning). The text starts
+  16 px down, inside the NTSC safe area; the field's attributes are uploaded
+  again when it closes. Pulses last
   4 steps and start at least 8 steps apart. A Select press on the entry step
   sets the pin used by the entry.
 

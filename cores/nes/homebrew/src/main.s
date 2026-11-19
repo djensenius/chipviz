@@ -1412,6 +1412,9 @@ UpdateRequests:
   bne ReqOperator
   lda Latch
   bne ReqOperator
+  lda SceneRing          ; leaving scene 7 this step (exempt): no warning
+  cmp #7
+  bne ReqOperator
   lda PalSel             ; unarmed mode 3: show the warning screen
   jmp StartWarning
 ReqOperator:
@@ -1543,6 +1546,8 @@ RequestModeDone:
 ; Console warning screen (operator role only). The detector is paused.
 StartWarning:
   sta WarnP
+  lda #PIN_AUTO          ; drops any queued attribute upload: redo it on return
+  sta AttrShown
   lda #$00
   sta WarnLo
   sta WarnHi
