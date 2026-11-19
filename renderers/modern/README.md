@@ -324,7 +324,8 @@ A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed
 from frame 0 like the camera. `--lines-drop-cuts` turns on Lines drop cuts
-as in the renderer, replayed from frame 0. Procedural input never arms flash/gate; with
+as in the renderer, replayed from frame 0; only a `.cvz` input carries drop
+flags. Procedural input never arms flash/gate; with
 the `unmeasured-flash` feature, a recording arms it only as a target would,
 from a stable absolute wire 3 or 7 held in scene 7, and default builds never
 flash. Recorded inputs use

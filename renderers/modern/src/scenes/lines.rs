@@ -25,8 +25,9 @@
 //!   every 512 frames (about 8.5 s).
 //! - With [`SceneConfig::lines_drop_cuts`](super::SceneConfig) (`--lines-drop-cuts`),
 //!   a rising drop flag (0x04) cuts straight to the next section. The cut
-//!   refolds the same lines rather than flashing the screen, and any section
-//!   change, cut or not, waits for one bar after the last one.
+//!   refolds the same lines rather than flashing the screen. A section
+//!   change, cut or not, within one bar of the last one is ignored, not
+//!   delayed.
 //!
 //! Timings in seconds assume 60 control frames per second; the fold's real
 //! speed follows the sender's frame rate. Everything else derives from the
@@ -859,6 +860,12 @@ mod tests {
     /// pair, and section changes are at least one bar (60 frames, 1 s at
     /// 60 fps) apart, so cuts stay well under 3 flashes per second. If a
     /// stricter policy is wanted, crossfade the cut over a few frames.
+    /// This covers the default fourth-section cut too: it is accepted on the
+    /// same frequency argument, not because it is opt-in.
+    ///
+    /// The model point-samples at 1280x720; at the m1 target size thin far
+    /// lines cover more pixels, so native lit and changed shares may be
+    /// somewhat higher than measured here.
     #[test]
     fn cuts_keep_luminance_change_bounded() {
         const MAX_MEAN_CHANGE: f32 = 0.08;

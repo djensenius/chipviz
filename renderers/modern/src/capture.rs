@@ -25,7 +25,8 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --size     output size in pixels (default: the profile's target size)
   --lines-drop-cuts
              Lines (scene 3) cuts on a rising drop flag, as the renderer's
-             flag of the same name (default: drops are ignored)";
+             flag of the same name (default: drops are ignored); only
+             .cvz inputs carry drop flags, procedural input never does";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
