@@ -72,7 +72,8 @@ After that the pad is a digital-only source: energy and every band are fixed at
   (30 stable steps) and the palette ring is a relative wire value that goes
   through P_STABLE, so it never arms. Modes 3 and 7 run as 2 and 6.
 - **Operator role** (`make INPUT_ROLE=operator`, `chipviz-nes-operator.nes`):
-  scene presses apply at once; palette presses are operator pulses. Choosing
+  scene presses apply at once; palette presses are operator pulses while scene
+  7 is shown (including its entry step). Choosing
   3 or 7 while unarmed shows the photosensitivity warning: Start arms, any
   other press cancels (runs unarmed as mode 2/6), and it times out after 600
   steps (a press that also leaves scene 7 shows no warning). The text starts

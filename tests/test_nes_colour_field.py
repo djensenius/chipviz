@@ -75,6 +75,7 @@ def expected_indices(trace):
 class Run:
   """One ROM run, stepped once per frame with buttons chosen by step index."""
 
+  STARTUP_FRAMES = 16  # boot frames before the first step (4 observed)
   ROMS = {"data": "chipviz-nes.nes", "operator": "chipviz-nes-operator.nes", "test": "chipviz-nes-test.nes"}
 
   def __init__(self, role):
@@ -99,7 +100,11 @@ class Run:
     frame is drawn after it, so the frame of step s + 1 shows step s.
     """
     shots = {}
+    attempts = steps - len(self.states) + self.STARTUP_FRAMES
     while len(self.states) < steps:
+      if attempts == 0:
+        raise AssertionError(f"step clock stalled at step {len(self.states)} of {steps}")
+      attempts -= 1
       ram = self.nes.ram()
       step = self.var(ram, "StepLo") | self.var(ram, "StepHi") << 8
       if step != len(self.states):
@@ -378,6 +383,42 @@ class NesColourFieldTests(unittest.TestCase):
     self.assertEqual(run.at(40, "PalSel"), 3)
     self.assertEqual([run.at(s, "ShowMode") for s in (40, 41)], [1, 0])
     self.assertNotIn(2, [run.at(s, "ShowMode") for s in range(40, 80)])
+
+  def test_operator_palette_press_on_entry_step_warns(self):
+    # PalSel is 2 before scene 7; Right on the entry step selects an unarmed 3.
+    run = self.start("operator")
+    table = {0: ("b",), 1: ("right",), 3: ("right",), 5: ("up",), 6: ("right",), 20: ("start",)}
+    run.run(80, presses(table))
+    self.assertEqual(run.at(6, "PalSel"), 3)
+    self.assertEqual(run.at(6, "ShowMode"), 2)  # warning after scene init
+    self.assertEqual(run.at(20, "ShowMode"), 1)
+    armed = next(s for s in range(20, 80) if run.trace(s)[0] == 3)
+    self.assertEqual(run.at(armed, "Latch"), 1)
+
+  def test_operator_presses_outside_scene_7_are_not_pulses(self):
+    run = self.start("operator")
+    table = {0: ("b",), 1: ("right",), 3: ("right",), 5: ("right",), 7: ("up",)}  # 3 before entry
+    run.run(60, presses(table))
+    self.assertEqual(run.at(8, "PEff"), 3)
+    self.assertNotIn(2, [run.at(s, "ShowMode") for s in range(60)])
+    self.assertEqual(run.trace(30)[0], 2)  # unarmed 3 runs as mode 2
+
+  def test_palette_change_outside_window_rearms_wire_gate(self):
+    # Data role: p = 1 is consumed at e+75 but blocked by the cut at e+73; the
+    # ring leaves 7 at e+78 (the debounce keeps the field), which discards it,
+    # and the palette goes 1 -> 2 -> 1 there. The new run of 1 must apply.
+    run = self.start()
+    e = ENTRY
+    table = {0: ("b",), 1: ("up",), e + 1: ("right",), e + 3: ("right",)}  # cuts at e+53, e+73
+    table.update({step: ("b",) for step in range(72, e + 150, 2)})
+    table.update({e + 46: ("left",), e + 78: ("down",), e + 82: ("right",), e + 86: ("left",),
+                  e + 90: ("up",)})
+    run.run(e + 200, presses(table))
+    self.assertTrue(all(run.var(ram, "Shown7") for ram in run.states[e:]))
+    self.assertEqual((run.trace(e + 76)[0], run.at(e + 76, "ReqPending")), (2, 1))  # blocked
+    self.assertEqual(run.at(e + 78, "ReqPending"), 0)  # discarded outside the window
+    self.assertEqual(run.trace(e + 119)[0], 2)
+    self.assertEqual(run.trace(e + 199)[0], 1)  # the new run of p = 1 applied
 
   def test_operator_pin_on_entry_step(self):
     run = self.start("operator")

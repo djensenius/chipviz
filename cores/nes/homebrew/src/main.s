@@ -410,6 +410,9 @@ StepScene:
   sta EntryPending
   jsr SceneEntry
   jsr BuildField
+.ifdef CHIPVIZ_INPUT_ROLE_OPERATOR
+  jsr EntryPulse
+.endif
   jmp StepDebounce
 StepField:
   jsr FieldStep          ; renders step t, then applies requests for t + 1
@@ -568,6 +571,8 @@ RingApply:
   adc PalSel
   and #7
   sta PalSel
+  lda Shown7             ; outside scene 7 nothing is shown: no pulse
+  beq RingPin
   inc OpPal
 .else
   clc
@@ -698,7 +703,6 @@ EntrySpec:
   sta Latch
   sta ReqPending
   sta PinPending
-  sta OpPal
   sta OpPin
   sta SinceLayLo
   sta SinceLayHi
@@ -1399,6 +1403,27 @@ GateStart:
 GateDone:
   rts
 
+; Operator role: a palette press on the entry step is already in PEff; an
+; unarmed 3 or 7 still opens the warning after the scene is initialised.
+.ifdef CHIPVIZ_INPUT_ROLE_OPERATOR
+EntryPulse:
+  lda OpPal
+  beq EntryPulseDone
+  lda #$00
+  sta OpPal
+  lda PalSel
+  and #3
+  cmp #3
+  bne EntryPulseDone
+  lda SceneRing          ; leaving again this step (exempt): no warning
+  cmp #7
+  bne EntryPulseDone
+  lda PalSel
+  jmp StartWarning
+EntryPulseDone:
+  rts
+.endif
+
 ; Step 7 requests: palette gate or operator pulses, pin, then the budget.
 UpdateRequests:
 .ifdef CHIPVIZ_INPUT_ROLE_OPERATOR
@@ -1429,15 +1454,8 @@ ReqPinPulse:
   lda #1
   sta PinPending
 .else
-  ; Wire gate. The ring is relative, so a stable value is never armed.
-  lda SceneRing
-  cmp #7
-  beq WireCount
-  lda #$00               ; outside the scene-7 window
-  sta WireN
-  sta ReqPending
-  beq ReqClearEqual
-WireCount:
+  ; Wire gate. The ring is relative, so a stable value is never armed. A
+  ; change is tracked in every step, so a new value is never left consumed.
   lda PalRing
   cmp WireVal
   beq WireSame
@@ -1446,6 +1464,14 @@ WireCount:
   sta WireN
   sta WireUsed
 WireSame:
+  lda SceneRing
+  cmp #7
+  beq WireCount
+  lda #$00               ; outside the scene-7 window
+  sta WireN
+  sta ReqPending
+  beq ReqClearEqual
+WireCount:
   incsat WireN
   lda WireN
   cmp #P_STABLE
