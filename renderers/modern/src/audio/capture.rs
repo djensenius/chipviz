@@ -12,7 +12,8 @@
 //! Samples dropped on either side are reported to the
 //! analyzer with [`Analyzer::skip`] so its beat clock keeps real time. If the
 //! device stops delivering, the thread feeds silence so the published levels
-//! decay instead of freezing. [`SampleClock`] counts each stretch of time
+//! decay instead of freezing, and a shorter gap where the device lost audio is
+//! filled with silence too. [`SampleClock`] counts each stretch of time
 //! once: the stall threshold adapts to devices that deliver in large batches
 //! (and returns to its base after a second of normal deliveries), and real
 //! samples that arrive late for time already filled with silence are discarded
@@ -38,6 +39,9 @@ const MAX_BACKLOG_S: f32 = 0.1;
 const POLL: Duration = Duration::from_millis(5);
 const STALL: Duration = Duration::from_millis(100);
 const MAX_STALL: Duration = Duration::from_millis(500);
+/// A shorter gap before a delivery than this (or half the delivery, for
+/// batched devices) is delivery jitter, not lost audio.
+const LOSS_MARGIN: Duration = Duration::from_millis(20);
 /// Deliveries this long with only normal gaps reset the stall threshold.
 const STALL_RESET: Duration = Duration::from_secs(1);
 const SILENCE_WARNING: Duration = Duration::from_secs(3);
@@ -322,7 +326,8 @@ struct Accounting {
     /// Late real samples covering time already filled with silence. They are
     /// consumed (oldest first) without reaching the analyzer.
     overlap: usize,
-    /// Silence to synthesize because the device has stalled.
+    /// Silence to synthesize because the device has stalled or lost audio.
+    /// It precedes this poll's real samples.
     silence: usize,
 }
 
@@ -332,7 +337,8 @@ struct Accounting {
 ///
 /// A delivery of `n` samples seen at `now` is taken to cover the
 /// `n / rate` seconds ending at `now`. Silence is synthesized only after a
-/// stall, from the end of the covered time up to `now`. When real samples
+/// stall, from the end of the covered time up to `now`, or when a delivery
+/// leaves a gap after the covered time (the device lost audio). When real samples
 /// later turn up for time that silence already covered, that overlap is
 /// discarded, so it is never counted twice.
 #[derive(Debug)]
@@ -384,8 +390,17 @@ impl SampleClock {
             let span = Duration::from_secs_f64(real as f64 / rate);
             let overlap = (self.covered_until + span).saturating_duration_since(now);
             let overlap = (overlap.as_secs_f64() * rate).round() as usize;
+            // Time between the covered end and this delivery's start that no
+            // sample accounts for: the device lost audio for less than a
+            // stall. Ring overflow drops are already in `real`, so they never
+            // look like a gap. A late delivery mistaken for a loss is undone
+            // by the overlap when the delayed samples catch up.
+            let gap = now.saturating_duration_since(self.covered_until + span);
+            if gap > LOSS_MARGIN.max(span / 2) {
+                accounting.silence = (gap.as_secs_f64() * rate).round() as usize;
+            }
             if overlap == 0 {
-                self.unmatched_silence = 0;
+                self.unmatched_silence = accounting.silence;
             } else {
                 accounting.overlap = overlap.min(self.unmatched_silence).min(real);
                 self.unmatched_silence -= accounting.overlap;
@@ -496,6 +511,8 @@ fn analysis_loop(
         let available = consumer.slots();
         let accounting = clock.poll(now, dropped + available);
         let drain = Drain::plan(dropped, available, accounting.overlap, max_backlog);
+        // Silence covers time before this poll's real samples.
+        analyzer.push_silence(accounting.silence);
         if drain.skip > 0 {
             analyzer.skip(drain.skip);
         }
@@ -503,7 +520,6 @@ fn analysis_loop(
             heard_signal |= samples.iter().any(|&s| s != 0.0);
             analyzer.push(samples);
         });
-        analyzer.push_silence(accounting.silence);
         shared.store(analyzer.features());
 
         if !warned && !heard_signal && now.duration_since(started) > SILENCE_WARNING {
@@ -710,6 +726,59 @@ mod tests {
         let (accounted, silence) = replay(&callbacks, Duration::from_secs(2));
         assert_close(accounted, Duration::from_secs(2));
         assert!(silence >= samples(Duration::from_millis(950)), "{silence}");
+    }
+
+    #[test]
+    fn a_short_device_loss_is_filled_with_silence() {
+        // 10 ms callbacks with `lost` ms of them never delivered.
+        let chunk = samples(Duration::from_millis(10));
+        for lost in [30, 50, 80, 95] {
+            let callbacks: Vec<_> = (1..=100)
+                .chain(101 + lost / 10..=200)
+                .map(|i| (Duration::from_millis(10 * i), chunk))
+                .collect();
+            let (accounted, silence) = replay(&callbacks, Duration::from_secs(2));
+            assert_close(accounted, Duration::from_secs(2));
+            assert_close(silence, Duration::from_millis(lost));
+        }
+    }
+
+    #[test]
+    fn late_deliveries_without_loss_add_no_silence() {
+        let chunk = samples(Duration::from_millis(10));
+        let callbacks: Vec<_> = (1..=200u64)
+            .map(|i| {
+                let at = match i {
+                    // Held back 60 ms, then delivered together.
+                    100..=106 => 1060,
+                    // Up to 18 ms late in pairs.
+                    150..=151 => 1518,
+                    160..=161 => 1615,
+                    _ => 10 * i,
+                };
+                (Duration::from_millis(at), chunk)
+            })
+            .collect();
+        let (accounted, silence) = replay(&callbacks, Duration::from_secs(2));
+        assert_close(accounted, Duration::from_secs(2));
+        assert_eq!(silence, 0);
+    }
+
+    #[test]
+    fn jittered_batches_add_no_silence_beyond_start_up() {
+        // 200 ms batches arriving up to 45 ms late; only the start-up stall
+        // before the first batch (as without jitter) is filled.
+        let batch = Duration::from_millis(200);
+        let late = [0, 40, 0, 45, 10, 0, 40, 0, 30, 0];
+        let steady: Vec<_> = (1..=10).map(|i| (batch * i, samples(batch))).collect();
+        let jittered: Vec<_> = (1..=10u32)
+            .zip(late)
+            .map(|(i, late)| (batch * i + Duration::from_millis(late), samples(batch)))
+            .collect();
+        let (_, baseline) = replay(&steady, Duration::from_secs(2));
+        let (accounted, silence) = replay(&jittered, Duration::from_secs(2));
+        assert_close(accounted, Duration::from_secs(2));
+        assert_eq!(silence, baseline);
     }
 
     /// Polls every 10 ms over `from..to`, delivering 10 ms of audio per poll
