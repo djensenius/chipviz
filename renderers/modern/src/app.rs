@@ -599,12 +599,12 @@ impl FrameSource {
         let since_udp = self.last_udp.map(|last| now.duration_since(last));
         match idle_source(self.mic.is_some(), self.udp.socket.is_some(), since_udp) {
             IdleSource::Hold => {
-                // Beat, bar, drop, and notes are one-off events: with a mic, a
-                // held packet keeps its levels but must not repeat them every
-                // redraw.
+                // Beat, bar, and drop are one-off events: with a mic, a held
+                // packet keeps its levels but must not repeat them every
+                // redraw. Notes are sustained voice state (active/gated voices
+                // that producers resend until note-off), so they are kept.
                 if self.mic.is_some() {
                     self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
-                    self.latest.note_count = 0;
                 }
             }
             IdleSource::Procedural => {
@@ -984,7 +984,8 @@ mod tests {
         );
         set_count(9);
 
-        // Held redraws keep the packet's fields but clear its one-off events.
+        // Held redraws keep the packet's fields and sustained notes but clear
+        // its one-off events.
         for elapsed in [
             Duration::ZERO,
             UDP_HOLD / 2,
@@ -993,9 +994,10 @@ mod tests {
             let held = source.next_frame_at(start + elapsed);
             assert_eq!(
                 (held.energy, held.flags, held.note_count),
-                (77, 0, 0),
+                (77, 0, 1),
                 "{held:?}"
             );
+            assert_eq!((held.notes[0].note, held.notes[0].velocity), (60, 100));
         }
 
         // Back on the mic: the count jumped while UDP held, but that is not a beat.
