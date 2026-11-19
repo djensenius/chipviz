@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import fractions
 import hashlib
 import json
 import math
@@ -103,6 +104,8 @@ def decode_png(data: bytes) -> Image:
   pos = len(PNG_SIGNATURE)
   header: tuple[int, ...] | None = None
   idat = bytearray()
+  idat_open = False
+  idat_done = False
   saw_end = False
   while pos < len(data):
     if pos + 8 > len(data):
@@ -122,10 +125,17 @@ def decode_png(data: bytes) -> Image:
         raise CaptureError("invalid IHDR chunk")
       header = struct.unpack(">IIBBBBB", body)
     elif kind == b"IDAT":
+      if idat_done:
+        raise CaptureError("non-consecutive IDAT chunks")
       idat.extend(body)
+      idat_open = True
     elif kind == b"IEND":
       saw_end = True
-      break
+      break  # bytes after IEND are ignored
+    elif kind != b"PLTE" and not kind[0] & 0x20:
+      raise CaptureError(f"unknown critical PNG chunk {kind!r}")
+    if kind != b"IDAT" and idat_open:
+      idat_done = True
     pos = end
   if header is None:
     raise CaptureError("missing IHDR chunk")
@@ -182,6 +192,8 @@ def parse_size(text: str) -> tuple[int, int]:
     width, height = (int(part) for part in text.lower().split("x"))
   except ValueError as error:
     raise argparse.ArgumentTypeError("size must be WxH") from error
+  if width <= 0 or height <= 0:
+    raise argparse.ArgumentTypeError("size must have positive width and height")
   return width, height
 
 
@@ -206,6 +218,7 @@ def region_rows(image: Image, region: Region | None) -> tuple[Region, list[bytes
 
 
 def measure(rows: list[bytes], lit_threshold: int) -> dict[str, object]:
+  """Return exact counts and unrounded statistics; round only for display."""
   histogram: collections.Counter[tuple[int, int, int]] = collections.Counter()
   for row in rows:
     histogram.update(zip(row[0::3], row[1::3], row[2::3]))
@@ -220,17 +233,19 @@ def measure(rows: list[bytes], lit_threshold: int) -> dict[str, object]:
     if luma > lit_threshold:
       lit += count
   mean = luma_sum / total
-  variance = max(luma_sq / total - mean * mean, 0.0)
+  variance = (luma_sq * total - luma_sum * luma_sum) / (total * total)
   return {
     "pixels": total,
     "distinct_colors": len(histogram),
-    "luma_mean": round(mean, 4),
-    "luma_stddev": round(math.sqrt(variance), 4),
-    "lit_fraction": round(lit / total, 6),
+    "luma_mean": mean,
+    "luma_stddev": math.sqrt(variance),
+    "lit_pixels": lit,
+    "lit_fraction": fractions.Fraction(lit, total),
   }
 
 
 def compare(first: list[bytes], second: list[bytes], tolerance: int) -> dict[str, object]:
+  """Return exact changed-pixel counts; changed_fraction is an exact Fraction."""
   changed = 0
   max_delta = 0
   total = 0
@@ -245,10 +260,48 @@ def compare(first: list[bytes], second: list[bytes], tolerance: int) -> dict[str
       if delta > tolerance:
         changed += 1
   return {
+    "compared_pixels": total,
     "changed_pixels": changed,
-    "changed_fraction": round(changed / total, 6),
+    "changed_fraction": fractions.Fraction(changed, total),
     "max_channel_delta": max_delta,
   }
+
+
+def _display(stats: dict[str, object]) -> dict[str, object]:
+  shown = dict(stats)
+  for key, digits in (("luma_mean", 4), ("luma_stddev", 4), ("lit_fraction", 6), ("changed_fraction", 6)):
+    if key in shown:
+      shown[key] = round(float(shown[key]), digits)
+  return shown
+
+
+def _exact(value: float) -> fractions.Fraction:
+  return fractions.Fraction(value)
+
+
+def validate(args: argparse.Namespace) -> None:
+  if args.sequence and len(args.images) < 2:
+    raise CaptureError("--sequence needs at least two images")
+  if not 0 <= args.tolerance <= 255:
+    raise CaptureError("--tolerance must be between 0 and 255")
+  if not 0 <= args.lit_threshold <= 255:
+    raise CaptureError("--lit-threshold must be between 0 and 255")
+  if not 0.0 <= args.change_fraction < 1.0:
+    raise CaptureError("--change-fraction must be in [0, 1)")
+  for option in ("min_lit_fraction", "max_lit_fraction"):
+    value = getattr(args, option)
+    if value is not None and not 0.0 <= value <= 1.0:
+      raise CaptureError(f"--{option.replace('_', '-')} must be in [0, 1]")
+  for option in ("min_colors", "max_colors"):
+    value = getattr(args, option)
+    if value is not None and value < 0:
+      raise CaptureError(f"--{option.replace('_', '-')} must be non-negative")
+  if args.min_luma_stddev is not None and not args.min_luma_stddev >= 0.0:
+    raise CaptureError("--min-luma-stddev must be non-negative")
+
+
+def _fraction_text(stats: dict[str, object]) -> str:
+  return f"{stats['lit_pixels']}/{stats['pixels']} ({float(stats['lit_fraction']):.6g})"
 
 
 def _check(results: list[dict[str, object]], name: str, target: str, expected: str, measured: object, passed: bool) -> None:
@@ -279,10 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
-  if args.sequence and len(args.images) < 2:
-    raise CaptureError("--sequence needs at least two images")
-  if not 0 <= args.tolerance <= 255:
-    raise CaptureError("--tolerance must be between 0 and 255")
+  validate(args)
   checks: list[dict[str, object]] = []
   frames: list[dict[str, object]] = []
   regions: list[list[bytes]] = []
@@ -305,7 +355,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
       "height": image.height,
       "color_type": image.color_type,
       "region": [region.x, region.y, region.width, region.height],
-      **stats,
+      **_display(stats),
     })
     regions.append(rows)
     if args.expect_size is not None:
@@ -319,24 +369,25 @@ def run(args: argparse.Namespace) -> dict[str, object]:
       _check(checks, "max-colors", name, f"<= {args.max_colors}", stats["distinct_colors"],
              stats["distinct_colors"] <= args.max_colors)
     if args.min_luma_stddev is not None:
-      _check(checks, "min-luma-stddev", name, f">= {args.min_luma_stddev}", stats["luma_stddev"],
+      _check(checks, "min-luma-stddev", name, f">= {args.min_luma_stddev}", round(stats["luma_stddev"], 4),
              stats["luma_stddev"] >= args.min_luma_stddev)
     if args.min_lit_fraction is not None:
-      _check(checks, "min-lit-fraction", name, f">= {args.min_lit_fraction}", stats["lit_fraction"],
-             stats["lit_fraction"] >= args.min_lit_fraction)
+      _check(checks, "min-lit-fraction", name, f">= {args.min_lit_fraction}", _fraction_text(stats),
+             stats["lit_fraction"] >= _exact(args.min_lit_fraction))
     if args.max_lit_fraction is not None:
-      _check(checks, "max-lit-fraction", name, f"<= {args.max_lit_fraction}", stats["lit_fraction"],
-             stats["lit_fraction"] <= args.max_lit_fraction)
+      _check(checks, "max-lit-fraction", name, f"<= {args.max_lit_fraction}", _fraction_text(stats),
+             stats["lit_fraction"] <= _exact(args.max_lit_fraction))
 
   steps: list[dict[str, object]] = []
+  comparable: bool | None = None
   if len(regions) > 1:
     shape = (len(regions[0]), len(regions[0][0]))
     comparable = all((len(rows), len(rows[0])) == shape for rows in regions)
     if comparable:
       for index in range(1, len(regions)):
         step = compare(regions[index - 1], regions[index], args.tolerance)
-        step["changed"] = step["changed_fraction"] > args.change_fraction
-        steps.append({"from": frames[index - 1]["path"], "to": frames[index]["path"], **step})
+        changed = step["changed_fraction"] > _exact(args.change_fraction)
+        steps.append({"from": frames[index - 1]["path"], "to": frames[index]["path"], **_display(step), "changed": changed})
     elif args.sequence:
       raise CaptureError("sequence images/regions have different dimensions")
   if args.sequence:
@@ -363,6 +414,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
       "change_fraction": args.change_fraction,
     },
     "frames": frames,
+    "steps_comparable": comparable,
     "steps": steps,
     "assertions": checks,
     "passed": all(check["passed"] for check in checks),

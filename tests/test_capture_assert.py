@@ -19,6 +19,13 @@ def _chunk(kind: bytes, body: bytes) -> bytes:
   return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
 
 
+def reference_paeth(a: int, b: int, c: int) -> int:
+  """Independent PNG specification Paeth predictor (left, up, upper-left)."""
+  estimate = a + b - c
+  distances = [(abs(estimate - a), 0, a), (abs(estimate - b), 1, b), (abs(estimate - c), 2, c)]
+  return min(distances)[2]  # ties resolve in order a, b, c
+
+
 def _filter_row(filter_type: int, line: bytes, previous: bytes, bpp: int) -> bytes:
   out = bytearray(len(line))
   for i, value in enumerate(line):
@@ -30,7 +37,7 @@ def _filter_row(filter_type: int, line: bytes, previous: bytes, bpp: int) -> byt
       1: left,
       2: up,
       3: (left + up) >> 1,
-      4: capture_assert._paeth(left, up, upper_left),
+      4: reference_paeth(left, up, upper_left),
     }[filter_type]
     out[i] = (value - predictor) & 0xFF
   return bytes([filter_type]) + bytes(out)
@@ -56,6 +63,15 @@ def make_png(pixels, color_type=2, bit_depth=8, interlace=0, filters=(0,), raw_o
     + _chunk(b"IDAT", zlib.compress(bytes(raw)))
     + _chunk(b"IEND", b"")
   )
+
+
+def raw_png(width: int, height: int, rows: list[bytes], chunks=()) -> bytes:
+  """Encode filter-0 RGB rows quickly, optionally inserting extra chunks after IHDR."""
+  header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+  raw = b"".join(b"\x00" + row for row in rows)
+  extra = b"".join(_chunk(kind, body) for kind, body in chunks)
+  return (capture_assert.PNG_SIGNATURE + _chunk(b"IHDR", header) + extra
+          + _chunk(b"IDAT", zlib.compress(raw)) + _chunk(b"IEND", b""))
 
 
 def solid(width, height, color):
@@ -118,6 +134,40 @@ class DecodeTests(CaptureAssertCase):
       with self.subTest(message=message):
         with self.assertRaisesRegex(capture_assert.CaptureError, message):
           capture_assert.decode_png(data)
+
+  def test_paeth_predictor_matches_hard_coded_values_including_ties(self) -> None:
+    # (left a, up b, upper-left c) -> predictor; p = a + b - c.
+    cases = [
+      ((9, 1, 0), 9),  # p=10: pa=1 < pb=9, pc=10 -> a
+      ((1, 9, 0), 9),  # p=10: pb=1 < pa=9, pc=10 -> b
+      ((2, 8, 5), 5),  # p=5: pc=0 < pa=pb=3 -> c
+      ((7, 1, 5), 1),  # p=3: pa=4 > pb=2 == pc=2 -> b wins tie with c
+      ((1, 7, 5), 1),  # p=3: pa=2 == pc=2 < pb=4 -> a wins tie with c
+      ((6, 6, 3), 6),  # p=9: pa=3 == pb=3 < pc=6 -> a
+      ((5, 5, 5), 5),  # all distances zero -> a
+      ((0, 0, 255), 0),  # p=-255: pa=pb=255 < pc=510 -> a
+      ((255, 255, 0), 255),  # p=510: pa=pb=255 < pc=510 -> a
+    ]
+    for (a, b, c), expected in cases:
+      with self.subTest(a=a, b=b, c=c):
+        self.assertEqual(reference_paeth(a, b, c), expected)
+        self.assertEqual(capture_assert._paeth(a, b, c), expected)
+
+  def test_chunk_ordering_and_critical_chunks(self) -> None:
+    rows = [bytes(6), bytes(6)]
+    header = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
+    compressed = zlib.compress(b"".join(b"\x00" + row for row in rows))
+    split = (capture_assert.PNG_SIGNATURE + _chunk(b"IHDR", header) + _chunk(b"IDAT", compressed[:5])
+             + _chunk(b"tEXt", b"k\x00v") + _chunk(b"IDAT", compressed[5:]) + _chunk(b"IEND", b""))
+    with self.assertRaisesRegex(capture_assert.CaptureError, "non-consecutive IDAT"):
+      capture_assert.decode_png(split)
+    consecutive = (capture_assert.PNG_SIGNATURE + _chunk(b"IHDR", header) + _chunk(b"IDAT", compressed[:5])
+                   + _chunk(b"IDAT", compressed[5:]) + _chunk(b"IEND", b"") + b"trailing bytes ignored")
+    self.assertEqual(capture_assert.decode_png(consecutive).rows, rows)
+    with self.assertRaisesRegex(capture_assert.CaptureError, "unknown critical PNG chunk"):
+      capture_assert.decode_png(raw_png(2, 2, rows, chunks=[(b"ABCD", b"")]))
+    allowed = raw_png(2, 2, rows, chunks=[(b"PLTE", bytes(3)), (b"abCD", b"x"), (b"tIME", bytes(7))])
+    self.assertEqual(capture_assert.decode_png(allowed).rows, rows)
 
   def test_rejects_corrupt_zlib_stream(self) -> None:
     header = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
@@ -202,7 +252,91 @@ class SingleImageTests(CaptureAssertCase):
     self.assertEqual(report["frames"][0]["color_type"], 6)
 
 
+class LargeImageTests(CaptureAssertCase):
+  """Regression: one pixel in 1920x1080 must not round away to a passing result."""
+
+  WIDTH = 1920
+  HEIGHT = 1080
+
+  def one_pixel_images(self):
+    black = [bytes(self.WIDTH * 3)] * self.HEIGHT
+    dot = list(black)
+    dot[540] = bytes(960 * 3) + b"\xff\xff\xff" + bytes((self.WIDTH - 961) * 3)
+    return black, dot
+
+  def test_measure_and_compare_keep_single_pixel_exact(self) -> None:
+    black, dot = self.one_pixel_images()
+    stats = capture_assert.measure(dot, capture_assert.DEFAULT_LIT_THRESHOLD)
+    self.assertEqual((stats["pixels"], stats["lit_pixels"]), (2073600, 1))
+    self.assertGreater(stats["lit_fraction"], 0)
+    step = capture_assert.compare(black, dot, 0)
+    self.assertEqual((step["changed_pixels"], step["compared_pixels"]), (1, 2073600))
+    self.assertGreater(step["changed_fraction"], 0)
+
+  def test_cli_does_not_fail_open_for_single_pixel(self) -> None:
+    black, dot = self.one_pixel_images()
+    first = self.write("black.png", raw_png(self.WIDTH, self.HEIGHT, black))
+    second = self.write("dot.png", raw_png(self.WIDTH, self.HEIGHT, dot))
+    code, report, _ = self.invoke(first, second, "--sequence", "identical", "--max-lit-fraction", "0")
+    self.assertEqual(code, 1)
+    self.assertEqual(report["steps"][0]["changed_pixels"], 1)
+    self.assertTrue(report["steps"][0]["changed"])
+    self.assertEqual(report["steps"][0]["changed_fraction"], 0.0)  # display rounding only
+    results = {(check["assertion"], check["target"]): check["passed"] for check in report["assertions"]}
+    self.assertEqual(results[("max-lit-fraction", first)], True)
+    self.assertEqual(results[("max-lit-fraction", second)], False)
+    self.assertEqual(results[("sequence-identical", "sequence")], False)
+    code, _, _ = self.invoke(first, second, "--sequence", "changes", "--min-lit-fraction", "0.0000004")
+    self.assertEqual(code, 1)  # black frame has zero lit pixels
+    code, _, _ = self.invoke(second, "--min-lit-fraction", "0.0000004")
+    self.assertEqual(code, 0)  # 1/2073600 is about 4.8e-7
+
+
+class OptionValidationTests(CaptureAssertCase):
+  def test_out_of_range_options_exit_2(self) -> None:
+    path = self.write("img.png", make_png(solid(4, 4, (0, 0, 0))))
+    invalid = [
+      ["--change-fraction", "1"],
+      ["--change-fraction", "-0.1"],
+      ["--change-fraction", "nan"],
+      ["--min-lit-fraction", "1.5"],
+      ["--max-lit-fraction", "-0.1"],
+      ["--lit-threshold", "-1"],
+      ["--lit-threshold", "256"],
+      ["--min-colors", "-1"],
+      ["--max-colors", "-2"],
+      ["--min-luma-stddev", "-1"],
+    ]
+    for options in invalid:
+      with self.subTest(options=options):
+        code, report, err = self.invoke(path, *options)
+        self.assertEqual(code, 2)
+        self.assertIsNone(report)
+        self.assertIn(options[0], err)
+
+  def test_invalid_expect_size_is_a_usage_error(self) -> None:
+    path = self.write("img.png", make_png(solid(4, 4, (0, 0, 0))))
+    for size in ("-1x5", "0x4", "4", "axb"):
+      with self.subTest(size=size):
+        with self.assertRaises(SystemExit) as raised:
+          with contextlib.redirect_stderr(io.StringIO()):
+            capture_assert.main([path, "--expect-size", size])
+        self.assertEqual(raised.exception.code, 2)
+
+
 class SequenceTests(CaptureAssertCase):
+  def test_mismatched_sizes_without_sequence_report_not_comparable(self) -> None:
+    one = self.write("one.png", make_png(solid(4, 4, (0, 0, 0))))
+    other = self.write("other.png", make_png(solid(5, 4, (0, 0, 0))))
+    code, report, _ = self.invoke(one, other)
+    self.assertEqual(code, 0)
+    self.assertIs(report["steps_comparable"], False)
+    self.assertEqual(report["steps"], [])
+    code, report, _ = self.invoke(one, one)
+    self.assertIs(report["steps_comparable"], True)
+    code, report, _ = self.invoke(one)
+    self.assertIsNone(report["steps_comparable"])
+
   def test_identical_sequence(self) -> None:
     paths = [self.write(f"same{i}.png", make_png(gradient(12, 6), filters=(i % 5,))) for i in range(3)]
     code, report, _ = self.invoke(*paths, "--sequence", "identical")

@@ -43,14 +43,18 @@ already produced (for example `scripts/retroarch_smoke.py` or a renderer
 harness). It does not launch emulators, renderers or frontends. It uses only
 the Python standard library and decodes non-interlaced 8-bit RGB/RGBA PNGs;
 alpha is ignored. Palette, grayscale, 16-bit, interlaced, truncated or
-CRC-corrupt files are rejected.
+CRC-corrupt files are rejected, as are split (non-consecutive) `IDAT` data and
+unknown critical chunks. Bytes after `IEND` are ignored.
 
 It always prints measurements as JSON: file SHA-256, dimensions, distinct RGB
-colours, Rec.601 luma mean/stddev and lit fraction for the selected region,
-plus the changed-pixel fraction and maximum channel delta between consecutive
-images. It applies only the assertions you request. Exit status is `0` when
-every requested assertion passes, `1` when one fails and `2` for invalid
-input or usage.
+colours, Rec.601 luma mean/stddev and lit pixel count/fraction for the
+selected region, plus the changed-pixel count/fraction and maximum channel
+delta between consecutive images. `steps_comparable` is `false` when image or
+region sizes differ (no steps are reported). Fractions in the JSON are rounded
+for display only; assertions compare exact pixel counts, so a single changed
+or lit pixel in a 1080p frame still counts. It applies only the assertions you
+request. Exit status is `0` when every requested assertion passes, `1` when
+one fails and `2` for invalid input, usage or out-of-range options.
 
 ```sh
 # SNES backdrop-only failure: one colour on the full 256x224 frame.
@@ -71,15 +75,15 @@ python3 shared/tools/capture_assert.py --sequence changes \
 | --- | --- |
 | `--region X,Y,W,H` | Measure and compare only this rectangle |
 | `--expect-size WxH` | Each image has exactly these dimensions |
-| `--min-colors N`, `--max-colors N` | Distinct RGB colour bounds |
+| `--min-colors N`, `--max-colors N` | Distinct RGB colour bounds (non-negative) |
 | `--min-luma-stddev F` | Minimum luma standard deviation (0-255 scale) |
 | `--min-lit-fraction F`, `--max-lit-fraction F` | Lit-pixel fraction bounds (0-1) |
-| `--lit-threshold N` | A pixel is lit when its integer luma exceeds `N` (default 8) |
+| `--lit-threshold N` | A pixel is lit when its integer luma exceeds `N` (0-255, default 8) |
 | `--sequence identical` | No consecutive step changes |
 | `--sequence changes` | At least one consecutive step changes |
 | `--sequence every-step-changes` | Every consecutive step changes |
 | `--tolerance N` | Per-channel delta still treated as unchanged (default 0) |
-| `--change-fraction F` | A step changes only when its changed fraction exceeds `F` |
+| `--change-fraction F` | A step changes only when its changed fraction exceeds `F` (0 <= F < 1, default 0) |
 | `--meta KEY=VALUE` | Provenance echoed under `provenance` in the report |
 
 There are no universal thresholds. Sparse scenes, intentionally static
