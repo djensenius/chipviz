@@ -137,6 +137,8 @@ pub struct LinesState {
     from: f32,
     /// Frames observed since the section started.
     frames: u32,
+    /// A section has changed, so the one-bar guard applies.
+    changed: bool,
     /// Fold length and minimum section length, from `bpm` at its start.
     bar: f32,
     /// Frames since `beat_count` last advanced.
@@ -159,6 +161,7 @@ impl LinesState {
             cut: false,
             from: 0.0,
             frames: 0,
+            changed: false,
             bar: bar_frames(0),
             stalled: 0,
         }
@@ -190,7 +193,7 @@ impl LinesState {
         } else {
             self.stalled.saturating_add(frames)
         };
-        if (self.frames as f32) < self.bar {
+        if self.changed && (self.frames as f32) < self.bar {
             return;
         }
         let phrase = advanced && frame.beat_count % SECTION_BEATS < beats;
@@ -206,6 +209,7 @@ impl LinesState {
         self.section = self.section.wrapping_add(1);
         self.cut = cut || self.section % 4 == 3;
         self.frames = 0;
+        self.changed = true;
         self.bar = bar_frames(bpm);
     }
 
@@ -707,6 +711,23 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn the_first_section_change_is_not_held_back() {
+        // A drop within the first bar cuts at once: no section has changed yet.
+        let mut on = LinesState::new(true);
+        for frame in &with_drops(&[30], 0..31) {
+            on.observe(frame);
+        }
+        assert_eq!((on.section(), on.morph()), (1, 1.0));
+        // Joining a live source just before a phrase boundary folds on it.
+        let mut state = LinesState::default();
+        for index in 250..=256 {
+            state.observe(&ControlFrame::procedural(index));
+        }
+        assert_eq!(state.section(), 1);
+        assert_eq!(state.morph(), 0.0);
     }
 
     #[test]
