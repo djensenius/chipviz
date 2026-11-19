@@ -503,7 +503,7 @@ static void fixture_f17(void) {
         } else if (n == 24u) {
           ok &= s == 195u;
         }
-        ok &= n == 0u || s - last >= 8u;
+        ok &= n == 0u || (uint16_t)(s - last) >= 8u;
         last = s;
         n++;
       }
