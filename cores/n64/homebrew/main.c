@@ -107,7 +107,11 @@ static unsigned read_joybus_packet(uint8_t packet[16]) {
     packet[p * 4 + 1] = buttons_b;
     packet[p * 4 + 2] = (uint8_t)inputs.stick_x;
     packet[p * 4 + 3] = (uint8_t)inputs.stick_y;
-    if (joypad_is_connected(port)) {
+    /* joypad_is_connected() only refreshes on libdragon's ~1 s identify poll;
+     * the style is cleared by the very next failed controller read. The Pico
+     * identifies as a standard N64 pad (05 00 02).
+     */
+    if (joypad_is_connected(port) && joypad_get_style(port) == JOYPAD_STYLE_N64) {
       connected_mask |= 1u << p;
     }
   }

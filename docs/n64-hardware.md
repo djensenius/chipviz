@@ -65,7 +65,7 @@ The Pico is powered over USB. Do not power the Pico from the N64 controller-port
 Wire all four controller ports for live mode. Ports 1 to 3 carry the v1 frame
 marker. Port 4 carries the scene, palette, beat, energy and MIDI data, which
 the marker checksum covers. The ROM requires all four ports to be connected.
-If any port is missing, it switches to procedural immediately.
+If any port is missing, it switches to procedural immediately, on the next poll.
 
 ## Data format and budget
 

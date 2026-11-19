@@ -64,9 +64,10 @@ vectors.
 
 The ROM chooses one of three sources every frame:
 
-- **Procedural** unless all four controller ports report a connected device.
-  A partial disconnect counts as no device: the ROM switches immediately and
-  resets its state. It also
+- **Procedural** unless all four controller ports report a connected
+  standard N64 controller that answered the latest read. The Pico identifies
+  as one (`05 00 02`). A partial disconnect counts as no device: the ROM
+  switches immediately, on the next poll, and resets its state. It also
   stays procedural while a connected pad sends no valid marker, which covers an
   idle pad, a pad in use, a v0 host or a corrupt marker.
 - **Live** after a valid frame followed by 4 valid frames with an advancing
