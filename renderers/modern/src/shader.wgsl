@@ -3,7 +3,7 @@ struct Uniforms {
   time: f32,
   energy: f32,
   beat: f32,
-  _padding: f32,
+  screen_space: f32,
 };
 
 @group(0) @binding(0)
@@ -50,6 +50,10 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+  // Flat screen-space fields must tile without seams or global pulsing.
+  if (uniforms.screen_space > 0.5) {
+    return input.color;
+  }
   let edge = max(abs(input.local.x), abs(input.local.y));
   let crisp = select(1.0, 0.78, edge > 0.46);
   let pulse = 1.0 + uniforms.beat * 0.35 + uniforms.energy * 0.18;
