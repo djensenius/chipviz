@@ -22,7 +22,8 @@
 //! frequencies never fill a band (see `decimate` in `audio::scope`).
 //! Whatever its source, the ribbon is limited once more as it is drawn
 //! ([`limit_ribbon`]): it never covers more than `RIBBON_SCREEN_FRACTION` of
-//! the screen, at any aspect.
+//! the screen, at any aspect. The limit tightens at once but relaxes over
+//! `LIMIT_RELAX_S`, so input hovering at the budget does not jitter.
 //!
 //! Flash design (not a measured compliance claim): a burst is one smooth rise
 //! (`ATTACK_S`) and exponential fall, so each is at most one flash. Its
@@ -42,6 +43,8 @@
 //! bursts keep their shape at any aspect ratio. In portrait the whole ribbon
 //! scales with the width. Overlay time is f64 seconds, so burst timing stays
 //! exact however long the renderer runs.
+
+use std::cell::Cell;
 
 use super::{colour_field, hash, palette};
 use crate::audio::scope::{POINTS, ScopeSnapshot, envelope};
@@ -84,6 +87,11 @@ pub const RIBBON_SCREEN_FRACTION: f32 = 0.13;
 const AREA_COLUMNS: usize = 2048;
 /// Bisection steps [`limit_ribbon`] takes along its reduction path.
 const LIMIT_STEPS: usize = 8;
+/// Seconds the drawn ribbon's limiter takes to relax across its whole
+/// reduction path (2 units): 1/30 of it per 60 fps frame. Tightening is
+/// instant, so input hovering at the budget holds one steady reduction
+/// instead of jumping between positions each frame.
+const LIMIT_RELAX_S: f32 = 0.5;
 /// Upper bound on overlay instances: a quad per ribbon segment per outline
 /// per pass, plus each burst's glow and sparks.
 pub const MAX_INSTANCES: usize =
@@ -311,18 +319,27 @@ pub fn ribbon_area_bound(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> f32 {
         * width
 }
 
-/// The final, guaranteed limit on the drawn ribbon: `wave` unchanged if its
-/// [`ribbon_area_bound`] at `aspect` is within [`ribbon_budget`], else the
-/// least reduction that is. Reductions follow one path: blend towards the
-/// outlines' envelope (see `scope::envelope`), so alternating outlines
-/// become steady lines, then scale that towards the centre line, ending at
-/// a flat line, which is always within budget. Bisection along the path
-/// keeps an end known to be within budget, so whatever the input (live,
-/// synthesised, a torn read, any aspect) the result is.
-pub fn limit_ribbon(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> [[f32; POINTS]; OUTLINES] {
+/// The final, guaranteed limit on the drawn ribbon. With `floor` 0: `wave`
+/// unchanged if its [`ribbon_area_bound`] at `aspect` is within
+/// [`ribbon_budget`], else the least reduction that is. Reductions follow
+/// one path (position 0 to 2): blend towards the outlines' envelope (see
+/// `scope::envelope`), so alternating outlines become steady lines, then
+/// scale that towards the centre line, ending at a flat line, which is
+/// always within budget. A `floor` above 0 starts there instead: `floor`
+/// itself if measured within budget, else the least reduction above it
+/// (how [`MicLayers`] holds a reduction across frames). Bisection along the
+/// path keeps an end known to be within budget, so whatever the input
+/// (live, synthesised, a torn read, any aspect) and floor, the result is.
+/// Returns the limited ribbon and its position.
+pub fn limit_ribbon(
+    wave: &[[f32; POINTS]; OUTLINES],
+    aspect: f32,
+    floor: f32,
+) -> ([[f32; POINTS]; OUTLINES], f32) {
     let budget = ribbon_budget(aspect);
-    if ribbon_area_bound(wave, aspect) <= budget {
-        return *wave;
+    let floor = floor.clamp(0.0, 2.0);
+    if floor <= 0.0 && ribbon_area_bound(wave, aspect) <= budget {
+        return (*wave, 0.0);
     }
     let (high, low) = envelope(&wave[0], &wave[1]);
     let along = |position: f32| -> [[f32; POINTS]; OUTLINES] {
@@ -331,7 +348,13 @@ pub fn limit_ribbon(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> [[f32; POI
             std::array::from_fn(|index| (raw[index] + (held[index] - raw[index]) * blend) * gain)
         })
     };
-    let (mut over, mut within) = (0.0_f32, 2.0_f32);
+    if floor > 0.0 {
+        let held = along(floor);
+        if ribbon_area_bound(&held, aspect) <= budget {
+            return (held, floor);
+        }
+    }
+    let (mut over, mut within) = (floor, 2.0_f32);
     for _ in 0..LIMIT_STEPS {
         let middle = 0.5 * (over + within);
         if ribbon_area_bound(&along(middle), aspect) <= budget {
@@ -340,7 +363,7 @@ pub fn limit_ribbon(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> [[f32; POI
             over = middle;
         }
     }
-    along(within)
+    (along(within), within)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -368,6 +391,10 @@ pub struct MicLayers {
     level: f32,
     /// Whether the ribbon was drawn last step; `wave` is stale otherwise.
     ribbon_shown: bool,
+    /// The drawn ribbon's last limiter position and the overlay time it was
+    /// set at (see [`MicLayers::limited`]); `None` while the ribbon is hidden.
+    /// A `Cell`, as it is set where the aspect is known: at build.
+    limit: Cell<Option<(f32, f64)>>,
     bursts: [Option<Burst>; MAX_BURSTS],
     serial: u32,
     last_trigger: Option<Trigger>,
@@ -388,6 +415,7 @@ impl MicLayers {
             wave: [[0.0; POINTS]; OUTLINES],
             level: 0.0,
             ribbon_shown: false,
+            limit: Cell::new(None),
             bursts: [None; MAX_BURSTS],
             serial: 0,
             last_trigger: None,
@@ -447,6 +475,9 @@ impl MicLayers {
             }
         }
         self.ribbon_shown = ribbon;
+        if !ribbon {
+            self.limit.set(None);
+        }
 
         let trigger = match live {
             Some(snapshot) => Trigger::Onsets(snapshot.onsets),
@@ -508,7 +539,24 @@ impl MicLayers {
 
     fn build_ribbon(&self, frame: ControlFrame, aspect: f32, instances: &mut Vec<Instance>) {
         // The final, guaranteed limit, on exactly what is drawn.
-        self.push_ribbon(&limit_ribbon(&self.wave, aspect), frame, aspect, instances);
+        self.push_ribbon(&self.limited(aspect), frame, aspect, instances);
+    }
+
+    /// The ribbon as drawn at `aspect`: [`limit_ribbon`] with hysteresis.
+    /// The limiter starts from its last position eased back towards no
+    /// reduction by at most the elapsed time over `LIMIT_RELAX_S` (of the
+    /// whole path), tightening at once if that is over budget, so every
+    /// frame is within budget and the reduction relaxes steadily.
+    fn limited(&self, aspect: f32) -> [[f32; POINTS]; OUTLINES] {
+        let floor = match (self.limit.get(), self.last_elapsed) {
+            (Some((position, at)), Some(now)) => {
+                position - (now - at).max(0.0) as f32 * 2.0 / LIMIT_RELAX_S
+            }
+            _ => 0.0,
+        };
+        let (wave, position) = limit_ribbon(&self.wave, aspect, floor);
+        self.limit.set(self.last_elapsed.map(|now| (position, now)));
+        wave
     }
 
     /// Draws `wave` as the ribbon, as it is (unlimited).
@@ -1454,7 +1502,7 @@ mod tests {
     /// budget and rasterises within [`cap`] at `aspect`.
     fn assert_drawn_within_cap(wave: &[[f32; POINTS]; OUTLINES], aspect: f32, what: &str) {
         assert!(ribbon_budget(aspect) <= cap(aspect));
-        let limited = limit_ribbon(wave, aspect);
+        let limited = limit_ribbon(wave, aspect, 0.0).0;
         let bound = ribbon_area_bound(&limited, aspect);
         assert!(
             bound <= ribbon_budget(aspect),
@@ -1580,7 +1628,11 @@ mod tests {
         let tone = [tone.upper, tone.lower];
         let zigzag = std::array::from_fn(|index| if index % 2 == 0 { 1.0 } else { -1.0 });
         for aspect in PORTRAITS {
-            assert_eq!(limit_ribbon(&tone, aspect), tone, "440 Hz at {aspect}");
+            assert_eq!(
+                limit_ribbon(&tone, aspect, 0.0).0,
+                tone,
+                "440 Hz at {aspect}"
+            );
             assert_drawn_within_cap(&tone, aspect, "440 Hz");
             assert_drawn_within_cap(&[zigzag, zigzag], aspect, "zigzag");
             // A flat line stays a thin line: under 2% of the screen.
@@ -1616,7 +1668,7 @@ mod tests {
         for rate in [44_100.0, 48_000.0, 96_000.0] {
             for snapshot in published(rate, 0.3, sine(rate, 440.0)).iter().skip(5) {
                 let wave = [snapshot.upper, snapshot.lower];
-                assert_eq!(limit_ribbon(&wave, ASPECT), wave, "440 Hz at {rate}");
+                assert_eq!(limit_ribbon(&wave, ASPECT, 0.0).0, wave, "440 Hz at {rate}");
             }
         }
         let snapshot = *published(48_000.0, 0.3, |n| {
@@ -1624,7 +1676,7 @@ mod tests {
         })
         .last()
         .unwrap();
-        let [upper, lower] = limit_ribbon(&[snapshot.upper, snapshot.lower], ASPECT);
+        let [upper, lower] = limit_ribbon(&[snapshot.upper, snapshot.lower], ASPECT, 0.0).0;
         let middle = POINTS / 4..3 * POINTS / 4;
         assert!(upper[middle.clone()].iter().all(|&value| value >= 0.5));
         assert!(lower[middle].iter().all(|&value| value <= -0.5));
@@ -1690,11 +1742,18 @@ mod tests {
             };
             let wave = [outline(1.0), outline(-1.0)];
             let aspect = aspects[case % aspects.len()];
-            let limited = limit_ribbon(&wave, aspect);
+            let limited = limit_ribbon(&wave, aspect, 0.0).0;
             let bound = ribbon_area_bound(&limited, aspect);
             assert!(
                 bound <= ribbon_budget(aspect),
                 "case {case} at {aspect}: {bound}"
+            );
+            // Held at any floor, as across frames, it is within budget too.
+            let floor = next() * 2.0;
+            let held = ribbon_area_bound(&limit_ribbon(&wave, aspect, floor).0, aspect);
+            assert!(
+                held <= ribbon_budget(aspect),
+                "case {case} at {aspect} from {floor}: {held}"
             );
             if case % 40 == 0 {
                 assert_drawn_within_cap(&wave, aspect, &format!("case {case}"));
@@ -1747,5 +1806,163 @@ mod tests {
 
     fn max_area(areas: &[f32]) -> f32 {
         areas.iter().copied().fold(0.0, f32::max)
+    }
+
+    /// Steps a scope ribbon through `frames` 60 fps frames of `input` (a
+    /// control frame and an optional live snapshot) at `aspect`; returns
+    /// each frame's drawn bound ([`ribbon_area_bound`] of what is drawn)
+    /// and limiter position.
+    fn limiter_run(
+        frames: usize,
+        aspect: f32,
+        mut input: impl FnMut(usize) -> (ControlFrame, Option<ScopeSnapshot>),
+    ) -> Vec<(f32, f32)> {
+        let mut layers = MicLayers::new(Mode::Scope);
+        (0..frames)
+            .map(|step| {
+                let (frame, live) = input(step);
+                layers.step(frame, live.as_ref(), step as f64 / f64::from(FPS), true);
+                let bound = ribbon_area_bound(&layers.limited(aspect), aspect);
+                (
+                    bound,
+                    layers.limit.get().map_or(0.0, |(position, _)| position),
+                )
+            })
+            .collect()
+    }
+
+    /// Largest frame-to-frame change of `values`, and the number of times
+    /// two successive changes over `threshold` have opposite signs (one
+    /// high/low alternation each).
+    fn changes(values: &[f32], threshold: f32) -> (f32, usize) {
+        let changes: Vec<f32> = values.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let largest = changes
+            .iter()
+            .fold(0.0_f32, |most, change| most.max(change.abs()));
+        let flips = changes
+            .windows(2)
+            .filter(|pair| {
+                pair[0].abs() > threshold && pair[1].abs() > threshold && pair[0] * pair[1] < 0.0
+            })
+            .count();
+        (largest, flips)
+    }
+
+    /// Input at or near the budget must not make the limiter jitter or
+    /// alternate between high and low reductions from frame to frame. Over
+    /// 600 frames (10 s at 60 fps) each of a sparse pulse train, the
+    /// densest synthesised ribbon (band 7) and a dense drifting tone
+    /// hovering at the budget (its level alternating around it every frame
+    /// or at 3 Hz), every frame is within budget and the limiter relaxes by
+    /// at most 1/30 of its path per frame. The drawn bound changes by at
+    /// most `STEP` (a fifth: the pulse train's own frame-to-frame changes
+    /// reach about 0.14 of it, unlimited) of the budget between frames,
+    /// and neither it
+    /// nor the limiter position alternates (successive changes over
+    /// `THRESHOLD`, 2% of the budget or of the path, of opposite sign) more
+    /// than `FLIPS` times in the run.
+    #[test]
+    fn the_final_limiter_does_not_jitter() {
+        const FRAMES: usize = 600;
+        const STEP: f32 = 0.2;
+        const THRESHOLD: f32 = 0.02;
+        const FLIPS: usize = 4;
+        let pulses = published(48_000.0, FRAMES as f32 / FPS, |n| match n % 80 {
+            0 => -1.0,
+            1 => 1.0,
+            _ => 0.0,
+        });
+        let mut spectrum = [0; 8];
+        spectrum[7] = 255;
+        let band7 = ControlFrame {
+            energy: 255,
+            spectrum,
+            ..ControlFrame::procedural(0)
+        };
+        // One dense line (0.13 cycles per point) whose blend towards its
+        // envelope first grows the area, so the least reduction jumps
+        // between none and over a quarter of the path as it crosses the
+        // budget; `level` puts it at the budget.
+        let tone = |gain: f32, step: usize| -> [f32; POINTS] {
+            std::array::from_fn(|index| {
+                let phase = std::f32::consts::TAU * index as f32 * 0.13 + step as f32 * 0.05;
+                gain * phase.sin()
+            })
+        };
+        let (mut level, mut over) = (0.0_f32, 1.0_f32);
+        for _ in 0..30 {
+            let middle = 0.5 * (level + over);
+            let line = tone(middle, 0);
+            if ribbon_area_bound(&[line, line], ASPECT) <= ribbon_budget(ASPECT) {
+                level = middle;
+            } else {
+                over = middle;
+            }
+        }
+        assert!(level < 0.95, "{level}");
+        let hover = move |gain: f32, step: usize| {
+            let line = tone(level * gain, step);
+            Some(ScopeSnapshot {
+                upper: line,
+                lower: line,
+                onsets: 0,
+            })
+        };
+        type Input<'a> = Box<dyn FnMut(usize) -> (ControlFrame, Option<ScopeSnapshot>) + 'a>;
+        let cases: [(&str, f32, Input); 5] = [
+            (
+                "pulses",
+                ASPECT,
+                Box::new(|step| (quiet(), Some(pulses[step]))),
+            ),
+            (
+                "pulses, portrait",
+                PORTRAITS[0],
+                Box::new(|step| (quiet(), Some(pulses[step]))),
+            ),
+            ("band 7", ASPECT, Box::new(|_| (band7, None))),
+            (
+                "hovering",
+                ASPECT,
+                Box::new(|step| {
+                    let gain = if step % 2 == 0 { 1.1 } else { 0.9 };
+                    (quiet(), hover(gain, step))
+                }),
+            ),
+            (
+                "hovering at 3 Hz",
+                ASPECT,
+                Box::new(|step| {
+                    let gain = if step % 20 < 10 { 1.1 } else { 0.9 };
+                    (quiet(), hover(gain, step))
+                }),
+            ),
+        ];
+        for (name, aspect, input) in cases {
+            let budget = ribbon_budget(aspect);
+            let run = limiter_run(FRAMES, aspect, input);
+            let bounds: Vec<f32> = run.iter().map(|&(bound, _)| bound / budget).collect();
+            let positions: Vec<f32> = run.iter().map(|&(_, position)| position).collect();
+            let worst = max_area(&bounds);
+            let (largest, flips) = changes(&bounds, THRESHOLD);
+            let (_, position_flips) = changes(&positions, 2.0 * THRESHOLD);
+            let relax = positions
+                .windows(2)
+                .fold(0.0_f32, |most, pair| most.max(pair[0] - pair[1]));
+            assert!(worst <= 1.0, "{name}: {worst} of the budget");
+            assert!(
+                largest <= STEP,
+                "{name}: bound changed by {largest} of the budget"
+            );
+            assert!(flips <= FLIPS, "{name}: bound alternated {flips} times");
+            assert!(
+                position_flips <= FLIPS,
+                "{name}: limiter alternated {position_flips} times"
+            );
+            assert!(
+                relax <= 2.0 / 30.0 + 1e-4,
+                "{name}: limiter relaxed {relax} in a frame"
+            );
+        }
     }
 }

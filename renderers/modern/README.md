@@ -204,8 +204,8 @@ snapshots (a read racing a publish), the densest synthesised ribbon, portrait
 windows (9:16 and 1:10) and a thousand seeded random outlines through the
 final limit, and check each stays within 13% of the screen. Overlay timing is
 kept in f64 seconds, so burst timing and the 0.5 s cap hold however long the
-renderer runs (a test checks after 30 days). Measure the actual display before relying on this for
-a photosensitive audience.
+renderer runs (a test checks after 30 days). Measure the actual display
+before relying on this for a photosensitive audience.
 
 ```sh
 just modern-m1 -- --mic --mic-layers both
