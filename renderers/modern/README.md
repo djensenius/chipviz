@@ -48,15 +48,18 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
 - `Lines`: lines of varied direction, speed, length and thickness travel
   across a mirrored plane; each spectrum band drives its own group and energy
   sets density (up to an eighth of the instance budget per half, fading lines
-  at the cutoff). Every 256 control frames (about 4.3 s at 60 fps) the plane
+  at the cutoff). Every 512 control frames (about 8.5 s at 60 fps) the plane
   alternates with a hallway whose two walls mirror each other: the fold eases
   in over 96 frames (1.6 s), but every fourth section cuts straight to it. The
   fold follows the monotonic `frame` counter because the scene is stateless
-  and some sources wrap `beat_phase` before `beat_count` ticks; the drop flag
-  is not used. The camera swings around the plane and eases into the hallway
-  entrance. The scene projects its own camera on the CPU, so it uses
-  `ScreenSpace`. Procedural input never selects it; use `--scene 3` (frames
-  120, 304 and 400 show plane, mid-fold and hallway).
+  and some sources wrap `beat_phase` before `beat_count` ticks; beat-synced
+  folds are follow-up [#80](https://github.com/djensenius/chipviz/issues/80).
+  The timings in seconds assume 60 control frames per second; the fold's real
+  speed follows the sender's frame rate.
+  The drop flag is not used. The camera swings around the plane and eases
+  into the hallway entrance. The scene projects its own camera on the CPU, so
+  it uses `ScreenSpace`. Procedural input never selects it; use `--scene 3`
+  (frames 120, 560 and 800 show plane, mid-fold and hallway).
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
 mode, and append that entry to `REGISTRY`. Appending keeps every byte below the

@@ -6,7 +6,7 @@
 //! shader can only draw quads facing the z axis, and the hallway walls face x.
 //!
 //! The plane is two mirrored halves (`x >= 0` and its reflection) running the
-//! same line animation. Every 256 control frames (about 4.3 s at 60 fps) a
+//! same line animation. Every 512 control frames (about 8.5 s at 60 fps) a
 //! section starts: odd sections are a hallway (each half folds up about its
 //! outer edge into a wall, so the walls mirror each other) and even sections
 //! are the flat plane. A section change morphs smoothly over its first 96
@@ -16,7 +16,9 @@
 //! The fold is timed by the monotonic `frame` counter, not `beat_count` and
 //! `beat_phase`: the scene is stateless, and sources whose phase wraps before
 //! the count ticks (procedural input, `live_bridge`) would make a beat-timed
-//! fold step backwards. The drop flag is not used: it is a one-frame trigger,
+//! fold step backwards. Timings in seconds assume 60 control frames per
+//! second; the fold's real speed follows the sender's frame rate. Beat-synced folds are follow-up
+//! <https://github.com/djensenius/chipviz/issues/80>. The drop flag is not used: it is a one-frame trigger,
 //! and without state it could only flash for that frame. Everything derives
 //! from the control frame and elapsed time, so captures are reproducible.
 
@@ -33,7 +35,7 @@ pub const ENTRY: SceneEntry = SceneEntry {
 };
 
 /// Divides the u16 frame counter's wrap, so section parity survives it.
-const SECTION_FRAMES: u16 = 256;
+const SECTION_FRAMES: u16 = 512;
 const MORPH_FRAMES: f32 = 96.0;
 /// Largest per-frame morph change: the smoothstep's peak slope.
 #[cfg(test)]
@@ -303,11 +305,14 @@ fn build_with_morph(
             [line.center[0] - half[0], line.center[1] - half[1]],
             [line.center[0] + half[0], line.center[1] + half[1]],
         );
-        let color = palette(
+        // Fade in alpha (the pipeline alpha-blends) so a fading line stays
+        // translucent instead of drawing a dark stroke over brighter ones.
+        let mut color = palette(
             frame.palette.wrapping_add(line.band as u8 / 2),
-            line.brightness * fade,
+            line.brightness,
             energy,
         );
+        color[3] = fade;
         for side in [1.0, -1.0] {
             let start = fold(a[0], a[1], side, morph);
             let end = fold(b[0], b[1], side, morph);
@@ -374,14 +379,14 @@ mod tests {
     #[test]
     fn hallway_alternates_by_section_with_smooth_and_cut_transitions() {
         assert_eq!(hallway_morph(at(120)), 0.0);
-        assert_eq!(hallway_morph(at(256)), 0.0);
-        let mid = hallway_morph(at(256 + 48));
+        assert_eq!(hallway_morph(at(512)), 0.0);
+        let mid = hallway_morph(at(512 + 48));
         assert!((mid - 0.5).abs() < 1e-6, "{mid}");
-        assert_eq!(hallway_morph(at(256 + 96)), 1.0);
-        assert_eq!(hallway_morph(at(512)), 1.0);
-        assert_eq!(hallway_morph(at(512 + 96)), 0.0);
+        assert_eq!(hallway_morph(at(512 + 96)), 1.0);
+        assert_eq!(hallway_morph(at(1024)), 1.0);
+        assert_eq!(hallway_morph(at(1024 + 96)), 0.0);
         // Every fourth section cuts straight to the hallway.
-        assert_eq!(hallway_morph(at(768)), 1.0);
+        assert_eq!(hallway_morph(at(1536)), 1.0);
         // Section parity survives the frame counter wrap.
         assert_eq!(hallway_morph(at(u16::MAX)), 1.0);
         assert_eq!(hallway_morph(at(0)), 1.0);
@@ -390,9 +395,9 @@ mod tests {
             flags: 0x04,
             beat_count: 999,
             beat_phase: 77,
-            ..at(300)
+            ..at(600)
         };
-        assert_eq!(hallway_morph(drop), hallway_morph(at(300)));
+        assert_eq!(hallway_morph(drop), hallway_morph(at(600)));
     }
 
     #[test]
@@ -405,7 +410,7 @@ mod tests {
             ..ControlFrame::procedural(index)
         };
         for source in [ControlFrame::procedural, live] {
-            for index in 1..2048u64 {
+            for index in 1..4096u64 {
                 let (before, after) = (source(index - 1), source(index));
                 let section = after.frame / SECTION_FRAMES;
                 if section != before.frame / SECTION_FRAMES {
@@ -477,6 +482,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn zero_length_segments_are_skipped() {
+        let view = View::new(ControlFrame::procedural(0), 1.0, 0.0, 16.0 / 9.0);
+        let point = [1.0, 0.0, 2.0];
+        assert!(view.segment(point, point, 0.05, [1.0; 4]).is_none());
+        // A segment along the ray from the eye also projects to one point.
+        let toward = add_scaled(point, sub(point, view.eye), 0.5);
+        assert!(view.segment(point, toward, 0.05, [1.0; 4]).is_none());
+        let across = add_scaled(point, view.right, 0.5);
+        assert!(view.segment(point, across, 0.05, [1.0; 4]).is_some());
+    }
+
+    fn add_scaled(point: [f32; 3], direction: [f32; 3], scale: f32) -> [f32; 3] {
+        std::array::from_fn(|axis| point[axis] + direction[axis] * scale)
     }
 
     #[test]
