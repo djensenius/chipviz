@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "joybus_link.h"
 #include "visual_math.h"
 
 typedef struct {
@@ -93,14 +94,13 @@ static bool read_joybus_packet(uint8_t packet[16]) {
     buttons_a |= inputs.btn.d_down ? 0x04 : 0;
     buttons_a |= inputs.btn.d_left ? 0x02 : 0;
     buttons_a |= inputs.btn.d_right ? 0x01 : 0;
-    if (p == 3) {
-      buttons_b |= inputs.btn.l ? 0x20 : 0;
-      buttons_b |= inputs.btn.r ? 0x10 : 0;
-      buttons_b |= inputs.btn.c_up ? 0x08 : 0;
-      buttons_b |= inputs.btn.c_down ? 0x04 : 0;
-      buttons_b |= inputs.btn.c_left ? 0x02 : 0;
-      buttons_b |= inputs.btn.c_right ? 0x01 : 0;
-    }
+    /* Buttons-low on every port: ports 1..3 carry the v1 frame marker. */
+    buttons_b |= inputs.btn.l ? 0x20 : 0;
+    buttons_b |= inputs.btn.r ? 0x10 : 0;
+    buttons_b |= inputs.btn.c_up ? 0x08 : 0;
+    buttons_b |= inputs.btn.c_down ? 0x04 : 0;
+    buttons_b |= inputs.btn.c_left ? 0x02 : 0;
+    buttons_b |= inputs.btn.c_right ? 0x01 : 0;
 
     packet[p * 4 + 0] = buttons_a;
     packet[p * 4 + 1] = buttons_b;
@@ -209,6 +209,9 @@ static void draw_status_strips(int frame, const visual_state_t *state) {
 
 int main(void) {
   int frame = 0;
+  joybus_link_t link;
+
+  joybus_link_init(&link);
 
   debug_init_emulog();
   debug_init_usblog();
@@ -222,8 +225,13 @@ int main(void) {
     visual_state_t state;
     surface_t *disp = display_get();
 
-    if (frame < 30 || !read_joybus_packet(packet)) {
+    bool connected = read_joybus_packet(packet);
+    joybus_link_mode_t mode = joybus_link_step(&link, connected, packet);
+
+    if (frame < 30 || mode == JOYBUS_LINK_PROCEDURAL) {
       procedural_packet(frame, packet);
+    } else if (mode == JOYBUS_LINK_HOLD) {
+      memcpy(packet, link.held, sizeof(packet));
     }
     decode_transport_packet(packet, &state);
 

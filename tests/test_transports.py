@@ -46,6 +46,53 @@ class TransportTests(unittest.TestCase):
 
     self.assertEqual(len(converted), 3 * n64_joybus.JOYBUS_SIZE)
 
+  def _joybus_packet(self, frame_index: int) -> bytes:
+    wire = chipviz_bridge.pack_frame(chipviz_bridge.make_procedural_frame(frame_index))
+    return n64_joybus.pack_joybus_frame(n64_joybus.decode_control_frame(wire))
+
+  def test_n64_joybus_marker_golden_vectors_match_rom_tests(self) -> None:
+    # Mirrored in tests/n64_joybus_link_tests.c so host and ROM agree.
+    self.assertEqual(self._joybus_packet(0).hex(), "802d001d00003a570202749101005050")
+    self.assertEqual(self._joybus_packet(63).hex(), "002d2f4c023f69860308a3c040016700")
+
+  def test_n64_joybus_marker_fields(self) -> None:
+    for frame_index in (0, 1, 62, 63, 64, 65535):
+      with self.subTest(frame_index=frame_index):
+        packet = self._joybus_packet(frame_index)
+        self.assertTrue(n64_joybus.joybus_marker_valid(packet))
+        self.assertEqual(packet[1], n64_joybus.JOYBUS_MARKER_MAGIC)
+        self.assertEqual(packet[5], frame_index & 0x3F)
+        for index in (1, 5, 9):
+          self.assertEqual(packet[index] & 0xC0, 0, "libdragon cannot read bits 0x80/0x40")
+
+  def test_n64_joybus_marker_keeps_payload_bytes(self) -> None:
+    packet = self._joybus_packet(7)
+    unmarked = bytearray(packet)
+    for index in (1, 5, 9):
+      unmarked[index] = 0
+    decoded = n64_joybus.decode_control_frame(chipviz_bridge.pack_frame(chipviz_bridge.make_procedural_frame(7)))
+    self.assertEqual(unmarked[2], decoded.spectrum[0])
+    self.assertEqual(unmarked[14], decoded.energy)
+    self.assertFalse(n64_joybus.joybus_marker_valid(bytes(unmarked)))
+
+  def test_n64_joybus_marker_silent_frame_is_valid(self) -> None:
+    silent = bytearray(16)
+    n64_joybus.apply_joybus_marker(silent, 3)
+    self.assertTrue(n64_joybus.joybus_marker_valid(bytes(silent)))
+    self.assertEqual(bytes(silent[i] for i in range(16) if i not in (1, 5, 9)), bytes(13))
+
+  def test_n64_joybus_marker_rejects_idle_pad_and_corruption(self) -> None:
+    self.assertFalse(n64_joybus.joybus_marker_valid(bytes(16)))
+    packet = self._joybus_packet(12)
+    for index in range(16):
+      with self.subTest(index=index):
+        corrupt = bytearray(packet)
+        corrupt[index] ^= 0x01
+        self.assertFalse(n64_joybus.joybus_marker_valid(bytes(corrupt)))
+    high_bit = bytearray(packet)
+    high_bit[5] |= 0x40
+    self.assertFalse(n64_joybus.joybus_marker_valid(bytes(high_bit)))
+
   def test_usb_hid_mapping_outputs_buttons_and_keys(self) -> None:
     state = usb_hid.map_frame(self.wire)
 
