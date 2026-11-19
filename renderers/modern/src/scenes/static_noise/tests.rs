@@ -405,6 +405,7 @@ fn instances_are_deterministic() {
 }
 
 /// FNV-1a over Static's instances for a spread of frames and both profiles.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn fingerprint() -> u64 {
     let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
     for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
