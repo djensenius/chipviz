@@ -487,7 +487,9 @@ impl MicLayers {
     /// for a hidden ribbon; when it reappears it starts at the current
     /// waveform instead of easing from a stale one. Bursts only start while
     /// they are drawn (`shown`, see [`shown`], and the mode includes
-    /// bursts), so none pop in mid-fade. Live bursts are dropped while hidden
+    /// bursts; the renderer also passes `shown` false while the phosphor
+    /// holds the layers dark, see `phosphor::Settle::can_draw`), so none
+    /// pop in mid-fade. Live bursts are dropped while hidden
     /// (the start-rate cap is kept), so none reappear mid-fade either. Time
     /// never runs backwards here.
     pub fn step(
@@ -1822,6 +1824,95 @@ mod tests {
         let (worst, unheld) = switched_flashes(Switch::ColourField);
         assert!(worst.0 <= 2, "{worst:?}");
         assert!(unheld >= 3, "{unheld}");
+    }
+
+    /// The age (s) of each burst on the first frame it reaches the screen, as the renderer steps the layers around the
+    /// phosphor's plan, while `switch` alternates every `period` s and an
+    /// onset arrives every frame. With `gate` the layers step as hidden
+    /// while `Settle::can_draw` says nothing would be drawn, as
+    /// `prepare_mic_layers` does; without it, as before that fix.
+    fn first_drawn_bursts(switch: Switch, period: f64, fps: f64, gate: bool) -> Vec<f64> {
+        use crate::phosphor::{Fading, Plan, Settle};
+        let times = frame_times(fps, false, 20.0);
+        let mut layers = MicLayers::new(Mode::Bursts);
+        let mut settle = Settle::default();
+        let mut held: Option<((u32, u32), Fading)> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut first = Vec::new();
+        for (step, &now) in times.iter().enumerate() {
+            let scope = snapshot(0.5, step as u32);
+            let even = ((now / period) as u64).is_multiple_of(2);
+            let size = match switch {
+                Switch::Size if !even => (640, 480),
+                _ => (800, 600),
+            };
+            if matches!(switch, Switch::ColourField) && !even {
+                layers.step(quiet(), Some(&scope), now, false);
+                if let Some((_, fading)) = held.take() {
+                    settle.drop_lit(&fading, now);
+                }
+                continue;
+            }
+            let drawable =
+                !gate || settle.can_draw(held.as_ref().map(|(size, _)| *size), size, now);
+            layers.step(quiet(), Some(&scope), now, drawable);
+            let mut instances = Vec::new();
+            if drawable {
+                layers.build(quiet(), 4.0 / 3.0, &mut instances);
+            }
+            let count = instances.len();
+            match settle.plan(
+                held.as_ref().map(|(size, fading)| (*size, fading)),
+                count,
+                size,
+                now,
+            ) {
+                Plan::Idle => {
+                    held = None;
+                    continue;
+                }
+                Plan::Make => held = Some((size, Fading::default())),
+                Plan::Draw => {}
+            }
+            held.as_mut().expect("made above").1.tick(now, count > 0);
+            for burst in layers.bursts.iter().flatten() {
+                if seen.insert(burst.serial) {
+                    first.push(now - burst.born);
+                }
+            }
+        }
+        first
+    }
+
+    /// A burst reaches the screen from the foot of its rise, never part
+    /// way up: onsets during a resize's settle or the hold after a dropped
+    /// afterglow (resize or scene 7) start no burst. Its start frame draws
+    /// nothing (`burst_envelope(0)` is 0), so it first shows on the next,
+    /// at most one frame (`burst_envelope(1 / fps)`, under 0.12 at 60 fps)
+    /// up its 80 ms rise, as without any hold. Without the gate, bursts
+    /// started in the hold first appear at their peak or on the way down.
+    #[test]
+    fn bursts_never_appear_part_way_up_after_a_hold() {
+        let mut ungated = 0.0_f32;
+        for switch in [Switch::Size, Switch::ColourField] {
+            for period in [0.2, 0.5, 1.0, 3.0, 8.0] {
+                for fps in [60.0, 120.0, 240.0] {
+                    let what = format!("{switch:?} every {period} s at {fps} fps");
+                    let first = first_drawn_bursts(switch, period, fps, true);
+                    assert!(first.len() > 2, "{what}: too few bursts seen");
+                    let oldest = first.iter().copied().fold(0.0, f64::max);
+                    assert!(
+                        oldest <= 1.0 / fps + 1e-9,
+                        "{what}: first drawn at {oldest} s"
+                    );
+                    let first = first_drawn_bursts(switch, period, fps, false);
+                    let brightest = first.iter().map(|&age| burst_envelope(age as f32));
+                    ungated = ungated.max(brightest.fold(0.0, f32::max));
+                }
+            }
+        }
+        eprintln!("ungated: a burst first drawn at brightness {ungated}");
+        assert!(ungated > 0.9, "{ungated}");
     }
 
     /// The bound is on the light the layers add, not on the output. A grey

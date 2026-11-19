@@ -255,6 +255,28 @@ impl Settle {
         }
     }
 
+    /// Whether layer light drawn this frame (overlay time `now`, target
+    /// `size`) would reach the screen, given the size of the phosphor held,
+    /// if any. Called before the layers are stepped, so that while a resize
+    /// settles or a dropped display is held dark they are stepped as hidden:
+    /// onsets are consumed and no burst starts, so none first appears part
+    /// way through its rise when the hold ends. A pending settle moves to a
+    /// new size here, as [`Settle::plan`] would move it.
+    pub fn can_draw(&mut self, held: Option<(u32, u32)>, size: (u32, u32), now: f64) -> bool {
+        if let Some(held) = held {
+            return held == size;
+        }
+        if let Some((pending, _)) = self.pending
+            && pending != size
+        {
+            self.pending = Some((size, now));
+        }
+        let settled = self
+            .pending
+            .is_none_or(|(_, since)| now - since >= SETTLE_S);
+        settled && now >= self.dark_until
+    }
+
     /// Records that a phosphor with `fading` is dropped at once at overlay
     /// time `now` (for a resize, or on entering the colour field): when it
     /// was lit, no new light is drawn until the decay would have faded its

@@ -498,7 +498,15 @@ impl ScenePipeline {
         size: (u32, u32),
     ) -> Option<u32> {
         let aspect = size_aspect(size);
-        let shown = mic_layers::shown(self.mic_layers.mode(), display);
+        // While a resize settles or a dropped afterglow is held dark, nothing
+        // drawn would reach the screen, so the layers step as hidden: no
+        // burst starts that would first appear part way through its rise.
+        let drawable = self.settle.can_draw(
+            self.phosphor.as_ref().map(phosphor::Phosphor::size),
+            size,
+            elapsed,
+        );
+        let shown = mic_layers::shown(self.mic_layers.mode(), display) && drawable;
         self.mic_layers
             .step(frame, self.live_scope.as_ref(), elapsed, shown);
         // Entering the colour field is already a full-screen change; its

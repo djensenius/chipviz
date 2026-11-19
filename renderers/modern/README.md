@@ -183,8 +183,10 @@ notice, and draw nothing.
 - `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
   rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
   one arriving less than 0.5 s after the last burst started is skipped, and
-  onsets while bursts are hidden (layers `off` or `scope`, or scene 7) start
-  nothing. Hiding bursts drops any still fading, so none reappear mid-fade.
+  onsets while bursts are hidden (layers `off` or `scope`, scene 7, or the
+  hold after a resize or scene 7, below) start nothing, so none first appears
+  part way up its rise. Hiding bursts drops any still fading, so none
+  reappear mid-fade.
   In portrait windows bursts shrink with the width, as the ribbon does.
 
 With `--mic`, the analysis thread publishes the samples, the onset count and
