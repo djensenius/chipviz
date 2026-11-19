@@ -129,7 +129,7 @@ input is not muted and is the expected device.
 All renderer binaries, including `chipviz-pi5` and `chipviz-capture`, link
 against ALSA even when `--mic` is not used. Building needs the headers
 (`libasound2-dev` on Debian and Raspberry Pi OS) and running needs the runtime
-library (`libasound2`, installed by default on Raspberry Pi OS desktop images).
+library `libasound2` (e.g. `sudo apt install libasound2`).
 
 ## Scene plan
 
