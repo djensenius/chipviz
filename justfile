@@ -23,6 +23,9 @@ test: c-test python-test rust-test build-sim simulate host-sample target-arrays 
 
 scaffold-check:
     @test -f README.md
+    @test -f LICENSE
+    @test -f COMMERCIAL.md
+    @test -f CONTRIBUTING.md
     @test -f docs/homebrew-targets.md
     @test -f shared/specs/source-adapter-v0.md
     @test -f shared/specs/chipsynth-source-v0.md

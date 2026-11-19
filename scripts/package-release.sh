@@ -11,6 +11,9 @@ mkdir -p "$assets"
 cd "$root"
 mise exec -- just check
 
+# Every release (individual assets and the combined zip) ships the licence terms.
+cp LICENSE COMMERCIAL.md "$assets/"
+
 mkdir -p build/release
 python3 host/bridge/chipviz_bridge.py --frames 120 --output "$assets/control-frame-v0-demo.cvz"
 python3 host/bridge/chipviz_encode.py --music host/fixtures/musical/scale.musicsource.json --output "$assets/scale.cvz"
