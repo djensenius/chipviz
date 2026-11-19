@@ -116,6 +116,7 @@ c-test:
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_visual_tests.c -o build/tests/n64_visual_tests
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_joybus_link_tests.c -o build/tests/n64_joybus_link_tests
     @${CC:-cc} {{ cflags }} -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_tests
+    @${CC:-cc} {{ cflags }} -DCF_UNMEASURED_FLASH -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_flash_tests
     @build/tests/control_frame_tests
     @build/tests/connection_tests
     @build/tests/interface_tests
@@ -124,6 +125,7 @@ c-test:
     @build/tests/n64_visual_tests
     @build/tests/n64_joybus_link_tests
     @build/tests/c64_colour_field_tests
+    @build/tests/c64_colour_field_flash_tests
     @echo "chipviz C tests OK"
 
 python-lint:

@@ -86,9 +86,16 @@ animation phase jumps ahead instead of resuming where it stopped.
   so up/right/down never change the scene or palette. Port 2 drives the column
   lines: on its own it reads as nothing, but while keys are held it copies them
   into other columns, which usually makes their group ambiguous (ignored).
-- **Flash/gate.** Palettes 3 and 7 (`R`, `I`) arm flash/gate only when an
-  absolute scene key `8` and the palette key are held together in the same
-  scan for P_STABLE (30) steps. Otherwise they run as hard cuts.
+- **Flash/gate is off by default.** Shipped builds must not flash until the
+  effect has had independent photosensitivity measurement (PEAT or Harding,
+  [#96](https://github.com/djensenius/chipviz/issues/96)). The default ROM
+  (`just c64-rom`, the release artifact) is built without `CF_UNMEASURED_FLASH`:
+  `cf_tick` drops every arming input, so palettes 3 and 7 (`R`, `I`) always run
+  as unarmed 2 and 6 (hard cuts), even with `8` held, and the flash latch is
+  never set. `make -C cores/c64/homebrew UNMEASURED_FLASH=1` builds a local
+  measurement ROM; there, 3 and 7 arm flash/gate only when an absolute scene key
+  `8` and the palette key are held together in the same scan for P_STABLE (30)
+  steps. Do not ship that ROM.
 - **Not implemented.** The operator role (`L` pin and the RETURN warning screen)
   and joystick relative palette pulses.
 - **Timing.** Every frame is a step, in or out of scene 7. Holding `8` shows
@@ -100,12 +107,15 @@ animation phase jumps ahead instead of resuming where it stopped.
   some time: it draws one loop in about 26 frames instead of about 22.
 
 Tests: `tests/c64_colour_field_tests.c` runs the spec fixtures on the host as
-part of `just c-test`. `just c64-colour-field-capture` drives the VICE x64sc
+part of `just c-test`, built twice: by default every flash fixture checks that
+3 and 7 run exactly as 2 and 6 and never latch, and with `-DCF_UNMEASURED_FLASH`
+the spec's flash results are checked. `just c64-colour-field-capture` drives the VICE x64sc
 libretro core headlessly, once as a PAL and once as an NTSC C64. It holds keys,
 saves PNGs to `build/c64-colour-field/` (NTSC files are `c64-ntsc-*`), and
 checks every region's exact colour, the boundary positions and the black
 border. It also measures the entry and exit timing from the core's RAM, and
-checks that `R` held without `8` stays in steady hard cuts and that the native
+checks that `R` held without `8`, and `8`+`R` in the default ROM, stay in
+steady hard cuts with the flash latch clear, and that the native
 demo animates. It needs a local RetroArch core, so it is not part of
 `just check`.
 

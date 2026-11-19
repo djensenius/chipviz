@@ -436,6 +436,15 @@ uint8_t cf_tick(void) {
   uint8_t shown;
 
   cf.fx = 0u;
+#ifndef CF_UNMEASURED_FLASH
+  /* Flash/gate needs independent photosensitivity measurement (#96) before a
+   * shipped build may flash. This is the single point that downgrades every
+   * armed request: with no absolute report and no pre-arm, palettes 3 and 7
+   * run as unarmed 2 and 6 (hard cuts) and cf.flash is never latched. Build
+   * with CF_UNMEASURED_FLASH (make UNMEASURED_FLASH=1) to measure it. */
+  cf_in.scene_abs = 0u;
+  cf_in.pre_armed = 0u;
+#endif
   if (!cf.started) {
     /* Power-on entry is exempt from the debounce. */
     cf.started = 1u;

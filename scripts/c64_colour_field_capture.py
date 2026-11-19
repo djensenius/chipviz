@@ -10,11 +10,14 @@ black. Like `scripts/retroarch_smoke.py` it needs a local RetroArch core, so it
 is not part of `just check`.
 
 Only the held and hard-cut modes are captured (keys Q/E/T/U). Flash/gate is
-never armed: palette keys R and I are refused, except for one negative check
-that holds R without the scene key 8, which must run as hard cuts (mode 2) with
-a steady picture. `--model ntsc` runs the same sequence on an NTSC C64 (one
-model per process: the VICE core is a singleton). The script also reads the core's RAM (the `_cf` address from
-the linker map) to measure the scene-7 entry and exit timing in frames.
+never armed: palette keys R and I are refused, except for two negative checks.
+R without the scene key 8 is not an absolute report; 8+R is, but the default
+ROM is built without UNMEASURED_FLASH (#96) and never arms. Both must run as
+hard cuts (mode 2) with a steady picture and the flash latch clear.
+`--model ntsc` runs the same sequence on an NTSC C64 (one model per process:
+the VICE core is a singleton). The script also reads the core's RAM (the `_cf`
+address from the linker map) to measure the scene-7 entry and exit timing in
+frames.
 """
 
 from __future__ import annotations
@@ -367,7 +370,8 @@ def main(argv: list[str] | None = None) -> int:
     frame += NATIVE_FRAMES
 
     def hold(*keys: str, unarmed: bool = False) -> None:
-      if FORBIDDEN & set(keys) and (unarmed is False or "8" in keys):
+      # unarmed: R without 8, or 8+R in the default (flash-free) ROM.
+      if FORBIDDEN & set(keys) and not unarmed:
         raise ValueError("flash/gate palettes are never captured")
       emu.held = {KEYS[k] for k in keys}
 
@@ -443,17 +447,27 @@ def main(argv: list[str] | None = None) -> int:
         cuts(family, cuts_key, 2, (1,))
     # Negative check: R (palette 3) without the scene key is not an absolute
     # report, so it never arms flash/gate and runs as hard cuts (family A).
-    hold("r", unarmed=True)
-    advance(GAP)
-    modes = set()
-    frames = set()
-    for _ in range(2 * GAP):
-      advance(1)
-      modes.add((emu.peek(cf + CF_MODE), emu.peek(cf + CF_FLASH)))
-      assert emu.frame is not None
-      frames.add(hashlib.sha256(emu.frame[2]).hexdigest())
+    def steady(*keys: str) -> dict:
+      hold(*keys, unarmed=True)
+      modes = set()
+      frames = set()
+      for index in range(3 * GAP):
+        advance(1)
+        modes.add((emu.peek(cf + CF_MODE), emu.peek(cf + CF_FLASH)))
+        if index >= GAP:
+          assert emu.frame is not None
+          frames.add(hashlib.sha256(emu.frame[2]).hexdigest())
+      return {"modes_flash": sorted(modes), "distinct_frames": len(frames)}
+
+    unarmed = steady("r")
     capture(f"unarmed-r-{names[state[0]]}", 0, *state)
-    unarmed = {"modes_flash": sorted(modes), "distinct_frames": len(frames)}
+    # 8+R is absolute and P_STABLE, so it would arm flash in a measurement
+    # build; the default ROM must still run it as steady hard cuts (#96).
+    # An absolute 8+E first restarts the P_STABLE count (R is still latched).
+    hold("8", "e")
+    advance(GAP)
+    default_8r = steady("8", "r")
+    capture(f"default-8r-{names[state[0]]}", 0, *state)
     # Scene key 1: the debounce leaves scene 7 for the native demo, whose last
     # drawn frame is still in screen RAM at $0400.
     hold("1", "q")
@@ -469,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
               "model": args.model, "palntsc_flag": palntsc, "core_options": CORE_OPTIONS, "boot_frames": BOOT,
               "window_origin": origin, "native_distinct_frames": len(native_frames),
               "native_after_exit_colours": colour_count(native), "timing": timing, "unarmed_r": unarmed,
+              "default_8r": default_8r,
               "captures": results}
     print(json.dumps(report, indent=2))
     if len(native_frames) < NATIVE_FRAMES // 2:
@@ -479,6 +494,9 @@ def main(argv: list[str] | None = None) -> int:
       return 1
     if unarmed["modes_flash"] != [(2, 0)] or unarmed["distinct_frames"] != 1:
       print("palette R without scene key 8 must stay in steady hard cuts", file=sys.stderr)
+      return 1
+    if default_8r["modes_flash"] != [(2, 0)] or default_8r["distinct_frames"] != 1:
+      print("8+R must never arm flash in the default ROM (build without UNMEASURED_FLASH)", file=sys.stderr)
       return 1
     return 1 if failed else 0
 

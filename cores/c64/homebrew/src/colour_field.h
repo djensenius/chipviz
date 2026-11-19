@@ -4,7 +4,8 @@
  * build it with -std=c99 -pedantic. It has no hardware access. The C64 is a
  * `data` input role build only: no pin control, no operator pulses, no warning
  * screen. Flash/gate arms only through an absolute, P_STABLE wire value with an
- * absolute incoming scene 7 on every step of the window (route (b)).
+ * absolute incoming scene 7 on every step of the window (route (b)), and only
+ * in builds with CF_UNMEASURED_FLASH; by default cf_tick never arms (#96).
  */
 #ifndef CHIPVIZ_C64_COLOUR_FIELD_H
 #define CHIPVIZ_C64_COLOUR_FIELD_H

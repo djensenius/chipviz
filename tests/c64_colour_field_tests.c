@@ -1,6 +1,9 @@
 /* Host checks for the C64 colour-field core against the normative fixtures in
  * shared/specs/colour-field-v0.md. Operator-only (F11, F12, F16), resampled
- * (F15, F18) and host-side (F23) fixtures do not apply to the C64 target build. */
+ * (F15, F18) and host-side (F23) fixtures do not apply to the C64 target build.
+ * Built twice: by default flash/gate never arms (#96), so every flash run
+ * checks that 3 and 7 behave as unarmed 2 and 6; with -DCF_UNMEASURED_FLASH
+ * the flash fixtures run as the spec states them. */
 #include "colour_field.h"
 
 #include <stdio.h>
@@ -8,13 +11,19 @@
 
 #define STEPS 600u
 
+#ifdef CF_UNMEASURED_FLASH
+#define FLASH 1
+#else
+#define FLASH 0
+#endif
+
 typedef struct {
   uint8_t e, band[3], spec[8], flags, scene, palette, abs_off;
   uint8_t notes[2][2];
 } frame_t;
 
 typedef struct {
-  uint8_t shown, mode, family, layout, combo, rot, lvl[3], fx;
+  uint8_t shown, mode, family, layout, combo, rot, lvl[3], fx, flash;
 } trace_t;
 
 typedef void (*gen_fn)(uint16_t step, frame_t *frame);
@@ -106,6 +115,7 @@ static void run(gen_fn gen, uint8_t p, uint8_t wire) {
       tr[step].lvl[i] = cf_level(i);
     }
     tr[step].fx = cf.fx;
+    tr[step].flash = cf.flash;
   }
 }
 
@@ -165,6 +175,30 @@ static int level_changes(uint16_t until, const uint16_t *list) {
 
 static int levels(uint16_t step, uint8_t a, uint8_t b) {
   return tr[step].lvl[0] == a && tr[step].lvl[1] == b;
+}
+
+/* Runs a flash/gate fixture (palette 3 or 7). Returns 1 in a
+ * CF_UNMEASURED_FLASH build, where the caller checks the spec's flash
+ * results. In the default build it checks the downgrade instead and returns
+ * 0: no step is in mode 3, latches flash or pulses, and a local-palette run
+ * is step-for-step the run of palette p - 1 (hard cuts). */
+static trace_t flash_ref[STEPS];
+static int run_flash(gen_fn gen, uint8_t p, uint8_t wire, const char *fixture) {
+  run(gen, p, wire);
+  if (!FLASH) {
+    uint16_t s;
+    int ok = 1;
+    for (s = 0; s < STEPS; s++) {
+      ok &= tr[s].mode != 3u && !tr[s].flash && !(tr[s].fx & CF_FX_PULSE);
+    }
+    require(ok, fixture, "default build: never armed, latched or pulsed");
+    if (!wire) {
+      memcpy(flash_ref, tr, sizeof(tr));
+      run(gen, (uint8_t)(p - 1u), wire);
+      require(memcmp(flash_ref, tr, sizeof(tr)) == 0, fixture, "default build: 3/7 run exactly as 2/6");
+    }
+  }
+  return FLASH;
 }
 
 static int max_changes_per_60(void) {
@@ -355,7 +389,8 @@ static void g_f24(uint16_t step, frame_t *f) {
 static void fixture_f0(void) {
   uint8_t p;
   for (p = 0; p < 8u; p++) {
-    uint8_t lit = (uint8_t)((p & 1u) == 0u);
+    /* Without the flash build 3 and 7 are hard cuts, lit like 2 and 6. */
+    uint8_t lit = (uint8_t)((p & 1u) == 0u || (!FLASH && (p & 3u) == 3u));
     run(g_f0, p, 0);
     require(constant(), "F0", "constant trace");
     require(tr[0].layout == 0 && tr[0].combo == 0, "F0", "V2 combo 0");
@@ -378,9 +413,10 @@ static void fixture_f1(void) {
     require(tr[299].layout == 0 && tr[300].layout == 1 && tr[300].combo == 1, "F1", "spectral H2 combo 1");
     run(g_f1, (uint8_t)(base + 2u), 0);
     require(fx_steps(CF_FX_CUT, at300) && tr[300].layout == 1 && tr[300].combo == 1, "F1", "cut to H2 combo 1");
-    run(g_f1, (uint8_t)(base + 3u), 0);
-    require(fx_steps(CF_FX_PULSE, at300) && tr[300].combo == 1 && tr[300].rot == 1 && tr[300].lvl[0] == 3,
-            "F1", "flash pulse combo 1 rot 1");
+    if (run_flash(g_f1, (uint8_t)(base + 3u), 0, "F1")) {
+      require(fx_steps(CF_FX_PULSE, at300) && tr[300].combo == 1 && tr[300].rot == 1 && tr[300].lvl[0] == 3,
+              "F1", "flash pulse combo 1 rot 1");
+    }
   }
 }
 
@@ -391,8 +427,9 @@ static void fixture_f2(void) {
   require(constant() && levels(0, 2, 2), "F2", "spectral 2/2");
   run(g_f2, 2, 0);
   require(fx_count(CF_FX_CUT | CF_FX_T) == 0, "F2", "no events");
-  run(g_f2, 3, 0);
-  require(constant() && levels(0, 1, 1) && fx_count(CF_FX_PULSE) == 0, "F2", "flash rests dim");
+  if (run_flash(g_f2, 3, 0, "F2")) {
+    require(constant() && levels(0, 1, 1) && fx_count(CF_FX_PULSE) == 0, "F2", "flash rests dim");
+  }
 }
 
 static void fixture_f3(void) {
@@ -402,24 +439,27 @@ static void fixture_f3(void) {
   require(constant(), "F3", "held never changes");
   run(g_f3, 2, 0);
   require(fx_steps(CF_FX_CUT, cuts), "F3", "cuts at 37 101 250 400 523");
-  run(g_f3, 3, 0);
-  require(fx_steps(CF_FX_PULSE, pulses), "F3", "pulses at all six");
+  if (run_flash(g_f3, 3, 0, "F3")) {
+    require(fx_steps(CF_FX_PULSE, pulses), "F3", "pulses at all six");
+  }
 }
 
 static void fixture_f4(void) {
   static const uint16_t at[] = {45, 130, 352, 0};
   run(g_f4, 2, 0);
   require(fx_steps(CF_FX_CUT, at), "F4", "cuts at 45 130 352");
-  run(g_f4, 3, 0);
-  require(fx_steps(CF_FX_PULSE, at), "F4", "pulses at 45 130 352");
+  if (run_flash(g_f4, 3, 0, "F4")) {
+    require(fx_steps(CF_FX_PULSE, at), "F4", "pulses at 45 130 352");
+  }
 }
 
 static void fixture_f8(void) {
   static const uint16_t at[] = {100, 200, 0};
   run(g_f8, 2, 0);
   require(fx_steps(CF_FX_CUT, at), "F8", "cuts at 100 and 200");
-  run(g_f8, 3, 0);
-  require(fx_steps(CF_FX_PULSE, at), "F8", "pulses at 100 and 200");
+  if (run_flash(g_f8, 3, 0, "F8")) {
+    require(fx_steps(CF_FX_PULSE, at), "F8", "pulses at 100 and 200");
+  }
 }
 
 /* Beats at 20 + 40k and bars (B from bar, the Return key on C64) at 40 + 120k
@@ -439,8 +479,9 @@ static void fixture_f9(void) {
   require(constant(), "F9", "held never changes");
   run(g_f9, 2, 0);
   require(fx_steps(CF_FX_CUT, at), "F9", "a cut at every beat and bar");
-  run(g_f9, 3, 0);
-  require(fx_steps(CF_FX_PULSE, at), "F9", "a pulse at every beat and bar");
+  if (run_flash(g_f9, 3, 0, "F9")) {
+    require(fx_steps(CF_FX_PULSE, at), "F9", "a pulse at every beat and bar");
+  }
 }
 
 static void fixture_f17(void) {
@@ -450,7 +491,9 @@ static void fixture_f17(void) {
     uint16_t n = 0;
     uint16_t last = 0;
     int ok = 1;
-    run(g_f17, p, 0);
+    if (!run_flash(g_f17, p, 0, "F17")) {
+      continue;
+    }
     for (s = 0; s < STEPS; s++) {
       if (tr[s].fx & CF_FX_PULSE) {
         if (n < 23u) {
@@ -483,8 +526,9 @@ static void fixture_f5(void) {
   require(fx_count(CF_FX_CUT) == 19 && fx_steps(CF_FX_LAYOUT, layouts), "F5", "19 cuts, layouts every 120");
   require(tr[120].layout == 1 && tr[240].layout == 2 && tr[360].layout == 3 && tr[480].layout == 0, "F5",
           "V2 H2 V3 H3 V2");
-  run(g_f5, 3, 0);
-  require(fx_count(CF_FX_PULSE) == 19, "F5", "19 pulses");
+  if (run_flash(g_f5, 3, 0, "F5")) {
+    require(fx_count(CF_FX_PULSE) == 19, "F5", "19 pulses");
+  }
 }
 
 static void fixture_f6(void) {
@@ -495,8 +539,9 @@ static void fixture_f6(void) {
               levels(490, 2, 2), "F6", "spectral steps");
   run(g_f6, 2, 0);
   require(fx_steps(CF_FX_CUT, hits), "F6", "cuts at 420 and 480");
-  run(g_f6, 3, 0);
-  require(fx_steps(CF_FX_PULSE, hits), "F6", "pulses at 420 and 480");
+  if (run_flash(g_f6, 3, 0, "F6")) {
+    require(fx_steps(CF_FX_PULSE, hits), "F6", "pulses at 420 and 480");
+  }
 }
 
 static void fixture_f7(void) {
@@ -515,14 +560,18 @@ static void fixture_f7(void) {
   require(levels(299, 3, 1) && levels(300, 2, 2) && levels(309, 2, 2) && levels(310, 1, 3), "F7", "spectral");
   run(g_f7, 2, 0);
   require(fx_steps(CF_FX_CUT, at300), "F7", "cut at 300");
-  run(g_f7, 3, 0);
-  require(fx_steps(CF_FX_PULSE, at300), "F7", "pulse at 300");
+  if (run_flash(g_f7, 3, 0, "F7")) {
+    require(fx_steps(CF_FX_PULSE, at300), "F7", "pulse at 300");
+  }
 }
 
 static void fixture_f10(void) {
-  run(g_f10, 0, 1);
-  require(tr[229].mode == 0 && tr[230].mode == 3 && tr[599].mode == 3, "F10", "mode 3 from 230");
-  require(levels(230, 1, 1), "F10", "resting dim");
+  if (run_flash(g_f10, 0, 1, "F10")) {
+    require(tr[229].mode == 0 && tr[230].mode == 3 && tr[599].mode == 3, "F10", "mode 3 from 230");
+    require(levels(230, 1, 1), "F10", "resting dim");
+  } else {
+    require(tr[229].mode == 0 && tr[230].mode == 2 && tr[599].mode == 2, "F10", "default build: mode 2 from 230");
+  }
   require(fx_count(CF_FX_APPLY) == 1, "F10", "steps 100-109 have no effect");
 }
 
@@ -541,21 +590,22 @@ static void fixture_f13(void) {
 static void fixture_f14(void) {
   uint16_t s;
   int ok = 1;
-  run(g_f14, 3, 0);
-  for (s = 0; s < STEPS; s++) {
-    int pulse = (tr[s].fx & CF_FX_PULSE) != 0;
-    ok &= pulse == (s % 10u == 5u);
+  if (run_flash(g_f14, 3, 0, "F14")) {
+    for (s = 0; s < STEPS; s++) {
+      int pulse = (tr[s].fx & CF_FX_PULSE) != 0;
+      ok &= pulse == (s % 10u == 5u);
+    }
+    require(ok && fx_count(CF_FX_PULSE) == 60, "F14", "pulses every 10 steps");
+    for (s = 0; s <= 28u; s++) {
+      ok &= levels(s, 1, 1) || levels(s, 3, 3);
+    }
+    require(ok, "F14", "dim rest through 28");
+    for (s = 30; s < STEPS; s++) {
+      uint8_t want = (uint8_t)((s % 10u) >= 5u && (s % 10u) <= 8u ? 3u : 0u);
+      ok &= levels(s, want, want);
+    }
+    require(ok, "F14", "0,0,0,0,0,3,3,3,3,0 from step 30");
   }
-  require(ok && fx_count(CF_FX_PULSE) == 60, "F14", "pulses every 10 steps");
-  for (s = 0; s <= 28u; s++) {
-    ok &= levels(s, 1, 1) || levels(s, 3, 3);
-  }
-  require(ok, "F14", "dim rest through 28");
-  for (s = 30; s < STEPS; s++) {
-    uint8_t want = (uint8_t)((s % 10u) >= 5u && (s % 10u) <= 8u ? 3u : 0u);
-    ok &= levels(s, want, want);
-  }
-  require(ok, "F14", "0,0,0,0,0,3,3,3,3,0 from step 30");
   run(g_f14, 2, 0);
   require(fx_count(CF_FX_CUT) == 30, "F14", "30 cuts");
   run(g_f14, 1, 0);
@@ -575,12 +625,13 @@ static void fixture_f19(void) {
               levels(380, 2, 2) && levels(390, 1, 1), "F19", "spectral 1/1 2/2 3/3");
   run(g_f19, 2, 0);
   require(fx_steps(CF_FX_CUT, cuts), "F19", "11 cuts");
-  run(g_f19, 3, 0);
-  require(fx_steps(CF_FX_PULSE, cuts), "F19", "11 pulses");
-  for (s = 0; s < STEPS; s++) {
-    dim &= tr[s].lvl[0] != 0;
+  if (run_flash(g_f19, 3, 0, "F19")) {
+    require(fx_steps(CF_FX_PULSE, cuts), "F19", "11 pulses");
+    for (s = 0; s < STEPS; s++) {
+      dim &= tr[s].lvl[0] != 0;
+    }
+    require(dim, "F19", "flash rest dim, never 0");
   }
-  require(dim, "F19", "flash rest dim, never 0");
 }
 
 static void fixture_f20(void) {
@@ -591,8 +642,9 @@ static void fixture_f20(void) {
           "spectral saturation");
   run(g_f20, 2, 0);
   require(fx_steps(CF_FX_CUT, at400), "F20", "one cut at 400");
-  run(g_f20, 3, 0);
-  require(fx_steps(CF_FX_PULSE, at400) && levels(0, 1, 1) && levels(599, 1, 1), "F20", "one pulse, dim rest");
+  if (run_flash(g_f20, 3, 0, "F20")) {
+    require(fx_steps(CF_FX_PULSE, at400) && levels(0, 1, 1) && levels(599, 1, 1), "F20", "one pulse, dim rest");
+  }
 }
 
 static void fixture_f21(void) {
@@ -613,19 +665,27 @@ static void fixture_f21(void) {
 static void fixture_f22(void) {
   uint16_t s;
   int ok = 1;
-  run(g_f22, 0, 1);
+  int armed = run_flash(g_f22, 0, 1, "F22");
   for (s = 0; s < STEPS; s++) {
     ok &= tr[s].shown;
   }
   require(ok, "F22", "scene 7 shown throughout");
-  require(tr[329].mode == 0 && tr[330].mode == 3 && levels(330, 1, 1), "F22", "arms at 329, mode 3 from 330");
+  if (armed) {
+    require(tr[329].mode == 0 && tr[330].mode == 3 && levels(330, 1, 1), "F22", "arms at 329, mode 3 from 330");
+  } else {
+    require(tr[329].mode == 0 && tr[330].mode == 2 && tr[599].mode == 2, "F22", "default build: mode 2 from 330");
+  }
 }
 
 static void fixture_f24_keys(void) {
   f24_abs_off = 0;
-  run(g_f24, 0, 1);
-  require(tr[59].mode == 0 && tr[60].mode == 3 && tr[159].mode == 3 && tr[160].mode == 2, "F24",
-          "absolute R arms at 59, mode 3 from 60 to 159");
+  if (run_flash(g_f24, 0, 1, "F24")) {
+    require(tr[59].mode == 0 && tr[60].mode == 3 && tr[159].mode == 3 && tr[160].mode == 2, "F24",
+            "absolute R arms at 59, mode 3 from 60 to 159");
+  } else {
+    require(tr[59].mode == 0 && tr[60].mode == 2 && tr[599].mode == 2 && fx_count(CF_FX_APPLY) == 1, "F24",
+            "default build: absolute R runs as 2 and never arms");
+  }
   f24_abs_off = 1;
   run(g_f24, 0, 1);
   require(tr[59].mode == 0 && tr[60].mode == 2 && tr[599].mode == 2 && fx_count(CF_FX_APPLY) == 1, "F24",
@@ -735,7 +795,12 @@ static void keys(void) {
   require(!key_steps(40, held_8q) && !key_steps(200, held_18r), "keys", "R with 1 and 8 never arms");
   require(key_shown && cf_mode() == 2u, "keys", "unarmed R runs as hard cuts in scene 7");
   cf_init();
-  require(!key_steps(40, held_8q) && key_steps(200, held_8r), "keys", "8+R arms flash/gate");
+  if (FLASH) {
+    require(!key_steps(40, held_8q) && key_steps(200, held_8r), "keys", "8+R arms flash/gate");
+  } else {
+    require(!key_steps(40, held_8q) && !key_steps(200, held_8r) && key_shown && cf_mode() == 2u && !cf.flash,
+            "keys", "default build: 8+R runs as hard cuts and never latches");
+  }
   cf_init();
   key_steps(1, keys_none); /* power-on adopts the procedural scene 2 */
   require(!key_steps(30, held_8) && !key_shown, "keys", "8 not shown on its first 30 steps");
