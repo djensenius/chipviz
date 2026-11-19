@@ -109,3 +109,26 @@ Each platform entrypoint consumes the shared `control-frame-v0` shape through a
 small connection abstraction. Until a live receiver is supplied, the connection
 generates deterministic procedural frames so every target has an immediate
 visualization loop.
+
+## License
+
+Copyright David Jensenius. chipviz is dual licensed:
+
+- **Noncommercial use is free** under the
+  [PolyForm Noncommercial License 1.0.0](LICENSE): personal use without any
+  anticipated commercial application (including hobby projects and research
+  for the benefit of public knowledge), and use by charitable organizations,
+  educational institutions, public research organizations, government
+  institutions, and the other noncommercial organizations the licence lists.
+  The licence text is authoritative.
+- **Commercial use needs a separate licence** from David Jensenius. See
+  [COMMERCIAL.md](COMMERCIAL.md) for what counts and how to ask.
+
+Contributions are accepted under the contributor licence agreement in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+Third-party components keep their own licences. Toolchains and SDKs fetched at
+build time, such as libdragon, devkitPro, cc65, PVSnesLib, RGBDS, and the
+Raspberry Pi pico-sdk, are not redistributed in this repository. Rust crates
+are fetched by Cargo under their own licences. Future embedded data, such as
+the HYG star catalog (CC BY-SA 4.0), will carry its own notices.

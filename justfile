@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
 
 default:
     just --list
@@ -24,6 +24,9 @@ test: c-test python-test rust-test build-sim simulate host-sample target-arrays 
 
 scaffold-check:
     @test -f README.md
+    @test -f LICENSE
+    @test -f COMMERCIAL.md
+    @test -f CONTRIBUTING.md
     @test -f docs/homebrew-targets.md
     @test -f shared/specs/source-adapter-v0.md
     @test -f shared/specs/chipsynth-source-v0.md
@@ -54,7 +57,9 @@ scaffold-check:
     @test -f host/fixtures/chipsynth/groove.cvz
     @test -f shared/tools/lint_docs.py
     @test -f shared/tools/build_homebrew.py
+    @test -f shared/tools/capture_assert.py
     @test -f shared/tools/cvz_to_c.py
+    @test -f tests/test_capture_assert.py
     @test -f tests/test_homebrew.py
     @test -f tests/control_frame_tests.c
     @test -f tests/connection_tests.c
@@ -108,11 +113,13 @@ c-test:
     @${CC:-cc} {{ cflags }} tests/interface_tests.c shared/src/control_frame.c shared/src/interface.c -o build/tests/interface_tests
     @${CC:-cc} {{ cflags }} -Ifirmware/pico/include tests/pico_joybus_tests.c firmware/pico/src/joybus_bridge.c -o build/tests/pico_joybus_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_input_tests.c -o build/tests/gba_input_tests
+    @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_visual_tests.c -o build/tests/n64_visual_tests
     @build/tests/control_frame_tests
     @build/tests/connection_tests
     @build/tests/interface_tests
     @build/tests/pico_joybus_tests
     @build/tests/gba_input_tests
+    @build/tests/n64_visual_tests
     @echo "chipviz C tests OK"
 
 python-lint:
@@ -309,6 +316,9 @@ modern-pi5 *args:
 
 modern-m1 *args:
     @cargo run --manifest-path {{ modern_manifest }} --bin chipviz-m1 -- "$@"
+
+modern-capture *args:
+    @cargo run --release --manifest-path {{ modern_manifest }} --bin chipviz-capture -- {{ args }}
 
 clean:
     @rm -rf build dist

@@ -5,22 +5,44 @@ use winit::dpi::PhysicalSize;
 
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
-use crate::scene::{Camera, Instance, QUAD_VERTICES, Vertex, build_instances};
+use crate::scene::{
+    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
+};
+use crate::scenes;
 
-pub struct Renderer {
+/// Offscreen capture format; sRGB like the window's preferred surface format.
+pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Pipeline, buffers and camera shared by the window and offscreen targets.
+pub struct ScenePipeline {
     profile: RenderProfile,
     camera: Camera,
-    window: Arc<winit::window::Window>,
-    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+}
+
+pub struct Renderer {
+    window: Arc<winit::window::Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    pipeline: ScenePipeline,
+}
+
+/// Renders the same pipeline into a texture and reads it back as RGB8.
+pub struct OffscreenRenderer {
+    pipeline: ScenePipeline,
+    width: u32,
+    height: u32,
+    padded_row: u32,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    readback: wgpu::Buffer,
 }
 
 #[derive(Debug)]
@@ -30,6 +52,12 @@ pub enum RendererError {
     RequestDevice(wgpu::RequestDeviceError),
     NoSurfaceFormat,
     Surface(wgpu::SurfaceError),
+    Readback(wgpu::BufferAsyncError),
+    TargetTooLarge {
+        width: u32,
+        height: u32,
+        max_dimension: u32,
+    },
 }
 
 impl std::fmt::Display for RendererError {
@@ -44,6 +72,16 @@ impl std::fmt::Display for RendererError {
                 formatter.write_str("surface does not expose any supported formats")
             }
             Self::Surface(error) => write!(formatter, "surface error: {error}"),
+            Self::Readback(error) => write!(formatter, "texture readback failed: {error}"),
+            Self::TargetTooLarge {
+                width,
+                height,
+                max_dimension,
+            } => write!(
+                formatter,
+                "capture size {width}x{height} exceeds the GPU limit \
+                 ({max_dimension} px per side, or the readback buffer limit)"
+            ),
         }
     }
 }
@@ -68,63 +106,54 @@ impl From<wgpu::SurfaceError> for RendererError {
     }
 }
 
-impl Renderer {
-    pub async fn new(
-        window: Arc<winit::window::Window>,
-        profile: RenderProfile,
-    ) -> Result<Self, RendererError> {
-        let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
-        let surface = instance.create_surface(window.clone())?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: profile.power_preference,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or(RendererError::NoAdapter)?;
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("chipviz device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                },
-                None,
-            )
-            .await?;
-        let surface_capabilities = surface.get_capabilities(&adapter);
-        let format = surface_capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .or_else(|| surface_capabilities.formats.first().copied())
-            .ok_or(RendererError::NoSurfaceFormat)?;
-        let present_mode = surface_capabilities
-            .present_modes
-            .iter()
-            .copied()
-            .find(|mode| *mode == wgpu::PresentMode::Mailbox)
-            .unwrap_or(wgpu::PresentMode::Fifo);
-        let config = surface_config(format, present_mode, &surface_capabilities, size);
-        surface.configure(&device, &config);
+async fn request_device(
+    instance: &wgpu::Instance,
+    profile: &RenderProfile,
+    compatible_surface: Option<&wgpu::Surface<'_>>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), RendererError> {
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: profile.power_preference,
+            compatible_surface,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok_or(RendererError::NoAdapter)?;
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("chipviz device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        )
+        .await?;
+    Ok((adapter, device, queue))
+}
 
+fn gpu_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
+    })
+}
+
+impl ScenePipeline {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+        profile: RenderProfile,
+        aspect: f32,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chipviz modern shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
         // Buffer initialization must not seed the live camera before its first frame.
-        let uniform = Camera::default().build_uniforms(
-            &profile,
-            ControlFrame::procedural(0),
-            0.0,
-            aspect(size),
-        );
+        let uniform =
+            Camera::default().build_uniforms(&profile, ControlFrame::procedural(0), 0.0, aspect);
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chipviz uniforms"),
             contents: bytemuck::bytes_of(&uniform),
@@ -198,20 +227,130 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        Ok(Self {
+        Self {
             profile,
             camera: Camera::default(),
-            window,
-            surface,
             device,
             queue,
-            config,
             render_pipeline,
             vertex_buffer,
             instance_buffer,
             instance_capacity,
             uniform_buffer,
             uniform_bind_group,
+        }
+    }
+
+    /// Restarts camera smoothing, as at renderer start-up.
+    pub fn reset_camera(&mut self) {
+        self.camera = Camera::default();
+    }
+
+    /// Steps camera smoothing for a frame that is not drawn.
+    pub fn advance_camera(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
+        self.camera
+            .build_uniforms(&self.profile, frame, elapsed, aspect);
+    }
+
+    /// Uploads this frame's instances and uniforms, then records its render pass.
+    pub fn encode(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame: ControlFrame,
+        elapsed: f32,
+        aspect: f32,
+    ) {
+        let instances = build_instances(&self.profile, frame, elapsed, aspect);
+        let uniforms = scene_uniforms(
+            scenes::select(frame.scene).camera,
+            &mut self.camera,
+            &self.profile,
+            frame,
+            elapsed,
+            aspect,
+        );
+        self.encode_instances(encoder, view, &instances, &uniforms);
+    }
+
+    /// Uploads explicit instances and uniforms, then records the render pass.
+    pub(crate) fn encode_instances(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        instances: &[Instance],
+        uniforms: &Uniforms,
+    ) {
+        let instance_count = instances.len().min(self.instance_capacity);
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&instances[..instance_count]),
+        );
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("chipviz render pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        render_pass.draw(0..QUAD_VERTICES.len() as u32, 0..instance_count as u32);
+    }
+
+    fn command_encoder(&self) -> wgpu::CommandEncoder {
+        self.device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("chipviz render encoder"),
+            })
+    }
+}
+
+impl Renderer {
+    pub async fn new(
+        window: Arc<winit::window::Window>,
+        profile: RenderProfile,
+    ) -> Result<Self, RendererError> {
+        let size = window.inner_size();
+        let instance = gpu_instance();
+        let surface = instance.create_surface(window.clone())?;
+        let (adapter, device, queue) = request_device(&instance, &profile, Some(&surface)).await?;
+        let surface_capabilities = surface.get_capabilities(&adapter);
+        let format = surface_capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .or_else(|| surface_capabilities.formats.first().copied())
+            .ok_or(RendererError::NoSurfaceFormat)?;
+        let present_mode = surface_capabilities
+            .present_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode == wgpu::PresentMode::Mailbox)
+            .unwrap_or(wgpu::PresentMode::Fifo);
+        let config = surface_config(format, present_mode, &surface_capabilities, size);
+        surface.configure(&device, &config);
+        let pipeline = ScenePipeline::new(device, queue, format, profile, aspect(size));
+
+        Ok(Self {
+            window,
+            surface,
+            config,
+            pipeline,
         })
     }
 
@@ -222,7 +361,7 @@ impl Renderer {
 
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        self.surface.configure(&self.pipeline.device, &self.config);
     }
 
     pub fn resize_to_current_window(&mut self) {
@@ -235,52 +374,155 @@ impl Renderer {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let instances = build_instances(&self.profile, frame, elapsed);
-        let instance_count = instances.len().min(self.instance_capacity);
-        self.queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&instances[..instance_count]),
-        );
-        let uniforms = self.camera.build_uniforms(
-            &self.profile,
-            frame,
-            elapsed,
-            self.config.width as f32 / self.config.height.max(1) as f32,
-        );
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("chipviz render encoder"),
-            });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("chipviz render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.draw(0..QUAD_VERTICES.len() as u32, 0..instance_count as u32);
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let mut encoder = self.pipeline.command_encoder();
+        self.pipeline
+            .encode(&mut encoder, &view, frame, elapsed, aspect);
+        self.pipeline
+            .queue
+            .submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
+    }
+}
+
+impl OffscreenRenderer {
+    /// Uses a headless adapter: no window, surface or screen-recording access.
+    pub async fn new(
+        profile: RenderProfile,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RendererError> {
+        let (width, height) = (width.max(1), height.max(1));
+        let (_, device, queue) = request_device(&gpu_instance(), &profile, None).await?;
+        check_target_size(width, height, &device.limits())?;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("chipviz offscreen target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: OFFSCREEN_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let padded_row = padded_row_bytes(width);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chipviz offscreen readback"),
+            size: u64::from(padded_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let aspect = width as f32 / height as f32;
+        let pipeline = ScenePipeline::new(device, queue, OFFSCREEN_FORMAT, profile, aspect);
+
+        Ok(Self {
+            pipeline,
+            width,
+            height,
+            padded_row,
+            texture,
+            view,
+            readback,
+        })
+    }
+
+    pub fn aspect(&self) -> f32 {
+        self.width as f32 / self.height as f32
+    }
+
+    pub fn pipeline_mut(&mut self) -> &mut ScenePipeline {
+        &mut self.pipeline
+    }
+
+    /// Draws one frame and returns tightly packed RGB8 rows, top row first.
+    pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<Vec<u8>, RendererError> {
+        let aspect = self.aspect();
+        self.render_with(|pipeline, encoder, view| {
+            pipeline.encode(encoder, view, frame, elapsed, aspect);
+        })
+    }
+
+    /// Records `draw` into the offscreen target, then reads back RGB8 rows.
+    pub(crate) fn render_with(
+        &mut self,
+        draw: impl FnOnce(&mut ScenePipeline, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+    ) -> Result<Vec<u8>, RendererError> {
+        let mut encoder = self.pipeline.command_encoder();
+        draw(&mut self.pipeline, &mut encoder, &self.view);
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.pipeline
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+
+        let slice = self.readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.pipeline.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .unwrap_or(Err(wgpu::BufferAsyncError))
+            .map_err(RendererError::Readback)?;
+        let mut rgb = Vec::with_capacity(self.width as usize * self.height as usize * 3);
+        {
+            let data = slice.get_mapped_range();
+            for row in data.chunks_exact(self.padded_row as usize) {
+                for pixel in row[..self.width as usize * 4].chunks_exact(4) {
+                    rgb.extend_from_slice(&pixel[..3]);
+                }
+            }
+        }
+        self.readback.unmap();
+        Ok(rgb)
+    }
+}
+
+fn padded_row_bytes(width: u32) -> u32 {
+    (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+}
+
+/// Rejects capture sizes the device cannot allocate, instead of letting wgpu
+/// validation panic.
+fn check_target_size(width: u32, height: u32, limits: &wgpu::Limits) -> Result<(), RendererError> {
+    let max_dimension = limits.max_texture_dimension_2d;
+    let fits = width <= max_dimension
+        && height <= max_dimension
+        && u64::from(padded_row_bytes(width)) * u64::from(height) <= limits.max_buffer_size;
+    if fits {
+        Ok(())
+    } else {
+        Err(RendererError::TargetTooLarge {
+            width,
+            height,
+            max_dimension,
+        })
     }
 }
 
@@ -308,4 +550,38 @@ fn surface_config(
 
 fn aspect(size: PhysicalSize<u32>) -> f32 {
     size.width.max(1) as f32 / size.height.max(1) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_size_check_follows_device_limits() {
+        let limits = wgpu::Limits::default();
+        let max = limits.max_texture_dimension_2d;
+        for (width, height) in [(1, 1), (1920, 1080), (3840, 2160), (max, max)] {
+            assert!(
+                check_target_size(width, height, &limits).is_ok(),
+                "{width}x{height}"
+            );
+        }
+        for (width, height) in [(max + 1, 10), (9000, 10), (10, max + 1)] {
+            let error = check_target_size(width, height, &limits).unwrap_err();
+            assert!(error.to_string().contains(&format!("{width}x{height}")));
+        }
+        let tight = wgpu::Limits {
+            max_buffer_size: 1024,
+            ..limits
+        };
+        assert!(check_target_size(64, 4, &tight).is_ok());
+        assert!(check_target_size(64, 5, &tight).is_err());
+    }
+
+    #[test]
+    fn readback_rows_are_padded_to_copy_alignment() {
+        assert_eq!(padded_row_bytes(64), 256);
+        assert_eq!(padded_row_bytes(100), 512);
+        assert_eq!(padded_row_bytes(1920), 7680);
+    }
 }
