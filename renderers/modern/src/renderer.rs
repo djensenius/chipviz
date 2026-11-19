@@ -524,6 +524,12 @@ impl OffscreenRenderer {
 
     /// Draws one new frame (observed by the colour field first) and returns
     /// tightly packed RGB8 rows, top row first.
+    ///
+    /// The colour field steps once per new `frame` counter value. A frame
+    /// whose counter equals the previously rendered one does not step, so
+    /// its scene and colour-field state stay those of the earlier frame;
+    /// give each frame a distinct counter (or call
+    /// [`ScenePipeline::reset_state`]) when rendering unrelated frames.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<Vec<u8>, RendererError> {
         self.pipeline.observe(&frame);
         let size = (self.width, self.height);

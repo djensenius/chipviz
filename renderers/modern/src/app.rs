@@ -249,7 +249,9 @@ Options:
   --monitor INDEX|NAME    display to use, by index or case-insensitive name substring
   --list-monitors         print available monitors and exit
   --layout LAYOUT         colour-field (scene 7) layout pin (default: auto)
-  --allow-flash           let scene 7 palettes 3 and 7 run flash/gate (prints a warning)
+  --allow-flash           print the flash/gate warning and arm operator flash requests;
+                          scene 7 wire palettes 3 and 7 from a host started with
+                          --allow-flash arm flash/gate without it
   -h, --help              print this help
 
 Keys:
@@ -441,8 +443,9 @@ struct AppArgs {
     allow_flash: bool,
 }
 
-/// Wire palettes go through the stability gate; procedural and mic-only
-/// frames use a local palette 0, which never arms.
+/// Wire palettes go through the stability gate, and a stable absolute 3 or 7
+/// arms whatever `--allow-flash` says (the host's flag is the opt-in).
+/// Procedural and mic-only frames use a local palette 0, which never arms.
 fn colour_field_config(args: &AppArgs) -> colour_field::Config {
     colour_field::Config {
         allow_flash: args.allow_flash,
@@ -678,6 +681,10 @@ impl FrameSource {
                     self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
                 }
             }
+            // Generated frames number from `fallback_index`, independent of
+            // UDP counters. On a handover the first one can equal the last
+            // stepped counter; the colour field then skips that one frame
+            // (see `ColourField::has_new_frame`).
             IdleSource::Procedural => {
                 self.fallback_index = self.fallback_index.wrapping_add(1);
                 self.latest = ControlFrame::procedural(self.fallback_index);
@@ -1123,7 +1130,8 @@ mod tests {
             sender.send_to(&packet, address).unwrap();
             // Until the first packet lands, redraws in mic mode generate mic
             // frames; wait for this packet itself.
-            for _ in 0..200 {
+            // About 2 s, for loaded CI hosts.
+            for _ in 0..1000 {
                 let result = redraw(source, field, start);
                 if source.fresh().iter().any(|frame| frame.frame == counter) {
                     return result;
@@ -1192,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn colour_field_config_never_arms_by_default() {
+    fn colour_field_config_arms_locally_only_with_the_flag() {
         let config = colour_field_config(&AppArgs::default());
         assert!(!config.allow_flash);
         assert_eq!(
@@ -1202,6 +1210,7 @@ mod tests {
         let udp = colour_field_config(&parse_run(&["--udp", "127.0.0.1:6464"]));
         assert_eq!(udp.palette, colour_field::PaletteSource::Wire);
         assert!(!udp.allow_flash);
+        assert!(colour_field_config(&parse_run(&["--allow-flash"])).allow_flash);
     }
 
     #[test]

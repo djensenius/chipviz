@@ -38,7 +38,7 @@ The renderer starts windowed by default.
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
-| `--allow-flash` | Let scene 7 run flash/gate (palettes 3 and 7). Prints the photosensitivity warning to stderr at start-up. Without it, 3 and 7 always run as hard cuts (2 and 6). |
+| `--allow-flash` | Print the photosensitivity warning to stderr at start-up and arm operator requests for flash/gate (palettes 3 and 7). The opt-in for wire arming is the host's own `--allow-flash`: hosts send 3 or 7 only with it, and a stable absolute wire 3 or 7 in scene 7 arms flash/gate with or without this flag. Procedural and mic frames never arm. |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -172,8 +172,10 @@ the colour field, whatever the registry length; every other byte selects
   repeats the last step and its cleared one-off flags never count as edges, so
   when mic frames take over, the debounce returns to the native scene after
   about 30 steps.
-  Flash/gate runs only with `--allow-flash` and a stable absolute wire 3 or 7;
-  without the flag, 3 and 7 run as hard cuts.
+  Flash/gate runs only when armed: a stable absolute wire 3 or 7 (held 30
+  steps with incoming scene 7 throughout) arms it, since hosts send those
+  only when started with `--allow-flash`. Relative palette inputs, procedural
+  and mic frames never arm, and unarmed 3 and 7 run as hard cuts (2 and 6).
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
@@ -289,7 +291,9 @@ frame 0, so very large frame indices take longer to capture.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed
-from frame 0 like the camera and never arms flash/gate. Recorded inputs use
+from frame 0 like the camera. Procedural input never arms flash/gate; a
+recording arms it only as a target would, from a stable absolute wire 3 or 7
+held in scene 7. Recorded inputs use
 their wire palettes; procedural input uses palette 0. `--input` is `procedural` (default) or a `.cvz` file of
 concatenated control-frame packets, such as the bridge's `--output`.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`

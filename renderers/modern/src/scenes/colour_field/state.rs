@@ -68,8 +68,9 @@ pub enum PaletteSource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// `--allow-flash`: operator requests for 3 or 7 are armed, and a stable
-    /// absolute wire 3 or 7 may arm (route b). Without it nothing arms.
+    /// `--allow-flash`: operator requests for 3 or 7 are armed (route a).
+    /// Wire arming (route b) does not depend on it: the host's own
+    /// `--allow-flash` guard is the opt-in for a stable absolute wire 3 or 7.
     pub allow_flash: bool,
     pub palette: PaletteSource,
     /// Initial layout pin (`None` is `auto`).
@@ -562,8 +563,8 @@ impl Field {
                 wire.clean &= !controls.relative_scene;
                 if wire.count >= P_STABLE && !wire.consumed {
                     wire.consumed = true;
-                    let armed =
-                        config.allow_flash && value & 3 == FLASH && !wire.relative && wire.clean;
+                    // Route (b): deliberate host selection arms on its own.
+                    let armed = value & 3 == FLASH && !wire.relative && wire.clean;
                     self.request(Request {
                         p: value,
                         armed,
@@ -664,7 +665,9 @@ impl ColourField {
     }
 
     /// True when the newest observed frame's `frame` counter has not been
-    /// stepped yet.
+    /// stepped yet. On a source handover (UDP to mic or procedural, or back)
+    /// the new source's first counter can equal the last stepped one; that
+    /// frame is then skipped, costing at most one step.
     pub fn has_new_frame(&self) -> bool {
         self.newest
             .is_some_and(|frame| self.last_stepped != Some(frame.frame))

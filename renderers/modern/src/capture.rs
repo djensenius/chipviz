@@ -185,7 +185,8 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         pollster::block_on(OffscreenRenderer::new(args.profile.clone(), width, height))
             .map_err(|error| error.to_string())?;
     // Recorded frames carry wire palettes; procedural frames use a local
-    // palette 0. Capture never arms flash/gate.
+    // palette 0. As on a target, only a recording's stable absolute wire 3
+    // or 7 held in scene 7 can arm flash/gate; procedural input never arms.
     renderer
         .pipeline_mut()
         .configure_colour_field(colour_field::Config {
@@ -405,11 +406,17 @@ mod tests {
         let mut renderer =
             pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), 160, 90)).unwrap();
         for scene in 0..scenes::REGISTRY.len() as u8 {
+            // A distinct counter per scene: a repeated counter is not a new
+            // frame, so the colour field would keep showing the first scene.
             let frame = ControlFrame {
                 scene,
-                ..ControlFrame::procedural(120)
+                ..ControlFrame::procedural(120 + u64::from(scene))
             };
             let rgb = renderer.render(frame, 2.0).unwrap();
+            assert_eq!(
+                renderer.pipeline_mut().colour_field_display(),
+                colour_field::Display::Native(scene)
+            );
             assert_eq!(rgb.len(), 160 * 90 * 3);
             assert!(
                 rgb.iter().any(|&value| value > 16),

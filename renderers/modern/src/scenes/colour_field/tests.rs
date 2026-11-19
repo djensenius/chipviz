@@ -61,12 +61,9 @@ fn local(p: u8, armed: bool) -> Config {
     }
 }
 
-fn wire(allow_flash: bool) -> Config {
-    Config {
-        allow_flash,
-        palette: PaletteSource::Wire,
-        pin: None,
-    }
+/// The default `data` role: wire palettes, no local arming.
+fn wire() -> Config {
+    Config::default()
 }
 
 /// Steps once per entry of `frames(step)` batch (resampling when a batch
@@ -468,7 +465,7 @@ fn f10(step: usize) -> ControlFrame {
 
 #[test]
 fn f10_wire_gate() {
-    let traces = run(wire(true), f10);
+    let traces = run(wire(), f10);
     assert!(traces[..230].iter().all(|trace| trace.mode == 0));
     assert!(traces[230..].iter().all(|trace| trace.mode == 3));
     assert_eq!(levels(&traces, 230), [1, 1, 0]);
@@ -476,10 +473,19 @@ fn f10_wire_gate() {
 }
 
 #[test]
-fn f10_without_allow_flash_runs_hard_cuts() {
-    let traces = run(wire(false), f10);
-    assert!(traces[..230].iter().all(|trace| trace.mode == 0));
-    assert!(traces[230..].iter().all(|trace| trace.mode == 2));
+fn wire_selection_arms_without_the_renderer_flag() {
+    // Route (b): the host's `--allow-flash` is the opt-in, so the renderer's
+    // own flag changes nothing on the wire path.
+    assert!(!Config::default().allow_flash);
+    let flagged = Config {
+        allow_flash: true,
+        ..Config::default()
+    };
+    for input in [f10 as fn(usize) -> ControlFrame, f22] {
+        let traces = run(Config::default(), input);
+        assert!(traces.iter().any(|trace| trace.mode == 3));
+        assert_eq!(traces, run(flagged, input));
+    }
 }
 
 #[test]
@@ -841,7 +847,7 @@ fn f21_scene_seven_debounce() {
         200..=299 | 320..=449 => 7,
         _ => 6,
     };
-    let mut field = ColourField::new(wire(false));
+    let mut field = ColourField::new(wire());
     let mut traces = Vec::new();
     for step in 0..STEPS {
         field.observe(&ControlFrame {
@@ -883,13 +889,10 @@ fn f22(step: usize) -> ControlFrame {
 
 #[test]
 fn f22_deferred_exit_never_arms() {
-    let traces = run(wire(true), f22);
+    let traces = run(wire(), f22);
     assert!(traces[..330].iter().all(|trace| trace.mode == 0));
     assert!(traces[330..].iter().all(|trace| trace.mode == 3));
     assert_eq!(levels(&traces, 330), [1, 1, 0]);
-    // Modern without --allow-flash never arms from the wire.
-    let traces = run(wire(false), f22);
-    assert!(traces[330..].iter().all(|trace| trace.mode == 2));
 }
 
 #[test]
@@ -907,7 +910,7 @@ fn f24_relative_palette() {
     };
     let pulse = |step: usize| [10, 20, 30, 130].contains(&step);
     let relative: Vec<_> = run_frames(
-        wire(true),
+        wire(),
         |step| vec![input(step)],
         |step| Controls {
             relative_palette: pulse(step),
@@ -923,7 +926,7 @@ fn f24_relative_palette() {
     assert_eq!(changes(&relative), [60]);
 
     // Absolute keys with scene key 8 held arm at 59, then E returns to 2.
-    let absolute = run(wire(true), |step| ControlFrame {
+    let absolute = run(wire(), |step| ControlFrame {
         palette: if step < 30 { 0 } else { ring(step) },
         ..input(step)
     });
