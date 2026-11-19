@@ -16,10 +16,11 @@ wgpu = "0.20"
 winit = "0.29"
 
 [features]
-# Flash/gate (colour-field palettes 3 and 7) can latch only with this feature.
-# It has not been measured by an independent photosensitivity analyser (PEAT
+# Flash/gate (colour-field palettes 3 and 7) can latch, and the mic layers
+# (whose red flashes are not yet bounded) are drawn, only with this feature.
+# Neither has been measured by an independent photosensitivity analyser (PEAT
 # or a Harding-style flash and red-flash check), so it is off by default and
-# must not ship until it has been.
+# must not ship until they have been.
 unmeasured-flash = []
 
 [[bin]]

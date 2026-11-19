@@ -3,10 +3,12 @@
 //! `capture` owns the cpal stream and an analysis thread; `analysis` is the
 //! pure, deterministic signal processing. The render thread only reads the
 //! latest [`AudioFeatures`] from [`SharedFeatures`] (two atomic loads) and
-//! never waits on audio.
+//! never waits on audio. `scope` is the renderer-internal waveform and onset
+//! side channel for the mic layers; it is not part of the control frame.
 
 pub mod analysis;
 mod capture;
+pub mod scope;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

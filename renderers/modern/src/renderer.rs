@@ -4,12 +4,14 @@ use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
+use crate::audio::scope::ScopeSnapshot;
 use crate::control_frame::ControlFrame;
+use crate::phosphor;
 use crate::profile::RenderProfile;
 use crate::scene::{
     Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
 };
-use crate::scenes::{self, CameraMode, SceneConfig, SceneState, colour_field};
+use crate::scenes::{self, CameraMode, SceneConfig, SceneState, colour_field, mic_layers};
 
 /// Offscreen capture format; sRGB like the window's preferred surface format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -23,6 +25,11 @@ pub struct ScenePipeline {
     colour_controls: colour_field::Controls,
     /// Wall-clock step cap for live rendering; `None` steps every new frame.
     step_clock: Option<(colour_field::StepClock, Instant)>,
+    /// Waveform/onset overlay over native scenes; see `scenes::mic_layers`.
+    mic_layers: mic_layers::MicLayers,
+    /// The mic side channel's latest snapshot while mic frames are shown;
+    /// `None` makes the layers fall back to the control frame.
+    live_scope: Option<ScopeSnapshot>,
     /// State registry scenes keep between observed frames.
     scene_state: SceneState,
     /// The colour attachment encodes sRGB on write, so flat colours are
@@ -33,9 +40,19 @@ pub struct ScenePipeline {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
+    /// Scene instances; the overlay's slots follow them in the same buffer.
     instance_capacity: usize,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    overlay_uniform_buffer: wgpu::Buffer,
+    overlay_bind_group: wgpu::BindGroup,
+    /// Draws the mic layers into the phosphor's emitted target.
+    overlay_pipeline: wgpu::RenderPipeline,
+    phosphor_pipelines: phosphor::Pipelines,
+    /// The mic layers' afterglow; made when they first draw, see `phosphor`.
+    phosphor: Option<phosphor::Phosphor>,
+    /// Holds off remaking the phosphor while the target is being resized.
+    settle: phosphor::Settle,
 }
 
 pub struct Renderer {
@@ -192,39 +209,57 @@ impl ScenePipeline {
                 resource: uniform_buffer.as_entire_binding(),
             }],
         });
+        let overlay_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chipviz overlay uniforms"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chipviz overlay bind group"),
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: overlay_uniform_buffer.as_entire_binding(),
+            }],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chipviz pipeline layout"),
             bind_group_layouts: &[&uniform_bind_group_layout],
             push_constant_ranges: &[],
         });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("chipviz render pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[Vertex::layout(), Instance::layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
+        let instance_pipeline = |label, format| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[Vertex::layout(), Instance::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
+        };
+        let render_pipeline = instance_pipeline("chipviz render pipeline", format);
+        let overlay_pipeline = instance_pipeline("chipviz mic layers pipeline", phosphor::FORMAT);
+        let phosphor_pipelines = phosphor::Pipelines::new(&device, format);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chipviz quad vertices"),
             contents: bytemuck::cast_slice(&QUAD_VERTICES),
@@ -233,7 +268,8 @@ impl ScenePipeline {
         let instance_capacity = profile.instance_count.max(1);
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chipviz instances"),
-            size: (instance_capacity * std::mem::size_of::<Instance>()) as u64,
+            size: ((instance_capacity + mic_layers::MAX_INSTANCES)
+                * std::mem::size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -244,6 +280,8 @@ impl ScenePipeline {
             colour_field: colour_field::ColourField::new(colour_field::Config::default()),
             colour_controls: colour_field::Controls::default(),
             step_clock: None,
+            mic_layers: mic_layers::MicLayers::new(mic_layers::Mode::Off),
+            live_scope: None,
             scene_state: SceneState::default(),
             srgb_target: format.is_srgb(),
             device,
@@ -254,6 +292,12 @@ impl ScenePipeline {
             instance_capacity,
             uniform_buffer,
             uniform_bind_group,
+            overlay_uniform_buffer,
+            overlay_bind_group,
+            overlay_pipeline,
+            phosphor_pipelines,
+            phosphor: None,
+            settle: phosphor::Settle::default(),
         }
     }
 
@@ -262,16 +306,53 @@ impl ScenePipeline {
     pub fn reset_state(&mut self) {
         self.camera = Camera::default();
         self.colour_field = colour_field::ColourField::new(self.colour_field.config());
+        self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
         self.scene_state = SceneState::new(self.scene_state.config());
+        self.phosphor = None;
+        self.settle = phosphor::Settle::default();
     }
 
-    /// Steps camera smoothing and the colour field for a frame that is not
-    /// drawn.
-    pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
+    /// Steps camera smoothing, the colour field and the mic layers for a
+    /// frame that is not drawn, at a target of `size` pixels.
+    ///
+    /// The mic layers are built and run through the phosphor as when drawn
+    /// (only the final composite is skipped), so the ribbon's limiter and
+    /// the afterglow of a later drawn frame (a capture still) match a live
+    /// run.
+    ///
+    /// `elapsed` is f64 seconds: the mic layers time bursts with it exactly
+    /// however long the renderer runs; scenes take it as f32.
+    pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame);
-        let (frame, _) = self.dispatch(frame);
+        let (frame, display) = self.dispatch(frame);
         self.camera
-            .build_uniforms(&self.profile, frame, elapsed, aspect);
+            .build_uniforms(&self.profile, frame, elapsed as f32, size_aspect(size));
+        if let Some(count) = self.prepare_mic_layers(frame, display, elapsed, size) {
+            let mut encoder = self.command_encoder();
+            self.encode_phosphor(&mut encoder, None, count, elapsed);
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+    }
+
+    /// Sets the mic layers' mode without applying the build gate. Callers
+    /// outside tests must filter the mode through `mic_layers::allowed()`
+    /// first, as `app` and `capture` do: default builds must draw no layers.
+    pub fn set_mic_layers(&mut self, mode: mic_layers::Mode) {
+        self.mic_layers.set_mode(mode);
+    }
+
+    /// Operator control (`M`): cycles off, scope, bursts, both. Ungated,
+    /// like `set_mic_layers`; callers check the build gate first.
+    pub fn cycle_mic_layers(&mut self) -> mic_layers::Mode {
+        let mode = self.mic_layers.mode().next();
+        self.mic_layers.set_mode(mode);
+        mode
+    }
+
+    /// The mic side channel's snapshot for the next drawn or advanced frame,
+    /// or `None` when the frame does not come from the microphone.
+    pub fn set_live_scope(&mut self, scope: Option<ScopeSnapshot>) {
+        self.live_scope = scope;
     }
 
     /// Replaces the colour-field configuration and restarts it from power-on.
@@ -330,11 +411,39 @@ impl ScenePipeline {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         frame: ControlFrame,
-        elapsed: f32,
+        elapsed: f64,
         size: (u32, u32),
     ) {
+        self.encode_frame(encoder, view, frame, elapsed, size, true);
+    }
+
+    /// `encode` as it was before the mic layers: neither steps nor draws
+    /// them. The baseline that layers `off` must match.
+    #[cfg(test)]
+    pub(crate) fn encode_without_mic_layers(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame: ControlFrame,
+        elapsed: f64,
+        size: (u32, u32),
+    ) {
+        self.encode_frame(encoder, view, frame, elapsed, size, false);
+    }
+
+    fn encode_frame(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame: ControlFrame,
+        elapsed: f64,
+        size: (u32, u32),
+        mic_layers: bool,
+    ) {
+        let overlay_elapsed = elapsed;
+        let elapsed = elapsed as f32;
         let (width, height) = size;
-        let aspect = width as f32 / height.max(1) as f32;
+        let aspect = size_aspect(size);
         let (frame, display) = self.dispatch(frame);
         let (instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
@@ -355,7 +464,133 @@ impl ScenePipeline {
             elapsed,
             aspect,
         );
-        self.encode_instances(encoder, view, &instances, &uniforms);
+        let glow = if mic_layers {
+            self.prepare_mic_layers(frame, display, overlay_elapsed, size)
+        } else {
+            None
+        };
+        match glow {
+            // The scene goes into the phosphor's copy, which the composite
+            // then writes to `view` with the layers added.
+            Some(count) => {
+                let phosphor = self.phosphor.take().expect("prepared above");
+                self.encode_layers(encoder, phosphor.scene(), &instances, &uniforms);
+                self.phosphor = Some(phosphor);
+                self.encode_phosphor(encoder, Some(view), count, overlay_elapsed);
+            }
+            None => self.encode_layers(encoder, view, &instances, &uniforms),
+        }
+    }
+
+    /// Steps the mic layers and uploads their instances. Returns the
+    /// instance count when the phosphor passes should run this frame: while
+    /// the layers draw or the phosphor still glows. With nothing drawn and a
+    /// dark phosphor (always, for layers `off`) no pass runs and the
+    /// phosphor's textures are freed. Entering the colour field or a resize
+    /// drops it at once and holds the layers dark while the dropped light
+    /// would have decayed (and, for a resize, while the target settles; see
+    /// `phosphor::Settle::plan`).
+    fn prepare_mic_layers(
+        &mut self,
+        frame: ControlFrame,
+        display: colour_field::Display,
+        elapsed: f64,
+        size: (u32, u32),
+    ) -> Option<u32> {
+        let aspect = size_aspect(size);
+        // While a resize settles or a dropped afterglow is held dark, nothing
+        // drawn would reach the screen, so the layers step as hidden: no
+        // burst starts that would first appear part way through its rise.
+        let drawable = self.settle.can_draw(
+            self.phosphor.as_ref().map(phosphor::Phosphor::size),
+            size,
+            elapsed,
+        );
+        let shown = mic_layers::shown(self.mic_layers.mode(), display) && drawable;
+        self.mic_layers
+            .step(frame, self.live_scope.as_ref(), elapsed, shown);
+        // Entering the colour field is already a full-screen change; its
+        // colours must follow its trace alone, so no afterglow lingers. The
+        // drop holds the layers dark as a resize's does.
+        if matches!(display, colour_field::Display::ColourField(_)) {
+            if let Some(glow) = self.phosphor.take() {
+                self.settle.drop_lit(glow.fading(), elapsed);
+            }
+            return None;
+        }
+        let mut overlay = Vec::new();
+        if shown {
+            self.mic_layers.build(frame, aspect, &mut overlay);
+        }
+        let count = overlay.len().min(mic_layers::MAX_INSTANCES);
+        let held = self
+            .phosphor
+            .as_ref()
+            .map(|glow| (glow.size(), glow.fading()));
+        match self.settle.plan(held, count, size, elapsed) {
+            phosphor::Plan::Idle => {
+                self.phosphor = None;
+                return None;
+            }
+            phosphor::Plan::Make => {
+                self.phosphor = Some(phosphor::Phosphor::new(
+                    &self.device,
+                    &self.phosphor_pipelines,
+                    size,
+                ));
+            }
+            phosphor::Plan::Draw => {}
+        }
+        if count > 0 {
+            self.queue.write_buffer(
+                &self.instance_buffer,
+                self.overlay_offset(),
+                bytemuck::cast_slice(&overlay[..count]),
+            );
+            // Flat screen-space instances use no other uniform.
+            let flat = Uniforms {
+                view_projection: mic_layers::transform(aspect),
+                time: 0.0,
+                energy: 0.0,
+                beat: 0.0,
+                screen_space: 1.0,
+            };
+            self.queue
+                .write_buffer(&self.overlay_uniform_buffer, 0, bytemuck::bytes_of(&flat));
+        }
+        Some(count as u32)
+    }
+
+    /// Records the phosphor passes for `count` prepared overlay instances,
+    /// compositing onto `view` (with the scene drawn into the phosphor's
+    /// copy first) when given.
+    fn encode_phosphor(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: Option<&wgpu::TextureView>,
+        count: u32,
+        elapsed: f64,
+    ) {
+        let overlay = phosphor::Overlay {
+            pipeline: &self.overlay_pipeline,
+            uniforms: &self.overlay_bind_group,
+            quad: &self.vertex_buffer,
+            instances: self.instance_buffer.slice(self.overlay_offset()..),
+            count,
+        };
+        self.phosphor.as_mut().expect("prepared").encode(
+            encoder,
+            &self.queue,
+            &self.phosphor_pipelines,
+            overlay,
+            elapsed,
+            view,
+        );
+    }
+
+    /// Where the overlay's instances start in the instance buffer.
+    fn overlay_offset(&self) -> u64 {
+        (self.instance_capacity * std::mem::size_of::<Instance>()) as u64
     }
 
     /// What the latest colour-field step shows.
@@ -364,7 +599,19 @@ impl ScenePipeline {
     }
 
     /// Uploads explicit instances and uniforms, then records the render pass.
+    #[cfg(test)]
     pub(crate) fn encode_instances(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        instances: &[Instance],
+        uniforms: &Uniforms,
+    ) {
+        self.encode_layers(encoder, view, instances, uniforms);
+    }
+
+    /// Uploads the scene's instances and uniforms and records their pass.
+    fn encode_layers(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
@@ -465,7 +712,7 @@ impl Renderer {
 
     /// Draws `frame`. The caller feeds new frames to the colour field with
     /// [`ScenePipeline::observe`] first, so held redraws repeat its last step.
-    pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<(), RendererError> {
+    pub fn render(&mut self, frame: ControlFrame, elapsed: f64) -> Result<(), RendererError> {
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -489,6 +736,17 @@ impl OffscreenRenderer {
         width: u32,
         height: u32,
     ) -> Result<Self, RendererError> {
+        Self::with_format(profile, width, height, OFFSCREEN_FORMAT).await
+    }
+
+    /// As [`OffscreenRenderer::new`], drawing into a target of `format` (4
+    /// bytes per pixel, RGBA order), as a surface of that format would.
+    pub(crate) async fn with_format(
+        profile: RenderProfile,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<Self, RendererError> {
         let (width, height) = (width.max(1), height.max(1));
         let (_, device, queue) = request_device(&gpu_instance(), &profile, None).await?;
         check_target_size(width, height, &device.limits())?;
@@ -502,7 +760,7 @@ impl OffscreenRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: OFFSCREEN_FORMAT,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -515,7 +773,7 @@ impl OffscreenRenderer {
             mapped_at_creation: false,
         });
         let aspect = width as f32 / height as f32;
-        let pipeline = ScenePipeline::new(device, queue, OFFSCREEN_FORMAT, profile, aspect);
+        let pipeline = ScenePipeline::new(device, queue, format, profile, aspect);
 
         Ok(Self {
             pipeline,
@@ -528,8 +786,13 @@ impl OffscreenRenderer {
         })
     }
 
+    #[cfg(test)]
     pub fn aspect(&self) -> f32 {
         self.width as f32 / self.height as f32
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     pub fn pipeline_mut(&mut self) -> &mut ScenePipeline {
@@ -544,7 +807,7 @@ impl OffscreenRenderer {
     /// its scene and colour-field state stay those of the earlier frame;
     /// give each frame a distinct counter (or call
     /// [`ScenePipeline::reset_state`]) when rendering unrelated frames.
-    pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<Vec<u8>, RendererError> {
+    pub fn render(&mut self, frame: ControlFrame, elapsed: f64) -> Result<Vec<u8>, RendererError> {
         self.pipeline.observe(&frame);
         let size = (self.width, self.height);
         self.render_with(|pipeline, encoder, view| {
@@ -653,7 +916,11 @@ fn surface_config(
 }
 
 fn aspect(size: PhysicalSize<u32>) -> f32 {
-    size.width.max(1) as f32 / size.height.max(1) as f32
+    size_aspect((size.width, size.height))
+}
+
+fn size_aspect((width, height): (u32, u32)) -> f32 {
+    width.max(1) as f32 / height.max(1) as f32
 }
 
 #[cfg(test)]
@@ -687,5 +954,91 @@ mod tests {
         assert_eq!(padded_row_bytes(64), 256);
         assert_eq!(padded_row_bytes(100), 512);
         assert_eq!(padded_row_bytes(1920), 7680);
+    }
+
+    /// The GPU composite matches its CPU model (`phosphor::composite_pixel`,
+    /// in linear light) within 8-bit rounding for a grid of scene and
+    /// display colours, on an sRGB target and on one that is not sRGB
+    /// (shown as sRGB-coded, so the composite decodes and encodes itself),
+    /// and leaves the scene byte for byte where the display is black.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn phosphor_composite_matches_its_model_on_either_target() {
+        let decode = |byte: u8| {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let encode = |linear: f32| {
+            let value = if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (value * 255.0).round()
+        };
+        let levels = [0_u8, 30, 90, 160, 220, 255];
+        let colours: Vec<[u8; 3]> = (0..216)
+            .map(|index| [levels[index % 6], levels[index / 6 % 6], levels[index / 36]])
+            .collect();
+        let side = colours.len() as u32;
+        let (mut scene, mut display) = (Vec::new(), Vec::new());
+        for row in &colours {
+            for column in &colours {
+                scene.extend_from_slice(&[column[0], column[1], column[2], 255]);
+                display.extend_from_slice(&[row[0], row[1], row[2], 255]);
+            }
+        }
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                side,
+                side,
+                format,
+            ))
+            .unwrap();
+            let pipeline = renderer.pipeline_mut();
+            let glow = phosphor::Phosphor::new(
+                &pipeline.device,
+                &pipeline.phosphor_pipelines,
+                (side, side),
+            );
+            glow.fill(&pipeline.queue, &scene, &display);
+            let drawn = renderer
+                .render_with(|pipeline, encoder, view| {
+                    glow.composite_only(
+                        encoder,
+                        &pipeline.queue,
+                        &pipeline.phosphor_pipelines,
+                        view,
+                    );
+                })
+                .unwrap();
+            for (pixel, got) in drawn.chunks_exact(3).enumerate() {
+                let stored = &scene[pixel * 4..pixel * 4 + 3];
+                let lit = &display[pixel * 4..pixel * 4 + 3];
+                if lit == [0, 0, 0] {
+                    assert_eq!(got, stored, "{format:?} pixel {pixel}: scene changed");
+                    continue;
+                }
+                let out = phosphor::composite_pixel(
+                    std::array::from_fn(|channel| decode(stored[channel])),
+                    std::array::from_fn(|channel| f32::from(lit[channel]) / 255.0),
+                );
+                for (channel, &value) in got.iter().enumerate() {
+                    let error = (f32::from(value) - encode(out[channel])).abs();
+                    assert!(
+                        error <= 1.0,
+                        "{format:?} scene {stored:?} display {lit:?}: got {got:?}, model {out:?}"
+                    );
+                }
+            }
+        }
     }
 }

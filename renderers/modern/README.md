@@ -38,6 +38,7 @@ The renderer starts windowed by default.
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
+| `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
 
@@ -52,6 +53,7 @@ just modern-m1 -- --fullscreen --monitor 1
 | `F`, `Cmd+F`, `Ctrl+Cmd+F` | Toggle fullscreen on the window's current display. |
 | `Esc` | Exit fullscreen (does nothing when windowed). |
 | `L` | Cycle the colour-field layout pin: auto, V2, H2, V3, H3. A pin that changes the layout waits for the change budget. |
+| `M` | Cycle the mic layers: off, scope, bursts, both. |
 | `Cmd+Q` | Quit (macOS application menu). |
 
 The cursor is hidden while fullscreen and restored when windowed.
@@ -138,6 +140,179 @@ All renderer binaries, including `chipviz-pi5` and `chipviz-capture`, link
 against ALSA even when `--mic` is not used. Building needs the headers
 (`libasound2-dev` on Debian and Raspberry Pi OS) and running needs the runtime
 library `libasound2` (e.g. `sudo apt install libasound2`).
+
+## Mic layers
+
+Two overlay layers can be drawn on top of any native scene (never over the
+colour field, scene 7, whose colours depend only on its trace). They are off by
+default; choose them with `--mic-layers` or cycle them with `M`. They do not
+change the control-frame wire format. Their red flashes are not yet bounded
+(see below), so like flash/gate they are drawn only in builds with the
+`unmeasured-flash` Cargo feature, for measurement and development. Default
+builds (including release packages) accept `--mic-layers` and `M`, print a
+notice, and draw nothing.
+
+- `scope`: an oscilloscope ribbon across the lower part of the screen. With
+  `--mic`, it shows a 2,048-sample window aligned on a rising zero crossing,
+  so steady tones hold still; the crossing is searched for in the newest
+  period of a 30 Hz tone (at least 1,024 samples; 1,600 at 48 kHz), so the
+  window can end up to about 33 ms (at 44.1 kHz and above) before the newest
+  sample. Its 256 points each cover 8 samples, and it is drawn as two thin
+  lines through each point's highest and lowest sample. For slow sound (a
+  440 Hz tone, say) the two lines coincide and draw the waveform. Faster
+  tones (from about 1 kHz at 48 kHz; 2 kHz at 96 kHz) and noise would make
+  each line jump between extremes from point to point and fill a band, so
+  the lines blend, by one weight for the whole window, into an envelope (the
+  highest and lowest values within 4 points either side): a loud tone of a
+  few kHz draws as two near-flat lines at its peaks. Tones in between keep
+  their waveform until the lines would cover more height than a loud 440 Hz
+  tone, then blend just enough to stay within that. It is peak-normalised
+  with a floor so room hiss stays flat, and silence flattens it smoothly.
+  Whatever its source (live, procedural or UDP), the ribbon is limited once
+  more just before drawing: if the lines drawn in one frame, strokes
+  included, would cover more than 13% of the screen, they blend towards
+  their envelope and then shrink towards a flat centre line until they fit.
+  This limits each frame's ribbon, not its afterglow (see below). A loud
+  440 Hz tone is drawn unchanged. This limit tightens at once but relaxes
+  over 0.5 s, so input hovering at the limit does not jitter, and just after
+  a loud burst even a 440 Hz tone stays briefly reduced. In portrait windows
+  the whole ribbon (amplitude and stroke widths as well as length) scales
+  with the width. Each line is drawn as a dimmed palette-tinted halo and a
+  near-white tinted core, with a gap between them where the scene shows
+  through (the layers only add light), so the core is its brightest part.
+- `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
+  rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
+  one arriving less than 0.5 s after the last burst started is skipped, and
+  onsets while bursts are hidden (layers `off` or `scope`, scene 7, or the
+  hold after a resize or scene 7, below) start nothing, so none first appears
+  part way up its rise. Hiding bursts drops any still fading, so none
+  reappear mid-fade.
+  In portrait windows bursts shrink with the width, as the ribbon does.
+
+With `--mic`, the analysis thread publishes the samples, the onset count and
+the newest onset's age (in analysed audio) through a lock-free side channel
+(atomics only), which the render thread reads without waiting. An onset older
+than 0.25 s when the renderer sees it, as after rendering was paused, starts
+no burst. When frames come from the procedural source or over UDP, the ribbon
+is synthesised from the eight spectrum bands and the energy, and bursts fire
+when `beat_count` changes.
+
+The layers glow like a long-persistence oscilloscope. They are drawn into
+their own target, and a per-pixel phosphor follows it in linear light: each
+channel rises at once to what is drawn but falls by at most 0.15 per second of
+full brightness, and the result is added onto the scene. So the ribbon leaves
+a fading trail wherever it has been, and a moving ribbon's trails can cover
+far more of the screen than the 13% one frame draws; a burst lingers for a few
+seconds after it ends; and turning the layers off fades them out over up to
+about 6.7 s rather than cutting. Entering the colour field (scene 7), which is
+already a full-screen change, clears the afterglow at once, so nothing is ever
+drawn over it, and a window resize clears it too. Either sudden fall is one
+the decay would have allowed, given time, so the layers then stay dark for as
+long as the decay would have taken to fade what was cleared. The hold counts
+from the layers' last drawn frame, so while the ribbon is shown (it draws
+every frame) it is usually the full 6.7 s; only after the layers have drawn
+nothing for a while is it shorter. After a resize the layers also wait until
+the size has held still for 0.15 s, so a drag does not reallocate anything
+each frame. Resizing in steps, or switching in and out of scene 7, therefore
+makes the layers vanish and return, with their trails restarted, but no faster
+than they could fade. Being added light, the layers brighten the scene beneath
+them and never darken it, so they cannot be seen where the scene is white
+(Static's white sections, for example); darkening the scene beneath them would
+make their falls depend on the scene, outside the bound below. Red layer
+colours are drawn slightly pink (see below).
+
+While the layers glow, the scene is drawn into a texture of its own and a
+final pass writes it with the layers added, in linear light; on a surface that
+is not sRGB, that pass decodes and encodes sRGB itself. The phosphor needs
+four 8-bit RGBA textures at the window size (the layers, two for the
+afterglow, and the scene copy): about 33 MB at 1920x1080 and 133 MB at
+3840x2160. Nothing is allocated, and no pass runs, until the layers first
+draw, and the textures are freed again once the afterglow has faded out. On an
+M1 Max, with scene 0 and both layers, a frame took about 0.3 ms longer at
+1920x1080 (2.09 ms against 1.80 ms with layers off) and 1.8 ms longer at
+3840x2160 (3.64 ms against 1.80 ms). The Pi 5 has not been measured; check its
+frame rate with the layers on before relying on them there, especially at 4K.
+
+The layers' added light (the output minus the scene) depends on the scene
+only where a channel saturates at full brightness, so a scene change alters
+it by at most the same amount in each linear channel; nothing about the
+layers switches on the scene's colour. Luminance flashes are bounded for any
+input, frame rate or geometry. A flash (WCAG 2.3.1) is a pair of opposing
+changes of at least 0.1 relative luminance, and relative luminance falls no
+faster than the fastest channel. Three flashes in 1 s would need three falls
+of 0.1 ending in that second, the last two wholly inside it, and 0.2 of fall
+takes at least 1.28 s at 0.15 per second (counting the decay's rounding), so
+the light the layers add to any point flashes at most twice in any 1 s, under
+the limit of three, with about 28% to spare for output rounding and frame
+timing. Where the scene moves, the added light also moves by up to the
+scene's own change.
+
+That bound is on the light the layers add, not on what reaches the screen.
+A scene that animates in step with the layers can combine with them into
+flashes neither makes alone: a grey scene point alternating between black
+and 0.091 at 5 Hz, under layers alternating between black and 10/255 in
+step, changes by more than 0.1 five times a second, at 120 fps. This is one
+reason the layers are gated (below).
+
+Red flashes are not bounded. A red flash needs a saturated red, at least 80%
+of a point's light, at one end of a change of its redness, and green or blue
+rising over a red point lowers its redness as much as red falling. The
+afterglow keeps green plus blue at least a third of its red (at most 75%
+red), so where the scene is not a saturated red, the layers never make one.
+But over a scene point that is already a saturated red, small green blips,
+relit as soon as they fade, make three red flashes in 1 s. Fading the layers
+out over red scene points would avoid that, but only with a steep switch on
+the scene's colour, which turns small, harmless scene changes (one level of
+noise near black, say) into large changes of the layers. Until there is a
+design with a stated bound for red and for the combined output, and the
+layers have been measured, they stay behind `unmeasured-flash`.
+
+Unit tests run a CPU model of the phosphor against adversarial per-pixel input
+at 60, 120 and 240 fps, steady and jittered. For luminance (alternating every
+frame, square waves of every period, random colours, and input that relights a
+pixel as soon as it has dimmed by 0.1) they find at most two flashes in any 1
+s; at 0.25 per second the relighting input reaches three. For red (red against
+white, red and green squares, relighting in red, green or white, a red and
+green staircase, and random colours) they find no saturated red over black,
+grey, orange, duller red and blue scenes, where per-channel decay with no
+floor allows three red flashes in 1 s, and they find three over saturated red
+scenes. Over animated scenes (one-level noise near black, a dark red changing
+every frame, and red and grey alternating at two flashes per second), the
+output never has more luminance or red flashes in 1 s than the larger of two
+and the scene's own for those inputs; the earlier switch on the scene's colour
+turned the dark red into over 100 flashes in 1 s. A regression test keeps the
+in-step counterexample above (five flashes in 1 s), and another pins the
+output to the scene over white. Windows alternating between two sizes, or
+between scene 7 and a native scene, every 0.16 to 8 s give at most two flashes
+in 1 s; without the hold, every 0.2 s gives five for sizes and three for scene
+7. GPU tests check that the composite matches its model on sRGB and non-sRGB
+targets; that the light added at any unsaturated pixel of an animated scene
+falls no faster than the decay; that a replayed still matches a live run; that
+the colour field is never drawn over; and that layers `off` render exactly as
+before the layers existed.
+
+The design keeps the layers calm well within the luminance bound. Each burst
+is a single smooth, partly transparent rise and fall (glow at most 30% and
+sparks at most 50% opacity), with its colour and peak fixed when it starts,
+new bursts start at most once every 0.5 s, and at most four are alive at
+once.
+Unit tests rasterise the ribbon for a loud 4 kHz tone and white noise gated
+at 3, 5 and 10 Hz, and for loud tones every 100 Hz from 0.5 to 8 kHz (plus
+those that divide the point spacing) at 44.1, 48 and 96 kHz, steady and
+gated. They check that it never draws more area than a steady full-scale
+440 Hz ribbon, nor more than 13% of the screen. Further tests pass a sparse
+pulse train, mixed snapshots (a read racing a publish), the densest
+synthesised ribbon, portrait windows (9:16 and 1:10) and a thousand seeded
+random outlines through the final limit, and check each stays within 13% of
+the screen. Overlay timing is kept in f64 seconds, so burst timing and the
+0.5 s cap hold however long the renderer runs (a test checks after 30 days).
+These are models, not photometric measurements: measure the actual display
+before relying on this for a photosensitive audience.
+
+```sh
+cargo run --manifest-path renderers/modern/Cargo.toml \
+  --features unmeasured-flash --bin chipviz-m1 -- --mic --mic-layers both
+```
 
 ## Scene plan
 
@@ -300,6 +475,9 @@ by default and must not be enabled for releases:
 - **`--features unmeasured-flash`** runs flash/gate as the spec describes, for
   measurement and development only.
 
+The same feature gates the mic layers, whose red flashes are not yet bounded
+(see [Mic layers](#mic-layers)): default builds never draw them.
+
 `just rust-lint` and `just rust-test` run clippy and the tests for both
 builds. The default build's tests check that every armed fixture equals hard
 cuts, and count WCAG 2.3.1 general and red flashes in its rendered sequences
@@ -330,7 +508,13 @@ the `unmeasured-flash` feature, a recording arms it only as a target would,
 from a stable absolute wire 3 or 7 held in scene 7, and default builds never
 flash. Recorded inputs use
 their wire palettes; procedural input uses palette 0. `--input` is `procedural` (default) or a `.cvz` file of
-concatenated control-frame packets, such as the bridge's `--output`.
+concatenated control-frame packets, such as the bridge's `--output`, or
+`synth-mic`, a deterministic synthetic microphone (110 Hz and 330 Hz tones with
+a click every 0.5 s, silent from 6 s). It uses the same analyser and scope tap
+as `--mic`, but is fed one capture frame of samples at a time in the capture
+thread, with no device, analysis thread, dropped audio, or wall-clock timing,
+so its results can differ slightly from a live microphone.
+`--mic-layers` draws the [mic layers](#mic-layers) as in the renderer.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`
 for every option. The GPU smoke test is ignored by default; run it with
 `cargo test --manifest-path renderers/modern/Cargo.toml --lib -- --ignored`.

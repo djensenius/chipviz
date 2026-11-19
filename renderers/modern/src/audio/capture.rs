@@ -32,6 +32,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
 
 use super::analysis::Analyzer;
+use super::scope::{ScopeSnapshot, ScopeTap, SharedScope};
 use super::{AudioFeatures, SharedFeatures};
 
 const RING_S: f32 = 1.0;
@@ -136,6 +137,8 @@ impl InputDevices {
 /// both.
 pub struct MicSource {
     shared: Arc<SharedFeatures>,
+    /// Only in builds that can draw the mic layers, its sole reader.
+    scope: Option<Arc<SharedScope>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     // Dropped after `Drop::drop` has joined the analysis thread.
@@ -167,18 +170,27 @@ impl MicSource {
             .map_err(|error| describe(&name, "could not start capturing", &error))?;
 
         let shared = Arc::new(SharedFeatures::default());
+        let scope = scope_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let shared = shared.clone();
+            let scope = scope.clone();
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("chipviz-audio".to_string())
-                .spawn(move || analysis_loop(&mut analyzer, consumer, &dropped, &shared, &stop))
+                .spawn(move || {
+                    let outputs = Outputs {
+                        features: &shared,
+                        scope: scope.as_deref(),
+                    };
+                    analysis_loop(&mut analyzer, consumer, &dropped, outputs, &stop)
+                })
                 .map_err(|error| format!("could not start the audio analysis thread: {error}"))?
         };
         eprintln!("microphone: {name} ({sample_rate} Hz, {channels} ch)");
         Ok(Self {
             shared,
+            scope,
             stop,
             thread: Some(thread),
             _stream: stream,
@@ -188,6 +200,12 @@ impl MicSource {
     /// Latest analysed features; never blocks.
     pub fn latest(&self) -> AudioFeatures {
         self.shared.load()
+    }
+
+    /// The waveform and onset side channel for the mic layers; `None` in
+    /// builds that never draw them.
+    pub fn scope(&self) -> Option<Arc<SharedScope>> {
+        self.scope.clone()
     }
 }
 
@@ -666,14 +684,56 @@ fn snapshot(
     }
 }
 
+/// Advances the analyzer and scope tap through one poll: synthesized
+/// `silence`, then the skipped interval, then the retained ring samples.
+/// The tap has no beat clock, so it records skipped time as silence: audio
+/// from before the gap ages out and the peak normaliser releases across it.
+/// Returns whether any analysed sample was non-zero.
+fn feed(
+    analyzer: &mut Analyzer,
+    tap: &mut ScopeTap,
+    silence: usize,
+    drain: &Drain,
+    consumer: &mut rtrb::Consumer<f32>,
+) -> bool {
+    // Silence covers time before this poll's real samples.
+    analyzer.push_silence(silence);
+    tap.push_silence(silence);
+    if drain.skip > 0 {
+        analyzer.skip(drain.skip);
+        tap.push_silence(drain.skip);
+    }
+    let mut heard = false;
+    drain.apply(consumer, |samples| {
+        heard |= samples.iter().any(|&s| s != 0.0);
+        analyzer.push(samples);
+        tap.push(samples);
+    });
+    heard
+}
+
+/// The mic layers' waveform and onset side channel, made only when they
+/// can be drawn (`mic_layers::LAYERS_BUILD`): nothing else reads it, so
+/// default builds skip building and publishing a snapshot every poll.
+fn scope_channel() -> Option<Arc<SharedScope>> {
+    crate::scenes::mic_layers::LAYERS_BUILD.then(|| Arc::new(SharedScope::default()))
+}
+
+/// Where the analysis thread publishes each poll's results.
+struct Outputs<'a> {
+    features: &'a SharedFeatures,
+    scope: Option<&'a SharedScope>,
+}
+
 fn analysis_loop(
     analyzer: &mut Analyzer,
     mut consumer: rtrb::Consumer<f32>,
     dropped: &AtomicUsize,
-    shared: &SharedFeatures,
+    outputs: Outputs<'_>,
     stop: &AtomicBool,
 ) {
     let rate = analyzer.sample_rate();
+    let mut tap = ScopeTap::new(rate);
     let max_backlog = (rate * MAX_BACKLOG_S) as usize;
     let started = Instant::now();
     let mut clock = SampleClock::new(rate, started);
@@ -684,16 +744,21 @@ fn analysis_loop(
         let (now, dropped, available) = snapshot(dropped, &consumer, Instant::now);
         let accounting = clock.poll(now, dropped + available);
         let drain = Drain::plan(dropped, available, accounting.overlap, max_backlog);
-        // Silence covers time before this poll's real samples.
-        analyzer.push_silence(accounting.silence);
-        if drain.skip > 0 {
-            analyzer.skip(drain.skip);
+        heard_signal |= feed(
+            analyzer,
+            &mut tap,
+            accounting.silence,
+            &drain,
+            &mut consumer,
+        );
+        outputs.features.store(analyzer.features());
+        // The onset count wraps; the mic layers only look for changes.
+        if let Some(scope) = outputs.scope {
+            scope.store(&ScopeSnapshot {
+                onset_age_s: analyzer.onset_age_s(),
+                ..tap.snapshot(analyzer.onsets() as u32)
+            });
         }
-        drain.apply(&mut consumer, |samples| {
-            heard_signal |= samples.iter().any(|&s| s != 0.0);
-            analyzer.push(samples);
-        });
-        shared.store(analyzer.features());
 
         if !warned && !heard_signal && now.duration_since(started) > SILENCE_WARNING {
             warned = true;
@@ -709,6 +774,14 @@ fn analysis_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scope_is_published_only_in_builds_that_draw_the_mic_layers() {
+        assert_eq!(
+            scope_channel().is_some(),
+            crate::scenes::mic_layers::LAYERS_BUILD
+        );
+    }
 
     #[test]
     fn error_limiter_reports_once_per_interval_with_suppressed_count() {
@@ -810,6 +883,54 @@ mod tests {
         assert_eq!(analysed, (4..10).map(|i| i as f32).collect::<Vec<_>>());
         assert_eq!(consumer.slots(), 5);
         assert_eq!(consumer.pop(), Ok(10.0));
+    }
+
+    #[test]
+    fn a_discarded_ring_ages_the_pre_gap_waveform_out_of_the_scope() {
+        let rate = 48_000;
+        let mut analyzer = Analyzer::new(rate).unwrap();
+        let mut tap = ScopeTap::new(rate as f32);
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(rate as usize);
+        let tone = |count: usize| {
+            (0..count).map(|n| 0.8 * (std::f32::consts::TAU * 220.0 * n as f32 / 48_000.0).sin())
+        };
+        for sample in tone(9_600) {
+            producer.push(sample).unwrap();
+        }
+        let drain = Drain::plan(0, consumer.slots(), 0, 48_000);
+        assert!(feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer));
+        assert!(tap.snapshot(0).upper.iter().any(|&point| point > 0.5));
+
+        // The ring overflows: its whole contents and the drops are skipped.
+        for sample in tone(rate as usize) {
+            producer.push(sample).unwrap();
+        }
+        // Drops for 2 s: 3 s of skipped time in all.
+        let drain = Drain::plan(2 * rate as usize, consumer.slots(), 0, 4_800);
+        assert_eq!((drain.discard, drain.analyse), (rate as usize, 0));
+        assert!(!feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer));
+        assert_eq!(consumer.slots(), 0);
+        let gap = tap.snapshot(0);
+        assert_eq!(gap.upper, [0.0; super::super::scope::POINTS]);
+        assert_eq!(gap.lower, gap.upper);
+
+        // Quiet post-gap audio is not stretched by the pre-gap peak's gain:
+        // the peak released across the skipped interval.
+        for sample in tone(4_800).map(|sample| sample * 0.05) {
+            producer.push(sample).unwrap();
+        }
+        let drain = Drain::plan(0, consumer.slots(), 0, 4_800);
+        feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer);
+        let peak = tap
+            .snapshot(0)
+            .upper
+            .iter()
+            .fold(0.0_f32, |peak, point| peak.max(point.abs()));
+        // Unreleased, the pre-gap peak would hold this near 0.05.
+        assert!(
+            peak > 0.2,
+            "the peak did not release across the gap: {peak}"
+        );
     }
 
     const RATE: f32 = 48_000.0;

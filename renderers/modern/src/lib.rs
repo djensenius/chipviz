@@ -2,6 +2,7 @@ mod app;
 mod audio;
 pub mod capture;
 mod control_frame;
+mod phosphor;
 mod profile;
 mod renderer;
 mod scene;

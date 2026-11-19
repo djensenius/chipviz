@@ -4,16 +4,20 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::audio::analysis::Analyzer;
+use crate::audio::mic_frame;
+use crate::audio::scope::{ScopeSnapshot, ScopeTap};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
-use crate::renderer::OffscreenRenderer;
-use crate::scenes::{self, CameraMode, SceneConfig, colour_field};
+use crate::renderer::{OffscreenRenderer, ScenePipeline};
+use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers};
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
 
 const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scene N]
-                       [--frames 0,60,120] [--input procedural|PATH.cvz] [--size WxH]
+                       [--frames 0,60,120] [--input procedural|synth-mic|PATH.cvz]
+                       [--size WxH] [--mic-layers off|scope|bursts|both]
                        [--lines-drop-cuts]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
@@ -21,8 +25,13 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --scene    force the control-frame scene byte: 7 is the colour field,
              otherwise registry index = N % scene count
   --frames   comma-separated frame indices (default 0); elapsed = index / 60 s
-  --input    procedural frames (default) or a raw .cvz control-frame file
+  --input    procedural frames (default), synth-mic (a deterministic synthetic
+             microphone: tones plus a click every 0.5 s, silent from 6 s, run
+             through the live analyzer and waveform tap) or a raw .cvz file
   --size     output size in pixels (default: the profile's target size)
+  --mic-layers
+             overlay the mic layers: off (default), scope, bursts or both;
+             only builds with the unmeasured-flash feature draw them
   --lines-drop-cuts
              Lines (scene 3) cuts on a rising drop flag, as the renderer's
              flag of the same name (default: drops are ignored); only
@@ -31,6 +40,7 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     Procedural,
+    SynthMic,
     File(PathBuf),
 }
 
@@ -42,6 +52,7 @@ pub struct CaptureArgs {
     pub input: Input,
     pub size: (u32, u32),
     pub out: PathBuf,
+    pub mic_layers: mic_layers::Mode,
     pub lines_drop_cuts: bool,
 }
 
@@ -58,6 +69,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     let mut input = Input::Procedural;
     let mut size = None;
     let mut out = None;
+    let mut layers = mic_layers::Mode::Off;
     let mut lines_drop_cuts = false;
     let mut args = args.into_iter();
 
@@ -94,10 +106,10 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
             }
             "--input" => {
                 let text = value()?;
-                input = if text == "procedural" {
-                    Input::Procedural
-                } else {
-                    Input::File(PathBuf::from(text))
+                input = match text.as_str() {
+                    "procedural" => Input::Procedural,
+                    "synth-mic" => Input::SynthMic,
+                    _ => Input::File(PathBuf::from(text)),
                 };
             }
             "--size" => {
@@ -109,6 +121,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                 size = Some(parsed.ok_or_else(|| format!("--size expects WxH, got {text}"))?);
             }
             "--out" => out = Some(PathBuf::from(value()?)),
+            "--mic-layers" => {
+                let text = value()?;
+                layers = mic_layers::Mode::parse(&text).ok_or_else(|| {
+                    format!("--mic-layers expects off|scope|bursts|both, got {text}")
+                })?;
+            }
             "--lines-drop-cuts" => lines_drop_cuts = true,
             _ => return Err(format!("unknown argument: {arg}")),
         }
@@ -123,6 +141,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
         input,
         size,
         out,
+        mic_layers: layers,
         lines_drop_cuts,
     }))
 }
@@ -167,14 +186,99 @@ impl FrameSource {
     }
 }
 
-fn elapsed(index: u64) -> f32 {
-    index as f32 / CAPTURE_FPS
+fn elapsed(index: u64) -> f64 {
+    index as f64 / f64::from(CAPTURE_FPS)
+}
+
+pub const SYNTH_RATE: u32 = 48_000;
+const SYNTH_SAMPLES_PER_FRAME: u64 = SYNTH_RATE as u64 / CAPTURE_FPS as u64;
+const SYNTH_BEAT_S: f64 = 0.5;
+const SYNTH_SILENT_FROM_S: f64 = 6.0;
+
+/// Sample `n` of the synthetic microphone: a 110 Hz tone with its third
+/// harmonic, plus a 40 ms noise click every 0.5 s (120 BPM); silent from
+/// 6 s on, so later frames show the layers decaying.
+pub fn synth_sample(n: u64) -> f32 {
+    let t = n as f64 / f64::from(SYNTH_RATE);
+    if t >= SYNTH_SILENT_FROM_S {
+        return 0.0;
+    }
+    let tau = std::f64::consts::TAU;
+    let tone = 0.25 * (tau * 110.0 * t).sin() + 0.12 * (tau * 330.0 * t + 0.5).sin();
+    let since = t % SYNTH_BEAT_S;
+    let click = if since < 0.04 {
+        let noise = f64::from(scenes::hash(n as u32)) * 2.0 - 1.0;
+        0.6 * (-since / 0.008).exp() * noise
+    } else {
+        0.0
+    };
+    (tone + click) as f32
+}
+
+/// `--input synth-mic`: feeds [`synth_sample`] through the live analyzer and
+/// waveform tap, one capture frame at a time, as the analysis thread would.
+struct SynthMic {
+    analyzer: Analyzer,
+    tap: ScopeTap,
+    next_sample: u64,
+    beat_count: Option<u16>,
+}
+
+impl SynthMic {
+    fn new() -> Result<Self, String> {
+        let analyzer = Analyzer::new(SYNTH_RATE)?;
+        Ok(Self {
+            tap: ScopeTap::new(analyzer.sample_rate()),
+            analyzer,
+            next_sample: 0,
+            beat_count: None,
+        })
+    }
+
+    /// Feeds the audio up to frame `index`'s time; returns the mic frame
+    /// (built on `base`, as live mic frames are) and the scope snapshot.
+    fn advance(&mut self, base: ControlFrame, index: u64) -> (ControlFrame, ScopeSnapshot) {
+        let end = index * SYNTH_SAMPLES_PER_FRAME;
+        let samples: Vec<f32> = (self.next_sample..end).map(synth_sample).collect();
+        self.next_sample = self.next_sample.max(end);
+        self.analyzer.push(&samples);
+        self.tap.push(&samples);
+        let features = self.analyzer.features();
+        let frame = mic_frame(base, features, self.beat_count);
+        self.beat_count = Some(features.beat_count);
+        let snapshot = ScopeSnapshot {
+            onset_age_s: self.analyzer.onset_age_s(),
+            ..self.tap.snapshot(self.analyzer.onsets() as u32)
+        };
+        (frame, snapshot)
+    }
+}
+
+/// Hands the pipeline frame `index`'s side-channel snapshot (synthetic mic
+/// only) and returns the frame to draw.
+fn feed(
+    pipeline: &mut ScenePipeline,
+    synth: Option<&mut SynthMic>,
+    base: ControlFrame,
+    index: u64,
+) -> ControlFrame {
+    match synth {
+        Some(synth) => {
+            let (frame, scope) = synth.advance(base, index);
+            pipeline.set_live_scope(Some(scope));
+            frame
+        }
+        None => {
+            pipeline.set_live_scope(None);
+            base
+        }
+    }
 }
 
 pub fn run(args: &CaptureArgs) -> Result<(), String> {
     let source = FrameSource {
         fixture: match &args.input {
-            Input::Procedural => None,
+            Input::Procedural | Input::SynthMic => None,
             Input::File(path) => {
                 let bytes =
                     std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -201,11 +305,19 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         .pipeline_mut()
         .configure_colour_field(colour_field::Config {
             palette: match args.input {
-                Input::Procedural => colour_field::PaletteSource::Local { p: 0, armed: false },
+                Input::Procedural | Input::SynthMic => {
+                    colour_field::PaletteSource::Local { p: 0, armed: false }
+                }
                 Input::File(_) => colour_field::PaletteSource::Wire,
             },
             ..colour_field::Config::default()
         });
+    // Default builds draw no mic layers (see `mic_layers::LAYERS_BUILD`).
+    let layers = mic_layers::allowed(args.mic_layers);
+    if layers != args.mic_layers {
+        eprintln!("{}", mic_layers::NO_LAYERS_NOTICE);
+    }
+    renderer.pipeline_mut().set_mic_layers(layers);
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
     });
@@ -214,13 +326,18 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     for &index in &args.frames {
         // Replay camera smoothing and the colour field from frame 0 so stills
         // match a live run.
-        let aspect = renderer.aspect();
+        let size = renderer.size();
+        let mut synth = match args.input {
+            Input::SynthMic => Some(SynthMic::new()?),
+            _ => None,
+        };
         let pipeline = renderer.pipeline_mut();
         pipeline.reset_state();
         for previous in 0..index {
-            pipeline.advance_state(source.frame(previous)?, elapsed(previous), aspect);
+            let frame = feed(pipeline, synth.as_mut(), source.frame(previous)?, previous);
+            pipeline.advance_state(frame, elapsed(previous), size);
         }
-        let frame = source.frame(index)?;
+        let frame = feed(pipeline, synth.as_mut(), source.frame(index)?, index);
         let rgb = renderer
             .render(frame, elapsed(index))
             .map_err(|error| error.to_string())?;
@@ -248,12 +365,14 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
 
     let input = match &args.input {
         Input::Procedural => "procedural".to_string(),
+        Input::SynthMic => "synth-mic".to_string(),
         Input::File(path) => path.display().to_string(),
     };
     let manifest = format!(
-        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"captures\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"captures\": [\n{}\n  ]\n}}\n",
         json_string(args.profile.name),
         json_string(&input),
+        json_string(layers.name()),
         captures.join(",\n"),
     );
     let path = args.out.join("manifest.json");
@@ -311,6 +430,7 @@ pub fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::phosphor;
 
     fn parse(args: &[&str]) -> Result<CaptureArgs, String> {
         match parse_args(args.iter().map(|arg| arg.to_string()))? {
@@ -334,9 +454,12 @@ mod tests {
             "1920x1080",
             "--out",
             "shots",
+            "--mic-layers",
+            "scope",
             "--lines-drop-cuts",
         ])
         .unwrap();
+        assert_eq!(args.mic_layers, mic_layers::Mode::Scope);
         assert!(args.lines_drop_cuts);
         assert_eq!(args.profile.name, "pi5");
         assert_eq!(args.scene, Some(4));
@@ -354,6 +477,9 @@ mod tests {
         assert_eq!(args.frames, [0]);
         assert_eq!(args.input, Input::Procedural);
         assert_eq!(args.size, (3840, 2160));
+        assert_eq!(args.mic_layers, mic_layers::Mode::Off);
+        let synth = parse(&["--out", "o", "--input", "synth-mic"]).unwrap();
+        assert_eq!(synth.input, Input::SynthMic);
         assert!(!args.lines_drop_cuts);
     }
 
@@ -367,6 +493,7 @@ mod tests {
             &["--out", "o", "--size", "0x10"],
             &["--out", "o", "--size", "1920"],
             &["--out", "o", "--bogus"],
+            &["--out", "o", "--mic-layers", "all"],
             &["--out"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
@@ -411,6 +538,37 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_mic_is_deterministic_detects_clicks_and_falls_silent() {
+        let run = || {
+            let mut synth = SynthMic::new().unwrap();
+            (0..=420)
+                .map(|index| synth.advance(ControlFrame::procedural(index), index))
+                .collect::<Vec<_>>()
+        };
+        let frames = run();
+        let again = run();
+        for ((frame, scope), (other, other_scope)) in frames.iter().zip(&again) {
+            assert_eq!(scope, other_scope);
+            assert_eq!(
+                (frame.energy, frame.spectrum),
+                (other.energy, other.spectrum)
+            );
+        }
+        // About one onset per click in the 6 s of sound (12 clicks).
+        let onsets = frames[400].1.onsets;
+        assert!((8..=14).contains(&onsets), "{onsets} onsets");
+        let (loud, loud_scope) = &frames[200];
+        assert!(loud.energy > 40, "{loud:?}");
+        assert!(loud_scope.upper.iter().any(|&point| point > 0.3));
+        // From 6 s (frame 360) the input is silent: flat waveform, no onsets.
+        let (quiet, quiet_scope) = &frames[420];
+        assert_eq!(quiet_scope.upper, [0.0; crate::audio::scope::POINTS]);
+        assert_eq!(quiet_scope.lower, quiet_scope.upper);
+        assert_eq!(quiet_scope.onsets, frames[380].1.onsets);
+        assert!(quiet.energy < loud.energy);
+    }
+
+    #[test]
     fn json_strings_are_escaped() {
         assert_eq!(json_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
     }
@@ -439,6 +597,267 @@ mod tests {
                 "scene {scene} is blank"
             );
         }
+    }
+
+    /// The mic layers never touch the colour field, and `off` renders exactly
+    /// as a pipeline that never steps or encodes them; over a native scene
+    /// `both` does draw (the no-mic fallback ribbon and beat bursts).
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn mic_layers_skip_the_colour_field_and_off_matches_the_baseline() {
+        // `None` renders through the encode path with no mic layers at all.
+        let render = |scene: u8, mode: Option<mic_layers::Mode>| {
+            let (width, height) = (160, 90);
+            let mut renderer =
+                pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                    .unwrap();
+            if let Some(mode) = mode {
+                renderer.pipeline_mut().set_mic_layers(mode);
+            }
+            let mut last = Vec::new();
+            // Two seconds at 60 fps, so beats change and bursts would fire.
+            for index in 0..120 {
+                let frame = ControlFrame {
+                    scene,
+                    ..ControlFrame::procedural(index)
+                };
+                let elapsed = elapsed(index);
+                last = match mode {
+                    Some(_) => renderer.render(frame, elapsed).unwrap(),
+                    None => {
+                        renderer.pipeline_mut().observe(&frame);
+                        renderer
+                            .render_with(|pipeline, encoder, view| {
+                                pipeline.encode_without_mic_layers(
+                                    encoder,
+                                    view,
+                                    frame,
+                                    elapsed,
+                                    (width, height),
+                                );
+                            })
+                            .unwrap()
+                    }
+                };
+            }
+            last
+        };
+        let both = Some(mic_layers::Mode::Both);
+        let off = Some(mic_layers::Mode::Off);
+        let field = render(colour_field::SCENE, None);
+        assert_eq!(render(colour_field::SCENE, both), field, "scene 7 overlaid");
+        assert_eq!(render(colour_field::SCENE, off), field);
+        let native = render(0, None);
+        assert_eq!(render(0, off), native, "off differs from the baseline");
+        assert_ne!(render(0, both), native, "both drew nothing over scene 0");
+    }
+
+    /// The GPU phosphor behaves as its CPU model: over scene 0, with both
+    /// layers drawing and then turned off, the light the layers add to any
+    /// unsaturated pixel (the capture minus the layer-free baseline, in
+    /// linear light), whether the animated scene there moves or not, falls
+    /// by at most `DECAY_PER_S` per second (plus 8-bit rounding), and once
+    /// it has faded the capture matches the baseline byte for byte.
+    /// This holds on an sRGB target and on one that is not sRGB (shown as
+    /// sRGB-coded), where the composite encodes for itself.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn phosphor_falls_no_faster_than_its_decay_and_fades_to_the_baseline() {
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            phosphor_falls_on(format);
+        }
+    }
+
+    fn phosphor_falls_on(format: wgpu::TextureFormat) {
+        let (width, height) = (160, 90);
+        let new = || {
+            pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                width,
+                height,
+                format,
+            ))
+            .unwrap()
+        };
+        let (mut layered, mut baseline) = (new(), new());
+        layered
+            .pipeline_mut()
+            .set_mic_layers(mic_layers::Mode::Both);
+        let linear = |byte: u8| {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let fps = CAPTURE_FPS as u64;
+        // 3 s drawing, then 7 s off: longer than the 1 / DECAY_PER_S fade.
+        let (lit, total) = (3 * fps, 10 * fps);
+        let window = fps / 2;
+        let mut excess: Vec<Vec<f32>> = Vec::new();
+        let mut last = (Vec::new(), Vec::new());
+        for index in 0..total {
+            if index == lit {
+                layered.pipeline_mut().set_mic_layers(mic_layers::Mode::Off);
+            }
+            let frame = ControlFrame {
+                scene: 0,
+                ..ControlFrame::procedural(index)
+            };
+            let elapsed = elapsed(index);
+            let drawn = layered.render(frame, elapsed).unwrap();
+            baseline.pipeline_mut().observe(&frame);
+            let base = baseline
+                .render_with(|pipeline, encoder, view| {
+                    pipeline.encode_without_mic_layers(
+                        encoder,
+                        view,
+                        frame,
+                        elapsed,
+                        (width, height),
+                    );
+                })
+                .unwrap();
+            // Saturated channels hide the added light; mark them unknown.
+            excess.push(
+                drawn
+                    .iter()
+                    .zip(&base)
+                    .map(|(&drawn, &base)| {
+                        if drawn == 255 {
+                            f32::NAN
+                        } else {
+                            linear(drawn) - linear(base)
+                        }
+                    })
+                    .collect(),
+            );
+            if index == lit {
+                assert_ne!(
+                    drawn, base,
+                    "{format:?}: no afterglow just after turning off"
+                );
+            }
+            last = (drawn, base);
+        }
+        assert!(
+            last.0 == last.1,
+            "{format:?}: the afterglow never faded to the baseline"
+        );
+        // Half-second windows: at most DECAY_PER_S / 2, plus a rounding
+        // margin for two 8-bit encodes per frame.
+        let bound = phosphor::DECAY_PER_S * 0.5 + 0.02;
+        let (mut steepest, mut measured) = (0.0_f32, 0_usize);
+        for (earlier, later) in excess.iter().zip(&excess[window as usize..]) {
+            for (&before, &after) in earlier.iter().zip(later) {
+                if before.is_finite() && after.is_finite() {
+                    steepest = steepest.max(before - after);
+                    measured += 1;
+                }
+            }
+        }
+        assert!(measured > 100_000, "{format:?}: only {measured} samples");
+        assert!(
+            steepest <= bound,
+            "{format:?}: fell {steepest} in 0.5 s (bound {bound})"
+        );
+        eprintln!(
+            "{format:?}: steepest fall {steepest} in 0.5 s over {measured} samples (bound {bound})"
+        );
+        assert!(
+            steepest > 0.02,
+            "{format:?}: the afterglow should visibly fade: {steepest}"
+        );
+    }
+
+    /// Switching from a native scene with glowing layers to the colour
+    /// field drops the afterglow on the frame the field appears: every
+    /// colour-field frame matches a layer-free baseline byte for byte.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn entering_the_colour_field_drops_the_afterglow() {
+        let (width, height) = (160, 90);
+        let new = || {
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height)).unwrap()
+        };
+        let (mut layered, mut baseline) = (new(), new());
+        layered
+            .pipeline_mut()
+            .set_mic_layers(mic_layers::Mode::Both);
+        let fps = CAPTURE_FPS as u64;
+        let (native, total) = (2 * fps, 4 * fps);
+        let (mut glowed, mut field_frames) = (false, 0);
+        for index in 0..total {
+            let scene = if index < native {
+                0
+            } else {
+                colour_field::SCENE
+            };
+            let frame = ControlFrame {
+                scene,
+                ..ControlFrame::procedural(index)
+            };
+            let elapsed = elapsed(index);
+            let drawn = layered.render(frame, elapsed).unwrap();
+            baseline.pipeline_mut().observe(&frame);
+            let base = baseline
+                .render_with(|pipeline, encoder, view| {
+                    pipeline.encode_without_mic_layers(
+                        encoder,
+                        view,
+                        frame,
+                        elapsed,
+                        (width, height),
+                    );
+                })
+                .unwrap();
+            let display = layered.pipeline_mut().colour_field_display();
+            assert_eq!(display, baseline.pipeline_mut().colour_field_display());
+            match display {
+                colour_field::Display::ColourField(_) => {
+                    field_frames += 1;
+                    assert!(drawn == base, "frame {index}: glow over the colour field");
+                }
+                colour_field::Display::Native(_) => glowed |= drawn != base,
+            }
+        }
+        assert!(glowed, "the layers never drew over the native scene");
+        assert!(field_frames > fps / 2, "{field_frames} colour-field frames");
+    }
+
+    /// A capture still replays earlier frames with `advance_state`, which
+    /// runs the phosphor passes too: it matches a live run byte for byte.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn replayed_stills_match_a_live_run_with_the_phosphor() {
+        let (width, height) = (160, 90);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        renderer
+            .pipeline_mut()
+            .set_mic_layers(mic_layers::Mode::Both);
+        let frame = |index| ControlFrame {
+            scene: 0,
+            ..ControlFrame::procedural(index)
+        };
+        let still = 150;
+        let mut live = Vec::new();
+        for index in 0..=still {
+            live = renderer.render(frame(index), elapsed(index)).unwrap();
+        }
+        renderer.pipeline_mut().reset_state();
+        for index in 0..still {
+            renderer
+                .pipeline_mut()
+                .advance_state(frame(index), elapsed(index), (width, height));
+        }
+        let replayed = renderer.render(frame(still), elapsed(still)).unwrap();
+        assert!(replayed == live, "replayed still differs from the live run");
     }
 
     /// Scene 7 enters the colour field at power-on and draws flat regions
