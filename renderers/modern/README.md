@@ -60,18 +60,37 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
-| 0, 3, 6, ... | `SignalField` | `Orbit3D` |
-| 1, 4, 7, ... | `SpectrumVolume` | `Orbit3D` |
-| 2, 5, 8, ... | `PulseTunnel` | `Orbit3D` |
+| 0, 4, 8, ... | `SignalField` | `Orbit3D` |
+| 1, 5, 9, ... | `SpectrumVolume` | `Orbit3D` |
+| 2, 6, 10, ... | `PulseTunnel` | `Orbit3D` |
+| 3, 7, 11, ... | `Lines` | `ScreenSpace` |
 
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
 - `PulseTunnel`: beat-driven planes and bars moving through depth.
+- `Lines`: lines of varied direction, speed, length and thickness travel
+  across a mirrored plane; each spectrum band drives its own group and energy
+  sets density (up to an eighth of the instance budget per half, fading lines
+  at the cutoff). Every 512 control frames (about 8.5 s at 60 fps) the plane
+  alternates with a hallway whose two walls mirror each other: the fold eases
+  in over 96 frames (1.6 s), but every fourth section cuts straight to it. The
+  fold follows the monotonic `frame` counter because the scene is stateless
+  and some sources wrap `beat_phase` before `beat_count` ticks; beat-synced
+  folds are follow-up [#80](https://github.com/djensenius/chipviz/issues/80).
+  The timings in seconds assume 60 control frames per second; the fold's real
+  speed follows the sender's frame rate.
+  The drop flag is not used. The camera swings around the plane and eases
+  into the hallway entrance. The scene projects its own camera on the CPU, so
+  it uses `ScreenSpace`. Procedural input never selects it; use `--scene 3`
+  (frames 120, 560 and 800 show plane, mid-fold and hallway).
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
 mode, and append that entry to `REGISTRY`. Appending keeps every byte below the
-old registry length on the same scene; wrapped bytes follow the new length.
+old registry length on the same scene; wrapped bytes follow the new length,
+because selection is `scene % REGISTRY.len()`. Appending `Lines` as the fourth
+scene shifted them: bytes 3, 4 and 5 (formerly `SignalField`, `SpectrumVolume`
+and `PulseTunnel`) now select `Lines`, `SignalField` and `SpectrumVolume`.
 `Orbit3D` scenes use world coordinates and the smoothed orbit camera.
 `ScreenSpace` scenes draw flat: `center.xy` is NDC (`-1..1` spans the viewport,
 `+y` up), depth is ignored, and instances draw in order with their colour
