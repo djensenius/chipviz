@@ -309,5 +309,8 @@ modern-pi5 *args:
 modern-m1 *args:
     @cargo run --manifest-path {{ modern_manifest }} --bin chipviz-m1 -- {{ args }}
 
+modern-capture *args:
+    @cargo run --release --manifest-path {{ modern_manifest }} --bin chipviz-capture -- {{ args }}
+
 clean:
     @rm -rf build dist

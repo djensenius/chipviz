@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 bytemuck = { version = "1.24", features = ["derive"] }
+png = "0.17"
 pollster = "0.4"
 wgpu = "0.20"
 winit = "0.29"
@@ -17,3 +18,7 @@ path = "src/bin/chipviz-pi5.rs"
 [[bin]]
 name = "chipviz-m1"
 path = "src/bin/chipviz-m1.rs"
+
+[[bin]]
+name = "chipviz-capture"
+path = "src/bin/chipviz-capture.rs"
