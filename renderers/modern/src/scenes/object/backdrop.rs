@@ -46,7 +46,7 @@ pub(super) fn chroma_key(clock: u16) -> Vec3 {
     key.map(|channel| (channel * gain).min(1.0))
 }
 
-fn rgba(color: Vec3, alpha: f32) -> [f32; 4] {
+pub(super) fn rgba(color: Vec3, alpha: f32) -> [f32; 4] {
     [color[0], color[1], color[2], alpha]
 }
 
@@ -152,17 +152,9 @@ fn stars(stage: &Stage, budget: usize, out: &mut Vec<Instance>) {
         let size = (0.004 + z * 0.014) * twinkle;
         let tint = hash(seed + 4);
         let color = [0.8 + 0.2 * tint, 0.85, 1.0 - 0.2 * tint, (z * 5.0).min(1.0)];
-        if index % 17 == 0 {
-            out.push(shape(
-                center,
-                size * 5.0,
-                stage.aspect,
-                color,
-                Shape::Sparkle,
-            ));
-        } else {
-            out.push(shape(center, size, stage.aspect, color, Shape::Disc));
-        }
+        let (scale, kind) =
+            [(1.0, Shape::Disc), (5.0, Shape::Sparkle)][usize::from(index % 17 == 0)];
+        out.push(shape(center, size * scale, stage.aspect, color, kind));
     }
 }
 
@@ -194,13 +186,8 @@ fn goop(stage: &Stage, budget: usize, out: &mut Vec<Instance>) {
         out.push(shape(center, radius * 2.2, stage.aspect, dark, Shape::Disc));
     }
     for &(center, radius, color) in &blobs {
-        out.push(shape(
-            center,
-            radius * 2.0,
-            stage.aspect,
-            rgba(color, 1.0),
-            Shape::Disc,
-        ));
+        let body = rgba(color, 1.0);
+        out.push(shape(center, radius * 2.0, stage.aspect, body, Shape::Disc));
     }
     for &(center, radius, color) in &blobs {
         let spot = [
@@ -225,13 +212,8 @@ fn vaporwave(stage: &Stage, out: &mut Vec<Instance>) {
     let center = [0.0, horizon + 0.34];
     let glow = [1.0, 0.4, 0.5, 0.6];
     out.push(shape(center, 1.5, stage.aspect, glow, Shape::Glow));
-    out.push(shape(
-        center,
-        0.95,
-        stage.aspect,
-        [1.0, 0.78, 0.25, 1.0],
-        Shape::Disc,
-    ));
+    let disc = [1.0, 0.78, 0.25, 1.0];
+    out.push(shape(center, 0.95, stage.aspect, disc, Shape::Disc));
     let scroll = (stage.clock * 0.002).fract() * 0.075;
     for stripe in 0..6 {
         let y = center[1] - 0.02 - stripe as f32 * 0.075 - scroll;
@@ -239,10 +221,11 @@ fn vaporwave(stage: &Stage, out: &mut Vec<Instance>) {
         let sky = [0.85, 0.28, 0.45, 1.0];
         out.push(solid([0.0, y], [1.0 / stage.aspect, thick], sky));
     }
+    let floor = [0.06, 0.0, 0.12, 1.0];
     out.push(solid(
         [0.0, (horizon - 1.0) * 0.5],
         [2.0, horizon + 1.0],
-        [0.06, 0.0, 0.12, 1.0],
+        floor,
     ));
     out.push(solid([0.0, horizon], [2.0, 0.008], [1.0, 0.5, 0.9, 1.0]));
     let travel = (stage.clock * 0.03).fract();
@@ -268,34 +251,20 @@ fn rainbow(stage: &Stage, budget: usize, out: &mut Vec<Instance>) {
         let d = -1.7 + (stripe as f32 + 0.5) * width;
         let center = [angle.cos() * d, angle.sin() * d];
         let color = hue(d * 0.45 - stage.clock * 0.004).map(|channel| 0.15 + 0.7 * channel);
-        out.push(quad(
-            center,
-            [width * 1.04, 4.0],
-            rgba(color, 1.0),
-            angle,
-            [0.0; 2],
-        ));
+        let size = [width * 1.04, 4.0];
+        out.push(quad(center, size, rgba(color, 1.0), angle, [0.0; 2]));
     }
 }
 
 /// The sun's spinning rays and halo, drawn behind it.
 pub(super) fn sun_rays(stage: &Stage, center: [f32; 2], radius: f32, out: &mut Vec<Instance>) {
-    out.push(shape(
-        center,
-        radius * 5.0,
-        stage.aspect,
-        [1.0, 0.55, 0.1, 0.6],
-        Shape::Glow,
-    ));
+    let halo = [1.0, 0.55, 0.1, 0.6];
+    out.push(shape(center, radius * 5.0, stage.aspect, halo, Shape::Glow));
     for index in 0..20 {
         let angle = stage.clock * 0.006 + index as f32 * TAU / 20.0;
         let wobble = 0.15 * (index as f32 * 1.7 + stage.clock * 0.05).sin();
         let length = radius * (1.45 + 0.45 * stage.bass + wobble);
-        let color = if index % 2 == 0 {
-            [1.0, 0.75, 0.2, 0.9]
-        } else {
-            [1.0, 0.45, 0.1, 0.9]
-        };
+        let color = [[1.0, 0.75, 0.2, 0.9], [1.0, 0.45, 0.1, 0.9]][index % 2];
         let end = ray(center, angle, length, stage.aspect);
         out.push(bar(center, end, radius * 0.16, color));
     }
@@ -381,13 +350,8 @@ pub(super) fn camcorder(stage: &Stage, out: &mut Vec<Instance>) {
     // Static's monochrome pixel noise: 45% blank, changing every frame.
     let clock = stage.clock as u32 & 0xffff;
     let noise = [-1.45, (clock << 4) as f32];
-    out.push(quad(
-        [0.0, roll],
-        [2.0, height],
-        [1.0, 1.0, 1.0, 0.55],
-        0.0,
-        noise,
-    ));
+    let haze = [1.0, 1.0, 1.0, 0.55];
+    out.push(quad([0.0, roll], [2.0, height], haze, 0.0, noise));
     let edge = [0.0, roll - height * 0.5];
     out.push(solid(edge, [2.0, 0.006], [1.0, 1.0, 1.0, 0.35]));
     let white = [0.95, 0.95, 0.95, 1.0];
@@ -416,21 +380,11 @@ pub(super) fn infomercial(stage: &Stage, object: Kind, out: &mut Vec<Instance>) 
     for index in 0..16 {
         let angle = stage.clock * 0.01 + index as f32 * TAU / 16.0;
         let end = ray(center, angle, radius * 1.55, stage.aspect);
-        let color = if index % 2 == 0 {
-            GOLD
-        } else {
-            [1.0, 0.3, 0.1, 1.0]
-        };
+        let color = [GOLD, [1.0, 0.3, 0.1, 1.0]][index % 2];
         out.push(bar(center, end, radius * 0.45, color));
     }
     let red = [0.85, 0.05, 0.1, 1.0];
     out.push(shape(center, radius * 2.0, stage.aspect, red, Shape::Disc));
-    text(
-        stage,
-        "NEW!",
-        center,
-        0.08 * (1.0 + 0.15 * stage.punch),
-        GOLD,
-        out,
-    );
+    let height = 0.08 * (1.0 + 0.15 * stage.punch);
+    text(stage, "NEW!", center, height, GOLD, out);
 }

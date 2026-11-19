@@ -155,8 +155,7 @@ impl Mesh {
                         local[b] = -half[b] + (j as f32 + 0.5) * sv;
                         let uv = [(i as f32 + 0.5) / nu as f32, (j as f32 + 0.5) / nv as f32];
                         let hit = Hit { local, normal, uv };
-                        let surface = paint(&hit);
-                        self.push(place, &hit, [du, dv], surface);
+                        self.push(place, &hit, [du, dv], paint(&hit));
                     }
                 }
             }
@@ -184,13 +183,8 @@ impl Mesh {
                     normal: [c, 0.0, s],
                     uv: [angle / TAU, (j as f32 + 0.5) / tall as f32],
                 };
-                let surface = paint(&hit);
-                self.push(
-                    place,
-                    &hit,
-                    [[-s * arc, 0.0, c * arc], [0.0, height, 0.0]],
-                    surface,
-                );
+                let edges = [[-s * arc, 0.0, c * arc], [0.0, height, 0.0]];
+                self.push(place, &hit, edges, paint(&hit));
             }
         }
         let rings = steps(radius - inner, self.step);
@@ -208,13 +202,8 @@ impl Mesh {
                         normal: [0.0, sign, 0.0],
                         uv: [angle / TAU, r / radius],
                     };
-                    let surface = paint(&hit);
-                    self.push(
-                        place,
-                        &hit,
-                        [[-s * arc, 0.0, c * arc], [c * dr, 0.0, s * dr]],
-                        surface,
-                    );
+                    let edges = [[-s * arc, 0.0, c * arc], [c * dr, 0.0, s * dr]];
+                    self.push(place, &hit, edges, paint(&hit));
                 }
             }
         }
@@ -237,19 +226,18 @@ impl Mesh {
                     normal,
                     uv: [angle / TAU, 1.0 - row as f32 / rows as f32],
                 };
-                let surface = paint(&hit);
                 let edges = [
                     [-s * arc, 0.0, c * arc],
-                    [cp * c, -sp, cp * s].map(|axis| axis * dv),
+                    [cp * c * dv, -sp * dv, cp * s * dv],
                 ];
-                self.push(place, &hit, edges, surface);
+                self.push(place, &hit, edges, paint(&hit));
             }
         }
     }
 }
 
 /// Audio and time inputs the paint functions animate with.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Look {
     /// Frames since the section started.
     pub(super) t: f32,
@@ -403,11 +391,7 @@ fn television(mesh: &mut Mesh, look: &Look) {
         let level = 0.12 + 0.82 * look.spectrum[band];
         let edge = (u - 0.5).abs().max((v - 0.5).abs());
         let tube = 1.0 - (edge - 0.38).max(0.0) * 4.0;
-        let line = if (v * 48.0).rem_euclid(1.0) < 0.7 {
-            1.0
-        } else {
-            0.7
-        };
+        let line = [0.7, 1.0][usize::from((v * 48.0).rem_euclid(1.0) < 0.7)];
         let color = scale3(BARS[band], if v < level { 1.0 } else { 0.12 });
         Surface {
             color: scale3(color, tube * line),
@@ -451,11 +435,7 @@ fn video_tape(mesh: &mut Mesh, look: &Look) {
         let [x, y, z] = hit.local;
         if hit.normal[2] < 0.5 {
             let ribbed = hit.normal[1].abs() < 0.5 && (z * 40.0).rem_euclid(1.0) < 0.3;
-            return if ribbed {
-                gloss([0.02; 3], 0.3)
-            } else {
-                BLACK_PLASTIC
-            };
+            return [BLACK_PLASTIC, gloss([0.02; 3], 0.3)][usize::from(ribbed)];
         }
         if x.abs() < 0.86 && (0.1..0.46).contains(&y) {
             let (u, v) = ((x + 0.86) / 1.72, (y - 0.1) / 0.36);
@@ -534,12 +514,8 @@ fn sun(mesh: &mut Mesh, look: &Look) {
         }
         let granule = speckle(hit.local, 0.09, boil);
         let warm = 0.5 + 0.5 * hit.normal[2];
-        let color = mix3(
-            [1.0, 0.42, 0.04],
-            [1.0, 0.88, 0.3],
-            warm * 0.7 + granule * 0.3,
-        );
-        lit(color, 0.92)
+        let heat = warm * 0.7 + granule * 0.3;
+        lit(mix3([1.0, 0.42, 0.04], [1.0, 0.88, 0.3], heat), 0.92)
     });
     let shades = |hit: &Hit| {
         let [x, y, _] = hit.local;
@@ -554,9 +530,8 @@ fn sun(mesh: &mut Mesh, look: &Look) {
         let arm = at([side * 0.5, 0.2, 0.38]);
         mesh.cuboid(arm, [0.025, 0.025, 0.36], |_| BLACK_PLASTIC);
     }
-    mesh.cuboid(at([0.0, 0.21, 0.74]), [0.08, 0.025, 0.03], |_| {
-        BLACK_PLASTIC
-    });
+    let bridge = at([0.0, 0.21, 0.74]);
+    mesh.cuboid(bridge, [0.08, 0.025, 0.03], |_| BLACK_PLASTIC);
 }
 
 /// A round tree with a few apples on a patch of grass; the crown sways
@@ -593,10 +568,8 @@ fn tree(mesh: &mut Mesh, look: &Look) {
     }
     mesh.cylinder(at([0.0, -0.97, 0.0]), [0.7, 0.0, 0.03], |hit| {
         if hit.normal[1] > 0.5 {
-            matte(scale3(
-                [0.2, 0.6, 0.12],
-                0.8 + 0.3 * speckle(hit.local, 0.05, 9),
-            ))
+            let shade = 0.8 + 0.3 * speckle(hit.local, 0.05, 9);
+            matte(scale3([0.2, 0.6, 0.12], shade))
         } else {
             matte([0.35, 0.22, 0.12])
         }
@@ -615,11 +588,7 @@ fn computer(mesh: &mut Mesh, look: &Look) {
             if (0.12..0.82).contains(&x) && (y - slot).abs() < 0.05 {
                 let gap = (y - slot).abs() < 0.008 && (0.2..0.66).contains(&x);
                 let latch = (0.7..0.76).contains(&x) && (y - slot).abs() < 0.03;
-                return matte(if gap || latch {
-                    [0.05; 3]
-                } else {
-                    [0.3, 0.29, 0.27]
-                });
+                return matte([[0.3, 0.29, 0.27], [0.05; 3]][usize::from(gap || latch)]);
             }
         }
         if (x + 0.75).hypot(y + 0.08) < 0.022 {
@@ -656,11 +625,7 @@ fn computer(mesh: &mut Mesh, look: &Look) {
             }
         };
         Surface {
-            color: if on {
-                [0.25, 1.0, 0.35]
-            } else {
-                [0.02, 0.07, 0.03]
-            },
+            color: [[0.02, 0.07, 0.03], [0.25, 1.0, 0.35]][usize::from(on)],
             shine: 0.8,
             glow: 0.9,
         }
@@ -676,10 +641,6 @@ fn computer(mesh: &mut Mesh, look: &Look) {
             return matte([0.25, 0.23, 0.2]);
         }
         let dark = (v * 5.0) as usize == 0 || (u * 17.0) as usize >= 15;
-        matte(if dark {
-            [0.55, 0.5, 0.42]
-        } else {
-            [0.88, 0.84, 0.74]
-        })
+        matte([[0.88, 0.84, 0.74], [0.55, 0.5, 0.42]][usize::from(dark)])
     });
 }

@@ -53,6 +53,7 @@ use crate::scene::Instance;
 use backdrop::Stage;
 use models::{Kind, Look, Mesh, Splat, Vec3, hue};
 use std::f32::consts::{PI, TAU};
+use std::sync::Mutex;
 
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "Object",
@@ -149,11 +150,7 @@ fn section(frame: ControlFrame) -> Section {
         object: Kind::ALL[usize::from(index % 6)],
         background: Background::ALL[usize::from(index % 5)],
         morph: [Morph::Cycle, Morph::Sweep, Morph::BeatJump][usize::from(round % 3)],
-        overlay: if round.is_multiple_of(2) {
-            Overlay::Camcorder
-        } else {
-            Overlay::Infomercial
-        },
+        overlay: [Overlay::Camcorder, Overlay::Infomercial][usize::from(round % 2)],
     }
 }
 
@@ -170,13 +167,9 @@ fn punch(frame: ControlFrame) -> f32 {
 /// Lens-flare strength: the drop flag, every eighth beat, and the reveal
 /// at the end of the intro.
 fn flare(frame: ControlFrame, section: Section) -> f32 {
-    let drop = if frame.flags & 0x04 != 0 { 1.0 } else { 0.0 };
+    let drop = f32::from(u8::from(frame.flags & 0x04 != 0));
     let fade = 1.0 - f32::from(frame.beat_phase) / 255.0;
-    let downbeat = if frame.beat_count.is_multiple_of(8) {
-        fade * fade
-    } else {
-        0.0
-    };
+    let downbeat = fade * fade * f32::from(u8::from(frame.beat_count.is_multiple_of(8)));
     let reveal = 1.0 - (f32::from(section.local) - INTRO_FRAMES).abs() / 24.0;
     f32::max(drop, downbeat).max(reveal.clamp(0.0, 1.0))
 }
@@ -210,23 +203,36 @@ fn pose(section: Section, frame: ControlFrame) -> Pose {
     }
 }
 
-/// Builds `kind` with the coarsest grid step whose splat count fits `target`.
-fn mesh(kind: Kind, look: &Look, target: usize) -> Mesh {
-    if target == 0 {
-        return Mesh::new(1.0);
+/// The coarsest grid step whose splat count fits `target`. Counts depend
+/// only on the model and the step (`Look` only paints and poses), so the
+/// search runs once per object and target, with a fixed reference look,
+/// and is cached.
+fn step_for(kind: Kind, target: usize) -> f32 {
+    static CACHE: Mutex<Vec<((Kind, usize), f32)>> = Mutex::new(Vec::new());
+    let key = (kind, target);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&(_, step)) = cache.iter().find(|(entry, _)| *entry == key) {
+        return step;
     }
-    let probe_step = 0.05;
-    let mut probe = Mesh::new(probe_step);
-    kind.build(&mut probe, look);
-    let mut step = probe_step * (probe.splats.len() as f32 / target as f32).sqrt();
-    loop {
+    let look = Look::default();
+    let count = |step: f32| {
         let mut mesh = Mesh::new(step);
-        kind.build(&mut mesh, look);
-        if mesh.splats.len() <= target || step > 1.0 {
-            return mesh;
-        }
+        kind.build(&mut mesh, &look);
+        mesh.splats.len()
+    };
+    let probe_step = 0.05;
+    let ratio = count(probe_step).max(1) as f32 / target.max(1) as f32;
+    let mut step = (probe_step * ratio.sqrt()).max(1e-3);
+    while step <= 1.0 && count(step) > target {
         step *= 1.05;
     }
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.push((key, step));
+    step
 }
 
 fn dot(a: Vec3, b: Vec3) -> f32 {
@@ -238,7 +244,10 @@ fn normalize(v: Vec3) -> Vec3 {
     v.map(|axis| axis / length)
 }
 
-/// Rotates `color` around the grey axis, roughly keeping its brightness.
+/// Rotates `color` around the grey axis, then restores its Rec. 709
+/// luminance so hue changes (including beat jumps) never flash: scaled
+/// down when brighter, or lifted towards white (exactly, as luminance is
+/// linear) when clamping leaves it darker.
 fn turn_hue(color: Vec3, angle: f32) -> Vec3 {
     let (s, c) = angle.sin_cos();
     let k = 1.0 / 3.0_f32.sqrt();
@@ -248,7 +257,21 @@ fn turn_hue(color: Vec3, angle: f32) -> Vec3 {
         k * (color[0] - color[2]),
         k * (color[1] - color[0]),
     ];
-    std::array::from_fn(|i| (color[i] * c + cross[i] * s + along).clamp(0.0, 1.0))
+    let turned: Vec3 =
+        std::array::from_fn(|i| (color[i] * c + cross[i] * s + along).clamp(0.0, 1.0));
+    let target = backdrop::luminance(color);
+    let now = backdrop::luminance(turned);
+    if now >= target {
+        let gain = if now > 1e-6 { target / now } else { 0.0 };
+        return turned.map(|channel| channel * gain);
+    }
+    let headroom = backdrop::luminance(turned.map(|channel| 1.0 - channel));
+    let lift = if headroom > 1e-6 {
+        ((target - now) / headroom).min(1.0)
+    } else {
+        0.0
+    };
+    turned.map(|channel| channel + (1.0 - channel) * lift)
 }
 
 fn morph(section: Section, frame: ControlFrame, splat: &Splat) -> Vec3 {
@@ -337,7 +360,8 @@ fn draw_object(
         yaw: pose.yaw,
     };
     let target = (budget as f32 * OVERSAMPLE) as usize;
-    let mesh = mesh(section.object, &look, target);
+    let mut mesh = Mesh::new(step_for(section.object, target));
+    section.object.build(&mut mesh, &look);
     let (sy, cy) = pose.yaw.sin_cos();
     let (sp, cp) = pose.pitch.sin_cos();
     let rotate = |v: Vec3| {
@@ -383,13 +407,7 @@ fn draw_object(
         });
         drawn.push(Drawn {
             depth,
-            instance: quad(
-                [x, y],
-                size,
-                [color[0], color[1], color[2], 1.0],
-                0.0,
-                [0.0; 2],
-            ),
+            instance: quad([x, y], size, backdrop::rgba(color, 1.0), 0.0, [0.0; 2]),
         });
     }
     drawn.sort_by(|a, b| b.depth.total_cmp(&a.depth));
@@ -412,21 +430,43 @@ fn sparkles(stage: &Stage, object: &[Drawn], flare: f32, out: &mut Vec<Instance>
         let pick = ((hash(seed) * near as f32) as usize).min(near.saturating_sub(1));
         let center = object[object.len() - 1 - pick].instance.center;
         let size = (0.05 + 0.08 * hash(seed ^ 1)) * (PI * phase).sin() * (1.0 + flare);
-        let tint = hue(hash(seed ^ 2));
-        let color = [
-            0.8 + 0.2 * tint[0],
-            0.8 + 0.2 * tint[1],
-            0.8 + 0.2 * tint[2],
-            1.0,
-        ];
+        let color = backdrop::rgba(hue(hash(seed ^ 2)).map(|c| 0.8 + 0.2 * c), 1.0);
+        let center = [center[0], center[1]];
         out.push(backdrop::shape(
-            [center[0], center[1]],
+            center,
             size,
             stage.aspect,
             color,
             Shape::Sparkle,
         ));
     }
+}
+
+fn stage(frame: ControlFrame, section: Section, aspect: f32) -> Stage {
+    Stage {
+        aspect,
+        clock: f32::from(frame.frame),
+        t: f32::from(section.local),
+        energy: f32::from(frame.energy) / 255.0,
+        bass: f32::from(frame.bass) / 255.0,
+        treble: f32::from(frame.treble) / 255.0,
+        punch: punch(frame),
+    }
+}
+
+/// Draws the background into a new list, returning it with the number of
+/// splats left for the object out of `budget`.
+fn background(
+    profile: &RenderProfile,
+    section: Section,
+    stage: &Stage,
+    budget: usize,
+) -> (Vec<Instance>, usize) {
+    let mut drawn = Vec::with_capacity(budget);
+    let background_budget = (profile.instance_count / BACKGROUND_SHARE).min(budget);
+    backdrop::background(section.background, stage, background_budget, &mut drawn);
+    let object_budget = budget.saturating_sub(drawn.len() + OVERLAY_RESERVE);
+    (drawn, object_budget)
 }
 
 fn build(
@@ -441,19 +481,8 @@ fn build(
     let section = section(frame);
     let pose = pose(section, frame);
     let flare = flare(frame, section);
-    let stage = Stage {
-        aspect,
-        clock: f32::from(frame.frame),
-        t: f32::from(section.local),
-        energy: f32::from(frame.energy) / 255.0,
-        bass: f32::from(frame.bass) / 255.0,
-        treble: f32::from(frame.treble) / 255.0,
-        punch: punch(frame),
-    };
-    let mut drawn = Vec::with_capacity(budget);
-    let background_budget = (profile.instance_count / BACKGROUND_SHARE).min(budget);
-    backdrop::background(section.background, &stage, background_budget, &mut drawn);
-    let object_budget = budget.saturating_sub(drawn.len() + OVERLAY_RESERVE);
+    let stage = stage(frame, section, aspect);
+    let (mut drawn, object_budget) = background(profile, section, &stage, budget);
     let object = draw_object(section, frame, pose, aspect, object_budget);
     if section.object == Kind::Sun && pose.scale > 1e-3 {
         let radius = FOCAL * 0.78 * pose.scale / DISTANCE;

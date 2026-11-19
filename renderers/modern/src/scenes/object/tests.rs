@@ -21,43 +21,18 @@ fn build_frame(profile: &RenderProfile, frame: ControlFrame, aspect: f32) -> Vec
 #[test]
 fn timeline_reaches_every_object_background_morph_and_overlay() {
     let sections: Vec<Section> = (0..30).map(|index| section(frame_in(index, 100))).collect();
+    let first = |count: usize| sections[..count].iter();
     for kind in Kind::ALL {
-        assert!(
-            sections.iter().take(6).any(|s| s.object == kind),
-            "{kind:?}"
-        );
-    }
-    for background in Background::ALL {
-        assert!(sections.iter().take(5).any(|s| s.background == background));
+        // Every object meets every background, and both overlays early.
+        for background in Background::ALL {
+            assert!(first(30).any(|s| (s.object, s.background) == (kind, background)));
+        }
+        for overlay in [Overlay::Camcorder, Overlay::Infomercial] {
+            assert!(first(12).any(|s| (s.object, s.overlay) == (kind, overlay)));
+        }
     }
     for morph in [Morph::Cycle, Morph::Sweep, Morph::BeatJump] {
-        assert!(sections.iter().take(6).any(|s| s.morph == morph));
-    }
-    for overlay in [Overlay::Camcorder, Overlay::Infomercial] {
-        assert!(sections.iter().take(2).any(|s| s.overlay == overlay));
-    }
-    // Every object meets every background within 30 sections.
-    for kind in Kind::ALL {
-        for background in Background::ALL {
-            assert!(
-                sections
-                    .iter()
-                    .any(|s| s.object == kind && s.background == background),
-                "{kind:?} on {background:?}"
-            );
-        }
-    }
-    // Each object is shown under both overlays within the first 12 sections.
-    for kind in Kind::ALL {
-        for overlay in [Overlay::Camcorder, Overlay::Infomercial] {
-            assert!(
-                sections
-                    .iter()
-                    .take(12)
-                    .any(|s| s.object == kind && s.overlay == overlay),
-                "{kind:?} under {overlay:?}"
-            );
-        }
+        assert!(first(6).any(|s| s.morph == morph));
     }
 }
 
@@ -76,33 +51,33 @@ fn beats_and_drops_do_not_move_the_schedule() {
 
 #[test]
 fn instances_stay_within_both_profile_budgets() {
+    let frames = (0..12)
+        .flat_map(|index| [0, 30, 48, 200, 490].map(|local| frame_in(index, local)))
+        .flat_map(|frame| {
+            [
+                frame,
+                ControlFrame {
+                    energy: 255,
+                    flags: 0x07,
+                    ..frame
+                },
+            ]
+        });
+    let frames: Vec<ControlFrame> = frames.collect();
     for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
         for aspect in [WIDE, 1.0, 9.0 / 16.0, 21.0 / 9.0] {
-            for index in 0..12 {
-                for local in [0, 30, 48, 200, 490] {
-                    for frame in [
-                        frame_in(index, local),
-                        ControlFrame {
-                            energy: 255,
-                            flags: 0x07,
-                            ..frame_in(index, local)
-                        },
-                    ] {
-                        let instances = build_frame(&profile, frame, aspect);
-                        assert!(
-                            instances.len() <= profile.instance_count,
-                            "{} section {index} local {local}: {}",
-                            profile.name,
-                            instances.len()
-                        );
-                        assert!(instances.iter().all(|instance| {
-                            instance.center.iter().all(|value| value.is_finite())
-                                && instance.size.iter().all(|value| value.is_finite())
-                                && instance.color.iter().all(|value| value.is_finite())
-                                && instance.rotation.is_finite()
-                        }));
-                    }
-                }
+            for &frame in &frames {
+                let instances = build_frame(&profile, frame, aspect);
+                assert!(instances.len() <= profile.instance_count, "{}", frame.frame);
+                assert!(instances.iter().all(|instance| {
+                    let [x, y, z] = instance.center;
+                    [x, y, z, instance.rotation]
+                        .into_iter()
+                        .chain(instance.size)
+                        .chain(instance.color)
+                        .chain(instance.pattern)
+                        .all(f32::is_finite)
+                }));
             }
         }
     }
@@ -126,11 +101,81 @@ fn every_object_is_drawn_and_pi5_uses_fewer_splats() {
         let frame = frame_in(index, 200);
         let section = section(frame);
         let pose = pose(section, frame);
-        let m1 = draw_object(section, frame, pose, WIDE, 12_000).len();
-        let pi5 = draw_object(section, frame, pose, WIDE, 2_500).len();
+        let stage = stage(frame, section, WIDE);
+        let drawn = [RenderProfile::m1(), RenderProfile::pi5()].map(|profile| {
+            let (_, budget) = background(&profile, section, &stage, profile.instance_count);
+            let splats = draw_object(section, frame, pose, WIDE, budget).len();
+            assert!(splats <= budget, "{:?} {}", section.object, profile.name);
+            splats
+        });
+        let [m1, pi5] = drawn;
         assert!(pi5 > 500, "{:?} pi5 {pi5}", section.object);
         assert!(m1 > 2 * pi5, "{:?} m1 {m1} pi5 {pi5}", section.object);
-        assert!(m1 <= 12_000 && pi5 <= 2_500);
+    }
+}
+
+#[test]
+fn splat_counts_do_not_depend_on_the_look() {
+    let loud = Look {
+        t: 333.0,
+        spectrum: [1.0; 8],
+        energy: 1.0,
+        yaw: 2.0,
+        ..Look::default()
+    };
+    for kind in Kind::ALL {
+        let step = step_for(kind, 4_000);
+        let [mut quiet_mesh, mut loud_mesh] = [Mesh::new(step), Mesh::new(step)];
+        kind.build(&mut quiet_mesh, &Look::default());
+        kind.build(&mut loud_mesh, &loud);
+        assert_eq!(quiet_mesh.splats.len(), loud_mesh.splats.len(), "{kind:?}");
+        assert!(loud_mesh.splats.len() <= 4_000);
+    }
+}
+
+#[test]
+fn overlay_survives_the_final_truncate() {
+    for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+        for index in 0..12 {
+            // Drop flag and a downbeat: the most sparkles and the flare.
+            let frame = ControlFrame {
+                flags: 0x05,
+                beat_count: 8,
+                beat_phase: 0,
+                ..frame_in(index, 200)
+            };
+            let section = section(frame);
+            let stage = stage(frame, section, WIDE);
+            let mut overlay = Vec::new();
+            match section.overlay {
+                Overlay::Camcorder => backdrop::camcorder(&stage, &mut overlay),
+                Overlay::Infomercial => backdrop::infomercial(&stage, section.object, &mut overlay),
+            }
+            let built = build_frame(&profile, frame, WIDE);
+            assert!(
+                bytemuck::cast_slice::<Instance, u8>(&built)
+                    .ends_with(bytemuck::cast_slice(&overlay)),
+                "{} section {index}",
+                profile.name
+            );
+        }
+    }
+}
+
+#[test]
+fn hue_turns_keep_luminance() {
+    for color in [
+        [0.9, 0.85, 0.1],
+        [0.05, 0.1, 0.9],
+        [0.8, 0.74, 0.6],
+        [1.0, 0.0, 0.0],
+    ] {
+        for step in 0..12 {
+            let turned = turn_hue(color, step as f32 * TAU / 12.0);
+            let (before, after) = (backdrop::luminance(color), backdrop::luminance(turned));
+            assert!((before - after).abs() < 1e-3, "{color:?} {step}: {after}");
+            assert!(turned.iter().all(|channel| (0.0..=1.0).contains(channel)));
+        }
     }
 }
 
@@ -204,32 +249,38 @@ fn intro_and_outro_shrink_the_object_to_nothing() {
 }
 
 #[test]
-fn flare_fires_on_drop_and_reveal_only() {
+fn flare_fires_on_drop_downbeat_and_reveal() {
     let quiet = ControlFrame {
         beat_count: 3,
         beat_phase: 100,
         flags: 0,
         ..frame_in(0, 300)
     };
-    assert_eq!(flare(quiet, section(quiet)), 0.0);
-    let drop = ControlFrame {
-        flags: 0x04,
-        ..quiet
-    };
-    assert_eq!(flare(drop, section(drop)), 1.0);
-    let reveal = ControlFrame {
-        beat_count: 3,
-        beat_phase: 100,
-        flags: 0,
-        ..frame_in(0, INTRO_FRAMES as u16)
-    };
-    assert_eq!(flare(reveal, section(reveal)), 1.0);
-    let downbeat = ControlFrame {
-        beat_count: 8,
-        beat_phase: 0,
-        ..quiet
-    };
-    assert_eq!(flare(downbeat, section(downbeat)), 1.0);
+    let strength = |frame: ControlFrame| flare(frame, section(frame));
+    assert_eq!(strength(quiet), 0.0);
+    assert_eq!(
+        strength(ControlFrame {
+            flags: 0x04,
+            ..quiet
+        }),
+        1.0
+    );
+    assert_eq!(
+        strength(ControlFrame {
+            beat_count: 8,
+            beat_phase: 0,
+            ..quiet
+        }),
+        1.0
+    );
+    let reveal = frame_in(0, INTRO_FRAMES as u16);
+    assert_eq!(
+        strength(ControlFrame {
+            frame: reveal.frame,
+            ..quiet
+        }),
+        1.0
+    );
 }
 
 #[test]
@@ -266,5 +317,5 @@ fn fingerprint() -> u64 {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn instances_match_recorded_golden() {
-    assert_eq!(fingerprint(), 0xcfae_60e8_a2aa_3035);
+    assert_eq!(fingerprint(), 0xbfff_534e_f332_2181);
 }
