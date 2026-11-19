@@ -113,6 +113,10 @@ animation phase jumps ahead instead of resuming where it stopped.
   `chipviz-c64.prg`; load that file by name in VICE or RetroArch, and never ship
   it. In it, 3 and 7 arm flash/gate only when an absolute scene key `8` and the
   palette key are held together in the same scan for P_STABLE (30) steps.
+  Each palette value becomes a request once: a value already consumed (for
+  example `R` held alone for 30 steps) stays consumed when the incoming scene
+  briefly leaves 7, until a different palette value arrives in scene 7 or a
+  new visit to scene 7 starts.
 - **Not implemented.** The operator role (`L` pin and the RETURN warning screen)
   and joystick relative palette pulses.
 - **Timing.** Every frame is a step, in or out of scene 7 (on the 6567R56A,

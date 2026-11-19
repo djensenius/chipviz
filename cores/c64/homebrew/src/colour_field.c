@@ -154,6 +154,7 @@ static void cf_enter(uint8_t power_on) {
   cf.w_val = (uint8_t)(cf_in.palette & 7u);
   cf.w_n = cf_in.scene == CF_SCENE ? 1u : 0u;
   cf.w_ok = cf_in.scene_abs;
+  cf.w_used = 0u;
   cf_mode_entry(power_on);
   cf.since_layout = 0u;
 }
@@ -265,22 +266,27 @@ static void cf_wire_gate(void) {
   uint8_t p = (uint8_t)(cf_in.palette & 7u);
 
   if (cf_in.scene != CF_SCENE) {
-    /* Outside the scene-7 window: restart the count, drop pending requests. */
+    /* Outside the scene-7 window: restart the count, drop pending requests.
+     * The value is not read here, and a consumed value stays consumed. */
     cf.w_n = 0u;
     cf.req_valid = 0u;
     return;
   }
-  if (cf.w_n == 0u || p != cf.w_val) {
+  if (p != cf.w_val) {
+    /* Only a new value starts a run that can become a request again. */
     cf.w_val = p;
-    cf.w_n = 1u;
-    cf.w_ok = cf_in.scene_abs;
-  } else {
-    SAT_INC(cf.w_n);
-    if (!cf_in.scene_abs) {
-      cf.w_ok = 0u;
-    }
+    cf.w_n = 0u;
+    cf.w_used = 0u;
   }
-  if (cf.w_n == CF_P_STABLE) {
+  if (cf.w_n == 0u) {
+    cf.w_ok = 1u;
+  }
+  SAT_INC(cf.w_n);
+  if (!cf_in.scene_abs) {
+    cf.w_ok = 0u;
+  }
+  if (cf.w_n >= CF_P_STABLE && !cf.w_used) {
+    cf.w_used = 1u;
     cf.req_p = p;
     cf.req_armed = (uint8_t)(cf.w_ok && (p & 3u) == 3u);
     cf.req_valid = 1u;

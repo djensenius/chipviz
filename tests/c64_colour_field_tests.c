@@ -758,6 +758,45 @@ static void held_8q(void) { key(3, 0x08u); key(7, 0x40u); }
 static void held_8r(void) { key(3, 0x08u); key(2, 0x02u); }
 static void held_r(void) { key(2, 0x02u); }
 static void held_18r(void) { key(7, 0x01u); key(3, 0x08u); key(2, 0x02u); }
+static void held_7(void) { key(3, 0x01u); }                /* scene 6 */
+static void held_7e(void) { key(3, 0x01u); key(1, 0x40u); } /* scene 6, palette 2 */
+static void held_8e(void) { key(3, 0x08u); key(1, 0x40u); }
+
+/* A consumed wire value stays consumed (spec: Scene-7 window): R held alone
+ * for 30 steps in scene 7 becomes an unarmed request. A step outside the
+ * window restarts the count but must not let the same value become a request
+ * again, so a later absolute 8+R never arms. 7d086c16 reset the consumption
+ * with the count and armed flash here. A new value seen in the window, or a
+ * new visit after the debounce left scene 7, is a new run and may arm. */
+static int consumed_run(uint16_t away, void (*away_keys)(void), uint16_t between, void (*between_keys)(void)) {
+  cf_init();
+  key_steps(40, held_8q); /* enter scene 7, palette 0 */
+  key_steps(30, held_r);  /* R alone: stable, unarmed, consumed */
+  key_steps(away, away_keys);
+  key_steps(between, between_keys);
+  return key_steps(200, held_8r);
+}
+
+static void consumed(void) {
+  int armed;
+
+  armed = consumed_run(1, held_7, 0, held_8r);
+  require(!armed && key_shown && cf_mode() == 2u && !cf.flash, "consumed",
+          "R alone 30, scene 6 for one step, 8+R: never arms");
+  armed = consumed_run(29, held_7, 0, held_8r);
+  require(!armed && key_shown && cf_mode() == 2u && !cf.flash, "consumed",
+          "deferred exit (scene 6 for 29 steps, still shown), 8+R: never arms");
+  armed = consumed_run(1, held_7e, 0, held_8r);
+  require(!armed && key_shown && cf_mode() == 2u && !cf.flash, "consumed",
+          "a palette change outside the window is not read, 8+R: never arms");
+  armed = consumed_run(1, held_7, 5, held_8e);
+  require(armed == FLASH && key_shown, "consumed",
+          FLASH ? "palette E in the window, then 8+R: a new run arms" : "palette E in the window, then 8+R: never arms");
+  armed = consumed_run(40, held_7, 0, held_8r);
+  require(armed == FLASH && key_shown, "consumed",
+          FLASH ? "scene exit, then 8+R: a new visit arms" : "scene exit, then 8+R: never arms");
+  require(cf_mode() == (FLASH ? 3u : 2u) && cf.flash == FLASH, "consumed", "mode after the new visit");
+}
 
 static void keys(void) {
   cf_init();
@@ -1058,6 +1097,7 @@ int main(void) {
   irq_rate();
   colours();
   keys();
+  consumed();
   fixture_f0();
   fixture_f1();
   fixture_f2();

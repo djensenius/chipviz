@@ -61,7 +61,9 @@ typedef struct {
   uint16_t deb_n, since_sw;
   /* palette: effective value (3/7 stored as 2/6 unless the latch is set) */
   uint8_t p_eff, flash;
-  uint8_t w_val, w_ok, req_valid, req_p, req_armed;
+  /* wire gate: value, every counted step absolute, value already requested
+   * (kept across scene-window resets until the value changes), count */
+  uint8_t w_val, w_ok, w_used, req_valid, req_p, req_armed;
   uint16_t w_n;
   /* detector */
   uint16_t acc[4];
