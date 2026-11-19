@@ -480,15 +480,16 @@ class GbColourFieldFixtures(unittest.TestCase):
     self.assertEqual(next(t for t, s in enumerate(trace) if s and s[0] == 3), 71)
     self.assertTrue(all(s[0] == 3 for s in trace[71:]))
 
-  def wire_discard_run(self, return_pal):
+  def wire_discard_run(self, return_pal, value=1, outside=range(80, 95)):
     """Cuts (p 2) on the wire, starved by a cut every 20 steps, so the stable
-    palette 1 at step 69 stays a pending request. Scene 6 at 80..94 (a deferred
-    exit) discards it; return_pal(t) gives the palette from 80. Beats stop at
-    95, so from then on a stable new request can apply."""
+    value from step 40 becomes a pending request at step 69 and is consumed.
+    Incoming scene 6 on the outside steps (a deferred exit) discards it;
+    return_pal(t) gives the palette from 80. Beats stop at 95, so from then on
+    a stable new request can apply."""
     def inputs(t):
-      pal = 2 if t < 40 else 1 if t < 80 else return_pal(t)
+      pal = 2 if t < 40 else value if t < 80 else return_pal(t)
       flags = BEAT if t < 95 and t % 2 else 0
-      return {"in": flat(100, flags=flags), "scene": 6 if 80 <= t <= 94 else 7, "pal": pal}
+      return {"in": flat(100, flags=flags), "scene": 6 if t in outside else 7, "pal": pal}
     trace = self.rom.run(inputs, steps=200, wire=True)
     self.assertNotIn(None, trace)
     self.assertTrue(all(s[0] == 2 for s in trace[:95]))
@@ -504,6 +505,29 @@ class GbColourFieldFixtures(unittest.TestCase):
     # An unchanged consumed 1 is not requested again after the window resets.
     trace = self.wire_discard_run(lambda t: 1)
     self.assertTrue(all(s[0] == 2 for s in trace))
+
+  def test_wire_consumed_armed_value_one_step_outside(self):
+    # An absolute 3 is consumed (pending, armed) and then discarded by one
+    # step with scene 6 and the same value. 100+ later in-window steps of
+    # that unchanged 3 neither request nor arm.
+    trace = self.wire_discard_run(lambda t: 3, value=3, outside=(80,))
+    self.assertTrue(all(s[0] == 2 for s in trace))
+
+  def test_wire_armed_value_changed_one_step_outside(self):
+    # The same, but the one outside step carries 2: a real change, so the
+    # fresh run of 3 from 81 requests and arms on its 30th step (110); the
+    # last cut was long enough ago, so it shows from 111.
+    trace = self.wire_discard_run(lambda t: 2 if t == 80 else 3, value=3, outside=(80,))
+    self.assertEqual(next((t for t, s in enumerate(trace) if s[0] == 3), None), 111)
+    self.assertTrue(all(s[0] == 3 for s in trace[111:]))
+
+  def test_wire_count_resets_outside_window(self):
+    # A fresh 1 from step 10, with one step of scene 6 (same value) at 25:
+    # the count restarts at 26, so the request is made at 55, not 39.
+    def inputs(t):
+      return {"in": flat(100), "scene": 6 if t == 25 else 7, "pal": 2 if t < 10 else 1}
+    trace = self.rom.run(inputs, steps=100, wire=True)
+    self.assertEqual(next((t for t, s in enumerate(trace) if s[0] == 1), None), 56)
 
   def test_f24_relative_palette(self):
     def inputs(t):
