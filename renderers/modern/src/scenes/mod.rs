@@ -2,11 +2,12 @@
 //!
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
 //! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
-//! with the current three entries scene 0/3/6... is SignalField, 1/4/7... is
-//! SpectrumVolume and 2/5/8... is PulseTunnel. Adding a scene is one new module
+//! with the current four entries scene 0/4/8... is SignalField, 1/5/9... is
+//! SpectrumVolume, 2/6/10... is PulseTunnel and 3/7/11... is Lines. Adding a scene is one new module
 //! plus one `REGISTRY` entry. Appending keeps every index below the old length
 //! on the same scene; wrapped indices (>= length) move with the new length.
 
+mod lines;
 mod pulse_tunnel;
 #[cfg(test)]
 mod reference;
@@ -42,6 +43,7 @@ pub const REGISTRY: &[SceneEntry] = &[
     signal_field::ENTRY,
     spectrum_volume::ENTRY,
     pulse_tunnel::ENTRY,
+    lines::ENTRY,
 ];
 
 pub fn select(scene: u8) -> &'static SceneEntry {
@@ -101,7 +103,7 @@ mod tests {
     const ELAPSED: [f32; 4] = [0.0, 0.5, 3.25, 120.0];
 
     /// FNV-1a over the instance bytes for every profile/frame/elapsed sample,
-    /// with the scene byte forced to `scene` or `scene + 3`.
+    /// with the scene byte forced to `scene` or its wrapped `scene + REGISTRY.len()`.
     fn fingerprint(
         scene: u8,
         build: fn(&RenderProfile, ControlFrame, f32) -> Vec<Instance>,
@@ -111,7 +113,7 @@ mod tests {
             for index in INDICES {
                 for elapsed in ELAPSED {
                     let frame = ControlFrame {
-                        scene: scene + 3 * (index as u8 % 2),
+                        scene: scene + REGISTRY.len() as u8 * (index as u8 % 2),
                         ..ControlFrame::procedural(index)
                     };
                     let instances = build(&profile, frame, elapsed);
@@ -134,19 +136,17 @@ mod tests {
                 "SignalField",
                 "SpectrumVolume",
                 "PulseTunnel",
+                "Lines",
                 "SignalField",
                 "SpectrumVolume",
                 "PulseTunnel",
-                "SignalField",
-                "SpectrumVolume",
+                "Lines",
             ]
         );
         assert_eq!(select(255).name, REGISTRY[255 % REGISTRY.len()].name);
-        assert!(
-            REGISTRY
-                .iter()
-                .all(|entry| entry.camera == CameraMode::Orbit3D)
-        );
+        let cameras: Vec<_> = REGISTRY.iter().map(|entry| entry.camera).collect();
+        let orbit = CameraMode::Orbit3D;
+        assert_eq!(cameras, [orbit, orbit, orbit, CameraMode::ScreenSpace]);
     }
 
     #[test]
@@ -167,7 +167,10 @@ mod tests {
                 fingerprint(scene, |profile, frame, elapsed| {
                     build_instances(profile, frame, elapsed, 16.0 / 9.0)
                 }),
-                fingerprint(scene, reference::build_instances),
+                fingerprint(scene, |profile, frame, elapsed| {
+                    let scene = frame.scene % REGISTRY.len() as u8;
+                    reference::build_instances(profile, ControlFrame { scene, ..frame }, elapsed)
+                }),
                 "scene {scene}"
             );
         }

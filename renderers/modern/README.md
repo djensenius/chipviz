@@ -36,14 +36,23 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
-| 0, 3, 6, ... | `SignalField` | `Orbit3D` |
-| 1, 4, 7, ... | `SpectrumVolume` | `Orbit3D` |
-| 2, 5, 8, ... | `PulseTunnel` | `Orbit3D` |
+| 0, 4, 8, ... | `SignalField` | `Orbit3D` |
+| 1, 5, 9, ... | `SpectrumVolume` | `Orbit3D` |
+| 2, 6, 10, ... | `PulseTunnel` | `Orbit3D` |
+| 3, 7, 11, ... | `Lines` | `ScreenSpace` |
 
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
 - `PulseTunnel`: beat-driven planes and bars moving through depth.
+- `Lines`: lines of varied direction, speed, length and thickness travel
+  across a mirrored plane; each spectrum band drives its own group and energy
+  sets density (up to an eighth of the instance budget per half). Every 16
+  beats the plane alternates with a hallway whose two walls mirror each other:
+  the fold eases in over 4 beats, but every fourth section, or a frame with the
+  drop flag, cuts straight to it. The scene projects its own orbiting camera
+  on the CPU, so it uses `ScreenSpace`. Procedural input never selects it;
+  use `--scene 3` (frames 120, 288 and 400 show plane, mid-fold and hallway).
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
 mode, and append that entry to `REGISTRY`. Appending keeps every byte below the

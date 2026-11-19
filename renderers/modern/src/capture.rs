@@ -348,7 +348,7 @@ mod tests {
         let frame = source.frame(120).unwrap();
         assert_eq!(frame.scene, 5);
         assert_eq!(frame.energy, ControlFrame::procedural(120).energy);
-        assert_eq!(scenes::select(frame.scene).name, "PulseTunnel");
+        assert_eq!(scenes::select(frame.scene).name, "SpectrumVolume");
         let unforced = FrameSource {
             fixture: None,
             scene: None,
