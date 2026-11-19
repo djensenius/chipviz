@@ -265,18 +265,18 @@ static void cf_snapshot(void) {
 static void cf_wire_gate(void) {
   uint8_t p = (uint8_t)(cf_in.palette & 7u);
 
-  if (cf_in.scene != CF_SCENE) {
-    /* Outside the scene-7 window: restart the count, drop pending requests.
-     * The value is not read here, and a consumed value stays consumed. */
-    cf.w_n = 0u;
-    cf.req_valid = 0u;
-    return;
-  }
+  /* The value is read on every step: only a new value (anywhere) starts a
+   * run that can become a request again; an unchanged value stays consumed. */
   if (p != cf.w_val) {
-    /* Only a new value starts a run that can become a request again. */
     cf.w_val = p;
     cf.w_n = 0u;
     cf.w_used = 0u;
+  }
+  if (cf_in.scene != CF_SCENE) {
+    /* Outside the scene-7 window: restart the count, drop pending requests. */
+    cf.w_n = 0u;
+    cf.req_valid = 0u;
+    return;
   }
   if (cf.w_n == 0u) {
     cf.w_ok = 1u;

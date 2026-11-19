@@ -115,8 +115,9 @@ animation phase jumps ahead instead of resuming where it stopped.
   palette key are held together in the same scan for P_STABLE (30) steps.
   Each palette value becomes a request once: a value already consumed (for
   example `R` held alone for 30 steps) stays consumed when the incoming scene
-  briefly leaves 7, until a different palette value arrives in scene 7 or a
-  new visit to scene 7 starts.
+  briefly leaves 7. The palette is read on every step, so a different value,
+  even while the scene is briefly not 7, or a new visit to scene 7 starts a
+  new run, which needs 30 stable steps in scene 7 again.
 - **Not implemented.** The operator role (`L` pin and the RETURN warning screen)
   and joystick relative palette pulses.
 - **Timing.** Every frame is a step, in or out of scene 7 (on the 6567R56A,
