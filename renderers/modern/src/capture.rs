@@ -343,10 +343,10 @@ mod tests {
     fn scene_override_selects_registry_entry() {
         let source = FrameSource {
             fixture: None,
-            scene: Some(5),
+            scene: Some(6),
         };
         let frame = source.frame(120).unwrap();
-        assert_eq!(frame.scene, 5);
+        assert_eq!(frame.scene, 6);
         assert_eq!(frame.energy, ControlFrame::procedural(120).energy);
         assert_eq!(scenes::select(frame.scene).name, "SpectrumVolume");
         let unforced = FrameSource {
@@ -418,7 +418,7 @@ mod tests {
             color: [0.5, 0.5, 0.5, 1.0],
             rotation: 0.0,
             scene_mix: 0.0,
-            _padding: [0.0; 2],
+            pattern: [0.0; 2],
         };
         let frame = ControlFrame {
             energy: 255,
@@ -450,6 +450,137 @@ mod tests {
                 };
                 assert!(ok, "pixel ({column}, {row}) = {pixel:?}, inside {inside}");
             }
+        }
+    }
+
+    /// Renders `instances` flat (ScreenSpace) into a `width` x `height` RGB
+    /// readback.
+    fn render_screen_space(
+        width: u32,
+        height: u32,
+        instances: &[crate::scene::Instance],
+    ) -> Vec<u8> {
+        use crate::scene::{Camera, scene_uniforms};
+
+        let profile = RenderProfile::pi5();
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height)).unwrap();
+        let uniforms = scene_uniforms(
+            CameraMode::ScreenSpace,
+            &mut Camera::default(),
+            &profile,
+            ControlFrame::procedural(0),
+            0.0,
+            renderer.aspect(),
+        );
+        renderer
+            .render_with(|pipeline, encoder, view| {
+                pipeline.encode_instances(encoder, view, instances, &uniforms);
+            })
+            .unwrap()
+    }
+
+    fn full_screen(color: [f32; 4], pattern: [f32; 2]) -> crate::scene::Instance {
+        crate::scene::Instance {
+            center: [0.0; 3],
+            size: [2.0, 2.0],
+            color,
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern,
+        }
+    }
+
+    /// A full-screen Static glyph quad: each of the 5x8 font pixels covers a
+    /// 20x20 block, which must be white exactly where the CPU bitmap is set.
+    /// 'L' has a lit left column and bottom row and a dark top right, so a
+    /// flipped or transposed decode fails.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn static_glyph_pattern_decodes_upright_on_gpu() {
+        let (bits, pattern) = scenes::static_gpu_reference::glyph_bits('L');
+        let rgb = render_screen_space(100, 160, &[full_screen([1.0; 4], pattern)]);
+        let at = |x: usize, y: usize| &rgb[(y * 100 + x) * 3..][..3];
+        for row in 0..8 {
+            for column in 0..5 {
+                let lit = bits >> (row * 5 + column) & 1 == 1;
+                // Skip the block edges, where rasterisation may round.
+                for y in row * 20 + 2..row * 20 + 18 {
+                    for x in column * 20 + 2..column * 20 + 18 {
+                        let expected = if lit { [255; 3] } else { [0; 3] };
+                        assert_eq!(at(x, y), expected, "({column}, {row}) pixel ({x}, {y})");
+                    }
+                }
+            }
+        }
+        // Spot checks spelled out: left column, bottom row, top right.
+        assert_eq!(at(10, 70), [255; 3]);
+        assert_eq!(at(90, 150), [255; 3]);
+        assert_eq!(at(90, 30), [0; 3]);
+    }
+
+    /// A full-screen Static pixel-noise quad matches the CPU prediction at
+    /// every pixel (blank or lit, colour and level), its blank share is near
+    /// the requested chance, and rendering is repeatable. Covers monochrome
+    /// and rainbow (palette 3) noise on black, and both inverted on a white
+    /// section's background, where rainbow hues must be complemented.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn static_pixel_noise_matches_cpu_prediction_on_gpu() {
+        use scenes::static_gpu_reference::{noise, pixel};
+
+        let (width, height) = (128, 96);
+        let srgb = |linear: f32| {
+            let encoded = if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (encoded * 255.0).round() as i32
+        };
+        let tint = [0.2, 0.6, 0.9, 1.0];
+        for (rainbow, inverted, color) in [
+            (false, false, [1.0; 4]),
+            (true, false, tint),
+            (true, true, tint),
+            (false, true, tint),
+        ] {
+            let pattern = noise(0.5, 4, 1234, 3, rainbow, inverted);
+            let background = if inverted { 1.0 } else { 0.0 };
+            let mut quads = vec![full_screen(color, pattern)];
+            if inverted {
+                quads.insert(0, full_screen([1.0; 4], [0.0; 2]));
+            }
+            let rgb = render_screen_space(width, height, &quads);
+            assert_eq!(rgb, render_screen_space(width, height, &quads));
+
+            let case = format!("rainbow {rainbow} inverted {inverted}");
+            let mut blank = 0;
+            for y in 0..height {
+                for x in 0..width {
+                    let actual = &rgb[((y * width + x) * 3) as usize..][..3];
+                    let expected = match pixel(x, y, color, pattern) {
+                        None => {
+                            blank += 1;
+                            [srgb(background); 3]
+                        }
+                        Some([red, green, blue, alpha]) => [red, green, blue]
+                            .map(|channel| srgb(channel * alpha + background * (1.0 - alpha))),
+                    };
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(&value, expected)| (i32::from(value) - expected).abs() <= 2),
+                        "{case}: pixel ({x}, {y}) = {actual:?}, expected ~{expected:?}"
+                    );
+                }
+            }
+            let share = f64::from(blank) / f64::from(width * height);
+            assert!(
+                (0.45..=0.55).contains(&share),
+                "{case}: blank share {share}"
+            );
         }
     }
 }
