@@ -108,12 +108,25 @@ same trace on every target. Reduced transports have their own oracle (see
     (`scene = value // 16`), so that a control resting near a boundary does not
     toggle the sent scene across 7. The target's
     [scene-7 debounce](#scene-7-debounce) is a backstop, not a substitute.
-  - **Every host path** follows one rule: it never sends `p` of 3 or 7 while in
-    scene 7 unless that host process was started with `--allow-flash`. Host
-    paths include live audio, MIDI, chipsynth, the procedural bridge, and file
-    playback of `.cvz` streams from `chipviz_encode`. Without the flag, the
-    host rewrites such a frame's palette to 2 or 6. This covers recorded files
-    as well as live sources.
+  - **Every host path** follows one rule: unless that host process was started
+    with `--allow-flash`, it never transmits a frame whose *decoded scene* is 7
+    with `p = palette & 7` of 3 or 7.
+    - The decoded scene is the scene value the receiver will decode after the
+      transport's mapping:
+      - the `scene` byte on the full control-frame path, including file
+        playback;
+      - `scene & 0x0F` on N64 Joybus (`n64_joybus.py` packs only the low
+        nibble), so for example 23 decodes as 7;
+      - `scene & 0x07` on USB HID (`usb_hid.py` sends key `(scene & 7) + 1`),
+        so for example 15 decodes as 7.
+    - Without the flag, the host clears palette bit 0 before transmission, so
+      `p` 3 or 7 goes out as 2 or 6 (F23). When one frame goes to several
+      transports, the rule applies to each transport's encoding separately.
+    - Host paths include live audio, MIDI, chipsynth, the procedural bridge,
+      and file playback of `.cvz` streams from `chipviz_encode`. This covers
+      recorded files as well as live sources.
+    - The target-side [wire arming window](#wire-arming-window)
+      is a second, independent guard.
 
 ### Palette index selects mode and family
 
@@ -149,6 +162,17 @@ The effective palette `p_eff` comes from one of three sources:
     been received unchanged for `P_STABLE = 30` consecutive steps. A wire 3 or
     7 held for 30 steps from entry therefore arms on its 30th step and, when
     the change budget allows (as in F10), runs from the 31st.
+  - <a id="wire-arming-window"></a>**Scene-7 window:** every one of those 30
+    steps must also have an incoming scene of 7. The incoming scene is the raw
+    received value before the [scene-7 debounce](#scene-7-debounce), as
+    decoded by the transport (see [Reduced transports](#reduced-transports)).
+    - A step whose incoming scene is not 7 resets the count to 0, so the next
+      step with incoming scene 7 counts as step 1. A consumed value stays
+      consumed.
+    - Such a step also discards any pending, unapplied wire request together
+      with its arming, as when a request is replaced.
+    - So a stream whose incoming scene leaves 7, while the debounce keeps scene
+      7 shown, can never arm flash (F22).
   - A stable 3 or 7 becomes an *armed request* (see
     [arming](#arming-and-operator-inputs)). The flash latch is set only when
     that request is applied under the change budget, never before.
@@ -156,8 +180,9 @@ The effective palette `p_eff` comes from one of three sources:
   - An operator pulse sets `p_req` and consumes the current wire value: that
     value never becomes `p_req` again, however long it stays.
   - The stability counter restarts only when a new wire value (different from
-    the consumed one) arrives. That new value overrides the operator choice
-    once it has stayed unchanged for 30 steps.
+    the consumed one) arrives, or after a step outside the
+    [scene-7 window](#wire-arming-window). That new value overrides the
+    operator choice once it has stayed unchanged for 30 steps.
 
 If `p_eff` selects mode 3 and flash is not armed, the target runs mode 2.
 
@@ -373,7 +398,8 @@ poll. Unavailable fields are 0.
     for them. There are no notes.
   - Palette comes from keys through the wire stability gate (`P_STABLE`).
     Scene changes from keys or D-pad pulses go through the
-    [scene-7 debounce](#scene-7-debounce).
+    [scene-7 debounce](#scene-7-debounce). Scene key `k` decodes as scene
+    `k - 1`, so the incoming scene is the sender's `scene & 7`.
 
   With no separate bands, dominance never changes on HID. With the digital-only
   values, `energy` never drops below `SIL_EXIT`, so digital-only receivers
@@ -690,7 +716,8 @@ Flash is armed only by a deliberate source.
     Pad input there may be a HID feed, and the N64's Joybus ports carry
     controller 4 Start/Z as scene bits.
 - **(b) Deliberate host selection:** a wire `p` of 3 or 7 that passes the
-  `P_STABLE` gate while scene is 7 becomes an armed request. This includes a 3
+  `P_STABLE` gate, with an incoming scene of 7 on every step of that window,
+  becomes an armed request. This includes a 3
   or 7 present at scene entry: it runs as 2 or 6, and after 30 stable steps its
   armed request differs in effective mode, so it is applied under the budget.
   - Hosts emit 3 or 7 only when that host process was started with
@@ -701,9 +728,10 @@ Flash is armed only by a deliberate source.
     `P_STABLE` steps.
 
 Edges, pulses, or values held for fewer than `P_STABLE` steps on a data channel
-never arm. Demo, attract and procedural sources never arm. The armed latch
-clears at power-on and reset, when leaving scene 7, and when `p_eff` leaves
-mode 3.
+never arm, and neither does a wire 3 or 7 whose window includes a step with an
+incoming scene other than 7. Demo, attract and procedural sources never arm.
+The armed latch clears at power-on and reset, when leaving scene 7, and when
+`p_eff` leaves mode 3.
 
 **Console warning screen:** this is a local screen added to the interface-v0
 flow, with no wire change. It exists only in `operator` builds.
@@ -789,3 +817,5 @@ OTHER = CANCEL
 | F19 HID digital-only | Digital-only USB HID receiver, one step per poll for 600 polls, scene 7 from power-on. Left shoulder held for polls 320–379 (`energy` 200), otherwise released (`energy` 64). South pressed for one poll at `50 + 60k` (`k = 0..9`). Nothing else is pressed. | Never silent. `T` at 320 only (the shoulder rise); the release at 380 is not a transient. `B` at 50, 110, …, 590. Held never changes. Spectral (V2) rests at 1/1, goes to 2/2 at 320 and 3/3 at 330, then back to 2/2 at 380 and 1/1 at 390. Cuts at 50, 110, 170, 230, 290, 320, 350, 410, 470, 530 and 590 (11). Flash/gate: pulses at the same 11 steps, and the rest is level 1 (dim) everywhere else, never 0. |
 | F20 level saturation | `e = 100`, spectrum 0. Bands 250 for steps 0–199 and 400–599, and 10 for steps 200–399. | Spectral (`p = 1`, 5; V2): 3/3 from entry through 199 with no change (`lvl < 3` guards `UP`). 2/2 at 200, 1/1 at 210 and 0/0 at 220, then 0/0 through 399 without silence (`lvl > 0` guards `DOWN`). 1/1 at 400, 2/2 at 410 and 3/3 at 420 (one step per update even though `250 >= UP[3]`), then 3/3 through 599. `T` at 400 only. Held never changes. Cuts: one, at 400. Flash/gate: one pulse at 400, otherwise resting at level 1 (dim). |
 | F21 scene-7 debounce | Default `data` input role, `p = 0`. `e`, bands and spectrum 100. Overrides the setup's `scene = 7`: scene 6 for steps 0–99; for steps 100–199, 7 on even steps and 6 on odd steps; 7 for 200–299; 6 for 300–319; 7 for 320–449; 6 for 450–599. | Native scene 6 through step 229, so the trace is `none` there: the jitter at 100–199 never enters scene 7. Scene-7 entry at step 230 (7 first arrives at 200, and 229 is its 30th consecutive step). It is not the power-on entry, so it sets `since_cut = 0` and `lg = 0`; with no events that changes nothing. No exit at 300–319 (only 20 steps). Exit at the end of 479 (6 first arrives at 450), so native scene 6 runs from 480 and the trace is `none` again. Exactly one entry and one exit. In scene 7 (steps 230–479) the trace is held, V2, combo 0, level 3, with no changes. |
+| F22 deferred-exit arming | Default `data` input role, no local arming. `e`, bands and spectrum 100. Wire scene 7 and palette 0 for steps 0–59. From step 60, wire palette 3. Wire scene alternates 5 for 20 steps and 6 for 20 steps from 60 to 299 (5 at `60 + 40k`…`79 + 40k`, 6 at `80 + 40k`…`99 + 40k`, `k = 0..5`), then 7 from 300 on. | The debounce never exits (each value lasts only 20 steps), so scene 7 is shown throughout. Every step from 60 to 299 has an incoming scene other than 7, so the palette count stays 0 and flash never arms there. Held (`p_eff` 0) through step 329. From 300 the scene-7 window is clean: 329 is the 30th step of wire 3, so the armed request applies at the end of 329, and mode 3 runs from 330, resting dim. Without the scene-7 window, 3 would arm at step 89 and run from 90, which is non-conforming. |
+| F23 host transport alias | Host-side check. A host started without `--allow-flash` sends 600 frames with `scene = 15`, `palette = 3`, and `e`, bands and spectrum 100 over USB HID. A second run uses `scene = 23` over N64 Joybus. Both feed default `data` targets that power on in scene 7. | HID decodes `15 & 7 = 7`, so every HID state carries scene key `8` and palette key `E` (`p = 2`), never `R`. Joybus decodes `23 & 0x0F = 7`, so every packet carries scene nibble 7 and palette nibble 2. Both targets run hard cuts (`p_eff` 2) throughout and never arm. A full-path frame with `scene = 15` is not rewritten, because its decoded scene is 15. |
