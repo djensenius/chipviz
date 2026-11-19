@@ -229,6 +229,33 @@ class RustNoticesTests(unittest.TestCase):
     content = rust_notices.render(self.metadata, self.fallback)
     self.assertIn("- fonty 1.0.0: embedded asset src/Font.ttf has no verified notice.", content)
 
+  def test_embedded_spdx_expressions_are_parsed(self) -> None:
+    parse = rust_notices.embedded_licences
+    self.assertEqual(parse("SPDX-License-Identifier: MIT AND LGPL-2.1-or-later\n", "f"), ({"MIT", "LGPL-2.1-or-later"}, set(), []))
+    self.assertEqual(parse("/* SPDX-License-Identifier: (MIT OR Apache-2.0) AND GPL-2.0-only */", "f"),
+                     ({"GPL-2.0-only"}, {"MIT", "Apache-2.0"}, []))
+    self.assertEqual(parse("<!-- SPDX-License-Identifier: MIT OR LGPL-2.1-or-later -->", "f"), (set(), {"MIT", "LGPL-2.1-or-later"}, []))
+    self.assertEqual(parse("# SPDX-License-Identifier: MIT ##", "f"), ({"MIT"}, set(), []))
+    self.assertEqual(parse("SPDX-License-Identifier: MIT\nSPDX-License-Identifier: MIT OR Zlib\n", "f"), ({"MIT"}, {"Zlib"}, []))
+    for broken in ("SPDX-License-Identifier: MIT AND (LGPL-2.1-or-later", "SPDX-License-Identifier:", "SPDX-License-Identifier: MIT WITH AND"):
+      required, optional, gaps = parse(broken, "vendor/COPYING")
+      self.assertEqual((required, optional), (set(), set()), broken)
+      self.assertEqual(len(gaps), 1, broken)
+      self.assertIn("unparseable SPDX-License-Identifier", gaps[0])
+      self.assertIn("in vendor/COPYING", gaps[0])
+
+  def test_embedded_and_expression_reaches_table_and_copyleft(self) -> None:
+    self.add_shipped("mixed", "MIT", {
+      "LICENSE": "mixed MIT\n",
+      "vendor/COPYING": "SPDX-License-Identifier: MIT AND LGPL-2.1-or-later\n",
+      "proto/a.xml": "<protocol><copyright>SPDX-License-Identifier: (BSD-3-Clause OR MPL-2.0)</copyright></protocol>",
+      "proto/b.xml": "<protocol><copyright>SPDX-License-Identifier: MIT AND (</copyright></protocol>",
+    })
+    content = rust_notices.render(self.metadata, self.fallback)
+    self.assertIn("| mixed | 1.0.0 | MIT (also contains BSD-3-Clause (optional), LGPL-2.1-or-later, MIT, MPL-2.0 (optional); 2 per-protocol notices) |", content)
+    self.assertIn("- mixed 1.0.0: LGPL-2.1-or-later, MPL-2.0 (optional: the crate may be used under an alternative licence).", content)
+    self.assertIn("- mixed 1.0.0: unparseable SPDX-License-Identifier 'MIT AND (' in proto/b.xml.", content)
+
   def test_fence_for_is_longer_than_any_backtick_run(self) -> None:
     self.assertEqual(rust_notices.fence_for("plain text"), "```")
     self.assertEqual(rust_notices.fence_for("```rust\ncode\n```"), "````")

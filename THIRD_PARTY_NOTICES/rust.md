@@ -10,8 +10,10 @@ choice of licences, every licence file shipped in its package is reproduced,
 including files in vendored subdirectories and the `<copyright>` blocks of
 embedded Wayland protocol XML files. Embedded assets under a different
 licence, such as fonts, get their own notice with a verified copyright.
-Licences found only in vendored files or assets are listed as "also
-contains" in the table. NOTICE and COPYRIGHT files are always reproduced.
+Every licence found in vendored files or assets, including any the crate
+also declares, is listed as "also contains" in the table; "(optional)"
+marks one that is only an OR alternative in its SPDX-License-Identifier.
+NOTICE and COPYRIGHT files are always reproduced.
 Notice numbers marked "(fallback)" are canonical SPDX licence texts used
 because the published crate ships no licence text (only attribution files
 or none at all). For MIT crates, the copyright line comes from the
@@ -162,7 +164,7 @@ upstream repository at the crate's commit.
 | wayland-csd-frame | 0.3.0 | MIT | https://github.com/rust-windowing/wayland-csd-frame | [22](#notice-22) |
 | wayland-cursor | 0.31.14 | MIT | https://github.com/smithay/wayland-rs | [85](#notice-85) |
 | wayland-protocols | 0.31.2 | MIT (38 per-protocol notices) | https://github.com/smithay/wayland-rs | [85](#notice-85), [87](#notice-87), [88](#notice-88) |
-| wayland-protocols-plasma | 0.2.0 | MIT (also contains BSD-3-Clause, CC0-1.0, LGPL-2.1-or-later, MIT-CMU; 27 per-protocol notices) | https://github.com/smithay/wayland-rs | [90](#notice-90) (fallback), [44](#notice-44), [89](#notice-89), [91](#notice-91), [92](#notice-92), [93](#notice-93), [94](#notice-94), [95](#notice-95) |
+| wayland-protocols-plasma | 0.2.0 | MIT (also contains BSD-3-Clause, CC0-1.0, LGPL-2.1-or-later, MIT, MIT-CMU; 27 per-protocol notices) | https://github.com/smithay/wayland-rs | [90](#notice-90) (fallback), [44](#notice-44), [89](#notice-89), [91](#notice-91), [92](#notice-92), [93](#notice-93), [94](#notice-94), [95](#notice-95) |
 | wayland-protocols-wlr | 0.2.0 | MIT (10 per-protocol notices) | https://github.com/smithay/wayland-rs | [90](#notice-90) (fallback), [96](#notice-96) |
 | wayland-scanner | 0.31.10 | MIT (1 per-protocol notice) | https://github.com/smithay/wayland-rs | [85](#notice-85), [97](#notice-97) |
 | wayland-sys | 0.31.11 | MIT | https://github.com/smithay/wayland-rs | [85](#notice-85) |

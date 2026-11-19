@@ -39,7 +39,8 @@ ASSET_SUFFIXES = {".ttf", ".otf", ".ttc", ".woff", ".woff2"}
 NON_SHIPPED_DIRS = {"tests", "examples", "benches", "docs", "doc"}
 # Source files whose names happen to match NOTICE_FILE (e.g. src/copying.rs).
 SOURCE_SUFFIXES = {".rs", ".c", ".h", ".py", ".js", ".sh", ".toml", ".xml", ".json"}
-SPDX_ID = re.compile(r"SPDX-License-Identifier:\s*([A-Za-z0-9.+-]+)")
+SPDX_ID = re.compile(r"SPDX-License-Identifier:[ \t]*([^\r\n]*)")
+COMMENT_END = re.compile(r"\s*(\*/|-->|\]\]>|#+)\s*$")
 COPYLEFT = re.compile(r"^(A?GPL|LGPL|MPL|EPL|CDDL)-")
 LGPL_DECISION = "https://github.com/djensenius/chipviz/issues/110"
 # Canonical SPDX texts (license-list-data v3.29.0) for crates whose package
@@ -289,6 +290,33 @@ def licence_alternatives(expression: str) -> list[list[str]]:
   return unique
 
 
+def embedded_licences(text: str, where: str) -> tuple[set[str], set[str], list[str]]:
+  """Parse every SPDX-License-Identifier line in text.
+
+  Returns (required, optional, gaps): terms in every alternative are required,
+  terms in only some alternatives are optional, and unparseable expressions
+  become gap reasons.
+  """
+  required: set[str] = set()
+  optional: set[str] = set()
+  gaps: list[str] = []
+  for raw in SPDX_ID.findall(text):
+    expression = raw.strip()
+    while COMMENT_END.search(expression):
+      expression = COMMENT_END.sub("", expression)
+    try:
+      alternatives = licence_alternatives(expression)
+    except ValueError:
+      alternatives = []
+    if not alternatives:
+      gaps.append(f"unparseable SPDX-License-Identifier {expression!r} in {where}")
+      continue
+    always = set(alternatives[0]).intersection(*alternatives[1:])
+    required |= always
+    optional |= {term for alternative in alternatives for term in alternative} - always
+  return required, optional - required, gaps
+
+
 def package_licences(package: dict) -> list[list[str]]:
   """Parse a crate's declared licence, naming the crate if the expression is invalid."""
   try:
@@ -374,6 +402,14 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     refs: list[str] = []
     own_licence = False
     embedded: set[str] = set()
+    embedded_optional: set[str] = set()
+
+    def scan(text: str, where: str) -> None:
+      required, optional, problems = embedded_licences(text, where)
+      embedded.update(required)
+      embedded_optional.update(optional)
+      gaps.extend((label, problem) for problem in problems)
+
     for path in notice_files(package):
       text = normalise(path.read_text(encoding="utf-8", errors="replace"))
       if text:
@@ -381,15 +417,15 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
         if is_own_licence(path, directory, package):
           own_licence = True
         elif not is_top_level(path, directory):
-          embedded.update(SPDX_ID.findall(text))
+          scan(text, display_path(path, directory))
           if any(NOTICE_DIR.match(part) for part in path.relative_to(directory).parts[:-1]):
             embedded.add(path.stem)
     protocols = protocol_copyrights(directory)
     if protocols:
       combined = "\n\n".join(f"== {path} ==\n{text}" for path, text in protocols)
       refs.append(add(combined, f"{label} (<copyright> blocks of {len(protocols)} protocol XML files)"))
-      for _, text in protocols:
-        embedded.update(SPDX_ID.findall(text))
+      for path, text in protocols:
+        scan(text, path)
     assets, asset_gaps = asset_notices(package, directory, fallback_dir)
     for asset_label, asset_licence, text in assets:
       refs.append(add(text, f"{label} ({asset_label})"))
@@ -404,22 +440,26 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     licence = package.get("license") or "not declared"
     declared_alternatives = package_licences(package)
     declared = {token for alternative in declared_alternatives for token in alternative}
-    extra = sorted(embedded - declared)
+    embedded_optional -= embedded
+    # Every licence found in vendored files or assets, including any the crate
+    # also declares, so the table agrees with the copyleft section.
+    contained = [f"{spdx_id} (optional)" if spdx_id in embedded_optional else spdx_id for spdx_id in sorted(embedded | embedded_optional)]
     notes = []
-    if extra:
-      notes.append("also contains " + ", ".join(extra))
+    if contained:
+      notes.append("also contains " + ", ".join(contained))
     if protocols:
       notes.append(f"{len(protocols)} per-protocol notice{'' if len(protocols) == 1 else 's'}")
     if notes:
       licence += " (" + "; ".join(notes) + ")"
-    # Licences found in vendored or embedded files always apply. A declared
-    # copyleft licence is optional only if it is an OR alternative and is not
-    # also found in those files.
+    # A copyleft licence is required if a vendored file or asset requires it
+    # (a term of every alternative of its expression) or the crate's own
+    # declaration does. Otherwise it is only an OR alternative and optional.
     copyleft_ids = []
-    for spdx_id in sorted(embedded | declared):
+    for spdx_id in sorted(embedded | embedded_optional | declared):
       if not COPYLEFT.match(spdx_id):
         continue
-      if spdx_id in embedded or all(spdx_id in alternative for alternative in declared_alternatives):
+      declared_required = spdx_id in declared and all(spdx_id in alternative for alternative in declared_alternatives)
+      if spdx_id in embedded or declared_required:
         copyleft_ids.append(spdx_id)
       else:
         copyleft_ids.append(f"{spdx_id} (optional: the crate may be used under an alternative licence)")
@@ -443,8 +483,10 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     "including files in vendored subdirectories and the `<copyright>` blocks of",
     "embedded Wayland protocol XML files. Embedded assets under a different",
     "licence, such as fonts, get their own notice with a verified copyright.",
-    "Licences found only in vendored files or assets are listed as \"also",
-    "contains\" in the table. NOTICE and COPYRIGHT files are always reproduced.",
+    "Every licence found in vendored files or assets, including any the crate",
+    "also declares, is listed as \"also contains\" in the table; \"(optional)\"",
+    "marks one that is only an OR alternative in its SPDX-License-Identifier.",
+    "NOTICE and COPYRIGHT files are always reproduced.",
     "Notice numbers marked \"(fallback)\" are canonical SPDX licence texts used",
     "because the published crate ships no licence text (only attribution files",
     "or none at all). For MIT crates, the copyright line comes from the",
