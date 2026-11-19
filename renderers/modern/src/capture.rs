@@ -648,15 +648,34 @@ mod tests {
 
     /// The GPU phosphor behaves as its CPU model: over scene 0, with both
     /// layers drawing and then turned off, the light the layers add to any
-    /// pixel (the capture minus the layer-free baseline, in linear light)
-    /// falls by at most `DECAY_PER_S` per second (plus 8-bit rounding), and
-    /// once it has faded the capture matches the baseline byte for byte.
+    /// pixel where the scene holds still (the capture minus the layer-free
+    /// baseline, in linear light) falls by at most `DECAY_PER_S` per second
+    /// (plus 8-bit rounding), and once it has faded the capture matches the
+    /// baseline byte for byte. (Where the scene changes, the red mask
+    /// follows it, see `phosphor`.)
+    /// This holds on an sRGB target and on one that is not sRGB (shown as
+    /// sRGB-coded), where the composite encodes for itself.
     #[test]
     #[ignore = "requires a GPU adapter"]
     fn phosphor_falls_no_faster_than_its_decay_and_fades_to_the_baseline() {
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            phosphor_falls_on(format);
+        }
+    }
+
+    fn phosphor_falls_on(format: wgpu::TextureFormat) {
         let (width, height) = (160, 90);
         let new = || {
-            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height)).unwrap()
+            pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                width,
+                height,
+                format,
+            ))
+            .unwrap()
         };
         let (mut layered, mut baseline) = (new(), new());
         layered
@@ -675,6 +694,9 @@ mod tests {
         let (lit, total) = (3 * fps, 10 * fps);
         let window = fps / 2;
         let mut excess: Vec<Vec<f32>> = Vec::new();
+        // Per frame and pixel, the first frame of the baseline's current
+        // unchanged run there.
+        let mut still_since: Vec<Vec<u64>> = Vec::new();
         let mut last = (Vec::new(), Vec::new());
         for index in 0..total {
             if index == lit {
@@ -712,31 +734,108 @@ mod tests {
                     })
                     .collect(),
             );
+            still_since.push(
+                base.chunks_exact(3)
+                    .enumerate()
+                    .map(|(pixel, colour)| match still_since.last() {
+                        Some(since) if last.1[pixel * 3..pixel * 3 + 3] == *colour => since[pixel],
+                        _ => index,
+                    })
+                    .collect(),
+            );
             if index == lit {
-                assert_ne!(drawn, base, "no afterglow just after turning off");
+                assert_ne!(
+                    drawn, base,
+                    "{format:?}: no afterglow just after turning off"
+                );
             }
             last = (drawn, base);
         }
-        assert_eq!(last.0, last.1, "the afterglow never faded to the baseline");
+        assert!(
+            last.0 == last.1,
+            "{format:?}: the afterglow never faded to the baseline"
+        );
         // Half-second windows: at most DECAY_PER_S / 2, plus a rounding
         // margin for two 8-bit encodes per frame.
         let bound = phosphor::DECAY_PER_S * 0.5 + 0.02;
-        let mut steepest = 0.0_f32;
-        for (earlier, later) in excess.iter().zip(&excess[window as usize..]) {
-            for (&before, &after) in earlier.iter().zip(later) {
-                if before.is_finite() && after.is_finite() {
+        let (mut steepest, mut measured) = (0.0_f32, 0_usize);
+        for (start, (earlier, later)) in excess.iter().zip(&excess[window as usize..]).enumerate() {
+            let since = &still_since[start + window as usize];
+            for (channel, (&before, &after)) in earlier.iter().zip(later).enumerate() {
+                let still = since[channel / 3] <= start as u64;
+                if still && before.is_finite() && after.is_finite() {
                     steepest = steepest.max(before - after);
+                    measured += 1;
                 }
             }
         }
         assert!(
+            measured > 100_000,
+            "{format:?}: only {measured} still samples"
+        );
+        assert!(
             steepest <= bound,
-            "fell {steepest} in 0.5 s (bound {bound})"
+            "{format:?}: fell {steepest} in 0.5 s (bound {bound})"
         );
         assert!(
             steepest > 0.02,
-            "the afterglow should visibly fade: {steepest}"
+            "{format:?}: the afterglow should visibly fade: {steepest}"
         );
+    }
+
+    /// Switching from a native scene with glowing layers to the colour
+    /// field drops the afterglow on the frame the field appears: every
+    /// colour-field frame matches a layer-free baseline byte for byte.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn entering_the_colour_field_drops_the_afterglow() {
+        let (width, height) = (160, 90);
+        let new = || {
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height)).unwrap()
+        };
+        let (mut layered, mut baseline) = (new(), new());
+        layered
+            .pipeline_mut()
+            .set_mic_layers(mic_layers::Mode::Both);
+        let fps = CAPTURE_FPS as u64;
+        let (native, total) = (2 * fps, 4 * fps);
+        let (mut glowed, mut field_frames) = (false, 0);
+        for index in 0..total {
+            let scene = if index < native {
+                0
+            } else {
+                colour_field::SCENE
+            };
+            let frame = ControlFrame {
+                scene,
+                ..ControlFrame::procedural(index)
+            };
+            let elapsed = elapsed(index);
+            let drawn = layered.render(frame, elapsed).unwrap();
+            baseline.pipeline_mut().observe(&frame);
+            let base = baseline
+                .render_with(|pipeline, encoder, view| {
+                    pipeline.encode_without_mic_layers(
+                        encoder,
+                        view,
+                        frame,
+                        elapsed,
+                        (width, height),
+                    );
+                })
+                .unwrap();
+            let display = layered.pipeline_mut().colour_field_display();
+            assert_eq!(display, baseline.pipeline_mut().colour_field_display());
+            match display {
+                colour_field::Display::ColourField(_) => {
+                    field_frames += 1;
+                    assert!(drawn == base, "frame {index}: glow over the colour field");
+                }
+                colour_field::Display::Native(_) => glowed |= drawn != base,
+            }
+        }
+        assert!(glowed, "the layers never drew over the native scene");
+        assert!(field_frames > fps / 2, "{field_frames} colour-field frames");
     }
 
     /// A capture still replays earlier frames with `advance_state`, which

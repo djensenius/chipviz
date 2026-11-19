@@ -51,6 +51,8 @@ pub struct ScenePipeline {
     phosphor_pipelines: phosphor::Pipelines,
     /// The mic layers' afterglow; made when they first draw, see `phosphor`.
     phosphor: Option<phosphor::Phosphor>,
+    /// Holds off remaking the phosphor while the target is being resized.
+    settle: phosphor::Settle,
 }
 
 pub struct Renderer {
@@ -295,6 +297,7 @@ impl ScenePipeline {
             overlay_pipeline,
             phosphor_pipelines,
             phosphor: None,
+            settle: phosphor::Settle::default(),
         }
     }
 
@@ -306,6 +309,7 @@ impl ScenePipeline {
         self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
         self.scene_state = SceneState::new(self.scene_state.config());
         self.phosphor = None;
+        self.settle = phosphor::Settle::default();
     }
 
     /// Steps camera smoothing, the colour field and the mic layers for a
@@ -323,8 +327,9 @@ impl ScenePipeline {
         let (frame, display) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed as f32, size_aspect(size));
-        let mut encoder = self.command_encoder();
-        if self.encode_mic_layers(&mut encoder, None, frame, display, elapsed, size) {
+        if let Some(count) = self.prepare_mic_layers(frame, display, elapsed, size) {
+            let mut encoder = self.command_encoder();
+            self.encode_phosphor(&mut encoder, None, count, elapsed);
             self.queue.submit(std::iter::once(encoder.finish()));
         }
     }
@@ -455,30 +460,47 @@ impl ScenePipeline {
             elapsed,
             aspect,
         );
-        self.encode_layers(encoder, view, &instances, &uniforms);
-        if mic_layers {
-            self.encode_mic_layers(encoder, Some(view), frame, display, overlay_elapsed, size);
+        let glow = if mic_layers {
+            self.prepare_mic_layers(frame, display, overlay_elapsed, size)
+        } else {
+            None
+        };
+        match glow {
+            // The scene goes into the phosphor's copy, which the composite
+            // then writes to `view` with the layers added.
+            Some(count) => {
+                let phosphor = self.phosphor.take().expect("prepared above");
+                self.encode_layers(encoder, phosphor.scene(), &instances, &uniforms);
+                self.phosphor = Some(phosphor);
+                self.encode_phosphor(encoder, Some(view), count, overlay_elapsed);
+            }
+            None => self.encode_layers(encoder, view, &instances, &uniforms),
         }
     }
 
-    /// Steps the mic layers and, while they draw or the phosphor still
-    /// glows, records their phosphor passes, adding the result onto `view`
-    /// when given. Returns whether anything was recorded: with nothing
-    /// drawn and a dark phosphor (always, for layers `off`) no pass or
-    /// texture is touched.
-    fn encode_mic_layers(
+    /// Steps the mic layers and uploads their instances. Returns the
+    /// instance count when the phosphor passes should run this frame: while
+    /// the layers draw or the phosphor still glows. With nothing drawn and a
+    /// dark phosphor (always, for layers `off`) no pass or texture is
+    /// touched. Over the colour field the phosphor is dropped at once, as
+    /// it is while a resized target settles.
+    fn prepare_mic_layers(
         &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        view: Option<&wgpu::TextureView>,
         frame: ControlFrame,
         display: colour_field::Display,
         elapsed: f64,
         size: (u32, u32),
-    ) -> bool {
+    ) -> Option<u32> {
         let aspect = size_aspect(size);
         let shown = mic_layers::shown(self.mic_layers.mode(), display);
         self.mic_layers
             .step(frame, self.live_scope.as_ref(), elapsed, shown);
+        // Entering the colour field is already a full-screen change; its
+        // colours must follow its trace alone, so no afterglow lingers.
+        if matches!(display, colour_field::Display::ColourField(_)) {
+            self.phosphor = None;
+            return None;
+        }
         let mut overlay = Vec::new();
         if shown {
             self.mic_layers.build(frame, aspect, &mut overlay);
@@ -490,25 +512,31 @@ impl ScenePipeline {
                 .as_ref()
                 .is_none_or(phosphor::Phosphor::is_dark)
         {
-            return false;
+            return None;
         }
-        // A new size starts dark: the old afterglow no longer lines up.
-        if self
+        // A new size starts dark (the old afterglow no longer lines up),
+        // once the size has held still.
+        let resized = self
             .phosphor
             .as_ref()
-            .is_none_or(|glow| glow.size() != size)
-        {
+            .is_some_and(|glow| glow.size() != size);
+        if resized {
+            self.phosphor = None;
+        }
+        if self.phosphor.is_none() {
+            if !self.settle.ready(resized, size, elapsed) {
+                return None;
+            }
             self.phosphor = Some(phosphor::Phosphor::new(
                 &self.device,
                 &self.phosphor_pipelines,
                 size,
             ));
         }
-        let offset = (self.instance_capacity * std::mem::size_of::<Instance>()) as u64;
         if count > 0 {
             self.queue.write_buffer(
                 &self.instance_buffer,
-                offset,
+                self.overlay_offset(),
                 bytemuck::cast_slice(&overlay[..count]),
             );
             // Flat screen-space instances use no other uniform.
@@ -522,14 +550,27 @@ impl ScenePipeline {
             self.queue
                 .write_buffer(&self.overlay_uniform_buffer, 0, bytemuck::bytes_of(&flat));
         }
+        Some(count as u32)
+    }
+
+    /// Records the phosphor passes for `count` prepared overlay instances,
+    /// compositing onto `view` (with the scene drawn into the phosphor's
+    /// copy first) when given.
+    fn encode_phosphor(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: Option<&wgpu::TextureView>,
+        count: u32,
+        elapsed: f64,
+    ) {
         let overlay = phosphor::Overlay {
             pipeline: &self.overlay_pipeline,
             uniforms: &self.overlay_bind_group,
             quad: &self.vertex_buffer,
-            instances: self.instance_buffer.slice(offset..),
-            count: count as u32,
+            instances: self.instance_buffer.slice(self.overlay_offset()..),
+            count,
         };
-        self.phosphor.as_mut().expect("made above").encode(
+        self.phosphor.as_mut().expect("prepared").encode(
             encoder,
             &self.queue,
             &self.phosphor_pipelines,
@@ -537,7 +578,11 @@ impl ScenePipeline {
             elapsed,
             view,
         );
-        true
+    }
+
+    /// Where the overlay's instances start in the instance buffer.
+    fn overlay_offset(&self) -> u64 {
+        (self.instance_capacity * std::mem::size_of::<Instance>()) as u64
     }
 
     /// What the latest colour-field step shows.
@@ -683,6 +728,17 @@ impl OffscreenRenderer {
         width: u32,
         height: u32,
     ) -> Result<Self, RendererError> {
+        Self::with_format(profile, width, height, OFFSCREEN_FORMAT).await
+    }
+
+    /// As [`OffscreenRenderer::new`], drawing into a target of `format` (4
+    /// bytes per pixel, RGBA order), as a surface of that format would.
+    pub(crate) async fn with_format(
+        profile: RenderProfile,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<Self, RendererError> {
         let (width, height) = (width.max(1), height.max(1));
         let (_, device, queue) = request_device(&gpu_instance(), &profile, None).await?;
         check_target_size(width, height, &device.limits())?;
@@ -696,7 +752,7 @@ impl OffscreenRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: OFFSCREEN_FORMAT,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -709,7 +765,7 @@ impl OffscreenRenderer {
             mapped_at_creation: false,
         });
         let aspect = width as f32 / height as f32;
-        let pipeline = ScenePipeline::new(device, queue, OFFSCREEN_FORMAT, profile, aspect);
+        let pipeline = ScenePipeline::new(device, queue, format, profile, aspect);
 
         Ok(Self {
             pipeline,
@@ -890,5 +946,91 @@ mod tests {
         assert_eq!(padded_row_bytes(64), 256);
         assert_eq!(padded_row_bytes(100), 512);
         assert_eq!(padded_row_bytes(1920), 7680);
+    }
+
+    /// The GPU composite matches its CPU model (`phosphor::composite_pixel`,
+    /// in linear light) within 8-bit rounding for a grid of scene and
+    /// display colours, on an sRGB target and on one that is not sRGB
+    /// (shown as sRGB-coded, so the composite decodes and encodes itself),
+    /// and leaves the scene byte for byte where the display is black.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn phosphor_composite_matches_its_model_on_either_target() {
+        let decode = |byte: u8| {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let encode = |linear: f32| {
+            let value = if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (value * 255.0).round()
+        };
+        let levels = [0_u8, 30, 90, 160, 220, 255];
+        let colours: Vec<[u8; 3]> = (0..216)
+            .map(|index| [levels[index % 6], levels[index / 6 % 6], levels[index / 36]])
+            .collect();
+        let side = colours.len() as u32;
+        let (mut scene, mut display) = (Vec::new(), Vec::new());
+        for row in &colours {
+            for column in &colours {
+                scene.extend_from_slice(&[column[0], column[1], column[2], 255]);
+                display.extend_from_slice(&[row[0], row[1], row[2], 255]);
+            }
+        }
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                side,
+                side,
+                format,
+            ))
+            .unwrap();
+            let pipeline = renderer.pipeline_mut();
+            let glow = phosphor::Phosphor::new(
+                &pipeline.device,
+                &pipeline.phosphor_pipelines,
+                (side, side),
+            );
+            glow.fill(&pipeline.queue, &scene, &display);
+            let drawn = renderer
+                .render_with(|pipeline, encoder, view| {
+                    glow.composite_only(
+                        encoder,
+                        &pipeline.queue,
+                        &pipeline.phosphor_pipelines,
+                        view,
+                    );
+                })
+                .unwrap();
+            for (pixel, got) in drawn.chunks_exact(3).enumerate() {
+                let stored = &scene[pixel * 4..pixel * 4 + 3];
+                let lit = &display[pixel * 4..pixel * 4 + 3];
+                if lit == [0, 0, 0] {
+                    assert_eq!(got, stored, "{format:?} pixel {pixel}: scene changed");
+                    continue;
+                }
+                let out = phosphor::composite_pixel(
+                    std::array::from_fn(|channel| decode(stored[channel])),
+                    std::array::from_fn(|channel| f32::from(lit[channel]) / 255.0),
+                );
+                for (channel, &value) in got.iter().enumerate() {
+                    let error = (f32::from(value) - encode(out[channel])).abs();
+                    assert!(
+                        error <= 1.0,
+                        "{format:?} scene {stored:?} display {lit:?}: got {got:?}, model {out:?}"
+                    );
+                }
+            }
+        }
     }
 }

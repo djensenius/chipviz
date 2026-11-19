@@ -165,15 +165,17 @@ change the control-frame wire format.
   tone, then blend just enough to stay within that. It is peak-normalised
   with a floor so room hiss stays flat, and silence flattens it smoothly.
   Whatever its source (live, procedural or UDP), the ribbon is limited once
-  more just before drawing: if the drawn lines, strokes included, would cover
-  more than 13% of the screen, they blend towards their envelope and then
-  shrink towards a flat centre line until they fit. A loud 440 Hz tone is
-  drawn unchanged. This limit tightens at once but relaxes over 0.5 s, so
-  input hovering at the limit does not jitter, and just after a loud burst
-  even a 440 Hz tone stays briefly reduced. In portrait windows the whole
-  ribbon (amplitude and stroke widths as well as length) scales with the
-  width. Each line is drawn as a dimmed palette-tinted halo with a dark gap
-  inside it and a near-white tinted core, so the core is its brightest part.
+  more just before drawing: if the lines drawn in one frame, strokes
+  included, would cover more than 13% of the screen, they blend towards
+  their envelope and then shrink towards a flat centre line until they fit.
+  This limits each frame's ribbon, not its afterglow (see below). A loud
+  440 Hz tone is drawn unchanged. This limit tightens at once but relaxes
+  over 0.5 s, so input hovering at the limit does not jitter, and just after
+  a loud burst even a 440 Hz tone stays briefly reduced. In portrait windows
+  the whole ribbon (amplitude and stroke widths as well as length) scales
+  with the width. Each line is drawn as a dimmed palette-tinted halo and a
+  near-white tinted core, with a gap between them where the scene shows
+  through (the layers only add light), so the core is its brightest part.
 - `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
   rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
   one arriving less than 0.5 s after the last burst started is skipped, and
@@ -191,29 +193,65 @@ when `beat_count` changes.
 
 The layers glow like a long-persistence oscilloscope. They are drawn into
 their own target, and a per-pixel phosphor follows it in linear light: each
-channel rises at once to what is drawn but falls by at most 0.18 per second
+channel rises at once to what is drawn but falls by at most 0.15 per second
 of full brightness, and the result is added onto the scene. So the ribbon
-leaves a fading trail where it has been, a burst lingers for a few seconds
-after it ends, and turning the layers off (or entering scene 7) fades them
-out over up to about 5.6 s rather than cutting. A window resize restarts the
-afterglow. Being added light, the layers brighten the scene beneath them and
-never darken it.
+leaves a fading trail wherever it has been, and a moving ribbon's trails can
+cover far more of the screen than the 13% one frame draws; a burst lingers
+for a few seconds after it ends; and turning the layers off fades them out
+over up to about 6.7 s rather than cutting. Entering the colour field (scene
+7), which is already a full-screen change, clears the afterglow at once, so
+nothing is ever drawn over it. A window resize clears the afterglow too, and
+the layers return once the size has held still for 0.15 s, so a drag does not
+reallocate anything each frame. Being added light, the layers brighten the
+scene beneath them and never darken it, except that they fade out over red
+scene areas (see below), and red layer colours are drawn slightly pink.
+
+While the layers glow, the scene is drawn into a texture of its own and a
+final pass writes it with the layers added, in linear light; on a surface
+that is not sRGB, that pass decodes and encodes sRGB itself. The phosphor
+needs four 8-bit RGBA textures at the window size (the layers, two for the
+afterglow, and the scene copy): about 33 MB at 1920x1080 and 133 MB at
+3840x2160. Nothing is allocated, and no pass runs, until the layers first
+draw. On an M1 Max, with scene 0 and both layers, a frame took about 0.3 ms
+longer at 1920x1080 (2.09 ms against 1.80 ms with layers off) and 1.8 ms
+longer at 3840x2160 (3.64 ms against 1.80 ms). The Pi 5 has not been
+measured; check its frame rate with the layers on before relying on them
+there, especially at 4K.
 
 The layers are not gated by the `unmeasured-flash` feature. The phosphor
-bounds their flashes for any input, frame rate or geometry: a flash (WCAG
-2.3.1) is a pair of opposing changes of at least 0.1 relative luminance, and
-relative luminance falls no faster than the fastest channel. Three flashes in
-1 s would need three falls of 0.1 ending in that second, the last two wholly
-inside it, and 0.2 of fall takes over 1.1 s at 0.18 per second. So the light
-the layers add to any point flashes at most twice in any 1 s, under the limit
-of three; red flashes also need opposing changes, and every channel falls
-equally slowly. A unit test runs a CPU model of the phosphor against
-adversarial per-pixel input (alternating every frame, square waves of every
-period, random colours, and input that relights a pixel as soon as it has
-dimmed by 0.1) at 60, 120 and 240 fps, steady and jittered, and finds at most
-two flashes in any 1 s; at 0.25 per second the last of those reaches three. A
-GPU test checks that the light added at any pixel falls no faster than the
-decay, and that layers `off` render exactly as before the layers existed.
+bounds their flashes for any input, frame rate or geometry, at any point
+where the scene holds still. A flash (WCAG 2.3.1) is a pair of opposing
+changes of at least 0.1 relative luminance, and relative luminance falls no
+faster than the fastest channel. Three flashes in 1 s would need three falls
+of 0.1 ending in that second, the last two wholly inside it, and 0.2 of fall
+takes at least 1.28 s at 0.15 per second (counting the decay's rounding), so
+the light the layers add to any point flashes at most twice in any 1 s, under
+the limit of three, with about 28% to spare for output rounding and frame
+timing. Red flashes are bounded differently, since green or blue rising over
+a red point lowers its redness as much as red falling: a red flash needs a
+saturated red, at least 80% of a point's light, at one end of a change, and
+the layers never make one. Their afterglow keeps green plus blue at least a
+third of its red (at most 75% red), and they fade out over scene points that
+are 60% to 75% red and are not drawn at all over redder ones. Wherever they
+add light, then, they mix with a scene colour at most 75% red, so the result
+is at most 75% red too; elsewhere the scene is shown unchanged. Where the
+scene changes under the layers, their light follows it: a moving red shape
+cuts through the afterglow as if in front of it.
+
+Unit tests run a CPU model of the phosphor against adversarial per-pixel
+input at 60, 120 and 240 fps, steady and jittered. For luminance (alternating
+every frame, square waves of every period, random colours, and input that
+relights a pixel as soon as it has dimmed by 0.1) they find at most two
+flashes in any 1 s; at 0.25 per second the relighting input reaches three.
+For red (red against white, red and green squares, relighting in red, green
+or white, a red and green staircase, and random colours, over black, grey,
+red, dark red, orange, partly red and blue scenes) they find no saturated
+red that is not the scene itself, so no red flashes, where per-channel decay
+alone allows three in 1 s. GPU tests check that the composite matches its
+model on sRGB and non-sRGB targets; that the light added at a pixel where
+the scene holds still falls no faster than the decay; that a replayed still
+matches a live run; that the colour field is never drawn over; and that
+layers `off` render exactly as before the layers existed.
 
 The design keeps the layers calm well within that bound. Each burst is a
 single smooth, partly transparent rise and fall (glow at most 30% and sparks

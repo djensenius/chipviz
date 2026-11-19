@@ -5,7 +5,8 @@
 //! selecting the scene underneath, and the overlay draws on top with its own
 //! `ScreenSpace` uniforms. They are off by default and selected with
 //! `--mic-layers` or cycled with `M` ([`Mode`]). The colour field (scene 7)
-//! is never overlaid, since its colours must follow its trace alone.
+//! is never overlaid, since its colours must follow its trace alone: entering
+//! it clears the phosphor's afterglow at once.
 //!
 //! Input, per rendered frame:
 //! - with live microphone frames, a [`ScopeSnapshot`] from the audio thread's
@@ -22,21 +23,26 @@
 //! coincide, and two for tones too fast for the points, so loud high
 //! frequencies never fill a band (see `decimate` in `audio::scope`).
 //! Whatever its source, the ribbon is limited once more as it is drawn
-//! ([`limit_ribbon`]): it never covers more than `RIBBON_SCREEN_FRACTION` of
-//! the screen, at any aspect. The limit tightens at once but relaxes over
-//! `LIMIT_RELAX_S`, so input hovering at the budget does not jitter.
+//! ([`limit_ribbon`]): the ribbon drawn in any one frame never covers more
+//! than `RIBBON_SCREEN_FRACTION` of the screen, at any aspect. The limit
+//! tightens at once but relaxes over `LIMIT_RELAX_S`, so input hovering at
+//! the budget does not jitter. It does not bound the phosphor's trails: a
+//! moving ribbon's afterglow can cover far more of the screen.
 //!
 //! Flashes: the renderer draws the layers through a per-pixel phosphor
 //! (`crate::phosphor`) added onto the scene. Each pixel's added light rises
 //! at once but falls by at most `phosphor::DECAY_PER_S` per second, which
 //! allows at most 2 flashes (pairs of opposing changes of 0.1 relative
-//! luminance) in any 1 s at any point, below the 3-per-second WCAG 2.3.1
-//! general flash limit that `shared/specs/colour-field-v0.md` also follows,
-//! for any input, frame rate or geometry. The design below keeps the layers
-//! calm before that bound: a burst is one smooth rise (`ATTACK_S`) and
-//! exponential fall, its colour and peak strength fixed when it starts, and
-//! bursts start at most once every `MIN_BURST_GAP_S` however fast onsets
-//! arrive. Nothing here inverts or flips the whole screen, so the layers
+//! luminance) in any 1 s at any point where the scene holds still, below the
+//! 3-per-second WCAG 2.3.1 general flash limit that
+//! `shared/specs/colour-field-v0.md` also follows, for any input, frame rate
+//! or geometry. The phosphor also makes no red flashes: its afterglow is at
+//! most `phosphor::RED_SHARE` red, and it fades out over scene pixels redder
+//! than that, so it never produces a saturated red. The design below keeps
+//! the layers calm before that bound: a burst is one smooth rise
+//! (`ATTACK_S`) and exponential fall, its colour and peak strength fixed when
+//! it starts, and bursts start at most once every `MIN_BURST_GAP_S` however
+//! fast onsets arrive. Nothing here inverts or flips the whole screen, so the layers
 //! have no `unmeasured-flash` gate. The `phosphor_model` and `flash_model`
 //! tests check CPU models; they are not photometric measurements of a
 //! display or projector.
@@ -44,8 +50,8 @@
 //! Geometry is built in aspect space (x spans `-aspect..aspect`, y `-1..1`)
 //! and flattened by [`transform`], so rotated ribbon segments and round
 //! bursts keep their shape at any aspect ratio. In portrait the whole ribbon
-//! and the bursts scale with the width. Overlay time is f64 seconds, so burst timing stays
-//! exact however long the renderer runs.
+//! and the bursts scale with the width. Overlay time is f64 seconds, so burst
+//! timing stays exact however long the renderer runs.
 
 use std::cell::Cell;
 
@@ -86,8 +92,9 @@ const RIBBON_PASSES: [(f32, f32, Pass); 3] = [
 ];
 /// Ribbon lines: the waveform's upper and lower outlines.
 const OUTLINES: usize = 2;
-/// Most of the screen the drawn ribbon may cover, at any aspect: its thin-line
-/// budget (see [`limit_ribbon`]).
+/// Most of the screen the ribbon drawn in one frame may cover, at any aspect:
+/// its thin-line budget (see [`limit_ribbon`]). The phosphor's trails are not
+/// counted.
 pub const RIBBON_SCREEN_FRACTION: f32 = 0.13;
 /// Columns the ribbon's area bound is measured in.
 const AREA_COLUMNS: usize = 2048;
@@ -1123,7 +1130,12 @@ mod tests {
     /// The most flashes (pairs of opposing changes of at least 0.1, see
     /// [`transitions`]) completing in any 1 s of `series`, sampled at `times`.
     fn most_flashes(series: &[f32], times: &[f64]) -> (usize, usize) {
-        let found = transitions(series, 0.1);
+        most_pairs(&transitions(series, 0.1), times)
+    }
+
+    /// The most transitions completing in any 1 s (at `found` indices into
+    /// `times`), as (pairs, transitions).
+    fn most_pairs(found: &[usize], times: &[f64]) -> (usize, usize) {
         let mut worst = 0;
         for (index, &start) in found.iter().enumerate() {
             let within = found[index..]
@@ -1135,18 +1147,30 @@ mod tests {
         (worst / 2, worst)
     }
 
-    /// One pixel through the phosphor's CPU model (`DecayClock` and
-    /// `decay_pixel`, as the GPU passes run them) over a static `scene`
-    /// level, added and saturated as the composite does: the displayed
-    /// relative luminance per frame. `emit` gives each frame's emitted
-    /// linear RGB from the frame index and the display's current RGB.
-    fn phosphor_pixel(
+    /// How a pixel's emitted light reaches the screen in the CPU models.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Model {
+        /// The phosphor as built: `DecayClock`, `decay_pixel` (with its red
+        /// floor) and `composite_pixel` (with its red-scene mask), as the
+        /// GPU passes run them.
+        Phosphor,
+        /// Per-channel decay added straight onto the scene, with no red
+        /// floor or mask: the earlier design, which bounds luminance only.
+        PerChannel,
+    }
+
+    /// One pixel's linear output per frame, over a still linear `scene`.
+    /// `emit` gives each frame's emitted linear RGB from the frame index
+    /// and the display's current RGB.
+    fn phosphor_output(
+        model: Model,
         rate: f32,
         times: &[f64],
-        scene: f32,
+        scene: [f32; 3],
         mut emit: impl FnMut(usize, [f32; 3]) -> [f32; 3],
-    ) -> Vec<f32> {
-        let mut clock = crate::phosphor::DecayClock::with_rate(rate);
+    ) -> Vec<[f32; 3]> {
+        use crate::phosphor::{DecayClock, GRID, composite_pixel, decay_pixel};
+        let mut clock = DecayClock::with_rate(rate);
         let mut display = [0.0_f32; 3];
         times
             .iter()
@@ -1154,13 +1178,245 @@ mod tests {
             .map(|(step, &now)| {
                 let amount = clock.tick(now);
                 let emitted = emit(step, display);
-                for (channel, lit) in display.iter_mut().zip(emitted) {
-                    *channel = crate::phosphor::decay_pixel(*channel, lit, amount);
+                match model {
+                    Model::Phosphor => {
+                        display = decay_pixel(display, emitted, amount);
+                        composite_pixel(scene, display)
+                    }
+                    Model::PerChannel => {
+                        for (channel, lit) in display.iter_mut().zip(emitted) {
+                            let lit = (lit.clamp(0.0, 1.0) * GRID).round();
+                            let held = ((*channel * GRID).round() - amount as f32).max(0.0);
+                            *channel = lit.max(held) / GRID;
+                        }
+                        std::array::from_fn(|channel| (scene[channel] + display[channel]).min(1.0))
+                    }
                 }
-                let [red, green, blue] = display.map(|channel| (scene + channel).min(1.0));
-                0.2126 * red + 0.7152 * green + 0.0722 * blue
             })
             .collect()
+    }
+
+    fn relative_luminance([red, green, blue]: [f32; 3]) -> f32 {
+        0.2126 * red + 0.7152 * green + 0.0722 * blue
+    }
+
+    /// The phosphor model's relative luminance per frame over a grey scene.
+    fn phosphor_pixel(
+        rate: f32,
+        times: &[f64],
+        scene: f32,
+        emit: impl FnMut(usize, [f32; 3]) -> [f32; 3],
+    ) -> Vec<f32> {
+        phosphor_output(Model::Phosphor, rate, times, [scene; 3], emit)
+            .into_iter()
+            .map(relative_luminance)
+            .collect()
+    }
+
+    /// Frame times over `seconds` at `fps`, steady or jittered by up to
+    /// half a frame either way.
+    fn frame_times(fps: f64, jitter: bool, seconds: f64) -> Vec<f64> {
+        let mut times = Vec::new();
+        let mut now = 0.0;
+        while now < seconds {
+            times.push(now);
+            let wobble = if jitter {
+                f64::from(hash(times.len() as u32)) - 0.5
+            } else {
+                0.0
+            };
+            now += (1.0 + wobble) / fps;
+        }
+        times
+    }
+
+    /// WCAG saturated red: linear `R / (R + G + B) >= 0.8`.
+    fn saturated_red([red, green, blue]: [f32; 3]) -> bool {
+        let sum = red + green + blue;
+        sum > 0.0 && red / sum >= 0.8
+    }
+
+    /// WCAG 2.3.1 red transitions in one pixel's linear output: opposing
+    /// changes of red `(R - G - B) * 320` (negatives as 0) by more than 20,
+    /// measured from the extreme since the last one, with either end a
+    /// saturated red (as `wcag_flashes` in the colour field tests counts
+    /// frame to frame); the indices where each completes.
+    fn red_transitions(output: &[[f32; 3]]) -> Vec<usize> {
+        let red = |[r, g, b]: [f32; 3]| (r - g - b).max(0.0);
+        let step = 20.0 / 320.0;
+        let mut found = Vec::new();
+        let (mut low, mut high) = (0, 0);
+        let mut rising: Option<bool> = None;
+        for (index, &colour) in output.iter().enumerate() {
+            if red(colour) < red(output[low]) {
+                low = index;
+            }
+            if red(colour) > red(output[high]) {
+                high = index;
+            }
+            let involves = |from: usize| saturated_red(output[from]) || saturated_red(colour);
+            let up = red(colour) - red(output[low]) > step && involves(low);
+            let down = red(output[high]) - red(colour) > step && involves(high);
+            if (up && rising != Some(true)) || (down && rising != Some(false)) {
+                found.push(index);
+                rising = Some(up && rising != Some(true));
+                (low, high) = (index, index);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn red_transitions_need_a_saturated_red_end() {
+        let red = [1.0, 0.0, 0.0];
+        let white = [1.0; 3];
+        let orange = [0.6, 0.3, 0.0];
+        assert_eq!(red_transitions(&[red, white, red, white]), [1, 2, 3]);
+        // Orange (red share 2/3) to black changes red by 0.3, but neither
+        // end is a saturated red.
+        assert!(red_transitions(&[orange, [0.0; 3], orange]).is_empty());
+        // A small change is no transition, saturated or not.
+        assert!(red_transitions(&[red, [0.95, 0.0, 0.0], red]).is_empty());
+    }
+
+    /// Red flashes, for any emitted input, at any point: the phosphor's
+    /// output is never a saturated red unless it is the scene unchanged, so
+    /// it makes no red transitions at all, over black, grey, saturated red,
+    /// dark red, orange, partly masked and blue scenes, for adversarial
+    /// inputs (red against white every frame, red and green squares of many
+    /// periods, greedy re-lighting in red, green or white, at full strength
+    /// or in blips of 0.07, once the light has fallen by just over 20/320,
+    /// a red and green staircase, and random
+    /// colours) at 60, 120 and 240 fps, steady and jittered. Its luminance
+    /// stays within 2 flashes per second there too. The same inputs through
+    /// per-channel decay with no red floor or mask (the earlier design)
+    /// reach 3 or more red flashes in 1 s, so the model does see them.
+    #[test]
+    fn phosphor_model_makes_no_red_flashes() {
+        const SECONDS: f64 = 12.0;
+        type Emit = Box<dyn FnMut(usize, [f32; 3]) -> [f32; 3]>;
+        // Re-lights `colour` once `channel` of the display has fallen by
+        // just over a red transition.
+        let greedy = |channel: usize, colour: [f32; 3]| -> Emit {
+            let mut peak = 0.0_f32;
+            Box::new(move |_, display: [f32; 3]| {
+                if peak == 0.0 || display[channel] <= peak - 0.064 {
+                    peak = colour[channel];
+                    colour
+                } else {
+                    [0.0; 3]
+                }
+            })
+        };
+        let red = [1.0, 0.0, 0.0];
+        let scenes = [
+            [0.0; 3],
+            [0.5; 3],
+            red,
+            [0.05, 0.0, 0.0],
+            [0.6, 0.15, 0.0],
+            [0.65, 0.2, 0.15],
+            [0.0, 0.0, 0.5],
+        ];
+        let mut worst_per_channel = (0, String::new());
+        for fps in [60.0, 120.0, 240.0] {
+            for jitter in [false, true] {
+                let times = frame_times(fps, jitter, SECONDS);
+                let inputs = || -> Vec<(String, Emit)> {
+                    let mut inputs: Vec<(String, Emit)> = vec![
+                        (
+                            "red/white".into(),
+                            Box::new(move |step, _| if step % 2 == 0 { red } else { [1.0; 3] }),
+                        ),
+                        ("greedy red".into(), greedy(0, red)),
+                        ("greedy green".into(), greedy(1, [0.0, 1.0, 0.0])),
+                        ("greedy white".into(), greedy(1, [1.0; 3])),
+                        // Over a red scene a small green or white rise keeps
+                        // the pixel a saturated red and lowers its red.
+                        ("green blips".into(), greedy(1, [0.0, 0.07, 0.0])),
+                        ("white blips".into(), greedy(1, [0.07; 3])),
+                        (
+                            // Raises red, then green, by just over 20/320.
+                            "staircase".into(),
+                            Box::new(|step, display: [f32; 3]| {
+                                let mut next = display;
+                                next[step % 2] = (next[step % 2] + 0.07).min(1.0);
+                                next
+                            }),
+                        ),
+                        (
+                            "random".into(),
+                            Box::new(|step, _| {
+                                let seed = step as u32 * 3 + 11;
+                                [hash(seed), hash(seed + 1), hash(seed + 2)]
+                            }),
+                        ),
+                    ];
+                    for period in [1, 2, 3, 5, 8, 13, 21, 34, 55] {
+                        inputs.push((
+                            format!("red square {period}"),
+                            Box::new(move |step, _| {
+                                if (step / period).is_multiple_of(2) {
+                                    red
+                                } else {
+                                    [0.0; 3]
+                                }
+                            }),
+                        ));
+                        inputs.push((
+                            format!("green square {period}"),
+                            Box::new(move |step, _| {
+                                if (step / period).is_multiple_of(2) {
+                                    [0.0, 1.0, 0.0]
+                                } else {
+                                    [0.0; 3]
+                                }
+                            }),
+                        ));
+                    }
+                    inputs
+                };
+                for scene in scenes {
+                    for (name, emit) in inputs() {
+                        let case = format!("{name} over {scene:?} at {fps} fps, jitter {jitter}");
+                        let output = phosphor_output(
+                            Model::Phosphor,
+                            crate::phosphor::DECAY_PER_S,
+                            &times,
+                            scene,
+                            emit,
+                        );
+                        for colour in &output {
+                            assert!(
+                                !saturated_red(*colour) || *colour == scene,
+                                "{case}: the layers made a saturated red {colour:?}"
+                            );
+                        }
+                        let (reds, changes) = most_pairs(&red_transitions(&output), &times);
+                        assert_eq!(reds, 0, "{case}: {reds} red flashes ({changes} changes)");
+                        let luminance: Vec<f32> =
+                            output.iter().copied().map(relative_luminance).collect();
+                        let (flashes, _) = most_flashes(&luminance, &times);
+                        assert!(flashes <= 2, "{case}: {flashes} flashes");
+                    }
+                    for (name, emit) in inputs() {
+                        let output = phosphor_output(
+                            Model::PerChannel,
+                            crate::phosphor::DECAY_PER_S,
+                            &times,
+                            scene,
+                            emit,
+                        );
+                        let (reds, _) = most_pairs(&red_transitions(&output), &times);
+                        if reds > worst_per_channel.0 {
+                            worst_per_channel =
+                                (reds, format!("{name} over {scene:?} at {fps} fps"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(worst_per_channel.0 >= 3, "{worst_per_channel:?}");
     }
 
     /// The phosphor bounds flashes for any emitted input: adversarial
@@ -1190,17 +1446,7 @@ mod tests {
         let mut worst = (0, 0, String::new());
         for fps in [60.0, 120.0, 240.0] {
             for jitter in [false, true] {
-                let mut times = Vec::new();
-                let mut now = 0.0;
-                while now < SECONDS {
-                    times.push(now);
-                    let wobble = if jitter {
-                        f64::from(hash(times.len() as u32)) - 0.5
-                    } else {
-                        0.0
-                    };
-                    now += (1.0 + wobble) / fps;
-                }
+                let times = frame_times(fps, jitter, SECONDS);
                 for scene in [0.0, 0.5] {
                     let mut cases: Vec<(String, Vec<f32>)> = Vec::new();
                     let rate = crate::phosphor::DECAY_PER_S;
