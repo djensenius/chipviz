@@ -176,6 +176,17 @@ The effective palette `p_eff` comes from one of three sources:
   - A stable 3 or 7 becomes an *armed request* (see
     [arming](#arming-and-operator-inputs)). The flash latch is set only when
     that request is applied under the change budget, never before.
+  - <a id="relative-palette-inputs"></a>**Relative palette inputs never arm.**
+    In the `data` role, a palette value reached by relative pulses counts as a
+    wire value for `P_STABLE`. Relative pulses are HID D-pad left/right, the
+    `chipviz_interface` palette next/prev inputs, and any palette ring.
+    - A 3 or 7 whose current run began with a relative pulse becomes an
+      unarmed request once stable, so it runs as 2 or 6. It never becomes an
+      armed request (F24).
+    - Only absolute values can arm under route (b): the control-frame
+      `palette` byte, the Joybus palette nibble, and HID palette keys.
+    - Operator pulses in an `operator` build are not wire values. They keep
+      the operator route and its arming (a) unchanged.
 - **Precedence:** a later event overrides an earlier one, whatever its source.
   - An operator pulse sets `p_req` and consumes the current wire value: that
     value never becomes `p_req` again, however long it stays.
@@ -251,7 +262,8 @@ Every build or config declares one input role:
 - **`data` (default):** pad and keyboard input is a data channel. There is no
   local pin, no physical arming, and no warning-screen confirmation from pad
   input. Scene and palette pulses are wire values, so they go through
-  `P_STABLE`.
+  `P_STABLE`. Relative palette pulses never arm (see
+  [Relative palette inputs](#relative-palette-inputs)).
 - **`operator`:** explicitly declared for standalone builds with a human at the
   controls. It enables the pin control and physical arming. An operator build
   must never be fed by USB HID.
@@ -396,7 +408,10 @@ poll. Unavailable fields are 0.
   - Only the right shoulder and the left stick Y (`beat_phase`) are ignored.
     Stick readers take energy from stick X, so the left shoulder adds nothing
     for them. There are no notes.
-  - Palette comes from keys through the wire stability gate (`P_STABLE`).
+  - Palette comes from keys, or from D-pad left/right pulses on gamepad-only
+    receivers, through the wire stability gate (`P_STABLE`). D-pad palette
+    pulses are relative and never arm (see
+    [Relative palette inputs](#relative-palette-inputs)).
     Scene changes from keys or D-pad pulses go through the
     [scene-7 debounce](#scene-7-debounce). Scene key `k` decodes as scene
     `k - 1`, so the incoming scene is the sender's `scene & 7`.
@@ -715,7 +730,8 @@ Flash is armed only by a deliberate source.
   - **Consoles in the default `data` role and N64:** no operator arming at all.
     Pad input there may be a HID feed, and the N64's Joybus ports carry
     controller 4 Start/Z as scene bits.
-- **(b) Deliberate host selection:** a wire `p` of 3 or 7 that passes the
+- **(b) Deliberate host selection:** an absolute wire `p` of 3 or 7 (not one
+  reached by [relative pulses](#relative-palette-inputs)) that passes the
   `P_STABLE` gate, with an incoming scene of 7 on every step of that window,
   becomes an armed request. This includes a 3
   or 7 present at scene entry: it runs as 2 or 6, and after 30 stable steps its
@@ -729,7 +745,8 @@ Flash is armed only by a deliberate source.
 
 Edges, pulses, or values held for fewer than `P_STABLE` steps on a data channel
 never arm, and neither does a wire 3 or 7 whose window includes a step with an
-incoming scene other than 7. Demo, attract and procedural sources never arm.
+incoming scene other than 7, and neither does a 3 or 7 reached by relative
+palette pulses. Demo, attract and procedural sources never arm.
 The armed latch clears at power-on and reset, when leaving scene 7, and when
 `p_eff` leaves mode 3.
 
@@ -819,3 +836,4 @@ OTHER = CANCEL
 | F21 scene-7 debounce | Default `data` input role, `p = 0`. `e`, bands and spectrum 100. Overrides the setup's `scene = 7`: scene 6 for steps 0–99; for steps 100–199, 7 on even steps and 6 on odd steps; 7 for 200–299; 6 for 300–319; 7 for 320–449; 6 for 450–599. | Native scene 6 through step 229, so the trace is `none` there: the jitter at 100–199 never enters scene 7. Scene-7 entry at step 230 (7 first arrives at 200, and 229 is its 30th consecutive step). It is not the power-on entry, so it sets `since_cut = 0` and `lg = 0`; with no events that changes nothing. No exit at 300–319 (only 20 steps). Exit at the end of 479 (6 first arrives at 450), so native scene 6 runs from 480 and the trace is `none` again. Exactly one entry and one exit. In scene 7 (steps 230–479) the trace is held, V2, combo 0, level 3, with no changes. |
 | F22 deferred-exit arming | Default `data` input role, no local arming. `e`, bands and spectrum 100. Wire scene 7 and palette 0 for steps 0–59. From step 60, wire palette 3. Wire scene alternates 5 for 20 steps and 6 for 20 steps from 60 to 299 (5 at `60 + 40k`…`79 + 40k`, 6 at `80 + 40k`…`99 + 40k`, `k = 0..5`), then 7 from 300 on. | The debounce never exits (each value lasts only 20 steps), so scene 7 is shown throughout. Every step from 60 to 299 has an incoming scene other than 7, so the palette count stays 0 and flash never arms there. Held (`p_eff` 0) through step 329. From 300 the scene-7 window is clean: 329 is the 30th step of wire 3, so the armed request applies at the end of 329, and mode 3 runs from 330, resting dim. Without the scene-7 window, 3 would arm at step 89 and run from 90, which is non-conforming. |
 | F23 host transport alias | Host-side check. A host started without `--allow-flash` sends 600 frames with `scene = 15`, `palette = 3`, and `e`, bands and spectrum 100 over USB HID. A second run uses `scene = 23` over N64 Joybus. Both feed default `data` targets that power on in scene 7. | HID decodes `15 & 7 = 7`, so every HID state carries scene key `8` and palette key `E` (`p = 2`), never `R`. Joybus decodes `23 & 0x0F = 7`, so every packet carries scene nibble 7 and palette nibble 2. Both targets run hard cuts (`p_eff` 2) throughout and never arm. A full-path frame with `scene = 15` is not rewritten, because its decoded scene is 15. |
+| F24 relative palette | Default `data` input role. HID gamepad-only receiver (digital-only, no palette keys), one step per poll for 600 polls, scene 7 from power-on, palette ring at 0. D-pad right is pulsed once at polls 10, 20 and 30, so the ring is 1 for 10–19, 2 for 20–29 and 3 for 30–129 (held 100 steps). D-pad left at poll 130 makes it 2 from then on. Nothing else is pressed. | Held (`p_eff` 0) through poll 59; ring values 1 and 2 last only 10 steps, so they change nothing. The ring's 3 was reached by relative pulses, so at poll 59 (its 30th step) it becomes an unarmed request (effective mode 2), applied at the end of 59. Hard cuts (mode 2) run from 60 through 599 and flash never arms. The ring's 2 at 159 matches the current mode and family, so it is cleared without effect. On a receiver with palette keys, an absolute key `R` held from poll 30 would instead arm at 59 and run mode 3 from 60 to 159. |
