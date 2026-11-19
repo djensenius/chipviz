@@ -17,6 +17,7 @@ use crate::control_frame::{ControlFrame, MAX_NOTES, Note};
 
 pub const BEAT_FLAG: u8 = 0x01;
 pub const BAR_FLAG: u8 = 0x02;
+pub const DROP_FLAG: u8 = 0x04;
 const BEATS_PER_BAR: u16 = 4;
 
 /// Latest analysed features, published without locks. Only the transport

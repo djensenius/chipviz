@@ -599,10 +599,10 @@ impl FrameSource {
         let since_udp = self.last_udp.map(|last| now.duration_since(last));
         match idle_source(self.mic.is_some(), self.udp.socket.is_some(), since_udp) {
             IdleSource::Hold => {
-                // Beat and bar are onsets: with a mic, a held packet keeps its
-                // levels but must not repeat its onset on every redraw.
+                // Beat, bar, and drop are one-off events: with a mic, a held
+                // packet keeps its levels but must not repeat them every redraw.
                 if self.mic.is_some() {
-                    self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG);
+                    self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
                 }
             }
             IdleSource::Procedural => {
@@ -953,11 +953,9 @@ mod tests {
         assert_eq!(frame.beat_count, 6);
 
         // A UDP packet wins and is held while recent, even as the mic moves on.
-        let onsets = audio::BEAT_FLAG | audio::BAR_FLAG;
+        let onsets = audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG;
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sender
-            .send_to(&wire_packet(77, onsets | 0x04), address)
-            .unwrap();
+        sender.send_to(&wire_packet(77, onsets), address).unwrap();
         let mut udp_frame = None;
         for _ in 0..200 {
             let frame = source.next_frame_at(start);
@@ -968,17 +966,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         let udp_frame = udp_frame.expect("UDP packet never arrived");
-        assert_eq!(udp_frame.flags, onsets | 0x04);
+        assert_eq!(udp_frame.flags, onsets);
         set_count(9);
 
-        // Held redraws keep the packet's fields but drop its beat/bar onsets.
+        // Held redraws keep the packet's fields but clear its one-off events.
         for elapsed in [
             Duration::ZERO,
             UDP_HOLD / 2,
             UDP_HOLD - Duration::from_millis(1),
         ] {
             let held = source.next_frame_at(start + elapsed);
-            assert_eq!((held.energy, held.flags), (77, 0x04), "{held:?}");
+            assert_eq!((held.energy, held.flags), (77, 0), "{held:?}");
         }
 
         // Back on the mic: the count jumped while UDP held, but that is not a beat.
