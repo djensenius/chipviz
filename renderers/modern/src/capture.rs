@@ -573,14 +573,17 @@ mod tests {
     }
 
     /// The mic layers never touch the colour field, and `off` renders exactly
-    /// as a pipeline that never heard of them; over a native scene `both`
-    /// does draw (the no-mic fallback ribbon and beat bursts).
+    /// as a pipeline that never steps or encodes them; over a native scene
+    /// `both` does draw (the no-mic fallback ribbon and beat bursts).
     #[test]
     #[ignore = "requires a GPU adapter"]
     fn mic_layers_skip_the_colour_field_and_off_matches_the_baseline() {
+        // `None` renders through the encode path with no mic layers at all.
         let render = |scene: u8, mode: Option<mic_layers::Mode>| {
+            let (width, height) = (160, 90);
             let mut renderer =
-                pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), 160, 90)).unwrap();
+                pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                    .unwrap();
             if let Some(mode) = mode {
                 renderer.pipeline_mut().set_mic_layers(mode);
             }
@@ -591,7 +594,24 @@ mod tests {
                     scene,
                     ..ControlFrame::procedural(index)
                 };
-                last = renderer.render(frame, elapsed(index)).unwrap();
+                let elapsed = elapsed(index);
+                last = match mode {
+                    Some(_) => renderer.render(frame, elapsed).unwrap(),
+                    None => {
+                        renderer.pipeline_mut().observe(&frame);
+                        renderer
+                            .render_with(|pipeline, encoder, view| {
+                                pipeline.encode_without_mic_layers(
+                                    encoder,
+                                    view,
+                                    frame,
+                                    elapsed,
+                                    (width, height),
+                                );
+                            })
+                            .unwrap()
+                    }
+                };
             }
             last
         };

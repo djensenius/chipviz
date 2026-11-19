@@ -370,6 +370,32 @@ impl ScenePipeline {
         elapsed: f32,
         size: (u32, u32),
     ) {
+        self.encode_frame(encoder, view, frame, elapsed, size, true);
+    }
+
+    /// `encode` as it was before the mic layers: neither steps nor draws
+    /// them. The baseline that layers `off` must match.
+    #[cfg(test)]
+    pub(crate) fn encode_without_mic_layers(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame: ControlFrame,
+        elapsed: f32,
+        size: (u32, u32),
+    ) {
+        self.encode_frame(encoder, view, frame, elapsed, size, false);
+    }
+
+    fn encode_frame(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame: ControlFrame,
+        elapsed: f32,
+        size: (u32, u32),
+        mic_layers: bool,
+    ) {
         let (width, height) = size;
         let aspect = width as f32 / height.max(1) as f32;
         let (frame, display) = self.dispatch(frame);
@@ -392,12 +418,14 @@ impl ScenePipeline {
             elapsed,
             aspect,
         );
-        let shown = mic_layers::shown(self.mic_layers.mode(), display);
-        self.mic_layers
-            .step(frame, self.live_scope.as_ref(), elapsed, shown);
         let mut overlay = Vec::new();
-        if shown {
-            self.mic_layers.build(frame, aspect, &mut overlay);
+        if mic_layers {
+            let shown = mic_layers::shown(self.mic_layers.mode(), display);
+            self.mic_layers
+                .step(frame, self.live_scope.as_ref(), elapsed, shown);
+            if shown {
+                self.mic_layers.build(frame, aspect, &mut overlay);
+            }
         }
         self.encode_layers(encoder, view, &instances, &uniforms, &overlay, aspect);
     }

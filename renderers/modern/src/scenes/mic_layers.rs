@@ -56,13 +56,12 @@ const RIBBON_AMPLITUDE: f32 = 0.3;
 const RIBBON_HALF_WIDTH: f32 = 0.92;
 /// Shapes from `scenes::object` (see `shape_alpha` in `shader.wgsl`).
 const GLOW: [f32; 2] = [0.0, -2.0];
-/// Ribbon passes, drawn in order: (thickness, alpha, kind). The halo is
-/// translucent, so its segments meet end to end instead of overlapping
-/// (overlaps would stack into visible dashes). The dark backing is opaque and
-/// the core nearly so; they overlap to hide joint gaps, which opaque quads
-/// can do without stacking.
+/// Ribbon passes, drawn in order: (thickness, alpha, kind). Every pass
+/// overlaps its neighbouring segments to hide joint gaps; the halo (a dimmed
+/// tint) and the backing are opaque so overlaps cannot stack into dashes,
+/// and the core is nearly opaque.
 const RIBBON_PASSES: [(f32, f32, Pass); 3] = [
-    (0.03, 0.16, Pass::Halo),
+    (0.026, 1.0, Pass::Halo),
     (0.017, 1.0, Pass::Backing),
     (0.008, 0.95, Pass::Core),
 ];
@@ -205,6 +204,10 @@ pub struct MicLayers {
     last_trigger: Option<Trigger>,
     last_burst: Option<f32>,
     last_elapsed: Option<f32>,
+    /// Tests only: every burst at this aspect-space spot instead of a hashed
+    /// one, so a single point sees every burst.
+    #[cfg(test)]
+    pinned: Option<[f32; 2]>,
 }
 
 impl MicLayers {
@@ -218,6 +221,8 @@ impl MicLayers {
             last_trigger: None,
             last_burst: None,
             last_elapsed: None,
+            #[cfg(test)]
+            pinned: None,
         }
     }
 
@@ -323,7 +328,10 @@ impl MicLayers {
         let tint = palette(frame.palette, brightness, energy);
         for (thickness, alpha, pass) in RIBBON_PASSES {
             let (color, overlap) = match pass {
-                Pass::Halo => ([tint[0], tint[1], tint[2], alpha], 0.0),
+                Pass::Halo => (
+                    [tint[0] * 0.3, tint[1] * 0.3, tint[2] * 0.3, alpha],
+                    thickness * 0.5,
+                ),
                 // A dark edge keeps the core readable over same-hued scenes.
                 Pass::Backing => ([0.0, 0.0, 0.0, alpha], thickness * 0.5),
                 // The core leans towards white for contrast with the palette.
@@ -370,6 +378,8 @@ impl MicLayers {
                 (hash(seed) * 1.3 - 0.65) * aspect,
                 hash(seed + 1) * 0.7 - 0.05,
             ];
+            #[cfg(test)]
+            let center = self.pinned.unwrap_or(center);
             let radius = 0.06 + 0.42 * (1.0 - (-age / 0.3).exp());
             let mut color = palette(frame.palette.wrapping_add(2), 1.0, energy);
             color[3] = envelope * GLOW_ALPHA;
@@ -665,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn ribbon_halo_meets_end_to_end_and_keeps_its_width_at_any_aspect() {
+    fn ribbon_passes_overlap_opaquely_and_keep_their_width_at_any_aspect() {
         let mut layers = MicLayers::new(Mode::Scope);
         let steep = ScopeSnapshot {
             points: std::array::from_fn(|index| if index % 2 == 0 { -1.0 } else { 1.0 }),
@@ -679,7 +689,9 @@ mod tests {
             let mut instances = Vec::new();
             layers.build(quiet(), aspect, &mut instances);
             assert_eq!(instances.len(), RIBBON_PASSES.len() * segments);
-            for (pass, (thickness, _, kind)) in RIBBON_PASSES.into_iter().enumerate() {
+            for (pass, (thickness, alpha, kind)) in RIBBON_PASSES.into_iter().enumerate() {
+                // Overlapping translucent quads would stack into dashes.
+                assert!(alpha >= 0.95, "{kind:?} is too translucent to overlap");
                 let quads = &instances[pass * segments..(pass + 1) * segments];
                 // Every quad keeps the pass thickness in aspect space, which
                 // `transform` maps to the viewport uniformly in x and y.
@@ -694,11 +706,7 @@ mod tests {
                     };
                     let (a, b) = (end(&pair[0], 1.0), end(&pair[1], -1.0));
                     let gap = (a[0] - b[0]).hypot(a[1] - b[1]);
-                    if kind == Pass::Halo {
-                        assert!(gap < 1e-4, "halo overlaps by {gap} at {aspect}");
-                    } else {
-                        assert!(gap > 0.0, "{kind:?} overlaps to hide joints");
-                    }
+                    assert!(gap > 0.0, "{kind:?} overlaps to hide joints");
                 }
             }
             let span = instances[segments - 1].center[0] - instances[0].center[0];
@@ -765,10 +773,11 @@ mod tests {
     }
 
     /// A CPU model of the bursts, not a photometric measurement: onsets every
-    /// frame at full energy, the brightest burst palette, over black. At
-    /// every probe point no 1 s window holds more than 3 flashes (6 opposing
-    /// changes of at least 0.1 relative luminance); with the start-rate cap
-    /// it should hold at most 2.
+    /// frame at full energy, the brightest burst palette, over black. With
+    /// hashed positions few bursts land on any one point, so the second case
+    /// pins every burst to one spot: there each burst is a flash, and only
+    /// the start-rate cap keeps it to 2 flashes (pairs of opposing changes of
+    /// at least 0.1 relative luminance) in any 1 s, under the limit of 3.
     #[test]
     fn flash_model_stays_under_three_flashes_per_second_at_max_onset_rate() {
         let aspect = 16.0 / 9.0;
@@ -778,49 +787,64 @@ mod tests {
             palette: 2,
             ..quiet()
         };
-        let mut layers = MicLayers::new(Mode::Bursts);
         let (columns, rows) = (48, 27);
-        let frames = 6 * FPS as usize;
-        let mut series = vec![Vec::with_capacity(frames); columns * rows];
-        let mut brightest = 0.0_f32;
-        for step in 0..frames {
-            layers.step(
-                frame,
-                Some(&snapshot(0.0, step as u32)),
-                step as f32 / FPS,
-                true,
-            );
-            let mut instances = Vec::new();
-            layers.build(frame, aspect, &mut instances);
-            for (probe, values) in series.iter_mut().enumerate() {
-                let point = [
+        let mut probes: Vec<[f32; 2]> = (0..columns * rows)
+            .map(|probe| {
+                [
                     ((probe % columns) as f32 + 0.5) / columns as f32 * 2.0 * aspect - aspect,
                     ((probe / columns) as f32 + 0.5) / rows as f32 * 2.0 - 1.0,
-                ];
-                let value = luminance(&instances, point);
-                brightest = brightest.max(value);
-                values.push(value);
+                ]
+            })
+            .collect();
+        // The pinned spot itself and points across its glow.
+        probes.extend((0..=8).map(|step| [step as f32 * 0.03, 0.0]));
+        for pinned in [None, Some([0.0, 0.0])] {
+            let mut layers = MicLayers::new(Mode::Bursts);
+            layers.pinned = pinned;
+            let frames = 6 * FPS as usize;
+            let mut series = vec![Vec::with_capacity(frames); probes.len()];
+            let mut brightest = 0.0_f32;
+            for step in 0..frames {
+                layers.step(
+                    frame,
+                    Some(&snapshot(0.0, step as u32)),
+                    step as f32 / FPS,
+                    true,
+                );
+                let mut instances = Vec::new();
+                layers.build(frame, aspect, &mut instances);
+                for (point, values) in probes.iter().zip(&mut series) {
+                    let value = luminance(&instances, *point);
+                    brightest = brightest.max(value);
+                    values.push(value);
+                }
+            }
+            assert!(
+                brightest > 0.1,
+                "the model must see the bursts: {brightest}"
+            );
+            let window = FPS as usize;
+            let mut worst = 0;
+            for values in &series {
+                let found = transitions(values, 0.1);
+                for (index, &start) in found.iter().enumerate() {
+                    let within = found[index..]
+                        .iter()
+                        .take_while(|&&later| later < start + window)
+                        .count();
+                    worst = worst.max(within);
+                }
+            }
+            let flashes = worst / 2;
+            assert!(
+                flashes <= 2,
+                "{pinned:?}: {flashes} flashes ({worst} opposing changes) in 1 s"
+            );
+            if pinned.is_some() {
+                // Every burst flashes the pinned spot, so only the cap bounds
+                // the count: it must reach the capped rate.
+                assert_eq!(flashes, 2, "pinned bursts must each flash: {worst}");
             }
         }
-        assert!(
-            brightest > 0.1,
-            "the model must see the bursts: {brightest}"
-        );
-        let window = FPS as usize;
-        let mut worst = 0;
-        for values in &series {
-            let found = transitions(values, 0.1);
-            for (index, &start) in found.iter().enumerate() {
-                let within = found[index..]
-                    .iter()
-                    .take_while(|&&later| later < start + window)
-                    .count();
-                worst = worst.max(within);
-            }
-        }
-        assert!(
-            worst <= 4,
-            "{worst} opposing changes in 1 s (2 flashes max)"
-        );
     }
 }
