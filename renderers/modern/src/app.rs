@@ -1,6 +1,6 @@
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Event, WindowEvent};
@@ -9,6 +9,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
+use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
@@ -21,6 +22,7 @@ pub enum AppError {
     Io(std::io::Error),
     Renderer(RendererError),
     Monitor(String),
+    Audio(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -31,6 +33,7 @@ impl std::fmt::Display for AppError {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Renderer(error) => write!(formatter, "renderer error: {error}"),
             Self::Monitor(message) => write!(formatter, "monitor error: {message}"),
+            Self::Audio(message) => write!(formatter, "audio error: {message}"),
         }
     }
 }
@@ -73,10 +76,26 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         ArgsCommand::Run(args) => args,
     };
 
+    // Both list flags may be given together; each list gets a heading then.
+    let both_lists = args.list_audio_devices && args.list_monitors;
+    if args.list_audio_devices {
+        let devices = InputDevices::enumerate().map_err(AppError::Audio)?;
+        if both_lists {
+            println!("Audio input devices:");
+        }
+        devices.print();
+        if !args.list_monitors {
+            return Ok(());
+        }
+    }
+
     let event_loop = EventLoop::new()?;
 
     if args.list_monitors {
         let monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
+        if both_lists {
+            println!("\nMonitors:");
+        }
         print_monitors(&monitors);
         return Ok(());
     }
@@ -97,6 +116,11 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     }
 
     let udp = UdpFrameSource::bind(args.udp_endpoint.as_deref())?;
+    let mic = if args.mic {
+        Some(start_mic(args.audio_device.as_ref()).map_err(AppError::Audio)?)
+    } else {
+        None
+    };
 
     let mut builder = WindowBuilder::new()
         .with_title(profile.window_title)
@@ -122,7 +146,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         .pipeline_mut()
         .configure_colour_field(colour_field_config(&args));
     renderer.pipeline_mut().limit_colour_field_steps();
-    let mut frame_source = FrameSource::new(udp);
+    let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
 
@@ -155,9 +179,11 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
             }
             WindowEvent::RedrawRequested => {
                 let elapsed = start.elapsed().as_secs_f32();
-                let (earlier, frame) = frame_source.next_frames();
-                for frame in &earlier {
-                    renderer.pipeline_mut().observe(frame);
+                let frame = frame_source.next_frame();
+                // The colour field sees each received or generated frame once;
+                // held redraws only repeat its last step.
+                for fresh in frame_source.fresh() {
+                    renderer.pipeline_mut().observe(fresh);
                 }
                 match renderer.render(frame, elapsed) {
                     Ok(()) => {}
@@ -207,11 +233,18 @@ fn print_monitors(monitors: &[MonitorHandle]) {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} [--udp LISTEN_ADDR:PORT] [--fullscreen] [--monitor INDEX|NAME] [--list-monitors]
+        "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
        [--layout auto|v2|h2|v3|h3] [--allow-flash]
+       {program} --list-monitors | --list-audio-devices
 
 Options:
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
+  --mic                   drive frames from live microphone analysis instead of
+                          procedural frames; UDP packets, when they arrive, still win
+  --audio-device INDEX|NAME
+                          microphone to use with --mic, by index or case-insensitive
+                          name substring (default: system default input)
+  --list-audio-devices    print available audio input devices and exit
   --fullscreen            start in borderless fullscreen (default: windowed)
   --monitor INDEX|NAME    display to use, by index or case-insensitive name substring
   --list-monitors         print available monitors and exit
@@ -233,12 +266,12 @@ fn cursor_visible(fullscreen: bool) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MonitorSelector {
+enum DeviceSelector {
     Index(usize),
     Name(String),
 }
 
-impl MonitorSelector {
+impl DeviceSelector {
     fn parse(value: &str) -> Self {
         match value.parse::<usize>() {
             Ok(index) => Self::Index(index),
@@ -247,19 +280,51 @@ impl MonitorSelector {
     }
 }
 
-/// Resolves a selector against monitor names (in enumeration order).
-/// All-digit selectors are indices (as printed by `--list-monitors`). Names
+/// Wording for selection errors about one kind of device.
+struct DeviceKind {
+    noun: &'static str,
+    flag: &'static str,
+    list_flag: &'static str,
+}
+
+const MONITOR: DeviceKind = DeviceKind {
+    noun: "monitor",
+    flag: "--monitor",
+    list_flag: "--list-monitors",
+};
+
+const AUDIO_INPUT: DeviceKind = DeviceKind {
+    noun: "audio input device",
+    flag: "--audio-device",
+    list_flag: "--list-audio-devices",
+};
+
+fn select_monitor(names: &[Option<String>], selector: &DeviceSelector) -> Result<usize, String> {
+    select_device(names, selector, &MONITOR)
+}
+
+/// Resolves a selector against device names (in enumeration order).
+/// All-digit selectors are indices (as printed by the list flag). Names
 /// match as a case-insensitive substring; a *unique* exact (case-insensitive)
-/// name wins when several monitors match. Duplicate names (e.g. two identical
+/// name wins when several devices match. Duplicate names (e.g. two identical
 /// displays) are ambiguous and must be selected by index.
-fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Result<usize, String> {
+fn select_device(
+    names: &[Option<String>],
+    selector: &DeviceSelector,
+    kind: &DeviceKind,
+) -> Result<usize, String> {
+    let DeviceKind {
+        noun,
+        flag,
+        list_flag,
+    } = kind;
     match selector {
-        MonitorSelector::Index(index) if *index < names.len() => Ok(*index),
-        MonitorSelector::Index(index) => Err(format!(
-            "monitor index {index} out of range ({} monitor(s) available; see --list-monitors)",
+        DeviceSelector::Index(index) if *index < names.len() => Ok(*index),
+        DeviceSelector::Index(index) => Err(format!(
+            "{noun} index {index} out of range ({} {noun}(s) available; see {list_flag})",
             names.len()
         )),
-        MonitorSelector::Name(query) => {
+        DeviceSelector::Name(query) => {
             let needle = query.to_lowercase();
             let lowered: Vec<Option<String>> = names
                 .iter()
@@ -283,10 +348,10 @@ fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Resul
             match matches.as_slice() {
                 [index] => Ok(*index),
                 [] => Err(format!(
-                    "no monitor name contains \"{query}\" (see --list-monitors)"
+                    "no {noun} name contains \"{query}\" (see {list_flag})"
                 )),
                 _ => Err(format!(
-                    "monitor name \"{query}\" is ambiguous: matches indices {matches:?}; select one with --monitor INDEX (see --list-monitors)"
+                    "{noun} name \"{query}\" is ambiguous: matches indices {matches:?}; select one with {flag} INDEX (see {list_flag})"
                 )),
             }
         }
@@ -366,15 +431,18 @@ enum ArgsCommand {
 struct AppArgs {
     udp_endpoint: Option<String>,
     fullscreen: bool,
-    monitor: Option<MonitorSelector>,
+    monitor: Option<DeviceSelector>,
     list_monitors: bool,
+    mic: bool,
+    audio_device: Option<DeviceSelector>,
+    list_audio_devices: bool,
     /// Colour-field layout pin; `None` is `auto`.
     layout: Option<u8>,
     allow_flash: bool,
 }
 
-/// Wire palettes go through the stability gate; procedural frames use a
-/// local palette 0, which never arms.
+/// Wire palettes go through the stability gate; procedural and mic-only
+/// frames use a local palette 0, which never arms.
 fn colour_field_config(args: &AppArgs) -> colour_field::Config {
     colour_field::Config {
         allow_flash: args.allow_flash,
@@ -416,9 +484,15 @@ impl AppArgs {
                 "--fullscreen" => parsed.fullscreen = true,
                 "--monitor" => {
                     let value = required_value(&mut args, "--monitor", "INDEX or NAME")?;
-                    parsed.monitor = Some(MonitorSelector::parse(&value));
+                    parsed.monitor = Some(DeviceSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
+                "--mic" => parsed.mic = true,
+                "--audio-device" => {
+                    let value = required_value(&mut args, "--audio-device", "INDEX or NAME")?;
+                    parsed.audio_device = Some(DeviceSelector::parse(&value));
+                }
+                "--list-audio-devices" => parsed.list_audio_devices = true,
                 "--layout" => {
                     let value = required_value(&mut args, "--layout", "auto|v2|h2|v3|h3")?;
                     parsed.layout = parse_layout(&value)?;
@@ -429,6 +503,10 @@ impl AppArgs {
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
                 _ => return Err(invalid_input(format!("unknown argument: {arg}"))),
             }
+        }
+
+        if parsed.audio_device.is_some() && !parsed.mic && !parsed.list_audio_devices {
+            return Err(invalid_input("--audio-device requires --mic".to_string()));
         }
 
         Ok(ArgsCommand::Run(parsed))
@@ -492,36 +570,132 @@ impl UdpFrameSource {
     }
 }
 
+/// Anything that can hand the render thread the latest analysed audio.
+trait LatestFeatures {
+    fn latest(&self) -> AudioFeatures;
+}
+
+impl LatestFeatures for MicSource {
+    fn latest(&self) -> AudioFeatures {
+        MicSource::latest(self)
+    }
+}
+
+fn start_mic(selector: Option<&DeviceSelector>) -> Result<MicSource, String> {
+    let devices = InputDevices::enumerate()?;
+    let index = selector
+        .map(|selector| select_device(devices.names(), selector, &AUDIO_INPUT))
+        .transpose()?;
+    MicSource::start(devices, index)
+}
+
+/// After a UDP packet, UDP keeps priority over the mic for this long, so a
+/// bridge streaming at about the render rate never flickers with mic frames.
+const UDP_HOLD: Duration = Duration::from_millis(500);
+
+/// What to render when no UDP packet arrived this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleSource {
+    /// Keep the last frame (UDP-only mode, or a recent UDP packet).
+    Hold,
+    Procedural,
+    Mic,
+}
+
+/// Precedence: fresh UDP packets > mic (`--mic`) > procedural fallback.
+/// Without `--mic` this is the pre-mic behaviour: UDP mode holds the last
+/// packet and procedural frames run only when `--udp` is absent.
+fn idle_source(mic: bool, udp: bool, since_udp: Option<Duration>) -> IdleSource {
+    if mic {
+        if since_udp.is_some_and(|elapsed| elapsed < UDP_HOLD) {
+            IdleSource::Hold
+        } else {
+            IdleSource::Mic
+        }
+    } else if udp {
+        IdleSource::Hold
+    } else {
+        IdleSource::Procedural
+    }
+}
+
 struct FrameSource {
     udp: UdpFrameSource,
+    mic: Option<Box<dyn LatestFeatures>>,
     fallback_index: u64,
     latest: ControlFrame,
+    last_udp: Option<Instant>,
+    mic_beat_count: Option<u16>,
+    fresh: Vec<ControlFrame>,
 }
 
 impl FrameSource {
-    fn new(udp: UdpFrameSource) -> Self {
+    fn new(udp: UdpFrameSource, mic: Option<MicSource>) -> Self {
+        Self::with_feed(udp, mic.map(|mic| Box::new(mic) as Box<dyn LatestFeatures>))
+    }
+
+    fn with_feed(udp: UdpFrameSource, mic: Option<Box<dyn LatestFeatures>>) -> Self {
         Self {
             udp,
+            mic,
             fallback_index: 0,
             latest: ControlFrame::procedural(0),
+            last_udp: None,
+            mic_beat_count: None,
+            fresh: Vec::new(),
         }
     }
 
-    /// The frame to draw, plus any earlier frames received since the last
-    /// redraw (the colour field's onset detection sees every frame).
-    fn next_frames(&mut self) -> (Vec<ControlFrame>, ControlFrame) {
-        let mut frames = self.udp.receive_all();
-        if let Some(frame) = frames.pop() {
+    fn next_frame(&mut self) -> ControlFrame {
+        self.next_frame_at(Instant::now())
+    }
+
+    /// Frames received or generated by the last `next_frame_at`, oldest
+    /// first. Empty on a held redraw: a held frame is a display repeat, not
+    /// a new frame, so the colour field neither steps on it nor sees its
+    /// cleared one-off flags as falling edges.
+    fn fresh(&self) -> &[ControlFrame] {
+        &self.fresh
+    }
+
+    fn next_frame_at(&mut self, now: Instant) -> ControlFrame {
+        self.fresh = self.udp.receive_all();
+        if let Some(&frame) = self.fresh.last() {
             self.latest = frame;
-            return (frames, frame);
+            self.last_udp = Some(now);
+            self.mic_beat_count = None;
+            return frame;
         }
 
-        if self.udp.socket.is_none() {
-            self.fallback_index = self.fallback_index.wrapping_add(1);
-            self.latest = ControlFrame::procedural(self.fallback_index);
+        let since_udp = self.last_udp.map(|last| now.duration_since(last));
+        match idle_source(self.mic.is_some(), self.udp.socket.is_some(), since_udp) {
+            IdleSource::Hold => {
+                // Beat, bar, and drop are one-off events: with a mic, a held
+                // packet keeps its levels but must not repeat them every
+                // redraw. Notes are sustained voice state (active/gated voices
+                // that producers resend until note-off), so they are kept.
+                if self.mic.is_some() {
+                    self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
+                }
+            }
+            IdleSource::Procedural => {
+                self.fallback_index = self.fallback_index.wrapping_add(1);
+                self.latest = ControlFrame::procedural(self.fallback_index);
+                self.fresh.push(self.latest);
+            }
+            IdleSource::Mic => {
+                if let Some(mic) = &self.mic {
+                    self.fallback_index = self.fallback_index.wrapping_add(1);
+                    let features = mic.latest();
+                    let base = ControlFrame::procedural(self.fallback_index);
+                    self.latest = audio::mic_frame(base, features, self.mic_beat_count);
+                    self.mic_beat_count = Some(features.beat_count);
+                    self.fresh.push(self.latest);
+                }
+            }
         }
 
-        (frames, self.latest)
+        self.latest
     }
 }
 
@@ -554,7 +728,7 @@ mod tests {
     fn parses_fullscreen_monitor_and_udp() {
         let args = parse_run(&["--fullscreen", "--monitor", "1", "--udp", "127.0.0.1:6464"]);
         assert!(args.fullscreen);
-        assert_eq!(args.monitor, Some(MonitorSelector::Index(1)));
+        assert_eq!(args.monitor, Some(DeviceSelector::Index(1)));
         assert_eq!(args.udp_endpoint.as_deref(), Some("127.0.0.1:6464"));
         assert!(!args.list_monitors);
     }
@@ -564,7 +738,7 @@ mod tests {
         let args = parse_run(&["--monitor", "Studio Display"]);
         assert_eq!(
             args.monitor,
-            Some(MonitorSelector::Name("Studio Display".to_string()))
+            Some(DeviceSelector::Name("Studio Display".to_string()))
         );
     }
 
@@ -590,15 +764,15 @@ mod tests {
     #[test]
     fn selects_monitor_by_index() {
         let monitors = names(&[Some("Built-in Retina Display"), Some("LG UltraFine")]);
-        assert_eq!(select_monitor(&monitors, &MonitorSelector::Index(1)), Ok(1));
-        let error = select_monitor(&monitors, &MonitorSelector::Index(2)).unwrap_err();
+        assert_eq!(select_monitor(&monitors, &DeviceSelector::Index(1)), Ok(1));
+        let error = select_monitor(&monitors, &DeviceSelector::Index(2)).unwrap_err();
         assert!(error.contains("out of range"), "{error}");
     }
 
     #[test]
     fn selects_monitor_by_case_insensitive_substring() {
         let monitors = names(&[Some("Built-in Retina Display"), None, Some("LG UltraFine")]);
-        let select = |query: &str| select_monitor(&monitors, &MonitorSelector::Name(query.into()));
+        let select = |query: &str| select_monitor(&monitors, &DeviceSelector::Name(query.into()));
         assert_eq!(select("ultrafine"), Ok(2));
         assert_eq!(select("RETINA"), Ok(0));
         assert!(select("Sidecar").unwrap_err().contains("no monitor"));
@@ -611,7 +785,7 @@ mod tests {
             Some("DELL U2720Q (2)"),
             Some("DELL P2419H"),
         ]);
-        let select = |query: &str| select_monitor(&monitors, &MonitorSelector::Name(query.into()));
+        let select = |query: &str| select_monitor(&monitors, &DeviceSelector::Name(query.into()));
         assert!(select("dell").unwrap_err().contains("ambiguous"));
         assert_eq!(select("dell u2720q"), Ok(0));
         assert_eq!(select("(2)"), Ok(1));
@@ -624,16 +798,16 @@ mod tests {
             Some("DELL U2720Q"),
             Some("dell u2720q"),
         ]);
-        let by_name = |query: &str| select_monitor(&monitors, &MonitorSelector::Name(query.into()));
+        let by_name = |query: &str| select_monitor(&monitors, &DeviceSelector::Name(query.into()));
         let error = by_name("DELL U2720Q").unwrap_err();
         assert!(error.contains("ambiguous"), "{error}");
         assert!(error.contains("[1, 2]"), "{error}");
         assert!(error.contains("--monitor INDEX"), "{error}");
         assert_eq!(by_name("retina"), Ok(0));
-        let by_index = |index: usize| select_monitor(&monitors, &MonitorSelector::Index(index));
+        let by_index = |index: usize| select_monitor(&monitors, &DeviceSelector::Index(index));
         assert_eq!(by_index(2), Ok(2));
         assert!(by_index(3).unwrap_err().contains("out of range"));
-        assert_eq!(MonitorSelector::parse("2"), MonitorSelector::Index(2));
+        assert_eq!(DeviceSelector::parse("2"), DeviceSelector::Index(2));
     }
 
     #[test]
@@ -765,10 +939,244 @@ mod tests {
         let args = parse_run(&["--", "--monitor", "Studio Display"]);
         assert_eq!(
             args.monitor,
-            Some(MonitorSelector::Name("Studio Display".to_string()))
+            Some(DeviceSelector::Name("Studio Display".to_string()))
         );
         assert!(parse_run(&["--", "--list-monitors"]).list_monitors);
         assert!(parse(&["--fullscreen", "--"]).is_err());
+    }
+
+    #[test]
+    fn parses_mic_options() {
+        let args = parse_run(&["--mic", "--audio-device", "2"]);
+        assert!(args.mic);
+        assert_eq!(args.audio_device, Some(DeviceSelector::Index(2)));
+        let args = parse_run(&["--mic", "--audio-device", "MacBook Pro Microphone"]);
+        assert_eq!(
+            args.audio_device,
+            Some(DeviceSelector::Name("MacBook Pro Microphone".to_string()))
+        );
+        assert!(parse_run(&["--list-audio-devices"]).list_audio_devices);
+        assert!(!parse_run(&[]).mic);
+        let message = parse(&["--audio-device", "1"]).unwrap_err().to_string();
+        assert!(
+            message.contains("--audio-device requires --mic"),
+            "{message}"
+        );
+        let message = parse(&["--mic", "--audio-device"]).unwrap_err().to_string();
+        assert!(message.contains("--audio-device requires"), "{message}");
+    }
+
+    #[test]
+    fn selects_audio_devices_like_monitors() {
+        let devices = names(&[
+            Some("MacBook Pro Microphone"),
+            Some("USB Audio Device"),
+            Some("USB Audio Device (2)"),
+        ]);
+        let select = |selector: DeviceSelector| select_device(&devices, &selector, &AUDIO_INPUT);
+        assert_eq!(select(DeviceSelector::parse("macbook")), Ok(0));
+        assert_eq!(select(DeviceSelector::parse("usb audio device")), Ok(1));
+        assert_eq!(select(DeviceSelector::parse("2")), Ok(2));
+        let error = select(DeviceSelector::parse("usb")).unwrap_err();
+        assert!(error.contains("audio input device name"), "{error}");
+        assert!(error.contains("--audio-device INDEX"), "{error}");
+        let error = select(DeviceSelector::parse("5")).unwrap_err();
+        assert!(error.contains("--list-audio-devices"), "{error}");
+        let error = select(DeviceSelector::parse("webcam")).unwrap_err();
+        assert!(error.contains("no audio input device name"), "{error}");
+    }
+
+    struct FakeMic(std::rc::Rc<std::cell::Cell<AudioFeatures>>);
+
+    impl LatestFeatures for FakeMic {
+        fn latest(&self) -> AudioFeatures {
+            self.0.get()
+        }
+    }
+
+    /// A valid wire packet with optional single `(note, velocity)`.
+    fn wire_packet(energy: u8, flags: u8, note: Option<(u8, u8)>) -> [u8; WIRE_SIZE] {
+        let mut packet = [0; WIRE_SIZE];
+        packet[0] = crate::control_frame::MAGIC;
+        packet[8] = energy;
+        packet[22] = flags;
+        if let Some((note, velocity)) = note {
+            packet[23] = 1;
+            packet[24] = note;
+            packet[25] = velocity;
+        }
+        packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+        packet
+    }
+
+    #[test]
+    fn mic_beat_flag_resets_after_a_udp_packet() {
+        let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+        let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures {
+            beat_count: 5,
+            ..AudioFeatures::default()
+        }));
+        let mut source = FrameSource::with_feed(udp, Some(Box::new(FakeMic(feed.clone()))));
+        let set_count = |count: u16| {
+            feed.set(AudioFeatures {
+                beat_count: count,
+                ..feed.get()
+            })
+        };
+        let start = Instant::now();
+
+        // Mic frames: no beat on the first frame, a beat when the count moves.
+        assert!(!source.next_frame_at(start).beat_onset());
+        set_count(6);
+        let frame = source.next_frame_at(start);
+        assert!(frame.beat_onset());
+        assert_eq!(frame.beat_count, 6);
+
+        // A UDP packet wins and is held while recent, even as the mic moves on.
+        let onsets = audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG;
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(&wire_packet(77, onsets, Some((60, 100))), address)
+            .unwrap();
+        let mut udp_frame = None;
+        for _ in 0..200 {
+            let frame = source.next_frame_at(start);
+            if frame.energy == 77 {
+                udp_frame = Some(frame);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let udp_frame = udp_frame.expect("UDP packet never arrived");
+        assert_eq!(udp_frame.flags, onsets);
+        assert_eq!(udp_frame.note_count, 1);
+        assert_eq!(
+            (udp_frame.notes[0].note, udp_frame.notes[0].velocity),
+            (60, 100)
+        );
+        set_count(9);
+
+        // Held redraws keep the packet's fields and sustained notes but clear
+        // its one-off events.
+        for elapsed in [
+            Duration::ZERO,
+            UDP_HOLD / 2,
+            UDP_HOLD - Duration::from_millis(1),
+        ] {
+            let held = source.next_frame_at(start + elapsed);
+            assert_eq!(
+                (held.energy, held.flags, held.note_count),
+                (77, 0, 1),
+                "{held:?}"
+            );
+            assert_eq!((held.notes[0].note, held.notes[0].velocity), (60, 100));
+        }
+
+        // Back on the mic: the count jumped while UDP held, but that is not a beat.
+        let later = start + UDP_HOLD * 2;
+        let frame = source.next_frame_at(later);
+        assert_eq!(frame.beat_count, 9);
+        assert!(!frame.beat_onset(), "{frame:?}");
+        set_count(10);
+        assert!(source.next_frame_at(later).beat_onset());
+    }
+
+    /// Held redraws in mic mode clear one-off flags. The colour field must
+    /// not see that as a falling edge (which would turn a sustained beat flag
+    /// in the next packet into a second onset), and a held redraw is a
+    /// display repeat, so it must not step.
+    #[test]
+    fn held_udp_redraws_neither_step_nor_retrigger_the_colour_field() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+        let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures::default()));
+        let mut source = FrameSource::with_feed(udp, Some(Box::new(FakeMic(feed))));
+        let mut field = ColourField::new(Config::default());
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let start = Instant::now();
+        // One window redraw, as in `run`: returns (new frames, beat edge
+        // pending, stepped).
+        fn redraw(
+            source: &mut FrameSource,
+            field: &mut ColourField,
+            now: Instant,
+        ) -> (usize, bool, bool) {
+            source.next_frame_at(now);
+            for fresh in source.fresh() {
+                field.observe(fresh);
+            }
+            let beat = field.pending_beat_bar();
+            let stepped = field.has_new_frame();
+            if stepped {
+                field.step(Controls::default());
+            }
+            (source.fresh().len(), beat, stepped)
+        }
+        // Packet counters stay clear of the mic frames' small counters.
+        let send = |source: &mut FrameSource, field: &mut ColourField, counter: u16, flags: u8| {
+            let mut packet = wire_packet(90, flags, Some((60, 100)));
+            packet[2..4].copy_from_slice(&counter.to_le_bytes());
+            packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+            sender.send_to(&packet, address).unwrap();
+            // Until the first packet lands, redraws in mic mode generate mic
+            // frames; wait for this packet itself.
+            for _ in 0..200 {
+                let result = redraw(source, field, start);
+                if source.fresh().iter().any(|frame| frame.frame == counter) {
+                    return result;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("UDP packet {counter} never arrived");
+        };
+
+        // Mic frames before any packet are new frames too.
+        for _ in 0..3 {
+            assert_eq!(redraw(&mut source, &mut field, start), (1, false, true));
+        }
+        assert_eq!(send(&mut source, &mut field, 1001, 0), (1, false, true));
+        assert_eq!(
+            send(&mut source, &mut field, 1002, audio::BEAT_FLAG),
+            (1, true, true)
+        );
+        // Held redraws (flags cleared for display) add no frames and no steps.
+        for _ in 0..5 {
+            let held = source.next_frame_at(start);
+            assert_eq!(held.flags, 0);
+            assert!(source.fresh().is_empty());
+            assert_eq!(redraw(&mut source, &mut field, start), (0, false, false));
+        }
+        // The beat flag is still high in the next packet: no second onset.
+        assert_eq!(
+            send(&mut source, &mut field, 1003, audio::BEAT_FLAG),
+            (1, false, true)
+        );
+        assert_eq!(send(&mut source, &mut field, 1004, 0), (1, false, true));
+        assert_eq!(
+            send(&mut source, &mut field, 1005, audio::BEAT_FLAG),
+            (1, true, true)
+        );
+        // After the hold, mic frames are new frames and step again.
+        let (fresh, _, stepped) = redraw(&mut source, &mut field, start + UDP_HOLD * 2);
+        assert_eq!((fresh, stepped), (1, true));
+    }
+
+    #[test]
+    fn udp_packets_win_over_mic_and_procedural_is_unchanged() {
+        let recent = Some(Duration::from_millis(100));
+        let stale = Some(UDP_HOLD);
+        // Without --mic: procedural without --udp, hold the last packet with it.
+        assert_eq!(idle_source(false, false, None), IdleSource::Procedural);
+        assert_eq!(idle_source(false, true, None), IdleSource::Hold);
+        assert_eq!(idle_source(false, true, stale), IdleSource::Hold);
+        // With --mic: mic replaces procedural; recent UDP holds priority.
+        assert_eq!(idle_source(true, false, None), IdleSource::Mic);
+        assert_eq!(idle_source(true, true, None), IdleSource::Mic);
+        assert_eq!(idle_source(true, true, recent), IdleSource::Hold);
+        assert_eq!(idle_source(true, true, stale), IdleSource::Mic);
     }
 
     #[test]
@@ -828,6 +1236,9 @@ mod tests {
             "--fullscreen",
             "--monitor",
             "--list-monitors",
+            "--mic",
+            "--audio-device",
+            "--list-audio-devices",
             "--layout auto|v2|h2|v3|h3",
             "--allow-flash",
             "cycle the colour-field layout pin",

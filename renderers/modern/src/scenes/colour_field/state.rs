@@ -675,6 +675,12 @@ impl ColourField {
         self.display
     }
 
+    /// A `beat`/`bar` rising edge has been observed since the last step.
+    #[cfg(test)]
+    pub(crate) fn pending_beat_bar(&self) -> bool {
+        self.onsets.pending.beat_bar
+    }
+
     #[cfg(test)]
     pub(super) fn is_silent(&self) -> bool {
         self.field.as_ref().is_some_and(|field| field.silent)

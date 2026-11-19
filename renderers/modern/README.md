@@ -21,7 +21,7 @@ just modern-pi5
 just modern-m1 -- --udp 127.0.0.1:6464
 ```
 
-Without `--udp`, the renderer uses deterministic procedural frames. With UDP,
+Without `--udp` or `--mic`, the renderer uses deterministic procedural frames. With UDP,
 it consumes `control-frame-v0` packets from the host bridge:
 
 ```sh
@@ -55,6 +55,88 @@ just modern-m1 -- --fullscreen --monitor 1
 
 The cursor is hidden while fullscreen and restored when windowed.
 
+## Microphone input
+
+The renderer can analyse live microphone audio itself, with no bridge
+needed. Capture is off by default.
+
+| Option | Effect |
+| --- | --- |
+| `--mic` | Drive frames from the microphone (the system default input unless `--audio-device` is given). |
+| `--audio-device INDEX\|NAME` | Choose the input by the index from `--list-audio-devices` (all-digit values are indices) or by name, matched like `--monitor`: a unique exact name, else a unique case-insensitive substring; ambiguous names are rejected. Requires `--mic`. |
+| `--list-audio-devices` | Print each input device's index and name (marking the default), then exit. Combined with `--list-monitors`, both lists are printed under headings. |
+
+```sh
+just modern-m1 -- --list-audio-devices
+just modern-m1 -- --mic
+just modern-m1 -- --mic --audio-device "MacBook Pro Microphone" --fullscreen
+```
+
+Source precedence, highest first:
+
+1. UDP packets (`--udp`). After a packet arrives, UDP keeps priority for
+   500 ms, so a bridge streaming at the frame rate never flickers with mic
+   frames.
+2. The microphone (`--mic`), which replaces the procedural fallback.
+3. Procedural frames, used only when neither `--mic` nor `--udp` is given.
+
+Without `--mic`, behaviour is unchanged. Mic frames fill `energy`, `bass`,
+`mid`, `treble`, the eight `spectrum` bands (log-spaced from 40 Hz to 12 kHz,
+as in the host bridge), `bpm` (`0` until a tempo is detected), `beat_phase`,
+`beat_count`, and the beat and bar flags. `frame`, `scene`, and `palette`
+follow the same timeline as procedural frames, so scenes still cycle.
+
+The beat clock only moves forward: `beat_count` increments exactly when
+`beat_phase` wraps, and `beat_count * 256 + beat_phase` never decreases. Onsets
+near the expected beat nudge the clock (jumping forward, or briefly slowing
+down) instead of rewinding it; off-beat onsets are ignored. Tempo comes from
+onset gaps folded into 60-200 BPM, so eighths faster than 200 per minute read as
+the quarter-note tempo. Known limits: tempos outside 60-200 BPM are folded into
+that range (tempos within about one analysis hop of either end are pinned to
+it), very fast tempos (about 180 BPM and up) with loose timing can read at half
+tempo, 3/4
+and swung feels are not distinguished from straight time, and music with only
+off-beat accents is tracked on those accents.
+
+Analysis runs on its own thread; the render thread reads the latest result
+without waiting. Levels use automatic gain with a noise floor, so quiet and
+loud rooms both move the scenes, room hiss stays dark, and silence (or a
+device that stops sending audio) fades smoothly to zero. Audio dropped while
+analysis catches up still advances the beat clock, so it keeps real time.
+
+The stream is not reopened if the device is unplugged or fails: the renderer
+prints a stream error (at most once every five seconds) and the levels fade to
+silence. Restart the renderer to pick up a reconnected device.
+
+If no input device exists, the name or index matches nothing, or the stream
+cannot be opened, the renderer prints an error and exits with a non-zero
+status before opening a window.
+
+### macOS microphone permission
+
+The unbundled binary has no app bundle of its own, so macOS asks the app that
+launched it (Terminal, iTerm2, VS Code, ...) for microphone access, and the
+permission is stored for that app. When access is denied, macOS sends silent
+audio instead of an error, so after three seconds of pure silence the renderer
+prints a warning that points to System Settings > Privacy & Security >
+Microphone. To be asked again, reset the permission (for every app, or only for
+one bundle ID), then restart the terminal app:
+
+```sh
+tccutil reset Microphone
+tccutil reset Microphone com.apple.Terminal
+```
+
+On other platforms the silence warning instead suggests checking that the
+input is not muted and is the expected device.
+
+### Linux (including Raspberry Pi 5)
+
+All renderer binaries, including `chipviz-pi5` and `chipviz-capture`, link
+against ALSA even when `--mic` is not used. Building needs the headers
+(`libasound2-dev` on Debian and Raspberry Pi OS) and running needs the runtime
+library `libasound2` (e.g. `sudo apt install libasound2`).
+
 ## Scene plan
 
 Scenes live in `src/scenes/`, one module per scene, behind the `REGISTRY`
@@ -85,6 +167,11 @@ the colour field, whatever the registry length; every other byte selects
   the rotation, within the spec's limit of 3 flashes per second. Wire palette
   and scene values must hold for 30 steps before they apply, and changes share
   a budget of one per 20 steps. Without `--udp` the palette is local 0 (held).
+  Scene 7 arrives over UDP (procedural and mic frames use scenes 0 to 2). The
+  field steps once per new UDP, mic or procedural frame. A held UDP frame
+  repeats the last step and its cleared one-off flags never count as edges, so
+  when mic frames take over, the debounce returns to the native scene after
+  about 30 steps.
   Flash/gate runs only with `--allow-flash` and a stable absolute wire 3 or 7;
   without the flag, 3 and 7 run as hard cuts.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D

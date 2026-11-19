@@ -260,6 +260,7 @@ impl ScenePipeline {
     /// Steps camera smoothing and the colour field for a frame that is not
     /// drawn.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
+        self.observe(&frame);
         let (frame, _) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed, aspect);
@@ -280,16 +281,18 @@ impl ScenePipeline {
         self.colour_controls.pin_cycle = true;
     }
 
-    /// Feeds a received frame to the colour field's onset detection without
-    /// drawing it (frames that arrive between redraws).
+    /// Feeds one received or generated frame to the colour field (onset
+    /// detection, and the newest frame for its next step). Call once per new
+    /// frame, never for a held display repeat; `encode` steps on what was
+    /// observed.
     pub fn observe(&mut self, frame: &ControlFrame) {
         self.colour_field.observe(frame);
     }
 
-    /// Scene dispatch: the colour field sees every frame and owns scene 7;
-    /// otherwise the native scene goes through the registry unchanged.
+    /// Scene dispatch: the colour field steps once per new observed frame
+    /// and owns scene 7; otherwise the native scene goes through the
+    /// registry unchanged. `frame` is only drawn, never observed here.
     fn dispatch(&mut self, frame: ControlFrame) -> (ControlFrame, colour_field::Display) {
-        self.colour_field.observe(&frame);
         let allowed = match &mut self.step_clock {
             None => true,
             Some((clock, start)) => {
@@ -446,6 +449,8 @@ impl Renderer {
         self.resize(size.width, size.height);
     }
 
+    /// Draws `frame`. The caller feeds new frames to the colour field with
+    /// [`ScenePipeline::observe`] first, so held redraws repeat its last step.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<(), RendererError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -517,8 +522,10 @@ impl OffscreenRenderer {
         &mut self.pipeline
     }
 
-    /// Draws one frame and returns tightly packed RGB8 rows, top row first.
+    /// Draws one new frame (observed by the colour field first) and returns
+    /// tightly packed RGB8 rows, top row first.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<Vec<u8>, RendererError> {
+        self.pipeline.observe(&frame);
         let size = (self.width, self.height);
         self.render_with(|pipeline, encoder, view| {
             pipeline.encode(encoder, view, frame, elapsed, size);
