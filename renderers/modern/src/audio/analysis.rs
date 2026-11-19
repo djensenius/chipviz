@@ -92,11 +92,25 @@ pub struct BeatTracker {
     lag: f32,
     last_on_beat_s: Option<f64>,
     off_beat_streak: u32,
+    /// Endpoint slack for [`fold_period`]; see [`BeatTracker::with_hop`].
+    fold_tolerance_s: f32,
 }
 
 impl Default for BeatTracker {
+    /// A tracker with no hop quantisation (one tempo bin of endpoint slack).
     fn default() -> Self {
+        Self::with_hop(0.0)
+    }
+}
+
+impl BeatTracker {
+    /// A tracker fed onsets quantised to `hop_s` seconds. Onset gaps within
+    /// `max(hop_s, TEMPO_BIN_S)` of the 0.3-1.0 s range endpoints are clamped
+    /// onto them rather than octave-folded, so hop jitter around 60 or
+    /// 200 BPM cannot fold a steady beat to half or double its tempo.
+    pub fn with_hop(hop_s: f32) -> Self {
         Self {
+            fold_tolerance_s: fold_tolerance(hop_s),
             time_s: 0.0,
             recent_onsets: VecDeque::with_capacity(RECENT_ONSETS),
             tempo_weight: [0.0; TEMPO_BINS],
@@ -110,9 +124,7 @@ impl Default for BeatTracker {
             off_beat_streak: 0,
         }
     }
-}
 
-impl BeatTracker {
     /// Advances the clock by `dt` seconds; `onset` marks an onset at the end.
     pub fn advance(&mut self, dt: f32, onset: bool) {
         self.time_s += f64::from(dt);
@@ -155,7 +167,7 @@ impl BeatTracker {
             if !(MIN_ONSET_GAP_S..=MAX_ONSET_GAP_S).contains(&gap) {
                 continue;
             }
-            let period = fold_period(gap as f32);
+            let period = fold_period(gap as f32, self.fold_tolerance_s);
             let bin = (((period - MIN_BEAT_PERIOD_S) / TEMPO_BIN_S) as usize).min(TEMPO_BINS - 1);
             let weight = 1.0 / (lag + 1) as f32;
             self.tempo_weight[bin] += weight;
@@ -207,17 +219,26 @@ impl BeatTracker {
     }
 }
 
-/// Octave-folds a positive, finite onset gap into the inclusive beat-period
-/// range, so both 60 and 200 BPM map to themselves.
-fn fold_period(gap: f32) -> f32 {
+/// Endpoint slack for onsets quantised to `hop_s`: at least one analysis hop
+/// and one tempo bin, capped well below the range so folding still terminates.
+fn fold_tolerance(hop_s: f32) -> f32 {
+    hop_s.clamp(TEMPO_BIN_S, MIN_BEAT_PERIOD_S / 4.0)
+}
+
+/// Octave-folds a positive, finite onset gap into the inclusive 0.3-1.0 s
+/// beat-period range. Gaps that fold to within `tolerance` outside an
+/// endpoint are clamped onto it instead of being doubled or halved, so
+/// 60 BPM (1.0 s) and 200 BPM (0.3 s) beats map to themselves despite hop
+/// jitter. `tolerance` must be below `MIN_BEAT_PERIOD_S`.
+fn fold_period(gap: f32, tolerance: f32) -> f32 {
     let mut period = gap;
-    while period < MIN_BEAT_PERIOD_S {
+    while period < MIN_BEAT_PERIOD_S - tolerance {
         period *= 2.0;
     }
-    while period > MAX_BEAT_PERIOD_S {
+    while period > MAX_BEAT_PERIOD_S + tolerance {
         period /= 2.0;
     }
-    period
+    period.clamp(MIN_BEAT_PERIOD_S, MAX_BEAT_PERIOD_S)
 }
 
 /// Analysed audio fields in control-frame units.
@@ -311,7 +332,7 @@ impl Analyzer {
             time_s: 0.0,
             last_onset_s: None,
             onsets: 0,
-            beat: BeatTracker::default(),
+            beat: BeatTracker::with_hop(hop as f32 / rate),
             features: AudioFeatures::default(),
         })
     }
@@ -838,20 +859,64 @@ mod tests {
 
     #[test]
     fn fold_period_maps_gaps_into_the_beat_range() {
-        assert!((fold_period(0.25) - 0.5).abs() < 1e-6);
-        assert!((fold_period(0.125) - 0.5).abs() < 1e-6);
-        assert!((fold_period(1.2) - 0.6).abs() < 1e-6);
-        assert!((fold_period(0.75) - 0.75).abs() < 1e-6);
+        let tolerance = fold_tolerance(0.0);
+        assert!((fold_period(0.25, tolerance) - 0.5).abs() < 1e-6);
+        assert!((fold_period(0.125, tolerance) - 0.5).abs() < 1e-6);
+        assert!((fold_period(1.2, tolerance) - 0.6).abs() < 1e-6);
+        assert!((fold_period(0.75, tolerance) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fold_tolerance_is_at_least_one_hop_and_one_bin() {
+        assert_eq!(fold_tolerance(0.0), TEMPO_BIN_S);
+        assert_eq!(fold_tolerance(0.0107), 0.0107);
+        assert!(fold_tolerance(1.0) < MIN_BEAT_PERIOD_S);
     }
 
     #[test]
     fn fold_period_keeps_both_range_endpoints() {
+        let tolerance = fold_tolerance(512.0 / RATE as f32);
         // 60 BPM: one-second gaps stay put; two-second gaps fold onto them.
-        assert_eq!(fold_period(MAX_BEAT_PERIOD_S), MAX_BEAT_PERIOD_S);
-        assert_eq!(fold_period(2.0 * MAX_BEAT_PERIOD_S), MAX_BEAT_PERIOD_S);
+        assert_eq!(fold_period(MAX_BEAT_PERIOD_S, tolerance), MAX_BEAT_PERIOD_S);
+        assert_eq!(
+            fold_period(2.0 * MAX_BEAT_PERIOD_S, tolerance),
+            MAX_BEAT_PERIOD_S
+        );
         // 200 BPM is neither doubled nor halved out of range.
-        assert_eq!(fold_period(MIN_BEAT_PERIOD_S), MIN_BEAT_PERIOD_S);
-        assert_eq!(fold_period(MIN_BEAT_PERIOD_S / 2.0), MIN_BEAT_PERIOD_S);
+        assert_eq!(fold_period(MIN_BEAT_PERIOD_S, tolerance), MIN_BEAT_PERIOD_S);
+        assert_eq!(
+            fold_period(MIN_BEAT_PERIOD_S / 2.0, tolerance),
+            MIN_BEAT_PERIOD_S
+        );
+        // Hop jitter just outside an endpoint clamps onto it.
+        let jitter = 0.9 * tolerance;
+        assert_eq!(
+            fold_period(MAX_BEAT_PERIOD_S + jitter, tolerance),
+            MAX_BEAT_PERIOD_S
+        );
+        assert_eq!(
+            fold_period(2.0 * (MAX_BEAT_PERIOD_S + jitter), tolerance),
+            MAX_BEAT_PERIOD_S
+        );
+        assert_eq!(
+            fold_period(MIN_BEAT_PERIOD_S - jitter, tolerance),
+            MIN_BEAT_PERIOD_S
+        );
+        // Beyond the tolerance, gaps still fold by octaves.
+        let beyond = MAX_BEAT_PERIOD_S + 2.0 * tolerance;
+        assert!((fold_period(beyond, tolerance) - beyond / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn click_train_at_60_bpm_reads_as_60_not_120() {
+        let features = replay_monotonic(&click_train(60.0, 0.5, 12.0));
+        assert!((58..=62).contains(&features.bpm), "{features:?}");
+    }
+
+    #[test]
+    fn click_train_at_200_bpm_reads_as_200_not_100() {
+        let features = replay_monotonic(&click_train(200.0, 0.5, 8.0));
+        assert!((194..=200).contains(&features.bpm), "{features:?}");
     }
 
     #[test]
