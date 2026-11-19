@@ -11,8 +11,12 @@ mkdir -p "$assets"
 cd "$root"
 mise exec -- just check
 
-# Every release (individual assets and the combined zip) ships the licence terms.
+# Every release (individual assets and the combined zip) ships the licence terms
+# and the third-party notices (THIRD_PARTY_NOTICES/, flattened into asset names).
 cp LICENSE COMMERCIAL.md "$assets/"
+for notice in THIRD_PARTY_NOTICES/*; do
+  cp "$notice" "$assets/THIRD_PARTY_NOTICES-$(basename "$notice")"
+done
 
 mkdir -p build/release
 python3 host/bridge/chipviz_bridge.py --frames 120 --output "$assets/control-frame-v0-demo.cvz"

@@ -135,3 +135,10 @@ build time, such as libdragon, devkitPro, cc65, PVSnesLib, RGBDS, and the
 Raspberry Pi pico-sdk, are not redistributed in this repository. Rust crates
 are fetched by Cargo under their own licences. Future embedded data, such as
 the HYG star catalog (CC BY-SA 4.0), will carry its own notices.
+
+Notices for third-party code shipped in release binaries are in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES): [rust.md](THIRD_PARTY_NOTICES/rust.md)
+for the Rust crates in the renderer binaries (regenerate with
+`just third-party-notices`) and [roms.md](THIRD_PARTY_NOTICES/roms.md) for SDK
+runtime code linked into the ROMs. Releases ship them as
+`THIRD_PARTY_NOTICES-*` assets.
