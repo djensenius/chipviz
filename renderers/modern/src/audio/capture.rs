@@ -368,6 +368,57 @@ impl SampleClock {
     }
 }
 
+/// What to do with one poll's real samples. `discard + analyse` never
+/// exceeds the ring length snapshotted for the poll.
+#[derive(Debug, PartialEq, Eq)]
+struct Drain {
+    /// Samples the analyzer should skip (time passes, nothing analysed).
+    skip: usize,
+    /// Oldest ring samples to consume without analysis.
+    discard: usize,
+    /// Ring samples to analyse after the discarded ones.
+    analyse: usize,
+}
+
+impl Drain {
+    /// `dropped` were lost in the callback and `available` is the ring length
+    /// snapshot that the clock was given. Late overlap is taken from the
+    /// dropped samples first, then from the oldest ring samples; anything
+    /// beyond `max_backlog` is skipped as stale.
+    fn plan(dropped: usize, available: usize, overlap: usize, max_backlog: usize) -> Self {
+        let overlap_dropped = overlap.min(dropped);
+        let mut skip = dropped - overlap_dropped;
+        let mut discard = (overlap - overlap_dropped).min(available);
+        if available > discard + max_backlog {
+            skip += available - discard - max_backlog;
+            discard = available - max_backlog;
+        }
+        Self {
+            skip,
+            discard,
+            analyse: available - discard,
+        }
+    }
+
+    /// Consumes exactly `discard + analyse` samples, passing the analysed ones
+    /// to `push`. Samples that arrived after the snapshot stay in the ring.
+    fn apply(&self, consumer: &mut rtrb::Consumer<f32>, mut push: impl FnMut(&[f32])) {
+        if self.discard > 0
+            && let Ok(stale) = consumer.read_chunk(self.discard)
+        {
+            stale.commit_all();
+        }
+        if self.analyse > 0
+            && let Ok(chunk) = consumer.read_chunk(self.analyse)
+        {
+            let (first, second) = chunk.as_slices();
+            push(first);
+            push(second);
+            chunk.commit_all();
+        }
+    }
+}
+
 fn analysis_loop(
     analyzer: &mut Analyzer,
     mut consumer: rtrb::Consumer<f32>,
@@ -384,37 +435,19 @@ fn analysis_loop(
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
-        let mut skipped = dropped.swap(0, Ordering::Relaxed);
-        let accounting = clock.poll(now, skipped + consumer.slots());
-
-        // Late samples for time already filled with silence: drop the
-        // callback-dropped ones first, then the oldest samples in the ring.
-        let overlap_dropped = accounting.overlap.min(skipped);
-        skipped -= overlap_dropped;
-        let mut discard = accounting.overlap - overlap_dropped;
+        let dropped = dropped.swap(0, Ordering::Relaxed);
+        // One snapshot bounds the whole poll; the callback may publish more
+        // meanwhile, and those samples wait for the next poll's clock.
         let available = consumer.slots();
-        if available > discard + max_backlog {
-            skipped += available - discard - max_backlog;
-            discard = available - max_backlog;
+        let accounting = clock.poll(now, dropped + available);
+        let drain = Drain::plan(dropped, available, accounting.overlap, max_backlog);
+        if drain.skip > 0 {
+            analyzer.skip(drain.skip);
         }
-        if discard > 0
-            && let Ok(stale) = consumer.read_chunk(discard)
-        {
-            stale.commit_all();
-        }
-        if skipped > 0 {
-            analyzer.skip(skipped);
-        }
-        let available = consumer.slots();
-        if available > 0
-            && let Ok(chunk) = consumer.read_chunk(available)
-        {
-            let (first, second) = chunk.as_slices();
-            heard_signal |= first.iter().chain(second).any(|&s| s != 0.0);
-            analyzer.push(first);
-            analyzer.push(second);
-            chunk.commit_all();
-        }
+        drain.apply(&mut consumer, |samples| {
+            heard_signal |= samples.iter().any(|&s| s != 0.0);
+            analyzer.push(samples);
+        });
         analyzer.push_silence(accounting.silence);
         shared.store(analyzer.features());
 
@@ -442,6 +475,47 @@ mod tests {
         assert_eq!(limiter.report(start + Duration::from_secs(2)), None);
         assert_eq!(limiter.report(start + ERROR_REPORT_INTERVAL), Some(2));
         assert_eq!(limiter.report(start + ERROR_REPORT_INTERVAL), None);
+    }
+
+    #[test]
+    fn drain_plan_takes_overlap_from_dropped_then_oldest_and_skips_stale() {
+        let plan = |dropped, available, overlap| Drain::plan(dropped, available, overlap, 100);
+        let drain = |skip, discard, analyse| Drain {
+            skip,
+            discard,
+            analyse,
+        };
+        assert_eq!(plan(0, 50, 0), drain(0, 0, 50));
+        assert_eq!(plan(30, 50, 20), drain(10, 0, 50));
+        assert_eq!(plan(10, 50, 30), drain(0, 20, 30));
+        assert_eq!(plan(0, 50, 80), drain(0, 50, 0));
+        assert_eq!(plan(5, 300, 40), drain(165, 200, 100));
+        for (dropped, available, overlap) in [(0, 50, 0), (30, 50, 20), (10, 50, 30), (5, 300, 40)]
+        {
+            // The ring gives up exactly the snapshot; time advances by the
+            // real samples minus the overlap.
+            let d = plan(dropped, available, overlap);
+            assert_eq!(d.discard + d.analyse, available);
+            assert_eq!(d.skip + d.analyse, dropped + available - overlap);
+        }
+    }
+
+    #[test]
+    fn drain_leaves_samples_published_after_the_snapshot_in_the_ring() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(64);
+        for i in 0..10 {
+            producer.push(i as f32).unwrap();
+        }
+        let drain = Drain::plan(0, consumer.slots(), 4, 100);
+        // A callback publishes between the snapshot and the reads.
+        for i in 10..15 {
+            producer.push(i as f32).unwrap();
+        }
+        let mut analysed = Vec::new();
+        drain.apply(&mut consumer, |samples| analysed.extend_from_slice(samples));
+        assert_eq!(analysed, (4..10).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(consumer.slots(), 5);
+        assert_eq!(consumer.pop(), Ok(10.0));
     }
 
     const RATE: f32 = 48_000.0;
