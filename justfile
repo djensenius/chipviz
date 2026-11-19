@@ -6,7 +6,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
 
 default:
     just --list
@@ -56,7 +56,9 @@ scaffold-check:
     @test -f host/fixtures/chipsynth/groove.cvz
     @test -f shared/tools/lint_docs.py
     @test -f shared/tools/build_homebrew.py
+    @test -f shared/tools/capture_assert.py
     @test -f shared/tools/cvz_to_c.py
+    @test -f tests/test_capture_assert.py
     @test -f tests/test_homebrew.py
     @test -f tests/control_frame_tests.c
     @test -f tests/connection_tests.c
