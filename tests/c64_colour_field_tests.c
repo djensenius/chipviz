@@ -1,6 +1,6 @@
 /* Host checks for the C64 colour-field core against the normative fixtures in
- * shared/specs/colour-field-v0.md. Operator-only (F12, F16), resampled (F15,
- * F18) and host-side (F23) fixtures do not apply to the C64 data-role build. */
+ * shared/specs/colour-field-v0.md. Operator-only (F11, F12, F16), resampled
+ * (F15, F18) and host-side (F23) fixtures do not apply to the C64 target build. */
 #include "colour_field.h"
 
 #include <stdio.h>
@@ -219,6 +219,44 @@ static void g_f3(uint16_t step, frame_t *f) {
   }
 }
 
+static void g_f4(uint16_t step, frame_t *f) {
+  fill(f, 80);
+  if (step == 45u || step == 46u || step == 130u || step == 352u) {
+    f->notes[0][0] = 60;
+    f->notes[0][1] = 100;
+  } else if (step == 200u) {
+    f->notes[0][0] = 60;
+    f->notes[0][1] = 40;
+  }
+}
+
+static void g_f8(uint16_t step, frame_t *f) {
+  fill(f, 80);
+  if (step >= 100u && step <= 299u) {
+    f->notes[0][0] = 60;
+    f->notes[0][1] = 100;
+  }
+  if (step >= 200u && step <= 299u) {
+    f->notes[1][0] = 64;
+    f->notes[1][1] = 100;
+  }
+}
+
+static void g_f9(uint16_t step, frame_t *f) {
+  fill(f, 100);
+  if (step >= 20u && step <= 580u && (step - 20u) % 40u == 0u) {
+    f->flags |= 1u;
+  }
+  if (step >= 40u && step <= 520u && (step - 40u) % 120u == 0u) {
+    f->flags |= 2u;
+  }
+}
+
+static void g_f17(uint16_t step, frame_t *f) {
+  f->e = (uint8_t)(step > 0u && step % 31u == 0u && step / 31u <= 19u ? 24u : 0u);
+  f->flags = (uint8_t)(step & 1u);
+}
+
 static void g_f5(uint16_t step, frame_t *f) {
   uint16_t phase = (uint16_t)(step % 30u);
   fill(f, 60);
@@ -366,6 +404,75 @@ static void fixture_f3(void) {
   require(fx_steps(CF_FX_CUT, cuts), "F3", "cuts at 37 101 250 400 523");
   run(g_f3, 3, 0);
   require(fx_steps(CF_FX_PULSE, pulses), "F3", "pulses at all six");
+}
+
+static void fixture_f4(void) {
+  static const uint16_t at[] = {45, 130, 352, 0};
+  run(g_f4, 2, 0);
+  require(fx_steps(CF_FX_CUT, at), "F4", "cuts at 45 130 352");
+  run(g_f4, 3, 0);
+  require(fx_steps(CF_FX_PULSE, at), "F4", "pulses at 45 130 352");
+}
+
+static void fixture_f8(void) {
+  static const uint16_t at[] = {100, 200, 0};
+  run(g_f8, 2, 0);
+  require(fx_steps(CF_FX_CUT, at), "F8", "cuts at 100 and 200");
+  run(g_f8, 3, 0);
+  require(fx_steps(CF_FX_PULSE, at), "F8", "pulses at 100 and 200");
+}
+
+/* Beats at 20 + 40k and bars (B from bar, the Return key on C64) at 40 + 120k
+ * never coincide: 20 B events. */
+static void fixture_f9(void) {
+  static uint16_t at[21];
+  uint16_t s;
+  uint8_t n = 0;
+  for (s = 20; s <= 580u; s++) {
+    if ((s - 20u) % 40u == 0u || (s >= 40u && (s - 40u) % 120u == 0u && s <= 520u)) {
+      at[n++] = s;
+    }
+  }
+  at[n] = 0;
+  require(n == 20u, "F9", "20 beat/bar steps");
+  run(g_f9, 0, 0);
+  require(constant(), "F9", "held never changes");
+  run(g_f9, 2, 0);
+  require(fx_steps(CF_FX_CUT, at), "F9", "a cut at every beat and bar");
+  run(g_f9, 3, 0);
+  require(fx_steps(CF_FX_PULSE, at), "F9", "a pulse at every beat and bar");
+}
+
+static void fixture_f17(void) {
+  uint8_t p;
+  for (p = 3; p < 8u; p += 4u) {
+    uint16_t s;
+    uint16_t n = 0;
+    uint16_t last = 0;
+    int ok = 1;
+    run(g_f17, p, 0);
+    for (s = 0; s < STEPS; s++) {
+      if (tr[s].fx & CF_FX_PULSE) {
+        if (n < 23u) {
+          ok &= s == 1u + 8u * n;
+        } else if (n == 23u) {
+          ok &= s == 187u;
+        } else if (n == 24u) {
+          ok &= s == 195u;
+        }
+        ok &= n == 0u || s - last >= 8u;
+        last = s;
+        n++;
+      }
+    }
+    require(ok && n == 75u, "F17", "75 pulse starts 1+8k to 177, then 187, 195, never closer than 8");
+    require(!(tr[127].fx & CF_FX_PULSE), "F17", "since_pulse holds off a start at 127");
+    for (s = 30; s < STEPS; s = (uint16_t)(s + 31u)) {
+      ok &= tr[s].lvl[0] != 3u;
+    }
+    require(ok, "F17", "silence entries at 31k - 1 are not lit");
+    require(max_changes_per_60() <= 16, "F17", "at most 16 displayed changes in 60 steps");
+  }
 }
 
 static void fixture_f5(void) {
@@ -562,19 +669,98 @@ static void colours(void) {
   require(cf_colour(0) == 7u && cf_colour(1) == 0u && cf_colour(2) == 0u, "colours", "level threshold");
 }
 
+/* Keyboard matrix bits (CIA1 column, row mask) for the keys used below. */
+static void key(uint8_t column, uint8_t mask) {
+  cf_keys[column] |= mask;
+}
+
+static void keys_none(void) {
+  memset(cf_keys, 0, sizeof(cf_keys));
+}
+
+/* Runs n steps of the keyboard poll with the given held keys; returns 1 when
+ * any step was in mode 3 (flash/gate armed). */
+static uint8_t key_shown; /* cf_tick's result on the last key step */
+static int key_steps(uint16_t n, void (*held)(void)) {
+  int armed = 0;
+  while (n-- > 0u) {
+    keys_none();
+    held();
+    cf_read_keys(2u);
+    key_shown = cf_tick();
+    armed |= cf_mode() == 3u;
+  }
+  return armed;
+}
+
+static void held_8(void) { key(3, 0x08u); }
+static void held_8q(void) { key(3, 0x08u); key(7, 0x40u); }
+static void held_8r(void) { key(3, 0x08u); key(2, 0x02u); }
+static void held_r(void) { key(2, 0x02u); }
+static void held_18r(void) { key(7, 0x01u); key(3, 0x08u); key(2, 0x02u); }
+
+static void keys(void) {
+  cf_init();
+  keys_none();
+  cf_read_keys(2u);
+  require(cf_in.scene == 2u && !cf_in.scene_abs && cf_in.palette == 0u && cf_in.wire && cf_in.energy == CF_HID_E_LO &&
+              cf_in.band[2] == CF_HID_E_LO && cf_in.spectrum[0] == 0u && cf_in.events == 0u, "keys",
+          "no keys: procedural scene, HID_E_LO, palette 0");
+  held_8r();
+  cf_read_keys(2u);
+  require(cf_in.scene == 7u && cf_in.palette == 3u && cf_in.scene_abs, "keys", "8+R is an absolute 7/3 report");
+  keys_none();
+  cf_read_keys(2u);
+  require(cf_in.scene == 7u && cf_in.palette == 3u && !cf_in.scene_abs, "keys", "released keys stay latched");
+  held_18r();
+  cf_read_keys(2u);
+  require(cf_in.scene == 7u && !cf_in.scene_abs, "keys", "two scene keys: no scene, not absolute");
+  keys_none();
+  key(7, 0x10u); /* Space */
+  cf_read_keys(2u);
+  require(cf_in.events == CF_EV_B, "keys", "Space press is a beat edge");
+  cf_read_keys(2u);
+  require(cf_in.events == 0u, "keys", "held Space does not repeat");
+  key(0, 0x02u); /* Return while Space is held */
+  cf_read_keys(2u);
+  require(cf_in.events == CF_EV_B, "keys", "Return press is a bar edge");
+  keys_none();
+  cf_read_keys(2u);
+  require(cf_in.events == 0u, "keys", "release is not an edge");
+
+  /* Palette R without 8 (or with several scene keys) never arms flash/gate. */
+  cf_init();
+  require(!key_steps(40, held_8q) && !key_steps(200, held_r), "keys", "R without 8 never arms");
+  cf_init();
+  require(!key_steps(40, held_8q) && !key_steps(200, held_18r), "keys", "R with 1 and 8 never arms");
+  require(key_shown && cf_mode() == 2u, "keys", "unarmed R runs as hard cuts in scene 7");
+  cf_init();
+  require(!key_steps(40, held_8q) && key_steps(200, held_8r), "keys", "8+R arms flash/gate");
+  cf_init();
+  key_steps(1, keys_none); /* power-on adopts the procedural scene 2 */
+  require(!key_steps(30, held_8) && !key_shown, "keys", "8 not shown on its first 30 steps");
+  key_steps(1, held_8);
+  require(key_shown, "keys", "8 shows scene 7 from the 31st step");
+}
+
 int main(void) {
   geometry();
   colours();
+  keys();
   fixture_f0();
   fixture_f1();
   fixture_f2();
   fixture_f3();
+  fixture_f4();
   fixture_f5();
   fixture_f6();
   fixture_f7();
+  fixture_f8();
+  fixture_f9();
   fixture_f10();
   fixture_f13();
   fixture_f14();
+  fixture_f17();
   fixture_f19();
   fixture_f20();
   fixture_f21();

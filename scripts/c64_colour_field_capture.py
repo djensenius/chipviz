@@ -10,7 +10,10 @@ black. Like `scripts/retroarch_smoke.py` it needs a local RetroArch core, so it
 is not part of `just check`.
 
 Only the held and hard-cut modes are captured (keys Q/E/T/U). Flash/gate is
-never selected: the script refuses palette keys R and I.
+never armed: palette keys R and I are refused, except for one negative check
+that holds R without the scene key 8, which must run as hard cuts (mode 2) with
+a steady picture. The script also reads the core's RAM (the `_cf` address from
+the linker map) to measure the scene-7 entry and exit timing in frames.
 """
 
 from __future__ import annotations
@@ -74,14 +77,18 @@ PALETTE = {
   1: {2: [(2, 3), (5, 4), (6, 7), (3, 4)], 3: [(2, 5, 6), (3, 4, 7), (2, 0, 3), (6, 0, 7)]},
 }
 
-KEYS = {"8": ord("8"), "1": ord("1"), "q": ord("q"), "e": ord("e"), "t": ord("t"), "u": ord("u"),
-        "space": 32}
+KEYS = {"8": ord("8"), "1": ord("1"), "q": ord("q"), "e": ord("e"), "r": ord("r"), "t": ord("t"),
+        "u": ord("u"), "space": 32}
 FORBIDDEN = {"r", "i"}  # palettes 3 and 7: flash/gate.
 
 BOOT = 400   # frames for VICE autostart to load and RUN the program
-# The native PETSCII demo redraws for about 20 frames per step, so the 30-step
-# scene-7 debounce from the native scene takes about 700 frames.
-ENTER = 900
+ENTER_LIMIT = 40  # frames: 30-step debounce at one step per frame, plus margin
+EXIT_LIMIT = 40
+RETRO_MEMORY_SYSTEM_RAM = 2
+# cf_state_t byte offsets (cores/c64/homebrew/src/colour_field.h).
+CF_MODE = 0
+CF_SHOWN = 9
+CF_FLASH = 17
 GAP = 60     # frames between scripted steps (P_STABLE + CUT_MIN margin)
 TAP = 3      # frames a Space tap is held
 
@@ -259,9 +266,27 @@ class Emulator:
     if not self.lib.retro_load_game(ctypes.byref(info)):
       raise RuntimeError(f"core refused {prg}")
 
+  def peek(self, address: int) -> int:
+    self.lib.retro_get_memory_data.restype = ctypes.c_void_p
+    self.lib.retro_get_memory_size.restype = ctypes.c_size_t
+    base = self.lib.retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM)
+    if not base or address >= self.lib.retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM):
+      raise RuntimeError("core exposes no system RAM")
+    return ctypes.string_at(base + address, 1)[0]
+
   def run(self, frames: int) -> None:
     for _ in range(frames):
       self.lib.retro_run()
+
+
+def symbol(map_file: pathlib.Path, name: str) -> int:
+  words = map_file.read_text().split()
+  return int(words[words.index(name) + 1], 16)
+
+
+def colour_count(frame: tuple[int, int, bytes]) -> int:
+  rgb = frame[2]
+  return len(set(rgb[i:i + 3] for i in range(0, len(rgb), 3)))
 
 
 def find_window(width: int, height: int, rgb: bytes) -> tuple[int, int]:
@@ -302,11 +327,13 @@ def main(argv: list[str] | None = None) -> int:
                       default=pathlib.Path(os.environ.get("RETROARCH_CORES", DEFAULT_CORES)) /
                       f"vice_x64sc_libretro{CORE_EXT}")
   parser.add_argument("--prg", type=pathlib.Path, default=ROOT / "cores/c64/homebrew/chipviz-c64.prg")
+  parser.add_argument("--map", type=pathlib.Path, default=ROOT / "cores/c64/homebrew/build/chipviz-c64.map")
   parser.add_argument("--output", type=pathlib.Path, default=ROOT / "build/c64-colour-field")
   args = parser.parse_args(argv)
-  if not args.core.exists() or not args.prg.exists():
-    print(f"missing core or prg: {args.core} {args.prg}", file=sys.stderr)
+  if not args.core.exists() or not args.prg.exists() or not args.map.exists():
+    print(f"missing core, prg or map: {args.core} {args.prg} {args.map}", file=sys.stderr)
     return 2
+  cf = symbol(args.map, "_cf")
   args.output.mkdir(parents=True, exist_ok=True)
 
   with tempfile.TemporaryDirectory() as workdir:
@@ -318,8 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     assert emu.frame is not None
     origin = find_window(*emu.frame)
 
-    def hold(*keys: str) -> None:
-      if FORBIDDEN & set(keys):
+    def hold(*keys: str, unarmed: bool = False) -> None:
+      if FORBIDDEN & set(keys) and (unarmed is False or "8" in keys):
         raise ValueError("flash/gate palettes are never captured")
       emu.held = {KEYS[k] for k in keys}
 
@@ -344,13 +371,34 @@ def main(argv: list[str] | None = None) -> int:
       result["frame"] = frame
       results.append(result)
 
+    def until(test, limit: int) -> int:
+      """Frames run until test() holds (checked after each frame)."""
+      for count in range(1, limit + 1):
+        advance(1)
+        if test():
+          return count
+      raise RuntimeError(f"condition not met within {limit} frames")
+
     # Held (Q, p=0) family A: entry after the scene-7 debounce, V2 combo dom=0.
+    # Steps run once per frame from a raster IRQ, whatever the native demo does.
     hold("8", "q")
-    advance(ENTER)
+    timing = {"entry_step_frames": until(lambda: emu.peek(cf + CF_SHOWN) == 1, ENTER_LIMIT)}
+    timing["entry_visible_frames"] = timing["entry_step_frames"] + until(
+      lambda: emu.frame is not None and colour_count(emu.frame) == 3, 3)
+    advance(GAP)
     capture("held-a-v2", 0, 0, 0, 0)
     # Hard cuts (E, p=2): Space taps (beat) cut through all four layouts.
     names = ["v2", "h2", "v3", "h3"]
     state = (0, 0, 0)
+
+    def cuts(family: int, cuts_key: str, count: int, at: tuple[int, ...]) -> None:
+      nonlocal state
+      for index, state in enumerate(cut_states(*state, count)):
+        tap("8", cuts_key)
+        if index in at:
+          layout, combo, rot = state
+          capture(f"cuts-{'ab'[family]}-{names[layout]}-c{combo}r{rot}", family, *state)
+
     for family, held_key, cuts_key in ((0, "q", "e"), (1, "t", "u")):
       if family:
         # Held family B keeps layout and rot; combo = dom = 0 (equal bands).
@@ -360,24 +408,52 @@ def main(argv: list[str] | None = None) -> int:
         capture(f"held-b-{names[state[0]]}", family, *state)
       hold("8", cuts_key)
       advance(GAP)
-      for index, state in enumerate(cut_states(*state, 16)):
-        tap("8", cuts_key)
-        if index in (3, 7, 11):
-          layout, combo, rot = state
-          capture(f"cuts-{'ab'[family]}-{names[layout]}-c{combo}r{rot}", family, *state)
-    # Scene key 1: the debounce leaves scene 7 for the native demo.
+      cuts(family, cuts_key, 16, (3, 7, 11))
+      if not family:
+        # White (index 1) is family A combo 1 in V3 (10/1/6). Combo and layout
+        # advance in lockstep under cuts, so cut to V3, reset combo to 0 with
+        # held (keeps layout and rot), then cut once more to combo 1.
+        cuts(family, cuts_key, 8, ())
+        state = (state[0], 0, state[2])
+        hold("8", held_key)
+        advance(GAP)
+        hold("8", cuts_key)
+        advance(GAP)
+        cuts(family, cuts_key, 2, (1,))
+    # Negative check: R (palette 3) without the scene key is not an absolute
+    # report, so it never arms flash/gate and runs as hard cuts (family A).
+    hold("r", unarmed=True)
+    advance(GAP)
+    modes = set()
+    frames = set()
+    for _ in range(2 * GAP):
+      advance(1)
+      modes.add((emu.peek(cf + CF_MODE), emu.peek(cf + CF_FLASH)))
+      assert emu.frame is not None
+      frames.add(hashlib.sha256(emu.frame[2]).hexdigest())
+    capture(f"unarmed-r-{names[state[0]]}", 0, *state)
+    unarmed = {"modes_flash": sorted(modes), "distinct_frames": len(frames)}
+    # Scene key 1: the debounce leaves scene 7 for the native demo, whose last
+    # drawn frame is still in screen RAM at $0400.
     hold("1", "q")
+    timing["exit_step_frames"] = until(lambda: emu.peek(cf + CF_SHOWN) == 0, EXIT_LIMIT)
+    timing["exit_visible_frames"] = timing["exit_step_frames"] + until(
+      lambda: emu.frame is not None and colour_count(emu.frame) > 3, 3)
     advance(2 * GAP)
     native = emu.frame
     assert native is not None
+    write_png(args.output / "c64-native-after-exit.png", *native)
     failed = [r for r in results if r["failures"]]
     report = {"core": str(args.core), "prg_sha256": hashlib.sha256(args.prg.read_bytes()).hexdigest(),
               "core_options": CORE_OPTIONS, "boot_frames": BOOT, "window_origin": origin,
-              "native_after_exit_colours": len(set(native[2][i:i + 3] for i in range(0, len(native[2]), 3))),
+              "native_after_exit_colours": colour_count(native), "timing": timing, "unarmed_r": unarmed,
               "captures": results}
     print(json.dumps(report, indent=2))
     if report["native_after_exit_colours"] < 3:
       print("native scene did not return after scene-7 exit", file=sys.stderr)
+      return 1
+    if unarmed["modes_flash"] != [(2, 0)] or unarmed["distinct_frames"] != 1:
+      print("palette R without scene key 8 must stay in steady hard cuts", file=sys.stderr)
       return 1
     return 1 if failed else 0
 

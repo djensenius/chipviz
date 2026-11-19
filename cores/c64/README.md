@@ -32,9 +32,12 @@ SDK-free tokenized BASIC fallback when cc65 is not installed.
 ## Colour field (scene 7)
 
 `src/colour_field.c` implements the [colour-field-v0](../../shared/specs/colour-field-v0.md)
-target role in the `data` input role. `src/main.c` runs one step per VBlank
-poll and writes all VIC-II changes together at raster line 255, so the screen
-never tears.
+target role in the `data` input role. A raster IRQ at line 300 (below the
+visible border on PAL) runs one step per VBlank poll: it writes the previous
+step's VIC-II registers (border first), samples the keyboard, and stages the
+next step. All changes land in the vertical blank, so the screen never tears.
+The native PETSCII demo keeps drawing in the main loop and pauses while scene 7
+is shown.
 
 - **Display.** ECM text mode with the blank glyph (screen code 32). Screen code
   bits 6–7 select `$D021`–`$D023` for regions 0–2. One screen is prepared per
@@ -64,25 +67,39 @@ never tears.
 
 - **Input.** The program reads the keyboard matrix directly as the
   usb-hid-transport-v0 keyboard: `1`–`8` select scenes 0–7, `Q W E R T Y U I`
-  select palettes 0–7, and Space or Return is the beat. Until a scene key
+  select palettes 0–7, Space is the beat and Return the bar. Until a scene key
   arrives, the procedural demo scene is used; it never selects scene 7. There
   is no energy key, so energy and bands stay at `HID_E_LO`. Spectral mode
   therefore rests at level 1 (black), and held mode keeps its layout. The KERNAL
-  CIA1 timer IRQ is stopped so it cannot cost a VBlank.
+  CIA1 timer IRQ is stopped; the raster IRQ is the only interrupt, and it
+  returns through `$EA81` without the KERNAL's clock, cursor and key-buffer
+  work. The key mapping (`cf_read_keys`) is portable and host-tested.
+- **Joysticks alias the keyboard.** The control ports share the CIA1 matrix
+  lines, so they read as keys. Port 1 drives the row lines in every column:
+  fire reads as Space (a beat), down as Return (a bar) plus `W R Y I`, up as
+  `1 3 5 7` and right as `2 4 6 8`. Several keys in one group select nothing,
+  so up/right/down never change the scene or palette. Port 2 drives the column
+  lines: on its own it reads as nothing, but while keys are held it copies them
+  into other columns, which usually makes their group ambiguous (ignored).
 - **Flash/gate.** Palettes 3 and 7 (`R`, `I`) arm flash/gate only when an
   absolute scene key `8` and the palette key are held together in the same
   scan for P_STABLE (30) steps. Otherwise they run as hard cuts.
 - **Not implemented.** The operator role (`L` pin and the RETURN warning screen)
   and joystick relative palette pulses.
-- **Limit.** The native PETSCII demo redraws for about 20 frames per loop, so the
-  30-step scene-7 debounce from the native scene takes about 14 seconds. In
-  scene 7 every frame is a step.
+- **Timing.** Every frame is a step, in or out of scene 7. Holding `8` shows
+  the field from the 31st sampled step (the debounce decides at the end of the
+  30th). Measured in VICE: 31–32 frames from the key press until the step that
+  shows scene 7, and 33–34 frames until it is on screen (registers land at the
+  next VBlank). Exit with `1` takes 31–32 frames, and 32–33 until the last
+  native frame is back on screen. The per-frame step costs the native demo
+  some time: it draws one loop in about 26 frames instead of about 22.
 
 Tests: `tests/c64_colour_field_tests.c` runs the spec fixtures on the host as
 part of `just c-test`. `just c64-colour-field-capture` drives the VICE x64sc
 libretro core headlessly. It holds keys, saves PNGs to `build/c64-colour-field/`,
 and checks every region's exact colour, the boundary positions and the black
-border. It needs a local RetroArch core, so it is not part of `just check`.
+border. It also measures the entry and exit timing from the core's RAM, and
+checks that `R` held without `8` stays in steady hard cuts. It needs a local RetroArch core, so it is not part of `just check`.
 
 ## Connection path
 

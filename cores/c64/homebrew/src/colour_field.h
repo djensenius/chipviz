@@ -90,4 +90,11 @@ uint8_t cf_colour(uint8_t region);
 /* Region of a 40x25 character cell for a layout (cells are 8x8 pixels). */
 uint8_t cf_cell_region(uint8_t layout, uint8_t column, uint8_t row);
 
+/* Keyboard HID poll: cf_keys[c] has bit r set while the key at CIA1 port A
+ * column c, port B row r is held (the target scans; the joystick ports share
+ * these lines). cf_read_keys fills cf_in from it, using fallback_scene until a
+ * scene key has been pressed. cf_init clears the key latches. */
+extern uint8_t cf_keys[8];
+void cf_read_keys(uint8_t fallback_scene);
+
 #endif

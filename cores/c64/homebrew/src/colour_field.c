@@ -1,9 +1,17 @@
 #include "colour_field.h"
 
+#include <string.h>
+
 #define CF_NONE 0xFFu
 
 cf_state_t cf;
 cf_input_t cf_in;
+uint8_t cf_keys[8];
+
+static uint8_t cf_latched_scene = 0xFFu;
+static uint8_t cf_latched_palette;
+static uint8_t cf_previous_beat_keys;
+
 #define SAT_INC(x) do { if ((x) != 0xFFFFu) { ++(x); } } while (0)
 
 static const uint8_t cf_up[4] = {0u, 48u, 104u, 168u};
@@ -419,6 +427,9 @@ void cf_init(void) {
     bytes[i] = 0u;
   }
   cf.since_sw = 0xFFFFu;
+  cf_latched_scene = 0xFFu;
+  cf_latched_palette = 0u;
+  cf_previous_beat_keys = 0u;
 }
 
 uint8_t cf_tick(void) {
@@ -501,4 +512,66 @@ uint8_t cf_cell_region(uint8_t layout, uint8_t column, uint8_t row) {
     }
   }
   return region;
+}
+
+/* Index 0..7 of the only set bit, or CF_NONE when none or several are set
+ * (several can be matrix ghosts or joystick aliases). */
+static uint8_t cf_single_key(uint8_t held) {
+  uint8_t index = 0u;
+
+  if (held == 0u || (held & (uint8_t)(held - 1u)) != 0u) {
+    return CF_NONE;
+  }
+  while (!(held & 1u)) {
+    held >>= 1;
+    ++index;
+  }
+  return index;
+}
+
+/* Keyboard HID is a reduced, digital-only transport with no energy key:
+ * energy and bands are HID_E_LO, the spectrum is 0, beat is Space and bar is
+ * Return. F (fill/drop) is ignored, so there are no X events.
+ * usb-hid-transport-v0 keys as (CIA1 port A column, port B row): scene keys
+ * 1..8 are (7,0) (7,3) (1,0) (1,3) (2,0) (2,3) (3,0) (3,3); palette keys
+ * Q W E R T Y U I are (7,6) (1,1) (1,6) (2,1) (2,6) (3,1) (3,6) (4,1); Space
+ * is (7,4) and Return (0,1). */
+void cf_read_keys(uint8_t fallback_scene) {
+  uint8_t c1 = cf_keys[1];
+  uint8_t c2 = cf_keys[2];
+  uint8_t c3 = cf_keys[3];
+  uint8_t c7 = cf_keys[7];
+  uint8_t scene;
+  uint8_t palette;
+  uint8_t beat_keys;
+
+  /* Bit i of each byte is key i of the group; the low and high nibbles of
+   * the column pairs are picked with constant masks. */
+  scene = (uint8_t)((c7 & 0x01u) | ((c7 & 0x08u) >> 2) | ((c1 & 0x01u) << 2) | (c1 & 0x08u) |
+                    ((c2 & 0x01u) << 4) | ((c2 & 0x08u) << 2) | ((c3 & 0x01u) << 6) | ((c3 & 0x08u) << 4));
+  palette = (uint8_t)(((c7 & 0x40u) >> 6) | (c1 & 0x02u) | ((c1 & 0x40u) >> 4) | ((c2 & 0x02u) << 2) |
+                      ((c2 & 0x40u) >> 2) | ((c3 & 0x02u) << 4) | (c3 & 0x40u) | ((cf_keys[4] & 0x02u) << 6));
+  beat_keys = (uint8_t)(((c7 >> 4) & 1u) | (cf_keys[0] & 2u));
+  scene = cf_single_key(scene);
+  palette = cf_single_key(palette);
+  if (scene != CF_NONE) {
+    cf_latched_scene = scene;
+  }
+  if (palette != CF_NONE) {
+    cf_latched_palette = palette;
+  }
+  memset(&cf_in, 0, sizeof(cf_in));
+  /* Until a scene key arrives the procedural scene is used; it is never 7. */
+  cf_in.scene = cf_latched_scene != CF_NONE ? cf_latched_scene : fallback_scene;
+  /* Flash can arm only from reports holding exactly one scene key and one
+   * palette key together, as usb_hid.py sends them. */
+  cf_in.scene_abs = (uint8_t)(scene != CF_NONE && palette != CF_NONE);
+  cf_in.palette = cf_latched_palette;
+  cf_in.wire = 1u;
+  cf_in.energy = CF_HID_E_LO;
+  memset(cf_in.band, CF_HID_E_LO, sizeof(cf_in.band));
+  if (beat_keys & (uint8_t)~cf_previous_beat_keys) {
+    cf_in.events = CF_EV_B;
+  }
+  cf_previous_beat_keys = beat_keys;
 }
