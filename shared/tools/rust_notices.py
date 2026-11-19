@@ -3,8 +3,10 @@
 
 Walks the dependency graph that Cargo resolved from renderers/modern/Cargo.lock
 (normal dependencies only, for the release platforms) and collects each crate's
-licence expression and the LICENSE/COPYING/NOTICE files shipped in its package.
-Identical licence texts are printed once, with the crates that use them.
+licence expression, the LICENSE/COPYING/NOTICE files shipped anywhere in its
+package (including vendored subdirectories) and the <copyright> blocks of any
+Wayland protocol XML files it embeds. Identical texts are printed once, with
+the crates that use them.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 
@@ -27,6 +30,11 @@ OUTPUT = ROOT / "THIRD_PARTY_NOTICES" / "rust.md"
 PLATFORMS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin")
 NOTICE_FILE = re.compile(r"^(licen[cs]e|copying|notice|unlicense|copyright)([-._].*)?$", re.IGNORECASE)
 NOTICE_DIR = re.compile(r"^licen[cs]es$", re.IGNORECASE)
+# Source files whose names happen to match NOTICE_FILE (e.g. src/copying.rs).
+SOURCE_SUFFIXES = {".rs", ".c", ".h", ".py", ".js", ".sh", ".toml", ".xml", ".json"}
+SPDX_ID = re.compile(r"SPDX-License-Identifier:\s*([A-Za-z0-9.+-]+)")
+COPYLEFT = re.compile(r"^(A?GPL|LGPL|MPL|EPL|CDDL)-")
+LGPL_DECISION = "https://github.com/djensenius/chipviz/issues/110"
 # Canonical SPDX texts (license-list-data v3.29.0) for crates whose package
 # ships no licence file.
 FALLBACK_DIR = ROOT / "THIRD_PARTY_NOTICES" / "licenses"
@@ -98,16 +106,48 @@ def notice_files(package: dict) -> list[Path]:
   if not directory.is_dir():
     raise SourcesUnavailable(f"missing sources for {package['name']} {package['version']}")
   files: set[Path] = set()
-  for entry in directory.iterdir():
-    if entry.is_file() and NOTICE_FILE.match(entry.name):
+  for entry in directory.rglob("*"):
+    if not entry.is_file() or "target" in entry.relative_to(directory).parts[:-1]:
+      continue
+    in_notice_dir = any(NOTICE_DIR.match(part) for part in entry.relative_to(directory).parts[:-1])
+    if in_notice_dir or (NOTICE_FILE.match(entry.name) and entry.suffix.lower() not in SOURCE_SUFFIXES):
       files.add(entry)
-    elif entry.is_dir() and NOTICE_DIR.match(entry.name):
-      files.update(child for child in entry.iterdir() if child.is_file())
   if package.get("license_file"):
     licence_file = directory / package["license_file"]
     if licence_file.is_file():
       files.add(licence_file)
   return sorted(files, key=lambda path: display_path(path, directory))
+
+
+def protocol_copyrights(directory: Path) -> list[tuple[str, str]]:
+  """Return (relative path, text) for each <copyright> block in the crate's XML files."""
+  blocks = []
+  for path in sorted(directory.rglob("*.xml"), key=lambda path: display_path(path, directory)):
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if "<copyright" not in raw:
+      continue
+    try:
+      elements = ElementTree.fromstring(raw).iter("copyright")
+      texts = ["".join(element.itertext()) for element in elements]
+    except ElementTree.ParseError:
+      texts = re.findall(r"<copyright>(.*?)</copyright>", raw, re.DOTALL)
+    for text in texts:
+      text = normalise(dedent(text))
+      if text:
+        blocks.append((display_path(path, directory), text))
+  return blocks
+
+
+def dedent(text: str) -> str:
+  lines = text.replace("\r\n", "\n").split("\n")
+  indents = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
+  margin = min(indents, default=0)
+  return "\n".join(line[margin:] for line in lines)
+
+
+def is_top_level(path: Path, directory: Path) -> bool:
+  """True for the crate's own licence files: in its root or its root LICENSES/ directory."""
+  return path.parent == directory or (path.parent.parent == directory and bool(NOTICE_DIR.match(path.parent.name)))
 
 
 def display_path(path: Path, directory: Path) -> str:
@@ -133,9 +173,11 @@ def fallback_texts(package: dict, fallback_dir: Path) -> tuple[list[tuple[str, s
   expression = package.get("license") or ""
   alternatives = licence_alternatives(expression)
   found: list[tuple[str, str]] = []
+  complete_found: list[tuple[str, str]] = []
   satisfied = False
   for alternative in alternatives:
     complete = True
+    alternative_found: list[tuple[str, str]] = []
     for spdx_id in alternative:
       path = fallback_dir / f"{spdx_id}.txt"
       if not path.is_file():
@@ -149,13 +191,17 @@ def fallback_texts(package: dict, fallback_dir: Path) -> tuple[list[tuple[str, s
         label += f", copyright line from {source}"
       elif spdx_id not in NO_HOLDER_NEEDED:
         complete = False
-      if (label, text) not in found:
-        found.append((label, text))
-    satisfied = satisfied or complete
+      if (label, text) not in alternative_found:
+        alternative_found.append((label, text))
+    found += [item for item in alternative_found if item not in found]
+    if complete:
+      satisfied = True
+      complete_found += [item for item in alternative_found if item not in complete_found]
   if not alternatives:
     return found, "no licence declared"
   if satisfied:
-    return found, None
+    # Only link texts of complete alternatives, never an unfilled template.
+    return complete_found, None
   return found, KNOWN_GAPS.get(key, "no licence file in package and no verified copyright holder for its licence")
 
 
@@ -173,8 +219,9 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
   fallback_dir = FALLBACK_DIR if fallback_dir is None else fallback_dir
   packages = shipped_packages(metadata)
   texts: dict[str, dict] = {}
-  rows: list[tuple[str, str, str, list[str], bool]] = []
+  rows: list[tuple[str, str, str, list[str], list[str]]] = []
   gaps: list[tuple[str, str]] = []
+  copyleft: list[tuple[str, list[str]]] = []
 
   def add(text: str, user: str) -> str:
     key = hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
@@ -186,17 +233,44 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     label = f"{package['name']} {package['version']}"
     directory = Path(package["manifest_path"]).parent
     refs: list[str] = []
+    top_level = False
+    embedded: set[str] = set()
     for path in notice_files(package):
       text = normalise(path.read_text(encoding="utf-8", errors="replace"))
       if text:
         refs.append(add(text, f"{label} ({display_path(path, directory)})"))
-    fallback = not refs
-    if fallback:
+        if is_top_level(path, directory) or path == directory / (package.get("license_file") or ""):
+          top_level = True
+        else:
+          embedded.update(SPDX_ID.findall(text))
+          if any(NOTICE_DIR.match(part) for part in path.relative_to(directory).parts[:-1]):
+            embedded.add(path.stem)
+    protocols = protocol_copyrights(directory)
+    if protocols:
+      combined = "\n\n".join(f"== {path} ==\n{text}" for path, text in protocols)
+      refs.append(add(combined, f"{label} (<copyright> blocks of {len(protocols)} protocol XML files)"))
+      for _, text in protocols:
+        embedded.update(SPDX_ID.findall(text))
+    fallback: list[str] = []
+    if not top_level:
       found, gap = fallback_texts(package, fallback_dir)
-      refs = [add(text, f"{label} ({fallback_label})") for fallback_label, text in found]
+      fallback = [add(text, f"{label} ({fallback_label})") for fallback_label, text in found]
       if gap:
         gaps.append((label, gap))
-    rows.append((label, package.get("license") or "not declared", package.get("repository") or "", refs, fallback))
+    licence = package.get("license") or "not declared"
+    declared = {token for alternative in licence_alternatives(licence) for token in alternative}
+    extra = sorted(embedded - declared)
+    notes = []
+    if extra:
+      notes.append("also contains " + ", ".join(extra))
+    if protocols:
+      notes.append(f"{len(protocols)} per-protocol notice{'' if len(protocols) == 1 else 's'}")
+    if notes:
+      licence += " (" + "; ".join(notes) + ")"
+    copyleft_ids = [spdx_id for spdx_id in extra if COPYLEFT.match(spdx_id)]
+    if copyleft_ids:
+      copyleft.append((label, copyleft_ids))
+    rows.append((label, licence, package.get("repository") or "", refs, fallback))
 
   ordered = sorted(texts.items(), key=lambda item: item[1]["users"][0])
   numbers = {key: index for index, (key, _) in enumerate(ordered, start=1)}
@@ -210,7 +284,10 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     "include the Rust crates below, resolved from `renderers/modern/Cargo.lock`",
     f"for {', '.join(f'`{platform}`' for platform in PLATFORMS)}.",
     "Each crate is distributed under its own licence. Where a crate offers a",
-    "choice of licences, every licence file shipped in its package is reproduced.",
+    "choice of licences, every licence file shipped in its package is reproduced,",
+    "including files in vendored subdirectories and the `<copyright>` blocks of",
+    "embedded Wayland protocol XML files. Licences found only in those vendored",
+    "files are listed as \"also contains\" in the table.",
     "Notice numbers marked \"(fallback)\" are canonical SPDX licence texts used",
     "because the published crate ships no licence file. For MIT crates, the",
     "copyright line comes from the upstream repository at the crate's commit.",
@@ -222,10 +299,18 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
   ]
   for label, licence, repository, refs, fallback in rows:
     name, version = label.split(" ", 1)
-    notices = ", ".join(f"[{numbers[key]}](#notice-{numbers[key]})" for key in refs) or "none"
-    if fallback:
-      notices += " (fallback)"
+    links = [f"[{numbers[key]}](#notice-{numbers[key]}) (fallback)" for key in sorted(set(fallback), key=numbers.get)]
+    links += [f"[{numbers[key]}](#notice-{numbers[key]})" for key in sorted(set(refs) - set(fallback), key=numbers.get)]
+    notices = ", ".join(links) or "none"
     lines.append(f"| {name} | {version} | {licence.replace('|', '/')} | {repository} | {notices} |")
+  if copyleft:
+    lines += ["", "## Copyleft components", ""]
+    lines += [f"- {label}: {', '.join(ids)}." for label, ids in copyleft]
+    lines += [
+      "",
+      "How the release binaries meet these licences' terms is tracked in",
+      f"[issue #110]({LGPL_DECISION}).",
+    ]
   lines += ["", "## Known gaps", ""]
   if gaps:
     lines += [
@@ -256,6 +341,10 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
   return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def running_in_ci() -> bool:
+  return os.environ.get("CI", "").strip().lower() not in ("", "0", "false")
+
+
 def main(argv: list[str] | None = None) -> int:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--check", action="store_true", help="fail if the committed notices are stale")
@@ -264,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
   try:
     content = render(cargo_metadata())
   except SourcesUnavailable as error:
-    if args.check and not os.environ.get("CI"):
+    if args.check and not running_in_ci():
       print(f"chipviz Rust notices check skipped: {error}")
       return 0
     reason = " (crate sources are required when CI is set)" if args.check else ""
