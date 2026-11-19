@@ -92,17 +92,19 @@ animation phase jumps ahead instead of resuming where it stopped.
   (`just c64-rom`, the release artifact) is built without `CF_UNMEASURED_FLASH`:
   `cf_tick` drops every arming input, so palettes 3 and 7 (`R`, `I`) always run
   as unarmed 2 and 6 (hard cuts), even with `8` held, and the flash latch is
-  never set. `make -C cores/c64/homebrew UNMEASURED_FLASH=1` builds a local
-  measurement ROM; there, 3 and 7 arm flash/gate only when an absolute scene key
-  `8` and the palette key are held together in the same scan for P_STABLE (30)
-  steps. Do not ship that ROM.
+  never set. For measurement only, `make -C cores/c64/homebrew
+  UNMEASURED_FLASH=1` builds `chipviz-c64-unmeasured-flash.prg` (objects and
+  map in `build/unmeasured-flash/`) next to the untouched release
+  `chipviz-c64.prg`; load that file by name in VICE or RetroArch, and never ship
+  it. In it, 3 and 7 arm flash/gate only when an absolute scene key `8` and the
+  palette key are held together in the same scan for P_STABLE (30) steps.
 - **Not implemented.** The operator role (`L` pin and the RETURN warning screen)
   and joystick relative palette pulses.
 - **Timing.** Every frame is a step, in or out of scene 7. Holding `8` shows
   the field from the 31st sampled step (the debounce decides at the end of the
   30th). Measured in VICE (PAL and NTSC alike): 31–32 frames from the key press until the step that
   shows scene 7, and 33–34 frames until it is on screen (registers land at the
-  next VBlank). Exit with `1` takes 31–32 frames, and 32–33 until the last
+  next VBlank). Exit with `1` takes 31–33 frames, and 32–34 until the last
   native frame is back on screen. The per-frame step costs the native demo
   some time: it draws one loop in about 26 frames instead of about 22.
 
