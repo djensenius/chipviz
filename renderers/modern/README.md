@@ -197,25 +197,27 @@ when `beat_count` changes.
 
 The layers glow like a long-persistence oscilloscope. They are drawn into
 their own target, and a per-pixel phosphor follows it in linear light: each
-channel rises at once to what is drawn but falls by at most 0.15 per second
-of full brightness, and the result is added onto the scene. So the ribbon
-leaves a fading trail wherever it has been, and a moving ribbon's trails can
-cover far more of the screen than the 13% one frame draws; a burst lingers
-for a few seconds after it ends; and turning the layers off fades them out
-over up to about 6.7 s rather than cutting. Entering the colour field (scene
-7), which is already a full-screen change, clears the afterglow at once, so
-nothing is ever drawn over it. A window resize clears the afterglow too.
-That sudden fall is one the decay would have allowed, given time, so the
-layers then stay dark for as long as the decay would have taken to fade
-what was cleared (up to about 6.7 s after full brightness) and until the
-size has held still for 0.15 s, so a drag does not reallocate anything each
-frame. Resizing in steps therefore makes the layers vanish and return, with
-their trails restarted, but no faster than they could fade. Being added
-light, the layers brighten the scene beneath them and never darken it, so
-they cannot be seen where the scene is white (Static's white sections, for
-example); darkening the scene beneath them would make their falls depend on
-the scene, outside the bound below. Red layer colours are drawn slightly
-pink (see below).
+channel rises at once to what is drawn but falls by at most 0.15 per second of
+full brightness, and the result is added onto the scene. So the ribbon leaves
+a fading trail wherever it has been, and a moving ribbon's trails can cover
+far more of the screen than the 13% one frame draws; a burst lingers for a few
+seconds after it ends; and turning the layers off fades them out over up to
+about 6.7 s rather than cutting. Entering the colour field (scene 7), which is
+already a full-screen change, clears the afterglow at once, so nothing is ever
+drawn over it, and a window resize clears it too. Either sudden fall is one
+the decay would have allowed, given time, so the layers then stay dark for as
+long as the decay would have taken to fade what was cleared. The hold counts
+from the layers' last drawn frame, so while the ribbon is shown (it draws
+every frame) it is usually the full 6.7 s; only after the layers have drawn
+nothing for a while is it shorter. After a resize the layers also wait until
+the size has held still for 0.15 s, so a drag does not reallocate anything
+each frame. Resizing in steps, or switching in and out of scene 7, therefore
+makes the layers vanish and return, with their trails restarted, but no faster
+than they could fade. Being added light, the layers brighten the scene beneath
+them and never darken it, so they cannot be seen where the scene is white
+(Static's white sections, for example); darkening the scene beneath them would
+make their falls depend on the scene, outside the bound below. Red layer
+colours are drawn slightly pink (see below).
 
 While the layers glow, the scene is drawn into a texture of its own and a
 final pass writes it with the layers added, in linear light; on a surface that
@@ -278,13 +280,14 @@ output never has more luminance or red flashes in 1 s than the larger of two
 and the scene's own for those inputs; the earlier switch on the scene's colour
 turned the dark red into over 100 flashes in 1 s. A regression test keeps the
 in-step counterexample above (five flashes in 1 s), and another pins the
-output to the scene over white. Windows alternating between two sizes every
-0.16 to 8 s give at most two flashes in 1 s; without the hold after a resize,
-every 0.2 s gives five. GPU tests check that the composite matches its model
-on sRGB and non-sRGB targets; that the light added at any unsaturated pixel of
-an animated scene falls no faster than the decay; that a replayed still
-matches a live run; that the colour field is never drawn over; and that layers
-`off` render exactly as before the layers existed.
+output to the scene over white. Windows alternating between two sizes, or
+between scene 7 and a native scene, every 0.16 to 8 s give at most two flashes
+in 1 s; without the hold, every 0.2 s gives five for sizes and three for scene
+7. GPU tests check that the composite matches its model on sRGB and non-sRGB
+targets; that the light added at any unsaturated pixel of an animated scene
+falls no faster than the decay; that a replayed still matches a live run; that
+the colour field is never drawn over; and that layers `off` render exactly as
+before the layers existed.
 
 The design keeps the layers calm well within the luminance bound. Each burst
 is a single smooth, partly transparent rise and fall (glow at most 30% and

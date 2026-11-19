@@ -38,11 +38,12 @@
 //! test). Added light cannot show over white, where the output is the
 //! scene; darkening the scene would make the layers' falls depend on it.
 //!
-//! A resize drops the display at once (it no longer lines up), a fall of
-//! at most [`Fading::brightest`]; [`Settle`] then holds the layers dark for
+//! A resize (the display no longer lines up) or entering the colour field
+//! drops the display at once, a fall of at most [`Fading::brightest`];
+//! [`Settle`] then holds the layers dark for
 //! as long as the decay would have taken to fade that much, so the drop and
 //! hold together take no less time than the decay and the bound above
-//! still holds across stepped resizes.
+//! still holds across stepped resizes and scene switches.
 //!
 //! Red flashes are not bounded. They need a saturated red
 //! (`R / (R + G + B) >= 0.8`, linear) at one end of a change of
@@ -241,10 +242,7 @@ impl Settle {
         }
         let resized = match held {
             Some((held_size, fading)) if held_size != size => {
-                if !fading.is_dark() {
-                    let hold = f64::from(fading.brightest() / self.hold_rate);
-                    self.dark_until = self.dark_until.max(now + hold);
-                }
+                self.drop_lit(fading, now);
                 true
             }
             Some(_) => return Plan::Draw,
@@ -254,6 +252,17 @@ impl Settle {
             Plan::Make
         } else {
             Plan::Idle
+        }
+    }
+
+    /// Records that a phosphor with `fading` is dropped at once at overlay
+    /// time `now` (for a resize, or on entering the colour field): when it
+    /// was lit, no new light is drawn until the decay would have faded its
+    /// brightest level, so the drop is a fall the decay limit allows.
+    pub fn drop_lit(&mut self, fading: &Fading, now: f64) {
+        if !fading.is_dark() {
+            let hold = f64::from(fading.brightest() / self.hold_rate);
+            self.dark_until = self.dark_until.max(now + hold);
         }
     }
 

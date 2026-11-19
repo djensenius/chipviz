@@ -486,9 +486,9 @@ impl ScenePipeline {
     /// instance count when the phosphor passes should run this frame: while
     /// the layers draw or the phosphor still glows. With nothing drawn and a
     /// dark phosphor (always, for layers `off`) no pass runs and the
-    /// phosphor's textures are freed. Over the colour field the phosphor is
-    /// dropped at once; a resize drops it and holds the layers dark while
-    /// the target settles and the dropped light would have decayed (see
+    /// phosphor's textures are freed. Entering the colour field or a resize
+    /// drops it at once and holds the layers dark while the dropped light
+    /// would have decayed (and, for a resize, while the target settles; see
     /// `phosphor::Settle::plan`).
     fn prepare_mic_layers(
         &mut self,
@@ -502,9 +502,12 @@ impl ScenePipeline {
         self.mic_layers
             .step(frame, self.live_scope.as_ref(), elapsed, shown);
         // Entering the colour field is already a full-screen change; its
-        // colours must follow its trace alone, so no afterglow lingers.
+        // colours must follow its trace alone, so no afterglow lingers. The
+        // drop holds the layers dark as a resize's does.
         if matches!(display, colour_field::Display::ColourField(_)) {
-            self.phosphor = None;
+            if let Some(glow) = self.phosphor.take() {
+                self.settle.drop_lit(glow.fading(), elapsed);
+            }
             return None;
         }
         let mut overlay = Vec::new();

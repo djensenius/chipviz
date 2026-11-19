@@ -1684,13 +1684,24 @@ mod tests {
         eprintln!("step mask over the dark red: {masked_worst} flashes in 1 s");
     }
 
-    /// One pixel's relative luminance per frame over black, through the
-    /// phosphor as the renderer keeps it (`Settle::plan`, `Fading`,
-    /// `decay_pixel`, `composite_pixel`), while the target alternates
-    /// between two sizes every `period` s and the layers draw every frame.
-    fn resized_pixel(
+    /// What alternates every period in [`switched_pixel`].
+    #[derive(Clone, Copy, Debug)]
+    enum Switch {
+        /// The target between two sizes.
+        Size,
+        /// The display between a native scene and the colour field.
+        ColourField,
+    }
+
+    /// One pixel's added light (relative luminance) per frame, through the
+    /// phosphor as the renderer keeps it (`Settle::plan`,
+    /// `Settle::drop_lit`, `Fading`, `decay_pixel`, `composite_pixel` over
+    /// black), while `switch` alternates every `period` s and the layers
+    /// draw every frame they are shown.
+    fn switched_pixel(
         mut settle: crate::phosphor::Settle,
         times: &[f64],
+        switch: Switch,
         period: f64,
         mut emit: impl FnMut(usize, [f32; 3]) -> [f32; 3],
     ) -> Vec<f32> {
@@ -1700,11 +1711,19 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(step, &now)| {
-                let size = if ((now / period) as u64).is_multiple_of(2) {
-                    (800, 600)
-                } else {
-                    (640, 480)
+                let first = ((now / period) as u64).is_multiple_of(2);
+                let size = match switch {
+                    Switch::Size if !first => (640, 480),
+                    _ => (800, 600),
                 };
+                // As in `prepare_mic_layers`: the colour field drops the
+                // phosphor, holding the layers dark, and adds no light.
+                if matches!(switch, Switch::ColourField) && !first {
+                    if let Some((_, fading, _)) = held.take() {
+                        settle.drop_lit(&fading, now);
+                    }
+                    return 0.0;
+                }
                 let plan = settle.plan(
                     held.as_ref().map(|(size, fading, _)| (*size, fading)),
                     1,
@@ -1727,13 +1746,11 @@ mod tests {
             .collect()
     }
 
-    /// Stepped resizes drop the afterglow at once; the hold after a lit
-    /// drop (no new light until the decay would have faded it) keeps a
-    /// pixel to 2 flashes in any 1 s however the sizes alternate. Without
-    /// the hold, sizes alternating every 0.2 s blink the layers about 5
-    /// times a second.
-    #[test]
-    fn stepped_resizes_blink_the_layers_no_faster_than_the_decay() {
+    /// The most flashes in any 1 s of the added light while `switch`
+    /// alternates every 0.16 to 8 s, at 60, 120 and 240 fps, steady or
+    /// jittered, for steady and relight-on-fade input; and the most, every
+    /// 0.2 s, with no hold after a drop.
+    fn switched_flashes(switch: Switch) -> ((usize, String), usize) {
         use crate::phosphor::Settle;
         const SECONDS: f64 = 20.0;
         let steady = || |_: usize, _: [f32; 3]| [1.0_f32; 3];
@@ -1754,15 +1771,16 @@ mod tests {
             for jitter in [false, true] {
                 let times = frame_times(fps, jitter, SECONDS);
                 for period in [0.16, 0.2, 0.25, 0.4, 0.7, 1.0, 1.5, 2.0, 2.5, 3.0, 7.0, 8.0] {
+                    let run = |settle, emit| switched_pixel(settle, &times, switch, period, emit);
                     let runs = [
                         (
                             "steady",
-                            resized_pixel(Settle::default(), &times, period, steady()),
+                            run(
+                                Settle::default(),
+                                Box::new(steady()) as Box<dyn FnMut(_, _) -> _>,
+                            ),
                         ),
-                        (
-                            "greedy",
-                            resized_pixel(Settle::default(), &times, period, greedy()),
-                        ),
+                        ("greedy", run(Settle::default(), Box::new(greedy()))),
                     ];
                     for (what, series) in runs {
                         let (flashes, _) = most_flashes(&series, &times);
@@ -1770,19 +1788,38 @@ mod tests {
                             worst = (flashes, format!("{what} every {period} s at {fps} fps"));
                         }
                     }
-                    let series = resized_pixel(
-                        Settle::with_hold_rate(f32::INFINITY),
-                        &times,
-                        period,
-                        steady(),
-                    );
                     if period == 0.2 {
+                        let series = run(Settle::with_hold_rate(f32::INFINITY), Box::new(steady()));
                         unheld = unheld.max(most_flashes(&series, &times).0);
                     }
                 }
             }
         }
-        eprintln!("stepped resizes: at most {worst:?} flashes in 1 s; {unheld} without the hold");
+        eprintln!(
+            "{switch:?} switches: at most {worst:?} flashes in 1 s; {unheld} without the hold"
+        );
+        (worst, unheld)
+    }
+
+    /// Stepped resizes drop the afterglow at once; the hold after a lit
+    /// drop (no new light until the decay would have faded it) keeps a
+    /// pixel to 2 flashes in any 1 s however the sizes alternate. Without
+    /// the hold, sizes alternating every 0.2 s blink the layers about 5
+    /// times a second.
+    #[test]
+    fn stepped_resizes_blink_the_layers_no_faster_than_the_decay() {
+        let (worst, unheld) = switched_flashes(Switch::Size);
+        assert!(worst.0 <= 2, "{worst:?}");
+        assert!(unheld >= 3, "{unheld}");
+    }
+
+    /// Entering the colour field drops the afterglow at once too, with the
+    /// same hold: switching between scene 7 and a native scene (every 0.2 s
+    /// among others) gives the added light at most 2 flashes in any 1 s,
+    /// where with no hold every 0.2 s gives 3.
+    #[test]
+    fn scene_7_switches_blink_the_layers_no_faster_than_the_decay() {
+        let (worst, unheld) = switched_flashes(Switch::ColourField);
         assert!(worst.0 <= 2, "{worst:?}");
         assert!(unheld >= 3, "{unheld}");
     }
