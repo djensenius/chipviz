@@ -13,7 +13,12 @@
 //!   (moving mean) threshold and a refractory period;
 //! - tempo: gaps between each onset and the few before it are octave-folded
 //!   into 0.3-1.0 s (60-200 BPM) and accumulated in a decaying histogram,
-//!   weighted towards the nearest onsets; the strongest bin is the beat period. Folding makes steady eighths read as the
+//!   weighted towards the nearest onsets. The gap to the previous onset is
+//!   pinned to 0.3 s or 1.0 s when it lies within one analysis hop (or tempo
+//!   bin) outside that endpoint, so hop jitter cannot fold 60 or 200 BPM to
+//!   120 or 100; longer gaps fold strictly so they reinforce the shorter
+//!   period. The beat period is the weighted centroid of the strongest
+//!   three-bin neighbourhood. Folding makes steady eighths read as the
 //!   quarter-note tempo and keeps off-beats from doubling it;
 //! - a forward-only beat clock ([`BeatTracker`]): `beat_phase` advances at the
 //!   estimated tempo and `beat_count` increments exactly when the phase wraps,
@@ -24,7 +29,8 @@
 //!   several arrive in a row or the clock has lost lock (no on-beat onset for
 //!   two beats), in which case the next onset re-anchors the beat.
 //!
-//! Known limits: tempos outside 60-200 BPM are folded into that range, the
+//! Known limits: tempos outside 60-200 BPM are folded into that range (tempos
+//! within about one hop of either end are pinned to it), the
 //! tracker cannot tell a 3/4 or swung feel from straight time, and a pattern
 //! of only off-beats ends up treated as the beat.
 //!
@@ -108,7 +114,13 @@ impl BeatTracker {
     /// `max(hop_s, TEMPO_BIN_S)` of the 0.3-1.0 s range endpoints are clamped
     /// onto them rather than octave-folded, so hop jitter around 60 or
     /// 200 BPM cannot fold a steady beat to half or double its tempo.
+    /// A non-finite or negative `hop_s` is treated as `0.0`.
     pub fn with_hop(hop_s: f32) -> Self {
+        let hop_s = if hop_s.is_finite() && hop_s > 0.0 {
+            hop_s
+        } else {
+            0.0
+        };
         Self {
             fold_tolerance_s: fold_tolerance(hop_s),
             time_s: 0.0,
@@ -161,13 +173,19 @@ impl BeatTracker {
             *sum *= TEMPO_DECAY;
         }
         // Gaps to nearer onsets weigh more, so a multiple of the beat period
-        // (two or three beats back) never outvotes the period itself.
+        // (two or three beats back) never outvotes the period itself. Only
+        // the gap to the previous onset is pinned to a range endpoint; longer
+        // gaps fold strictly so multiples reinforce the shorter period.
         for (lag, &previous) in self.recent_onsets.iter().rev().enumerate() {
             let gap = self.time_s - previous;
             if !(MIN_ONSET_GAP_S..=MAX_ONSET_GAP_S).contains(&gap) {
                 continue;
             }
-            let period = fold_period(gap as f32, self.fold_tolerance_s);
+            let period = if lag == 0 {
+                fold_period(gap as f32, self.fold_tolerance_s)
+            } else {
+                fold_multiple(gap as f32)
+            };
             let bin = (((period - MIN_BEAT_PERIOD_S) / TEMPO_BIN_S) as usize).min(TEMPO_BINS - 1);
             let weight = 1.0 / (lag + 1) as f32;
             self.tempo_weight[bin] += weight;
@@ -178,17 +196,22 @@ impl BeatTracker {
         }
         self.recent_onsets.push_back(self.time_s);
 
-        // First strongest bin wins ties, so the result is deterministic.
+        // The peak is the bin whose neighbourhood (bin - 1..=bin + 1) holds the
+        // most weight, so votes for one period that straddle two bins are not
+        // outvoted by a single sharper bin. The period is the weighted
+        // centroid of that neighbourhood. The first strongest neighbourhood
+        // wins ties, so the result is deterministic.
+        let neighbourhood = |bin: usize| bin.saturating_sub(1)..(bin + 2).min(TEMPO_BINS);
+        let smoothed = |bin: usize| -> f32 { self.tempo_weight[neighbourhood(bin)].iter().sum() };
         let peak = (0..TEMPO_BINS).fold(0, |best, bin| {
-            if self.tempo_weight[bin] > self.tempo_weight[best] {
+            if smoothed(bin) > smoothed(best) {
                 bin
             } else {
                 best
             }
         });
-        let neighbours = peak.saturating_sub(1)..(peak + 2).min(TEMPO_BINS);
-        let weight: f32 = self.tempo_weight[neighbours.clone()].iter().sum();
-        let sum: f32 = self.tempo_sum[neighbours].iter().sum();
+        let weight = smoothed(peak);
+        let sum: f32 = self.tempo_sum[neighbourhood(peak)].iter().sum();
         if weight >= TEMPO_MIN_WEIGHT {
             self.period_s = (sum / weight).clamp(MIN_BEAT_PERIOD_S, MAX_BEAT_PERIOD_S);
             self.tempo_known = true;
@@ -231,6 +254,7 @@ fn fold_tolerance(hop_s: f32) -> f32 {
 /// 60 BPM (1.0 s) and 200 BPM (0.3 s) beats map to themselves despite hop
 /// jitter. `tolerance` must be below `MIN_BEAT_PERIOD_S`.
 fn fold_period(gap: f32, tolerance: f32) -> f32 {
+    debug_assert!(gap.is_finite() && gap > 0.0, "onset gap {gap}");
     let mut period = gap;
     while period < MIN_BEAT_PERIOD_S - tolerance {
         period *= 2.0;
@@ -239,6 +263,21 @@ fn fold_period(gap: f32, tolerance: f32) -> f32 {
         period /= 2.0;
     }
     period.clamp(MIN_BEAT_PERIOD_S, MAX_BEAT_PERIOD_S)
+}
+
+/// Octave-folds a gap spanning several onsets into 0.3 s up to (excluding)
+/// 1.0 s with no endpoint pinning, so a gap of two beats at 120 BPM votes for
+/// 0.5 s rather than for 60 BPM.
+fn fold_multiple(gap: f32) -> f32 {
+    debug_assert!(gap.is_finite() && gap > 0.0, "onset gap {gap}");
+    let mut period = gap;
+    while period < MIN_BEAT_PERIOD_S {
+        period *= 2.0;
+    }
+    while period >= MAX_BEAT_PERIOD_S {
+        period /= 2.0;
+    }
+    period
 }
 
 /// Analysed audio fields in control-frame units.
@@ -905,6 +944,57 @@ mod tests {
         // Beyond the tolerance, gaps still fold by octaves.
         let beyond = MAX_BEAT_PERIOD_S + 2.0 * tolerance;
         assert!((fold_period(beyond, tolerance) - beyond / 2.0).abs() < 1e-6);
+        let below = MIN_BEAT_PERIOD_S - 2.0 * tolerance;
+        assert!((fold_period(below, tolerance) - below * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn multiples_fold_strictly_onto_the_shorter_period() {
+        assert_eq!(fold_multiple(1.0), 0.5);
+        assert_eq!(fold_multiple(2.0), 0.5);
+        assert!((fold_multiple(1.5) - 0.75).abs() < 1e-6);
+        assert_eq!(fold_multiple(0.3), 0.3);
+    }
+
+    #[test]
+    fn with_hop_sanitises_bad_hops() {
+        for hop in [f32::NAN, f32::INFINITY, -1.0] {
+            assert_eq!(BeatTracker::with_hop(hop).fold_tolerance_s, TEMPO_BIN_S);
+        }
+    }
+
+    /// Quarter-note clicks at `bpm` with deterministic uniform timing jitter
+    /// of up to `jitter` seconds either way.
+    fn jittered_clicks(bpm: f32, jitter: f32, seconds: f32, seed: u32) -> Vec<f32> {
+        let period = 60.0 / bpm;
+        let mut state = seed;
+        let mut events = Vec::new();
+        let mut beat = 0.05;
+        while beat < seconds {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let unit = (state >> 8) as f32 / (1 << 23) as f32 - 1.0;
+            events.push((beat + unit * jitter, 0.5));
+            beat += period;
+        }
+        clicks(&events, seconds)
+    }
+
+    #[test]
+    fn jittered_click_trains_read_their_tempo() {
+        for (bpm, jitter, seconds, range) in [
+            (120.0, 0.005, 10.0, 118..=122),
+            (60.0, 0.005, 12.0, 58..=62),
+            (121.0, 0.0, 10.0, 119..=123),
+            (200.0, 0.003, 8.0, 192..=200),
+        ] {
+            for seed in 1..=4 {
+                let features = replay_monotonic(&jittered_clicks(bpm, jitter, seconds, seed));
+                assert!(
+                    range.contains(&features.bpm),
+                    "{bpm} BPM ±{jitter} s seed {seed}: {features:?}"
+                );
+            }
+        }
     }
 
     #[test]
