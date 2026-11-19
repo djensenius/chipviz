@@ -190,8 +190,8 @@ transparent rise and fall (glow at most 30% and sparks at most 50% opacity),
 with its colour and peak fixed when it starts, over a small part of the screen
 rather than a full-screen change, and new bursts start at most once every
 0.5 s (two per second, with margin under the three-per-second limit for dark
-rooms and projection), with at most four alive at once. A unit test composites a CPU model of the bursts over black at the
-maximum onset rate, including input whose palette and energy change every
+rooms and projection), with at most four alive at once. A unit test
+composites a CPU model of the bursts over black at the maximum onset rate, including input whose palette and energy change every
 frame at 60, 120 and 240 fps, and finds at most two flashes (opposing changes
 of 0.1 relative luminance) in any 1 s at any sampled point. The scope ribbon
 is outside that model; its exemption rests on staying thin lines. Unit tests
