@@ -520,19 +520,16 @@ mod tests {
     }
 
     /// A full-screen Static pixel-noise quad matches the CPU prediction at
-    /// every pixel (blank or lit, and the lit level), its blank share is near
-    /// the requested chance, and rendering is repeatable.
+    /// every pixel (blank or lit, colour and level), its blank share is near
+    /// the requested chance, and rendering is repeatable. Covers monochrome
+    /// and rainbow (palette 3) noise on black, and both inverted on a white
+    /// section's background, where rainbow hues must be complemented.
     #[test]
     #[ignore = "requires a GPU adapter"]
     fn static_pixel_noise_matches_cpu_prediction_on_gpu() {
         use scenes::static_gpu_reference::{noise, pixel};
 
         let (width, height) = (128, 96);
-        let pattern = noise(0.5, 4, 1234, 3);
-        let quad = [full_screen([1.0; 4], pattern)];
-        let rgb = render_screen_space(width, height, &quad);
-        assert_eq!(rgb, render_screen_space(width, height, &quad));
-
         let srgb = |linear: f32| {
             let encoded = if linear <= 0.003_130_8 {
                 linear * 12.92
@@ -541,28 +538,49 @@ mod tests {
             };
             (encoded * 255.0).round() as i32
         };
-        let mut blank = 0;
-        for y in 0..height {
-            for x in 0..width {
-                let actual = &rgb[((y * width + x) * 3) as usize..][..3];
-                match pixel(x, y, pattern) {
-                    None => {
-                        blank += 1;
-                        assert_eq!(actual, [0; 3], "pixel ({x}, {y}) should be blank");
-                    }
-                    Some(level) => {
-                        let expected = srgb(level);
-                        assert!(
-                            actual
-                                .iter()
-                                .all(|&value| (i32::from(value) - expected).abs() <= 2),
-                            "pixel ({x}, {y}) = {actual:?}, expected ~{expected}"
-                        );
-                    }
+        let tint = [0.2, 0.6, 0.9, 1.0];
+        for (rainbow, inverted, color) in [
+            (false, false, [1.0; 4]),
+            (true, false, tint),
+            (true, true, tint),
+            (false, true, tint),
+        ] {
+            let pattern = noise(0.5, 4, 1234, 3, rainbow, inverted);
+            let background = if inverted { 1.0 } else { 0.0 };
+            let mut quads = vec![full_screen(color, pattern)];
+            if inverted {
+                quads.insert(0, full_screen([1.0; 4], [0.0; 2]));
+            }
+            let rgb = render_screen_space(width, height, &quads);
+            assert_eq!(rgb, render_screen_space(width, height, &quads));
+
+            let case = format!("rainbow {rainbow} inverted {inverted}");
+            let mut blank = 0;
+            for y in 0..height {
+                for x in 0..width {
+                    let actual = &rgb[((y * width + x) * 3) as usize..][..3];
+                    let expected = match pixel(x, y, color, pattern) {
+                        None => {
+                            blank += 1;
+                            [srgb(background); 3]
+                        }
+                        Some([red, green, blue, alpha]) => [red, green, blue]
+                            .map(|channel| srgb(channel * alpha + background * (1.0 - alpha))),
+                    };
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(&value, expected)| (i32::from(value) - expected).abs() <= 2),
+                        "{case}: pixel ({x}, {y}) = {actual:?}, expected ~{expected:?}"
+                    );
                 }
             }
+            let share = f64::from(blank) / f64::from(width * height);
+            assert!(
+                (0.45..=0.55).contains(&share),
+                "{case}: blank share {share}"
+            );
         }
-        let share = f64::from(blank) / f64::from(width * height);
-        assert!((0.45..=0.55).contains(&share), "blank share {share}");
     }
 }

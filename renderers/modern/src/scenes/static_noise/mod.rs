@@ -416,9 +416,10 @@ fn content_amount(section: Section) -> f32 {
 }
 
 /// Instance pattern for per-pixel noise; decoded by `pixel_noise` in
-/// `shader.wgsl`.
-fn noise_pattern(blank: f32, rainbow: bool, noise: Noise) -> [f32; 2] {
-    let mode = if rainbow { 2.0 } else { 0.0 };
+/// `shader.wgsl`. `inverted` (white sections) complements rainbow hues, as
+/// `ink` does for every other colour.
+fn noise_pattern(blank: f32, rainbow: bool, inverted: bool, noise: Noise) -> [f32; 2] {
+    let mode = if rainbow { 2.0 } else { 0.0 } + if inverted { 4.0 } else { 0.0 };
     let clock = (noise.clock & 0xffff) | noise.beat << 16;
     let longest = noise.longest.clamp(1, 16) - 1;
     [
@@ -494,13 +495,15 @@ impl View {
 
     /// NDC centre and signed size of a plane rectangle (negative width when
     /// seen from behind, which mirrors the glyph), or `None` when it is
-    /// behind the near plane or off screen.
+    /// behind the near plane or off screen. The centre is the midpoint of the
+    /// projected edges, not the projected centre (perspective moves that), so
+    /// neighbours sharing an edge tile without overlap.
     fn rect(&self, center: [f32; 2], half: [f32; 2]) -> Option<([f32; 2], [f32; 2])> {
         let at = |dx: f32, dy: f32| self.project([center[0] + dx, center[1] + dy, 0.0]);
-        let middle = at(0.0, 0.0)?;
         let (left, right) = (at(-half[0], 0.0)?, at(half[0], 0.0)?);
         let (bottom, top) = (at(0.0, -half[1])?, at(0.0, half[1])?);
         let size = [right[0] - left[0], top[1] - bottom[1]];
+        let middle = [(left[0] + right[0]) * 0.5, (bottom[1] + top[1]) * 0.5];
         let visible = (0..2).all(|axis| middle[axis].abs() - size[axis].abs() * 0.5 < 1.0);
         (visible && size.iter().all(|value| value.is_finite())).then_some((middle, size))
     }
@@ -560,7 +563,7 @@ fn build_with(
     let half_width = grid.cols as f32 * cell_w * 0.5;
     if section.style == Style::Pixels {
         let blank = noise.blank + (0.985 - noise.blank) * content_amount(section);
-        let pattern = noise_pattern(blank, rainbow, noise);
+        let pattern = noise_pattern(blank, rainbow, section.white, noise);
         let strip = 2.0 * half_width / NOISE_STRIPS as f32;
         for index in 0..NOISE_STRIPS {
             let x = -half_width + (index as f32 + 0.5) * strip;
@@ -643,7 +646,7 @@ fn normalize(value: [f32; 3]) -> [f32; 3] {
 /// `capture.rs`.
 #[cfg(test)]
 pub(crate) mod gpu_reference {
-    use super::{Noise, glyph, glyph_pattern, mix, noise_pattern, unit};
+    use super::{Noise, glyph, glyph_pattern, hue, mix, noise_pattern, unit};
 
     /// Glyph bitmap (bit `row * 5 + column`, row 0 on top) and its pattern.
     pub(crate) fn glyph_bits(character: char) -> (u64, [f32; 2]) {
@@ -651,22 +654,34 @@ pub(crate) mod gpu_reference {
         (bits, glyph_pattern(bits))
     }
 
-    /// Pattern for monochrome pixel noise.
-    pub(crate) fn noise(blank: f32, longest: u32, clock: u32, beat: u32) -> [f32; 2] {
+    /// Pattern for pixel noise, rainbow (palette 3) or monochrome, and
+    /// inverted as in a white section.
+    pub(crate) fn noise(
+        blank: f32,
+        longest: u32,
+        clock: u32,
+        beat: u32,
+        rainbow: bool,
+        inverted: bool,
+    ) -> [f32; 2] {
         let noise = Noise {
             blank,
             longest,
             clock,
             beat,
         };
-        noise_pattern(blank, false, noise)
+        noise_pattern(blank, rainbow, inverted, noise)
     }
 
-    /// `pixel_noise` in `shader.wgsl` for monochrome noise: `None` where the
-    /// pixel at integer coordinates (`x`, `y`) is discarded, else the alpha
-    /// level it is drawn with.
-    pub(crate) fn pixel(x: u32, y: u32, pattern: [f32; 2]) -> Option<f32> {
-        let blank = -pattern[0] - 1.0;
+    /// `pixel_noise` in `shader.wgsl`: `None` where the pixel at integer
+    /// coordinates (`x`, `y`) is discarded, else the straight-alpha RGBA it
+    /// is blended with for instance colour `color`.
+    pub(crate) fn pixel(x: u32, y: u32, color: [f32; 4], pattern: [f32; 2]) -> Option<[f32; 4]> {
+        let flags = -pattern[0] - 1.0;
+        let inverted = flags >= 4.0;
+        let code = flags - if inverted { 4.0 } else { 0.0 };
+        let rainbow = code >= 2.0;
+        let blank = code - if rainbow { 2.0 } else { 0.0 };
         let packed = (pattern[1] + 0.5) as u32;
         let longest = (packed & 15) + 1;
         let clock = packed >> 4;
@@ -674,7 +689,21 @@ pub(crate) mod gpu_reference {
         let period = 1 + seed % longest;
         let step = ((clock & 0xffff) + (seed >> 8) % period) / period;
         let value = mix(seed ^ mix(step.wrapping_add((clock >> 16).wrapping_mul(0x85eb_ca6b))));
-        (unit(value) >= blank).then(|| unit(mix(value)))
+        if unit(value) < blank {
+            return None;
+        }
+        let alpha = color[3] * unit(mix(value));
+        let rgb = if rainbow {
+            let rgb = hue(unit(mix(value ^ 0x27d4_eb2f)));
+            if inverted {
+                rgb.map(|channel| 1.0 - channel)
+            } else {
+                rgb
+            }
+        } else {
+            [color[0], color[1], color[2]]
+        };
+        Some([rgb[0], rgb[1], rgb[2], alpha])
     }
 }
 

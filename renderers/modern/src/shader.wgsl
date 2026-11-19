@@ -75,11 +75,15 @@ fn glyph_lit(local: vec2<f32>, pattern: vec2<f32>) -> bool {
   return ((half >> ((row % 4u) * 5u + column)) & 1u) == 1u;
 }
 
-// Static per-pixel noise. pattern.x = -(1 + 2 * rainbow + blank chance);
-// pattern.y = clock * 16 + (longest change period - 1), where the clock's low
-// 16 bits are the frame counter and the rest reshuffles every pixel per beat.
+// Static per-pixel noise. pattern.x = -(1 + 2 * rainbow + 4 * inverted + blank
+// chance); pattern.y = clock * 16 + (longest change period - 1), where the
+// clock's low 16 bits are the frame counter and the rest reshuffles every
+// pixel per beat. Inverted (white sections) complements the rainbow hues;
+// monochrome noise uses color.rgb, which the scene has already inverted.
 fn pixel_noise(pixel: vec2<f32>, color: vec4<f32>, pattern: vec2<f32>) -> vec4<f32> {
-  let code = -pattern.x - 1.0;
+  let flags = -pattern.x - 1.0;
+  let inverted = flags >= 4.0;
+  let code = flags - select(0.0, 4.0, inverted);
   let rainbow = code >= 2.0;
   let blank = code - select(0.0, 2.0, rainbow);
   let packed = u32(pattern.y + 0.5);
@@ -97,7 +101,7 @@ fn pixel_noise(pixel: vec2<f32>, color: vec4<f32>, pattern: vec2<f32>) -> vec4<f
   if (rainbow) {
     let hue = unit(mix32(value ^ 0x27d4eb2fu)) + vec3<f32>(0.0, 2.0 / 3.0, 1.0 / 3.0);
     let rgb = clamp(abs(fract(hue) * 6.0 - 3.0) - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(rgb, color.a * level);
+    return vec4<f32>(select(rgb, 1.0 - rgb, inverted), color.a * level);
   }
   return vec4<f32>(color.rgb, color.a * level);
 }

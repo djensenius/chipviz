@@ -322,12 +322,94 @@ fn pixel_sections_draw_per_pixel_noise_that_thins_for_content() {
     }
 }
 
+/// A white section complements every colour, including the hues rainbow
+/// pixel noise generates in the shader.
+#[test]
+fn white_rainbow_pixel_noise_is_inverted() {
+    let profile = RenderProfile::m1();
+    // Section 4 is white pixel noise and frame 2400 has palette 3; section 13
+    // (frame 6760) is black pixel noise with palette 3.
+    let strip = |frame: u16| {
+        let frame = at(frame);
+        assert_eq!(frame.palette % 4, 3);
+        let instances = build_frame(&profile, frame, WIDE);
+        *instances
+            .iter()
+            .find(|instance| instance.pattern[0] < -0.5)
+            .expect("noise strip")
+    };
+    let (white, black) = (strip(2400), strip(6760));
+    assert!(section(at(2400)).white && !section(at(6760)).white);
+    let decode = |instance: &Instance| {
+        let flags = -instance.pattern[0] - 1.0;
+        (flags >= 4.0, flags - 4.0 * f32::from(flags >= 4.0) >= 2.0)
+    };
+    assert_eq!(decode(&white), (true, true));
+    assert_eq!(decode(&black), (false, true));
+    // Same pixel and pattern without the flag: the hue is complemented and
+    // the level unchanged.
+    let plain = [white.pattern[0] + 4.0, white.pattern[1]];
+    let mut lit = 0;
+    for (x, y) in (0..64).flat_map(|x| (0..64).map(move |y| (x, y))) {
+        let flipped = gpu_reference::pixel(x, y, white.color, white.pattern);
+        let normal = gpu_reference::pixel(x, y, white.color, plain);
+        assert_eq!(flipped.is_some(), normal.is_some());
+        if let (Some(flipped), Some(normal)) = (flipped, normal) {
+            lit += 1;
+            for channel in 0..3 {
+                assert!((normal[channel] + flipped[channel] - 1.0).abs() < 1e-6);
+            }
+            assert_eq!(normal[3], flipped[3]);
+        }
+    }
+    assert!(lit > 0);
+}
+
+/// Perspective moves the projected centre off the midpoint of the projected
+/// edges, so strips placed at their centres would overlap and blend twice.
+#[test]
+fn pixel_strips_tile_exactly_while_the_camera_moves() {
+    let profile = RenderProfile::m1();
+    // Zoom-out (section 4, 13) and orbit (section 5, 14) pixel sections,
+    // including frame 2702 (section 5) that overlapped ~1.2 px at 1920 wide.
+    let frames = [2102, 2300, 2500, 2702, 2900, 3000, 6900, 7400];
+    let mut checked = 0;
+    for frame in frames.map(at) {
+        let section = section(frame);
+        assert_eq!(section.style, Style::Pixels, "frame {}", frame.frame);
+        assert_ne!(camera_pose(section), (0.0, 0.0, FOCAL), "camera at rest");
+        for aspect in [WIDE, 1.0, 0.5] {
+            let strips: Vec<Instance> = build_frame(&profile, frame, aspect)
+                .into_iter()
+                .filter(|instance| instance.pattern[0] < -0.5)
+                .collect();
+            assert!(strips.len() > 1, "frame {} aspect {aspect}", frame.frame);
+            for pair in strips.windows(2) {
+                let edge = |instance: &Instance, side: f32| {
+                    instance.center[0] + side * instance.size[0] * 0.5
+                };
+                // Pixels at 1920 wide (NDC spans 2).
+                let gap = (edge(&pair[0], 1.0) - edge(&pair[1], -1.0)).abs() * 960.0;
+                assert!(
+                    gap < 1e-3,
+                    "frame {} aspect {aspect}: {gap} px",
+                    frame.frame
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 100);
+}
+
 #[test]
 fn noise_pattern_decodes_like_the_shader() {
-    for (energy, beat, rainbow, blank) in [
-        (0, 0, false, 0.2),
-        (255, 7, true, 0.985),
-        (90, 5, false, 0.0),
+    for (energy, beat, rainbow, inverted, blank) in [
+        (0, 0, false, false, 0.2),
+        (255, 7, true, false, 0.985),
+        (90, 5, false, true, 0.0),
+        (255, 7, true, true, 0.985),
+        (40, 2, true, true, 0.0),
     ] {
         let noise = Noise {
             beat,
@@ -336,12 +418,15 @@ fn noise_pattern_decodes_like_the_shader() {
                 ..at(65_535)
             })
         };
-        let [mode, packed] = noise_pattern(blank, rainbow, noise);
+        let [mode, packed] = noise_pattern(blank, rainbow, inverted, noise);
         // Mirror of `pixel_noise` in shader.wgsl.
-        let code = -mode - 1.0;
+        let flags = -mode - 1.0;
+        let is_inverted = flags >= 4.0;
+        let code = flags - if is_inverted { 4.0 } else { 0.0 };
         let is_rainbow = code >= 2.0;
         let decoded_blank = code - if is_rainbow { 2.0 } else { 0.0 };
         let packed = (packed + 0.5) as u32;
+        assert_eq!(is_inverted, inverted);
         assert_eq!(is_rainbow, rainbow);
         assert!((decoded_blank - blank).abs() < 1e-6);
         assert_eq!((packed & 15) + 1, noise.longest);
@@ -426,5 +511,5 @@ fn fingerprint() -> u64 {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn instances_match_recorded_golden() {
-    assert_eq!(fingerprint(), 0x6557_4ce2_d8d1_838c);
+    assert_eq!(fingerprint(), 0xe30c_b1b8_9d4f_14dd);
 }
