@@ -1,4 +1,5 @@
 set dotenv-load := true
+set positional-arguments := true
 
 cflags := "-std=c99 -Wall -Wextra -Werror -pedantic -Ishared/include"
 sim_platforms := "n64 gba c64 snes gb genesis nes sms"
@@ -304,10 +305,10 @@ modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
 
 modern-pi5 *args:
-    @cargo run --manifest-path {{ modern_manifest }} --bin chipviz-pi5 -- {{ args }}
+    @cargo run --manifest-path {{ modern_manifest }} --bin chipviz-pi5 -- "$@"
 
 modern-m1 *args:
-    @cargo run --manifest-path {{ modern_manifest }} --bin chipviz-m1 -- {{ args }}
+    @cargo run --manifest-path {{ modern_manifest }} --bin chipviz-m1 -- "$@"
 
 clean:
     @rm -rf build dist

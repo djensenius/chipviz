@@ -35,7 +35,7 @@ The renderer starts windowed by default.
 | Option | Effect |
 | --- | --- |
 | `--fullscreen` | Start in borderless fullscreen (primary display unless `--monitor` is given). |
-| `--monitor INDEX\|NAME` | Choose the display by index or case-insensitive name substring. |
+| `--monitor INDEX\|NAME` | Choose the display by index or case-insensitive name substring. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 
 ```sh
@@ -47,7 +47,7 @@ just modern-m1 -- --fullscreen --monitor "Studio Display"
 | --- | --- |
 | `F`, `Cmd+F`, `Ctrl+Cmd+F` | Toggle fullscreen on the window's current display. |
 | `Esc` | Exit fullscreen (does nothing when windowed). |
-| `Q`, `Cmd+Q` | Quit. |
+| `Cmd+Q` | Quit (macOS application menu). |
 
 The cursor is hidden while fullscreen and restored when windowed.
 

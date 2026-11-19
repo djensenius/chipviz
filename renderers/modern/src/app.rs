@@ -5,7 +5,7 @@ use std::time::Instant;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::EventLoop;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
@@ -73,15 +73,17 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     };
 
     let event_loop = EventLoop::new()?;
-    let monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
 
     if args.list_monitors {
+        let monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
         print_monitors(&monitors);
         return Ok(());
     }
 
+    // Only enumerate displays when one was requested; the default path is unchanged.
     let target_monitor = match &args.monitor {
         Some(selector) => {
+            let monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
             let names: Vec<Option<String>> = monitors.iter().map(MonitorHandle::name).collect();
             let index = select_monitor(&names, selector).map_err(AppError::Monitor)?;
             Some(monitors[index].clone())
@@ -128,7 +130,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
-                let input = KeyInput::from_winit(&event.logical_key);
+                let input = KeyInput::from_winit(&event.logical_key, event.physical_key);
                 let mods = KeyModifiers {
                     command: modifiers.super_key(),
                     control: modifiers.control_key(),
@@ -138,7 +140,6 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                 match key_action(input, mods, fullscreen) {
                     Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
                     Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
-                    Some(KeyAction::Quit) => target.exit(),
                     None => {}
                 }
             }
@@ -205,7 +206,7 @@ Options:
 Keys:
   F, Cmd+F, Ctrl+Cmd+F    toggle fullscreen
   Esc                     exit fullscreen
-  Q, Cmd+Q                quit"
+  Cmd+Q                   quit (macOS application menu)"
     )
 }
 
@@ -240,21 +241,21 @@ fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Resul
             names.len()
         )),
         MonitorSelector::Name(query) => {
-            let query = query.to_lowercase();
+            let needle = query.to_lowercase();
             let lowered: Vec<Option<String>> = names
                 .iter()
                 .map(|name| name.as_ref().map(|name| name.to_lowercase()))
                 .collect();
             if let Some(index) = lowered
                 .iter()
-                .position(|name| name.as_deref() == Some(&*query))
+                .position(|name| name.as_deref() == Some(&*needle))
             {
                 return Ok(index);
             }
             let matches: Vec<usize> = lowered
                 .iter()
                 .enumerate()
-                .filter(|(_, name)| name.as_deref().is_some_and(|name| name.contains(&query)))
+                .filter(|(_, name)| name.as_deref().is_some_and(|name| name.contains(&needle)))
                 .map(|(index, _)| index)
                 .collect();
             match matches.as_slice() {
@@ -278,16 +279,25 @@ enum KeyInput {
 }
 
 impl KeyInput {
-    fn from_winit(key: &Key) -> Self {
-        match key {
-            Key::Named(NamedKey::Escape) => Self::Escape,
+    /// Prefers the layout-aware logical key so Latin layouts (QWERTY, Dvorak,
+    /// AZERTY, ...) use the labelled key. Falls back to the physical key when
+    /// the logical key is not ASCII (e.g. Cyrillic or Greek layouts).
+    fn from_winit(logical: &Key, physical: PhysicalKey) -> Self {
+        match logical {
+            Key::Named(NamedKey::Escape) => return Self::Escape,
             Key::Character(text) => {
                 let mut chars = text.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(character), None) => Self::Character(character.to_ascii_lowercase()),
-                    _ => Self::Other,
+                if let (Some(character), None) = (chars.next(), chars.next())
+                    && character.is_ascii()
+                {
+                    return Self::Character(character.to_ascii_lowercase());
                 }
             }
+            _ => {}
+        }
+        match physical {
+            PhysicalKey::Code(KeyCode::KeyF) => Self::Character('f'),
+            PhysicalKey::Code(KeyCode::Escape) => Self::Escape,
             _ => Self::Other,
         }
     }
@@ -305,7 +315,6 @@ struct KeyModifiers {
 enum KeyAction {
     ToggleFullscreen,
     ExitFullscreen,
-    Quit,
 }
 
 fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
@@ -317,7 +326,6 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
         (KeyInput::Character('f'), _, false) | (KeyInput::Character('f'), true, true) => {
             Some(KeyAction::ToggleFullscreen)
         }
-        (KeyInput::Character('q'), _, false) => Some(KeyAction::Quit),
         (KeyInput::Escape, false, false) if fullscreen => Some(KeyAction::ExitFullscreen),
         _ => None,
     }
@@ -342,7 +350,9 @@ impl AppArgs {
         let mut parsed = Self::default();
         let mut args = args.into_iter();
 
+        let mut first = true;
         while let Some(arg) = args.next() {
+            let is_first = std::mem::replace(&mut first, false);
             match arg.as_str() {
                 "--udp" => {
                     parsed.udp_endpoint =
@@ -354,6 +364,8 @@ impl AppArgs {
                     parsed.monitor = Some(MonitorSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
+                // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
+                "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
                 _ => return Err(invalid_input(format!("unknown argument: {arg}"))),
             }
@@ -586,33 +598,92 @@ mod tests {
     }
 
     #[test]
-    fn q_and_cmd_q_quit_other_keys_do_nothing() {
+    fn q_and_other_keys_do_nothing() {
         let plain = KeyModifiers::default();
         let cmd = KeyModifiers {
             command: true,
             ..plain
         };
         let q = KeyInput::Character('q');
-        assert_eq!(key_action(q, plain, false), Some(KeyAction::Quit));
-        assert_eq!(key_action(q, cmd, true), Some(KeyAction::Quit));
-        assert_eq!(key_action(KeyInput::Character('x'), plain, true), None);
-        assert_eq!(key_action(KeyInput::Other, plain, true), None);
+        for fullscreen in [false, true] {
+            // Plain Q must not quit; Cmd+Q is left to winit's macOS app menu.
+            assert_eq!(key_action(q, plain, fullscreen), None);
+            assert_eq!(key_action(q, cmd, fullscreen), None);
+            assert_eq!(
+                key_action(KeyInput::Character('x'), plain, fullscreen),
+                None
+            );
+            assert_eq!(key_action(KeyInput::Other, plain, fullscreen), None);
+        }
     }
 
     #[test]
     fn winit_keys_map_to_inputs() {
+        let unidentified = PhysicalKey::Code(KeyCode::KeyA);
         assert_eq!(
-            KeyInput::from_winit(&Key::Character("F".into())),
+            KeyInput::from_winit(
+                &Key::Character("F".into()),
+                PhysicalKey::Code(KeyCode::KeyF)
+            ),
             KeyInput::Character('f')
         );
         assert_eq!(
-            KeyInput::from_winit(&Key::Named(NamedKey::Escape)),
+            KeyInput::from_winit(&Key::Named(NamedKey::Escape), unidentified),
             KeyInput::Escape
         );
         assert_eq!(
-            KeyInput::from_winit(&Key::Named(NamedKey::Enter)),
+            KeyInput::from_winit(&Key::Named(NamedKey::Enter), unidentified),
             KeyInput::Other
         );
+    }
+
+    #[test]
+    fn non_latin_layouts_fall_back_to_physical_keys() {
+        // Cyrillic layout: the physical F key produces 'а'.
+        assert_eq!(
+            KeyInput::from_winit(
+                &Key::Character("а".into()),
+                PhysicalKey::Code(KeyCode::KeyF)
+            ),
+            KeyInput::Character('f')
+        );
+        assert_eq!(
+            KeyInput::from_winit(
+                &Key::Character("ф".into()),
+                PhysicalKey::Code(KeyCode::KeyA)
+            ),
+            KeyInput::Other
+        );
+        assert_eq!(
+            KeyInput::from_winit(
+                &Key::Unidentified(winit::keyboard::NativeKey::Unidentified),
+                PhysicalKey::Code(KeyCode::Escape)
+            ),
+            KeyInput::Escape
+        );
+    }
+
+    #[test]
+    fn latin_layouts_use_logical_key_not_position() {
+        // Dvorak: the physical F position types 'u', which must not toggle.
+        assert_eq!(
+            KeyInput::from_winit(
+                &Key::Character("u".into()),
+                PhysicalKey::Code(KeyCode::KeyF)
+            ),
+            KeyInput::Character('u')
+        );
+    }
+
+    #[test]
+    fn leading_separator_is_ignored() {
+        let args = parse_run(&["--", "--monitor", "Studio Display"]);
+        assert_eq!(
+            args.monitor,
+            Some(MonitorSelector::Name("Studio Display".to_string()))
+        );
+        assert!(parse_run(&["--", "--list-monitors"]).list_monitors);
+        assert!(parse(&["--fullscreen", "--"]).is_err());
     }
 
     #[test]
@@ -624,7 +695,13 @@ mod tests {
     #[test]
     fn usage_documents_new_options() {
         let text = usage("chipviz-m1");
-        for needle in ["--fullscreen", "--monitor", "--list-monitors", "Esc"] {
+        for needle in [
+            "--fullscreen",
+            "--monitor",
+            "--list-monitors",
+            "Esc",
+            "Cmd+Q",
+        ] {
             assert!(text.contains(needle), "missing {needle}");
         }
     }
