@@ -27,15 +27,20 @@ same trace on every target. Reduced transports have their own oracle (see
   `$D018`. The border (`$D020`) stays black.
 - Cuts are abrupt, with no forced fades or easing.
 - Displayed hardware colours are a pure function of the step's trace tuple
-  (see **Trace** under [Modes](#modes)); ports must not add temporal
-  dithering, palette cycling or fades.
+  (see **Trace** under [Modes](#modes)), except the operator warning screen;
+  ports must not add temporal dithering, palette cycling or fades.
 - Modes 0–2 must stay within 3 flashes per second while scene 7 is shown,
   following WCAG 2.3.1 and the Harding test. Scene-7 entry and exit are single
-  full-field changes outside the mode rules. Outside the `operator` role, the
-  [scene-7 debounce](#scene-7-debounce) keeps them at least `P_STABLE` (30)
-  steps apart, so they add at most 2 changes per 60 steps. What native scenes
-  show on either side is outside this contract. Flash/gate exceeds that limit
-  and is opt-in only.
+  full-field changes outside the mode rules. A re-entry (any entry after the
+  power-on one) counts against the [change budget](#change-budget) like a mode
+  change, so these limits also hold across entry. The
+  [scene-7 debounce](#scene-7-debounce) applies to wire and transport scene
+  values in every role and to ring inputs outside the `operator` role. It keeps
+  entries and exits at least `P_STABLE` (30) steps apart, so exits add at most
+  1 change per 60 steps. Local operator scene inputs are exempt, and for them
+  these limits hold only while scene 7 stays shown. What native scenes show on
+  either side is outside this contract. Flash/gate exceeds that limit and is
+  opt-in only.
 
 ## Selection through existing fields
 
@@ -55,12 +60,19 @@ same trace on every target. Reduced transports have their own oracle (see
 
   When the effective scene is 7, ports must stop deriving the displayed scene
   from time.
-- <a id="scene-7-debounce"></a>**Scene-7 debounce:** outside the `operator`
-  input role, a target changes from or to scene 7 only once the new scene value
-  (from the wire, Joybus, HID keys, or a ring `next`/`prev` input) has been
-  received unchanged for `P_STABLE` (30) consecutive steps, and never sooner
-  than `CUT_MIN` (20) steps after the previous scene-7 entry or exit took
-  effect.
+- <a id="scene-7-debounce"></a>**Scene-7 debounce:** a target changes from or
+  to scene 7 only once the new scene value has been received unchanged for
+  `P_STABLE` (30) consecutive steps, and never sooner than `CUT_MIN` (20) steps
+  after the previous scene-7 entry or exit took effect. It applies to:
+  - scene values from the wire, file playback, Joybus or HID, in every input
+    role. Like the wire palette gate, it holds on `operator` builds too,
+    including modern, which is operator by nature but takes its scene from
+    host frames (for example MIDI CC1);
+  - ring `next`/`prev` inputs outside the `operator` role.
+
+  Only local operator scene inputs are exempt: keys or buttons on an `operator`
+  build, including the modern renderer's local keys. They take effect at once,
+  and the flash bounds then hold only while scene 7 stays shown.
   - The step on which the new value first arrives counts as step 1. The change
     is made at the end of its 30th consecutive step, and the new scene runs from
     the next step; for scene 7 that step is the [Entry](#entry) step.
@@ -70,10 +82,11 @@ same trace on every target. Reduced transports have their own oracle (see
     nothing.
   - Power-on entry into scene 7 is exempt: a target that powers on with
     scene 7 enters it on its first step.
-  - Because each change needs 30 steps of a value that differs from the one
-    that caused the previous change, entries and exits take effect at least 30
-    steps apart (so the `CUT_MIN` floor is always met), and any 60 consecutive
-    steps contain at most 2 of them (F21).
+  - Two debounced changes in a row take effect at least 30 steps apart,
+    because each needs 30 steps of a value on the other side of the boundary,
+    and any 60 consecutive steps contain at most 2 of them (F21). After an
+    exempt operator change, where the wire value may already be stable, the
+    `CUT_MIN` floor spaces the next debounced change.
   - Changes between native scenes are not affected.
 - Controller scene-select rings become `native scenes..., 7`. `next` from the
   last native scene goes to 7, and `next` from 7 goes to the first. `prev` works
@@ -124,7 +137,10 @@ The effective palette `p_eff` comes from one of three sources:
 - **Operator:** only in an `operator` input role (see
   [Input roles](#input-roles)). A pulse sets the requested palette `p_req`,
   which is applied under the [change budget](#change-budget).
-- **Wire:** control frames, file playback, Joybus and HID palette bits.
+- **Wire:** control frames, file playback, Joybus and HID palette bits. The
+  `P_STABLE` gate below applies to wire values in every input role, including
+  `operator` builds and modern; the [scene-7 debounce](#scene-7-debounce)
+  treats wire scene values the same way.
   - On scene entry, `p_eff` is the wire value. If that value is 3 or 7, it runs
     as 2 or 6.
   - The stability counter starts at scene entry. The entry value counts as
@@ -454,9 +470,14 @@ no events. This happens at power-on and every time scene 7 is entered again.
 unarmed 3→2 rule) or the family of `p_eff` changes. `layout`, `combo` and `rot` are kept, except that held mode sets
 `combo = dom`.
 
-- **Counters:** `act = 0`. On scene entry, `since_cut = CUT_MIN` and `lg =
-  LEVEL_OPP`. On a mode or family change, `since_cut = 0` and `lg = 0`: the
-  change is itself a visible full-field change and uses the budget.
+- **Counters:** `act = 0`. On the power-on entry (scene 7 entered on the first
+  step after power-on), `since_cut = CUT_MIN` and `lg = LEVEL_OPP`. On a
+  re-entry (any later scene-7 entry) and on a mode or family change,
+  `since_cut = 0` and `lg = 0`: the change is itself a visible full-field change
+  and uses the budget. After a re-entry at step `s`, the counters match a
+  request applied at the end of `s`: the next cut can be at `s + 21`, the next
+  level change at `s + 11`, and the next request is applied at the end of
+  `s + 20` (visible from `s + 21`).
 - **Spectral levels:** each region gets `lvl[i] = count(UP[k] <= v_i)`.
   `lvl[2] = 0` in 2-region layouts.
 - **Gate:** `pulse = 0`, `gate_off = GATE_OFF_MIN`, and `hyst = dim = avg_e
@@ -617,31 +638,37 @@ a request, so arming always goes through the budget.
       entry or mode/family entry): at most 16 edges per 60 steps;
     - silence entry from a dim rest (dim to dark): entries are at least 31
       steps apart (exit, then 30 quiet steps), so at most 2 per 60 steps;
-    - an applied mode or family change, or a pin applied while lit or at rest:
-      requests are at least `CUT_MIN` = 20 steps apart, so at most 3 per 60
-      steps;
-    - scene-7 entry and exit, outside the `operator` role: the
-      [scene-7 debounce](#scene-7-debounce) keeps them at least `P_STABLE` =
-      30 steps apart, so at most 2 per 60 steps. The flash latch clears on
-      exit. A re-entry takes effect at least 30 steps after the exit, so pulse
-      starts stay at least 8 steps apart across visits, even though entry sets
-      `since_pulse` to 8.
+    - an applied mode or family change, a pin applied while lit or at rest, or
+      a debounced scene-7 re-entry: each sets `since_cut = 0` and needs
+      `since_cut >= CUT_MIN`, and a debounced re-entry comes at least 30 steps
+      after any change of the previous visit, so they are at least `CUT_MIN` =
+      20 steps apart and at most 3 per 60 steps;
+    - a debounced scene-7 exit: an exit, a re-entry and the next exit are each
+      at least `P_STABLE` = 30 steps apart, so at most 1 exit per 60 steps.
+
+    Across visits: the flash latch clears on exit, so after a re-entry at `s`,
+    mode 3 needs an applied armed request, which the re-entry's
+    `since_cut = 0` delays to the end of `s + 20`. The first pulse of a visit
+    therefore starts at `s + 21` at the earliest, and pulse starts stay at
+    least 8 steps apart across visits in every role, even though entry sets
+    `since_pulse` to 8.
 
     Windows that leave mode 3: switching to a lit mode (held or cuts at level
     3) turns the light on without a pulse start, but leaving and returning are
     two applied changes at least `CUT_MIN` (20) steps apart. They cost more
     pulse starts than they add, so light-ons still stay at most 8 per 60 steps.
 
-    Outside the `operator` role, flash cycles therefore never exceed 7.5 per
-    second. All displayed changes in scene 7 together are at most 21 per 60
-    steps, or 23 counting scene-7 entry and exit, whatever the energy or
-    operator does. In the `operator` role, scene changes are made by the person
-    at the controls and are not debounced, so these bounds hold only while
-    scene 7 stays shown.
+    Pulse starts and flash cycles therefore never exceed 7.5 per second, in
+    any role. With debounced scene changes, all displayed changes together are
+    at most 22 per 60 steps: 21 while scene 7 is shown, plus at most 1 exit,
+    whatever the energy or operator does. Exempt local operator scene inputs
+    (see [scene-7 debounce](#scene-7-debounce)) are not debounced, so for them
+    the totals hold only while scene 7 stays shown.
 
 **Trace:** each step records
 `(mode, family, layout, combo, rot, lvl0, lvl1, lvl2)`, where `lvl` is the
-displayed level for each region and unused regions are 0. If audio starts
+displayed level for each region and unused regions are 0. A step on which
+scene 7 is not shown (a native scene) records `none`. If audio starts
 silent, held and cuts show combo 0 at level 3. Spectral and flash/gate show
 black.
 
@@ -723,6 +750,8 @@ OTHER = CANCEL
 - `p` is selected locally at `p = 0..7`. For `p = 3` and `p = 7`, flash is
   pre-armed by operator arming (the harness acts as an `operator` build). Unarmed
   3 and 7 must equal 2 and 6.
+- The Setup's local `p` and pre-arming are oracle conventions, independent of
+  the fixture's input role.
 - Unlisted fields are 0. "Bands" means bass, mid and treble. "Spectrum" means
   all 8 bands.
 - **LCG:** `x = (x * 25173 + 13849) & 0xFFFF`, with `x0 = 1`. It advances once
@@ -759,4 +788,4 @@ OTHER = CANCEL
 | F18 held across entry | `e`, bands and spectrum 100. `beat` set and note 60 at velocity 100 for steps 0–9, then both clear; `beat` set again at step 300 only. Run on the full path and resampled: a 120 Hz source of 1200 frames where frames `2t` and `2t+1` carry step `t`'s input, and step `t` takes those two frames. | Both paths give identical traces. No `B` or `N` at step 1 (or anywhere in steps 1–9), because the previous flags and notes are seeded from the entry frame. The only event is `B` at step 300: cuts and pulses at 300 only. Held never changes. Treating the previous flags and notes as empty at entry would give an onset at step 1 on the full path only, which is non-conforming. |
 | F19 HID digital-only | Digital-only USB HID receiver, one step per poll for 600 polls, scene 7 from power-on. Left shoulder held for polls 320–379 (`energy` 200), otherwise released (`energy` 64). South pressed for one poll at `50 + 60k` (`k = 0..9`). Nothing else is pressed. | Never silent. `T` at 320 only (the shoulder rise); the release at 380 is not a transient. `B` at 50, 110, …, 590. Held never changes. Spectral (V2) rests at 1/1, goes to 2/2 at 320 and 3/3 at 330, then back to 2/2 at 380 and 1/1 at 390. Cuts at 50, 110, 170, 230, 290, 320, 350, 410, 470, 530 and 590 (11). Flash/gate: pulses at the same 11 steps, and the rest is level 1 (dim) everywhere else, never 0. |
 | F20 level saturation | `e = 100`, spectrum 0. Bands 250 for steps 0–199 and 400–599, and 10 for steps 200–399. | Spectral (`p = 1`, 5; V2): 3/3 from entry through 199 with no change (`lvl < 3` guards `UP`). 2/2 at 200, 1/1 at 210 and 0/0 at 220, then 0/0 through 399 without silence (`lvl > 0` guards `DOWN`). 1/1 at 400, 2/2 at 410 and 3/3 at 420 (one step per update even though `250 >= UP[3]`), then 3/3 through 599. `T` at 400 only. Held never changes. Cuts: one, at 400. Flash/gate: one pulse at 400, otherwise resting at level 1 (dim). |
-| F21 scene-7 debounce | Default `data` input role, `p = 0`. `e`, bands and spectrum 100. Overrides the setup's `scene = 7`: scene 6 for steps 0–99; for steps 100–199, 7 on even steps and 6 on odd steps; 7 for 200–299; 6 for 300–319; 7 for 320–449; 6 for 450–599. | Native scene 6 through step 229: the jitter at 100–199 never enters scene 7. Scene-7 entry at step 230 (7 first arrives at 200, and 229 is its 30th consecutive step). No exit at 300–319 (only 20 steps). Exit at the end of 479 (6 first arrives at 450), so native scene 6 runs from 480. Exactly one entry and one exit. In scene 7 (steps 230–479) the trace is held, V2, combo 0, level 3, with no changes. |
+| F21 scene-7 debounce | Default `data` input role, `p = 0`. `e`, bands and spectrum 100. Overrides the setup's `scene = 7`: scene 6 for steps 0–99; for steps 100–199, 7 on even steps and 6 on odd steps; 7 for 200–299; 6 for 300–319; 7 for 320–449; 6 for 450–599. | Native scene 6 through step 229, so the trace is `none` there: the jitter at 100–199 never enters scene 7. Scene-7 entry at step 230 (7 first arrives at 200, and 229 is its 30th consecutive step). It is not the power-on entry, so it sets `since_cut = 0` and `lg = 0`; with no events that changes nothing. No exit at 300–319 (only 20 steps). Exit at the end of 479 (6 first arrives at 450), so native scene 6 runs from 480 and the trace is `none` again. Exactly one entry and one exit. In scene 7 (steps 230–479) the trace is held, V2, combo 0, level 3, with no changes. |
