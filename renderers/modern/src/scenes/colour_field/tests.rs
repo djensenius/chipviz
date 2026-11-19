@@ -925,6 +925,66 @@ fn f22_deferred_exit_never_arms() {
     }
 }
 
+/// Wire 1 from entry; an operator pulse selects 2 at step 50, consuming 1.
+/// `palette(step)` and `scene(step)` then drive the wire from step 51.
+fn consumed_wire(
+    palette: impl Fn(usize) -> u8,
+    scene: impl Fn(usize) -> u8,
+    pulse_step: usize,
+) -> Vec<Trace> {
+    run_frames(
+        wire(),
+        |step| {
+            vec![ControlFrame {
+                palette: palette(step),
+                scene: scene(step),
+                ..flat(step, 64)
+            }]
+        },
+        |step| Controls {
+            operator_palette: (step == pulse_step).then_some(2),
+            ..Controls::default()
+        },
+    )
+    .into_iter()
+    .map(|trace| trace.expect("scene 7 is shown"))
+    .collect()
+}
+
+#[test]
+fn unchanged_wire_value_stays_consumed_across_an_exit() {
+    // Wire 1 is consumed by the pulse; a one-step exit with the value
+    // unchanged only restarts the count, so 1 never becomes a request again.
+    let traces = consumed_wire(|_| 1, |step| if step == 100 { 5 } else { SCENE }, 50);
+    assert!(traces[..51].iter().all(|trace| trace.mode == 1));
+    assert!(traces[51..].iter().all(|trace| trace.mode == 2));
+}
+
+#[test]
+fn wire_change_outside_the_window_clears_consumption() {
+    // 1 -> 2 -> 1 while the incoming scene is not 7: the change clears the
+    // consumption, so 1 re-requests after 30 in-window steps (101..=130).
+    let palette = |step: usize| if step == 100 { 2 } else { 1 };
+    let scene = |step: usize| if step == 100 { 5 } else { SCENE };
+    let traces = consumed_wire(palette, scene, 50);
+    assert!(traces[..51].iter().all(|trace| trace.mode == 1));
+    assert!(traces[51..131].iter().all(|trace| trace.mode == 2));
+    assert!(traces[131..].iter().all(|trace| trace.mode == 1));
+}
+
+#[test]
+fn wire_change_with_an_operator_pulse_stays_consumed() {
+    // The new value is recorded as last seen before the pulse consumes it,
+    // inside or outside the window, so it never becomes a request.
+    for exit in [false, true] {
+        let palette = |step: usize| if step < 50 { 1 } else { 4 };
+        let scene = |step: usize| if exit && step == 50 { 5 } else { SCENE };
+        let traces = consumed_wire(palette, scene, 50);
+        assert!(traces[..51].iter().all(|trace| trace.mode == 1), "{exit}");
+        assert!(traces[51..].iter().all(|trace| trace.mode == 2), "{exit}");
+    }
+}
+
 #[test]
 fn f24_relative_palette() {
     let ring = |step: usize| match step {

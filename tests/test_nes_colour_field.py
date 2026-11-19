@@ -432,6 +432,21 @@ class NesColourFieldTests(unittest.TestCase):
     self.assertEqual(run.trace(e + 119)[0], 2)
     self.assertEqual(run.trace(e + 199)[0], 1)  # the new run of p = 1 applied
 
+  def test_unchanged_palette_across_exit_stays_consumed(self):
+    # As above, but the palette stays 1 across a one-step exit at e+78: the
+    # discarded request is not re-requested, so mode 2 stays.
+    run = self.start()
+    e = ENTRY
+    table = {0: ("b",), 1: ("up",), e + 1: ("right",), e + 3: ("right",)}  # cuts at e+53, e+73
+    table.update({step: ("b",) for step in range(72, e + 150, 2)})
+    table.update({e + 46: ("left",), e + 78: ("down",), e + 79: ("up",)})
+    run.run(e + 200, presses(table))
+    self.assertTrue(all(run.var(ram, "Shown7") for ram in run.states[e:]))
+    self.assertEqual((run.trace(e + 76)[0], run.at(e + 76, "ReqPending")), (2, 1))  # blocked
+    self.assertEqual(run.at(e + 78, "ReqPending"), 0)  # discarded outside the window
+    self.assertEqual((run.at(e + 199, "WireVal"), run.at(e + 199, "WireUsed")), (1, 1))
+    self.assertEqual([run.trace(s)[0] for s in range(e + 76, e + 200)], [2] * 124)
+
   def test_operator_pin_on_entry_step(self):
     run = self.start("operator")
     run.run(10, presses({0: ("b",), 1: ("up",), 2: ("select",)}))  # entry on step 2

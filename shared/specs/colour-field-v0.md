@@ -174,9 +174,14 @@ The effective palette `p_eff` comes from one of three sources:
     pulses), the ring value is the incoming scene for the reset rule below, but a 3 or
     7 whose window includes such a step becomes an unarmed request and never
     arms. Palette changes therefore still work on such receivers (F24).
+    - The wire value is tracked on every step, inside or outside the window.
+      A real change of value, wherever it happens, starts a new run and
+      clears consumption: the new value can become `p_req` again, even if it
+      equals a value consumed earlier (1 → 2 → 1 re-requests 1).
     - A step whose incoming scene is not 7 resets the count to 0, so the next
-      step with incoming scene 7 counts as step 1. A consumed value stays
-      consumed.
+      step with incoming scene 7 counts as step 1. It does not clear
+      consumption: an unchanged value stays consumed across it. Arming still
+      needs `P_STABLE` consecutive in-window steps.
     - Such a step also discards any pending, unapplied wire request together
       with its arming, as when a request is replaced.
     - So a stream whose incoming scene leaves 7, while the debounce keeps scene
@@ -203,9 +208,12 @@ The effective palette `p_eff` comes from one of three sources:
   - An operator pulse sets `p_req` and consumes the current wire value: that
     value never becomes `p_req` again, however long it stays.
   - The stability counter restarts only when a new wire value (different from
-    the consumed one) arrives, or after a step outside the
-    [scene-7 window](#wire-arming-window). That new value overrides the
-    operator choice once it has stayed unchanged for 30 steps.
+    the last one received, on any step) arrives, or after a step outside the
+    [scene-7 window](#wire-arming-window). Only the new value clears
+    consumption; a step outside the window does not. That new value overrides
+    the operator choice once it has stayed unchanged for 30 in-window steps.
+  - A wire change on the same step as an operator pulse is recorded as the
+    last value seen before the pulse consumes it, so it stays consumed.
 
 If `p_eff` selects mode 3 and flash is not armed, the target runs mode 2.
 
