@@ -1,6 +1,6 @@
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Event, WindowEvent};
@@ -9,6 +9,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
+use crate::audio::{self, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
@@ -20,6 +21,7 @@ pub enum AppError {
     Io(std::io::Error),
     Renderer(RendererError),
     Monitor(String),
+    Audio(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -30,6 +32,7 @@ impl std::fmt::Display for AppError {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Renderer(error) => write!(formatter, "renderer error: {error}"),
             Self::Monitor(message) => write!(formatter, "monitor error: {message}"),
+            Self::Audio(message) => write!(formatter, "audio error: {message}"),
         }
     }
 }
@@ -72,6 +75,11 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         ArgsCommand::Run(args) => args,
     };
 
+    if args.list_audio_devices {
+        InputDevices::enumerate().map_err(AppError::Audio)?.print();
+        return Ok(());
+    }
+
     let event_loop = EventLoop::new()?;
 
     if args.list_monitors {
@@ -92,6 +100,11 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     };
 
     let udp = UdpFrameSource::bind(args.udp_endpoint.as_deref())?;
+    let mic = if args.mic {
+        Some(start_mic(args.audio_device.as_ref()).map_err(AppError::Audio)?)
+    } else {
+        None
+    };
 
     let mut builder = WindowBuilder::new()
         .with_title(profile.window_title)
@@ -113,7 +126,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     window.set_cursor_visible(cursor_visible(args.fullscreen));
 
     let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
-    let mut frame_source = FrameSource::new(udp);
+    let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
 
@@ -194,10 +207,17 @@ fn print_monitors(monitors: &[MonitorHandle]) {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} [--udp LISTEN_ADDR:PORT] [--fullscreen] [--monitor INDEX|NAME] [--list-monitors]
+        "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
+       {program} --list-monitors | --list-audio-devices
 
 Options:
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
+  --mic                   drive frames from live microphone analysis instead of
+                          procedural frames; UDP packets, when they arrive, still win
+  --audio-device INDEX|NAME
+                          microphone to use with --mic, by index or case-insensitive
+                          name substring (default: system default input)
+  --list-audio-devices    print available audio input devices and exit
   --fullscreen            start in borderless fullscreen (default: windowed)
   --monitor INDEX|NAME    display to use, by index or case-insensitive name substring
   --list-monitors         print available monitors and exit
@@ -216,12 +236,12 @@ fn cursor_visible(fullscreen: bool) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MonitorSelector {
+enum DeviceSelector {
     Index(usize),
     Name(String),
 }
 
-impl MonitorSelector {
+impl DeviceSelector {
     fn parse(value: &str) -> Self {
         match value.parse::<usize>() {
             Ok(index) => Self::Index(index),
@@ -230,19 +250,51 @@ impl MonitorSelector {
     }
 }
 
-/// Resolves a selector against monitor names (in enumeration order).
-/// All-digit selectors are indices (as printed by `--list-monitors`). Names
+/// Wording for selection errors about one kind of device.
+struct DeviceKind {
+    noun: &'static str,
+    flag: &'static str,
+    list_flag: &'static str,
+}
+
+const MONITOR: DeviceKind = DeviceKind {
+    noun: "monitor",
+    flag: "--monitor",
+    list_flag: "--list-monitors",
+};
+
+const AUDIO_INPUT: DeviceKind = DeviceKind {
+    noun: "audio input device",
+    flag: "--audio-device",
+    list_flag: "--list-audio-devices",
+};
+
+fn select_monitor(names: &[Option<String>], selector: &DeviceSelector) -> Result<usize, String> {
+    select_device(names, selector, &MONITOR)
+}
+
+/// Resolves a selector against device names (in enumeration order).
+/// All-digit selectors are indices (as printed by the list flag). Names
 /// match as a case-insensitive substring; a *unique* exact (case-insensitive)
-/// name wins when several monitors match. Duplicate names (e.g. two identical
+/// name wins when several devices match. Duplicate names (e.g. two identical
 /// displays) are ambiguous and must be selected by index.
-fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Result<usize, String> {
+fn select_device(
+    names: &[Option<String>],
+    selector: &DeviceSelector,
+    kind: &DeviceKind,
+) -> Result<usize, String> {
+    let DeviceKind {
+        noun,
+        flag,
+        list_flag,
+    } = kind;
     match selector {
-        MonitorSelector::Index(index) if *index < names.len() => Ok(*index),
-        MonitorSelector::Index(index) => Err(format!(
-            "monitor index {index} out of range ({} monitor(s) available; see --list-monitors)",
+        DeviceSelector::Index(index) if *index < names.len() => Ok(*index),
+        DeviceSelector::Index(index) => Err(format!(
+            "{noun} index {index} out of range ({} {noun}(s) available; see {list_flag})",
             names.len()
         )),
-        MonitorSelector::Name(query) => {
+        DeviceSelector::Name(query) => {
             let needle = query.to_lowercase();
             let lowered: Vec<Option<String>> = names
                 .iter()
@@ -266,10 +318,10 @@ fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Resul
             match matches.as_slice() {
                 [index] => Ok(*index),
                 [] => Err(format!(
-                    "no monitor name contains \"{query}\" (see --list-monitors)"
+                    "no {noun} name contains \"{query}\" (see {list_flag})"
                 )),
                 _ => Err(format!(
-                    "monitor name \"{query}\" is ambiguous: matches indices {matches:?}; select one with --monitor INDEX (see --list-monitors)"
+                    "{noun} name \"{query}\" is ambiguous: matches indices {matches:?}; select one with {flag} INDEX (see {list_flag})"
                 )),
             }
         }
@@ -346,8 +398,11 @@ enum ArgsCommand {
 struct AppArgs {
     udp_endpoint: Option<String>,
     fullscreen: bool,
-    monitor: Option<MonitorSelector>,
+    monitor: Option<DeviceSelector>,
     list_monitors: bool,
+    mic: bool,
+    audio_device: Option<DeviceSelector>,
+    list_audio_devices: bool,
 }
 
 impl AppArgs {
@@ -366,14 +421,24 @@ impl AppArgs {
                 "--fullscreen" => parsed.fullscreen = true,
                 "--monitor" => {
                     let value = required_value(&mut args, "--monitor", "INDEX or NAME")?;
-                    parsed.monitor = Some(MonitorSelector::parse(&value));
+                    parsed.monitor = Some(DeviceSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
+                "--mic" => parsed.mic = true,
+                "--audio-device" => {
+                    let value = required_value(&mut args, "--audio-device", "INDEX or NAME")?;
+                    parsed.audio_device = Some(DeviceSelector::parse(&value));
+                }
+                "--list-audio-devices" => parsed.list_audio_devices = true,
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
                 _ => return Err(invalid_input(format!("unknown argument: {arg}"))),
             }
+        }
+
+        if parsed.audio_device.is_some() && !parsed.mic && !parsed.list_audio_devices {
+            return Err(invalid_input("--audio-device requires --mic".to_string()));
         }
 
         Ok(ArgsCommand::Run(parsed))
@@ -434,30 +499,90 @@ impl UdpFrameSource {
     }
 }
 
+fn start_mic(selector: Option<&DeviceSelector>) -> Result<MicSource, String> {
+    let devices = InputDevices::enumerate()?;
+    let index = selector
+        .map(|selector| select_device(devices.names(), selector, &AUDIO_INPUT))
+        .transpose()?;
+    MicSource::start(devices, index)
+}
+
+/// After a UDP packet, UDP keeps priority over the mic for this long, so a
+/// bridge streaming at about the render rate never flickers with mic frames.
+const UDP_HOLD: Duration = Duration::from_millis(500);
+
+/// What to render when no UDP packet arrived this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleSource {
+    /// Keep the last frame (UDP-only mode, or a recent UDP packet).
+    Hold,
+    Procedural,
+    Mic,
+}
+
+/// Precedence: fresh UDP packets > mic (`--mic`) > procedural fallback.
+/// Without `--mic` this is the pre-mic behaviour: UDP mode holds the last
+/// packet and procedural frames run only when `--udp` is absent.
+fn idle_source(mic: bool, udp: bool, since_udp: Option<Duration>) -> IdleSource {
+    if mic {
+        if since_udp.is_some_and(|elapsed| elapsed < UDP_HOLD) {
+            IdleSource::Hold
+        } else {
+            IdleSource::Mic
+        }
+    } else if udp {
+        IdleSource::Hold
+    } else {
+        IdleSource::Procedural
+    }
+}
+
 struct FrameSource {
     udp: UdpFrameSource,
+    mic: Option<MicSource>,
     fallback_index: u64,
     latest: ControlFrame,
+    last_udp: Option<Instant>,
+    mic_beat_count: Option<u16>,
 }
 
 impl FrameSource {
-    fn new(udp: UdpFrameSource) -> Self {
+    fn new(udp: UdpFrameSource, mic: Option<MicSource>) -> Self {
         Self {
             udp,
+            mic,
             fallback_index: 0,
             latest: ControlFrame::procedural(0),
+            last_udp: None,
+            mic_beat_count: None,
         }
     }
 
     fn next_frame(&mut self) -> ControlFrame {
+        let now = Instant::now();
         if let Some(frame) = self.udp.receive_latest() {
             self.latest = frame;
+            self.last_udp = Some(now);
+            self.mic_beat_count = None;
             return frame;
         }
 
-        if self.udp.socket.is_none() {
-            self.fallback_index = self.fallback_index.wrapping_add(1);
-            self.latest = ControlFrame::procedural(self.fallback_index);
+        let since_udp = self.last_udp.map(|last| now.duration_since(last));
+        match idle_source(self.mic.is_some(), self.udp.socket.is_some(), since_udp) {
+            IdleSource::Hold => {}
+            IdleSource::Procedural => {
+                self.fallback_index = self.fallback_index.wrapping_add(1);
+                self.latest = ControlFrame::procedural(self.fallback_index);
+            }
+            IdleSource::Mic => {
+                if let Some(mic) = &self.mic {
+                    self.fallback_index = self.fallback_index.wrapping_add(1);
+                    let features = mic.latest();
+                    let base = ControlFrame::procedural(self.fallback_index);
+                    self.latest = audio::mic_frame(base, features, self.mic_beat_count);
+                    self.mic_beat_count = Some(features.beat_count);
+                }
+            }
         }
 
         self.latest
@@ -493,7 +618,7 @@ mod tests {
     fn parses_fullscreen_monitor_and_udp() {
         let args = parse_run(&["--fullscreen", "--monitor", "1", "--udp", "127.0.0.1:6464"]);
         assert!(args.fullscreen);
-        assert_eq!(args.monitor, Some(MonitorSelector::Index(1)));
+        assert_eq!(args.monitor, Some(DeviceSelector::Index(1)));
         assert_eq!(args.udp_endpoint.as_deref(), Some("127.0.0.1:6464"));
         assert!(!args.list_monitors);
     }
@@ -503,7 +628,7 @@ mod tests {
         let args = parse_run(&["--monitor", "Studio Display"]);
         assert_eq!(
             args.monitor,
-            Some(MonitorSelector::Name("Studio Display".to_string()))
+            Some(DeviceSelector::Name("Studio Display".to_string()))
         );
     }
 
@@ -529,15 +654,15 @@ mod tests {
     #[test]
     fn selects_monitor_by_index() {
         let monitors = names(&[Some("Built-in Retina Display"), Some("LG UltraFine")]);
-        assert_eq!(select_monitor(&monitors, &MonitorSelector::Index(1)), Ok(1));
-        let error = select_monitor(&monitors, &MonitorSelector::Index(2)).unwrap_err();
+        assert_eq!(select_monitor(&monitors, &DeviceSelector::Index(1)), Ok(1));
+        let error = select_monitor(&monitors, &DeviceSelector::Index(2)).unwrap_err();
         assert!(error.contains("out of range"), "{error}");
     }
 
     #[test]
     fn selects_monitor_by_case_insensitive_substring() {
         let monitors = names(&[Some("Built-in Retina Display"), None, Some("LG UltraFine")]);
-        let select = |query: &str| select_monitor(&monitors, &MonitorSelector::Name(query.into()));
+        let select = |query: &str| select_monitor(&monitors, &DeviceSelector::Name(query.into()));
         assert_eq!(select("ultrafine"), Ok(2));
         assert_eq!(select("RETINA"), Ok(0));
         assert!(select("Sidecar").unwrap_err().contains("no monitor"));
@@ -550,7 +675,7 @@ mod tests {
             Some("DELL U2720Q (2)"),
             Some("DELL P2419H"),
         ]);
-        let select = |query: &str| select_monitor(&monitors, &MonitorSelector::Name(query.into()));
+        let select = |query: &str| select_monitor(&monitors, &DeviceSelector::Name(query.into()));
         assert!(select("dell").unwrap_err().contains("ambiguous"));
         assert_eq!(select("dell u2720q"), Ok(0));
         assert_eq!(select("(2)"), Ok(1));
@@ -563,16 +688,16 @@ mod tests {
             Some("DELL U2720Q"),
             Some("dell u2720q"),
         ]);
-        let by_name = |query: &str| select_monitor(&monitors, &MonitorSelector::Name(query.into()));
+        let by_name = |query: &str| select_monitor(&monitors, &DeviceSelector::Name(query.into()));
         let error = by_name("DELL U2720Q").unwrap_err();
         assert!(error.contains("ambiguous"), "{error}");
         assert!(error.contains("[1, 2]"), "{error}");
         assert!(error.contains("--monitor INDEX"), "{error}");
         assert_eq!(by_name("retina"), Ok(0));
-        let by_index = |index: usize| select_monitor(&monitors, &MonitorSelector::Index(index));
+        let by_index = |index: usize| select_monitor(&monitors, &DeviceSelector::Index(index));
         assert_eq!(by_index(2), Ok(2));
         assert!(by_index(3).unwrap_err().contains("out of range"));
-        assert_eq!(MonitorSelector::parse("2"), MonitorSelector::Index(2));
+        assert_eq!(DeviceSelector::parse("2"), DeviceSelector::Index(2));
     }
 
     #[test]
@@ -704,10 +829,66 @@ mod tests {
         let args = parse_run(&["--", "--monitor", "Studio Display"]);
         assert_eq!(
             args.monitor,
-            Some(MonitorSelector::Name("Studio Display".to_string()))
+            Some(DeviceSelector::Name("Studio Display".to_string()))
         );
         assert!(parse_run(&["--", "--list-monitors"]).list_monitors);
         assert!(parse(&["--fullscreen", "--"]).is_err());
+    }
+
+    #[test]
+    fn parses_mic_options() {
+        let args = parse_run(&["--mic", "--audio-device", "2"]);
+        assert!(args.mic);
+        assert_eq!(args.audio_device, Some(DeviceSelector::Index(2)));
+        let args = parse_run(&["--mic", "--audio-device", "MacBook Pro Microphone"]);
+        assert_eq!(
+            args.audio_device,
+            Some(DeviceSelector::Name("MacBook Pro Microphone".to_string()))
+        );
+        assert!(parse_run(&["--list-audio-devices"]).list_audio_devices);
+        assert!(!parse_run(&[]).mic);
+        let message = parse(&["--audio-device", "1"]).unwrap_err().to_string();
+        assert!(
+            message.contains("--audio-device requires --mic"),
+            "{message}"
+        );
+        let message = parse(&["--mic", "--audio-device"]).unwrap_err().to_string();
+        assert!(message.contains("--audio-device requires"), "{message}");
+    }
+
+    #[test]
+    fn selects_audio_devices_like_monitors() {
+        let devices = names(&[
+            Some("MacBook Pro Microphone"),
+            Some("USB Audio Device"),
+            Some("USB Audio Device (2)"),
+        ]);
+        let select = |selector: DeviceSelector| select_device(&devices, &selector, &AUDIO_INPUT);
+        assert_eq!(select(DeviceSelector::parse("macbook")), Ok(0));
+        assert_eq!(select(DeviceSelector::parse("usb audio device")), Ok(1));
+        assert_eq!(select(DeviceSelector::parse("2")), Ok(2));
+        let error = select(DeviceSelector::parse("usb")).unwrap_err();
+        assert!(error.contains("audio input device name"), "{error}");
+        assert!(error.contains("--audio-device INDEX"), "{error}");
+        let error = select(DeviceSelector::parse("5")).unwrap_err();
+        assert!(error.contains("--list-audio-devices"), "{error}");
+        let error = select(DeviceSelector::parse("webcam")).unwrap_err();
+        assert!(error.contains("no audio input device name"), "{error}");
+    }
+
+    #[test]
+    fn udp_packets_win_over_mic_and_procedural_is_unchanged() {
+        let recent = Some(Duration::from_millis(100));
+        let stale = Some(UDP_HOLD);
+        // Without --mic: procedural without --udp, hold the last packet with it.
+        assert_eq!(idle_source(false, false, None), IdleSource::Procedural);
+        assert_eq!(idle_source(false, true, None), IdleSource::Hold);
+        assert_eq!(idle_source(false, true, stale), IdleSource::Hold);
+        // With --mic: mic replaces procedural; recent UDP holds priority.
+        assert_eq!(idle_source(true, false, None), IdleSource::Mic);
+        assert_eq!(idle_source(true, true, None), IdleSource::Mic);
+        assert_eq!(idle_source(true, true, recent), IdleSource::Hold);
+        assert_eq!(idle_source(true, true, stale), IdleSource::Mic);
     }
 
     #[test]
@@ -723,6 +904,9 @@ mod tests {
             "--fullscreen",
             "--monitor",
             "--list-monitors",
+            "--mic",
+            "--audio-device",
+            "--list-audio-devices",
             "Esc",
             "Cmd+Q",
         ] {

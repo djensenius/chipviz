@@ -21,7 +21,7 @@ just modern-pi5
 just modern-m1 -- --udp 127.0.0.1:6464
 ```
 
-Without `--udp`, the renderer uses deterministic procedural frames. With UDP,
+Without `--udp` or `--mic`, the renderer uses deterministic procedural frames. With UDP,
 it consumes `control-frame-v0` packets from the host bridge:
 
 ```sh
@@ -51,6 +51,64 @@ just modern-m1 -- --fullscreen --monitor 1
 | `Cmd+Q` | Quit (macOS application menu). |
 
 The cursor is hidden while fullscreen and restored when windowed.
+
+## Microphone input
+
+The renderer can analyse live microphone audio itself, with no bridge
+needed. Capture is off by default.
+
+| Option | Effect |
+| --- | --- |
+| `--mic` | Drive frames from the microphone (the system default input unless `--audio-device` is given). |
+| `--audio-device INDEX\|NAME` | Choose the input by the index from `--list-audio-devices` (all-digit values are indices) or by name, matched like `--monitor`: a unique exact name, else a unique case-insensitive substring; ambiguous names are rejected. Requires `--mic`. |
+| `--list-audio-devices` | Print each input device's index and name (marking the default), then exit. |
+
+```sh
+just modern-m1 -- --list-audio-devices
+just modern-m1 -- --mic
+just modern-m1 -- --mic --audio-device "MacBook Pro Microphone" --fullscreen
+```
+
+Source precedence, highest first:
+
+1. UDP packets (`--udp`). After a packet arrives, UDP keeps priority for
+   500 ms, so a bridge streaming at the frame rate never flickers with mic
+   frames.
+2. The microphone (`--mic`), which replaces the procedural fallback.
+3. Procedural frames, used only when neither `--mic` nor `--udp` is given.
+
+Without `--mic`, behaviour is unchanged. Mic frames fill `energy`, `bass`,
+`mid`, `treble`, the eight `spectrum` bands (log-spaced from 40 Hz to 12 kHz,
+as in the host bridge), `bpm` (`0` until a tempo is detected), `beat_phase`,
+`beat_count`, and the beat and bar flags. `frame`, `scene`, and `palette`
+follow the same timeline as procedural frames, so scenes still cycle.
+
+Analysis runs on its own thread; the render thread reads the latest result
+without waiting. Levels use automatic gain with a noise floor, so quiet and
+loud rooms both move the scenes, room hiss stays dark, and silence (or a
+device that stops sending audio) fades smoothly to zero.
+
+If no input device exists, the name or index matches nothing, or the stream
+cannot be opened, the renderer prints an error and exits with a non-zero
+status before opening a window.
+
+### macOS microphone permission
+
+The unbundled binary has no app bundle of its own, so macOS asks the app that
+launched it (Terminal, iTerm2, VS Code, ...) for microphone access, and the
+permission is stored for that app. When access is denied, macOS sends silent
+audio instead of an error, so after three seconds of pure silence the renderer
+prints a warning that points to System Settings > Privacy & Security >
+Microphone. To be asked again, reset the permission (for every app, or only for
+one bundle ID), then restart the terminal app:
+
+```sh
+tccutil reset Microphone
+tccutil reset Microphone com.apple.Terminal
+```
+
+On Linux, building the renderer needs the ALSA headers (`libasound2-dev` on
+Debian and Raspberry Pi OS).
 
 ## Scene plan
 
