@@ -762,5 +762,85 @@ class MidiRateTests(unittest.TestCase):
         scenes = [frame[20] for frame in live_bridge.iter_midi_frames("fake", frames + 1, fps)]
       self.assertEqual(scenes, [0] * frames + [7])
 
+  def test_cc1_debounce_counts_transmitted_frames_end_to_end(self) -> None:
+    # CC1 selects scene 7 at poll 1 and scene 0 at poll 150. Each output must
+    # transmit at least 30 frames, over at least 500 ms, before it changes.
+    for rate in (60, 90, 120):
+      with self.subTest(rate=rate):
+        outputs = self._run_midi_main(rate, frames=300, exit_poll=150)
+        changes = outputs.pop("changes")
+        for name, sent in outputs.items():
+          for change_at, before in ((changes[0], 0), (changes[1], 7)):
+            after = [(at, scene) for at, scene in sent if at >= change_at]
+            first_new = next(index for index, (_, scene) in enumerate(after) if scene != before)
+            self.assertGreaterEqual(first_new, 30, f"{name}: only {first_new} frames transmitted before the change")
+            self.assertGreaterEqual(after[first_new][0] - change_at, 500_000_000, name)
+
+  def _run_midi_main(self, rate: int, frames: int, exit_poll: int) -> dict:
+    clock = _FakeClock()
+    outputs: dict = {"udp": [], "joybus": [], "changes": []}
+
+    class _Message:
+      type = "control_change"
+      control = 1
+
+      def __init__(self, value: int) -> None:
+        self.value = value
+
+    class _Port:
+      polls = 0
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc) -> None:
+        return None
+
+      def iter_pending(self):
+        self.polls += 1
+        if self.polls in (1, exit_poll):
+          outputs["changes"].append(clock.ns)
+          return [_Message(127 if self.polls == 1 else 0)]
+        return []
+
+    class _Socket:
+      def __init__(self, *args) -> None:
+        pass
+
+      def sendto(self, data: bytes, endpoint) -> None:
+        outputs["udp"].append((clock.ns, data[20]))
+
+      def close(self) -> None:
+        pass
+
+    class _Serial:
+      def __init__(self, *args, **kwargs) -> None:
+        pass
+
+      def write(self, packet: bytes) -> None:
+        scene = ((packet[13] >> 2) & 0x0C) | ((packet[12] >> 4) & 0x03)
+        outputs["joybus"].append((clock.ns, scene))
+
+      def flush(self) -> None:
+        pass
+
+      def close(self) -> None:
+        pass
+
+    fake_mido = type(sys)("mido")
+    fake_mido.open_input = lambda name: _Port()
+    fake_serial = type(sys)("serial")
+    fake_serial.Serial = _Serial
+    argv = ["live_bridge", "--midi-port", "fake", "--rate", str(rate), "--frames", str(frames),
+            "--udp", "127.0.0.1:9", "--n64-serial", "fake"]
+    with contextlib.ExitStack() as stack:
+      for name in ("monotonic", "monotonic_ns", "sleep"):
+        stack.enter_context(mock.patch.object(live_bridge.time, name, getattr(clock, name)))
+      stack.enter_context(mock.patch.object(live_bridge.socket, "socket", _Socket))
+      stack.enter_context(mock.patch.dict(sys.modules, {"mido": fake_mido, "serial": fake_serial}))
+      stack.enter_context(mock.patch.object(sys, "argv", argv))
+      self.assertEqual(live_bridge.main(), 0)
+    return outputs
+
 if __name__ == "__main__":
   unittest.main()

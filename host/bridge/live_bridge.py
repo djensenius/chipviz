@@ -157,35 +157,60 @@ class SceneDebounce:
   sent sooner than ``SCENE_CUT_MIN`` steps after the previous scene-7 entry or
   exit. Changes between other scenes are sent at once.
 
-  ``step`` runs once per frame at ``rate`` frames per second. Above 60 Hz the
-  step counts scale up (60 frames at 120 Hz), so the debounce lasts at least
-  500 ms; at or below 60 Hz it stays 30 frames, which is longer.
+  Each frame at ``rate`` frames per second is one ``begin`` (which returns the
+  scene to send) and one ``end`` (told whether every output transmitted it).
+  Both minimums must hold: 30 (20 for ``SCENE_CUT_MIN``) transmitted frames,
+  since targets count one step per received frame, and at least 500 ms, so
+  above 60 Hz the source frame counts scale up (60 frames at 120 Hz). The
+  60 fps cap can drop scene-7 frames, so a scene-7 exit at ``--rate 90`` waits
+  for 30 transmitted frames, not just 45 source frames. ``step`` is ``begin``
+  then ``end`` for a frame that was transmitted.
   """
 
   def __init__(self, scene: int = 0, rate: int = DEFAULT_FPS) -> None:
     self.scene = scene
     self._candidate = scene
-    self._count = 0
+    self._frames = 0
+    self._sent = 0
     scale = max(rate, DEFAULT_FPS)
     self._stable = -(-SCENE_P_STABLE * scale // DEFAULT_FPS)
     self._cut_min = -(-SCENE_CUT_MIN * scale // DEFAULT_FPS)
     self._since_cut = self._cut_min
+    self._sent_since_cut = SCENE_CUT_MIN
 
-  def step(self, raw: int) -> int:
-    """Advance one frame with the raw scene value; return the scene to send."""
+  def begin(self, raw: int) -> int:
+    """Start one frame with the raw scene value; return the scene to send."""
     if raw == self._candidate:
-      self._count += 1
+      self._frames += 1
     else:
       self._candidate = raw
-      self._count = 1
+      self._frames = 1
+      self._sent = 0
     self._since_cut += 1
     if (raw == COLOUR_FIELD_SCENE) == (self.scene == COLOUR_FIELD_SCENE):
       self.scene = raw
-      return self.scene
-    sent = self.scene
-    if self._count >= self._stable and self._since_cut >= self._cut_min:
-      self.scene = raw
+    return self.scene
+
+  def end(self, transmitted: bool = True) -> None:
+    """Finish the frame; a pending scene-7 change takes effect from the next."""
+    if transmitted:
+      self._sent += 1
+      self._sent_since_cut += 1
+    if (
+      (self._candidate == COLOUR_FIELD_SCENE) != (self.scene == COLOUR_FIELD_SCENE)
+      and self._frames >= self._stable
+      and self._sent >= SCENE_P_STABLE
+      and self._since_cut >= self._cut_min
+      and self._sent_since_cut >= SCENE_CUT_MIN
+    ):
+      self.scene = self._candidate
       self._since_cut = 0
+      self._sent_since_cut = 0
+
+  def step(self, raw: int) -> int:
+    """Advance one transmitted frame; return the scene to send."""
+    sent = self.begin(raw)
+    self.end()
     return sent
 
 
@@ -366,8 +391,16 @@ class ColourFieldRateCap:
     return True
 
 
-def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Iterator[bytes]:
+def iter_midi_frames(
+  port_name: str | None,
+  frame_count: int,
+  fps: int,
+  transmitted: Callable[[], bool] | None = None,
+) -> Iterator[bytes]:
   """Yield control frames captured from a MIDI port at real-time cadence.
+
+  ``transmitted`` is asked, once the consumer has sent a frame, whether every
+  output transmitted it; the CC1 debounce counts only those frames.
 
   Each iteration spends one ``1/fps`` interval polling the port, so the
   generator paces itself to wall-clock time and downstream sinks must not add
@@ -394,7 +427,7 @@ def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Itera
             raw_scene = int(message.value) // 16
           elif message.control == 2:
             palette = int(message.value) // 16
-      scene = debounce.step(raw_scene)
+      scene = debounce.begin(raw_scene)
       base = make_procedural_frame(frame_index)
       notes = (Note(60, clamp_byte(velocity * 2)),) if velocity > 0 else ()
       yield pack_frame(ControlFrame(
@@ -412,12 +445,16 @@ def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Itera
         flags=base.flags | (0x02 if velocity > 0 else 0x00),
         notes=notes,
       ))
+      debounce.end(transmitted() if transmitted else True)
       remaining = deadline - time.monotonic()
       if remaining > 0:
         time.sleep(remaining)
 
 
-def open_frame_source(args: argparse.Namespace) -> tuple[Iterable[bytes], bool]:
+def open_frame_source(
+  args: argparse.Namespace,
+  transmitted: Callable[[], bool] | None = None,
+) -> tuple[Iterable[bytes], bool]:
   """Return a frame iterable and whether it paces itself to real time.
 
   Live MIDI capture produces frames at wall-clock cadence (``realtime=True``)
@@ -431,7 +468,7 @@ def open_frame_source(args: argparse.Namespace) -> tuple[Iterable[bytes], bool]:
   if args.audio_seconds is not None:
     return build_audio_frames(args.audio_seconds, args.audio_rate, args.rate, args.audio_device), False
   if args.midi_port is not None:
-    return iter_midi_frames(args.midi_port, args.frames, args.rate), True
+    return iter_midi_frames(args.midi_port, args.frames, args.rate, transmitted), True
   return [pack_frame(make_procedural_frame(index)) for index in range(args.frames)], False
 
 
@@ -471,6 +508,7 @@ class UdpSink:
 
   def send(self, frame: bytes) -> None:
     frame = self._cap.filter(frame)
+    self.last_transmitted = frame is not None
     if frame is None:
       return
     self._socket.sendto(sanitise_flash(frame, "full", self.allow_flash), self._endpoint)
@@ -494,6 +532,7 @@ class N64SerialSink:
 
   def send(self, frame: bytes) -> None:
     frame = self._cap.filter(frame)
+    self.last_transmitted = frame is not None
     if frame is None:
       return
     # Own per-packet marker sequence: advances even if the source repeats or
@@ -505,6 +544,11 @@ class N64SerialSink:
 
   def close(self) -> None:
     self._port.close()
+
+
+def all_transmitted(sinks: list) -> Callable[[], bool]:
+  """Whether every sink transmitted its last frame (uncapped sinks always do)."""
+  return lambda: all(getattr(sink, "last_transmitted", True) for sink in sinks)
 
 
 def stream_frames(frames: Iterable[bytes], realtime: bool, rate: int, sinks: list) -> None:
@@ -556,9 +600,9 @@ def main() -> int:
     raise SystemExit("choose --output, --udp, --n64-serial, or a combination")
   announce_allow_flash(args.allow_flash)
 
-  frames, realtime = open_frame_source(args)
+  sinks: list = []
+  frames, realtime = open_frame_source(args, all_transmitted(sinks))
   with contextlib.ExitStack() as stack:
-    sinks: list = []
     if args.output:
       sinks.append(stack.enter_context(contextlib.closing(FileSink(args.output, args.allow_flash))))
     if args.udp:
