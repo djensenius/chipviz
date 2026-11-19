@@ -84,7 +84,8 @@ def apply_joybus_marker(packet: bytearray, sequence: int) -> None:
   packet[JOYBUS_CHECKSUM_BYTE] = joybus_marker_checksum(bytes(packet))
 
 
-def pack_joybus_frame(frame: DecodedFrame) -> bytes:
+def pack_joybus_frame(frame: DecodedFrame, sequence: int) -> bytes:
+  """Pack one Joybus packet; `sequence` must advance once per emitted packet."""
   midi_intensity = max(frame.note_velocities, default=0)
   packet = bytearray(JOYBUS_SIZE)
   packet[0] = ((frame.flags & 0x01) << 7) | (1 if frame.spectrum[0] > 127 else 0) | (2 if frame.spectrum[1] > 127 else 0)
@@ -100,16 +101,17 @@ def pack_joybus_frame(frame: DecodedFrame) -> bytes:
   packet[13] = ((frame.scene & 0x0C) << 2) | (frame.palette & 0x0F)
   packet[14] = frame.energy
   packet[15] = midi_intensity
-  apply_joybus_marker(packet, frame.frame)
+  apply_joybus_marker(packet, sequence)
   return bytes(packet)
 
 
-def convert_stream(stream: bytes) -> bytes:
+def convert_stream(stream: bytes, first_sequence: int = 0) -> bytes:
+  """Pack each record; the marker sequence is `first_sequence` + packet index."""
   if len(stream) % WIRE_SIZE != 0:
     raise ValueError("control-frame stream is not aligned to 33-byte records")
   return b"".join(
-    pack_joybus_frame(decode_control_frame(stream[offset:offset + WIRE_SIZE]))
-    for offset in range(0, len(stream), WIRE_SIZE)
+    pack_joybus_frame(decode_control_frame(stream[offset:offset + WIRE_SIZE]), first_sequence + index)
+    for index, offset in enumerate(range(0, len(stream), WIRE_SIZE))
   )
 
 

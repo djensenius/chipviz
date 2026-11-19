@@ -33,7 +33,11 @@ orbit, and tilt changes that reveal the objects live on a 3D plane.
 
 Use a Raspberry Pi plus Pi Pico wired controller-port bridge. The Pi sends the
 16-byte N64 Joybus transport over USB serial, and the Pico exposes the current
-frame as emulated N64 controller state across one to four controller ports. See
+frame as emulated N64 controller state across one to four controller ports.
+The ROM shows live data only for v1 frames carrying the frame marker. That
+needs all four ports wired: ports 1 to 3 carry the marker and port 4 carries
+scene, palette, beat, energy and MIDI data, which the checksum covers.
+Otherwise, as with an ordinary pad, it stays procedural. See
 [`../../docs/n64-hardware.md`](../../docs/n64-hardware.md) and
 [`../../shared/specs/n64-joybus-transport-v0.md`](../../shared/specs/n64-joybus-transport-v0.md).
 

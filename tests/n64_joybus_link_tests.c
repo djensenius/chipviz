@@ -133,7 +133,12 @@ static void stale_hold_then_procedural(void) {
 
   step_seq(&link, seq, 0x44);
   marked(frozen, seq, 0x44);
-  for (int i = 1; i < JOYBUS_LINK_HOLD_FRAMES; i++) {
+  int grace = 1;
+  for (int i = 1; i <= JOYBUS_LINK_REPEAT_GRACE; i++) {
+    grace &= joybus_link_step(&link, 1, frozen) == JOYBUS_LINK_LIVE;
+  }
+  require(grace, "short valid repeats stay live within the repeat grace");
+  for (int i = JOYBUS_LINK_REPEAT_GRACE + 1; i < JOYBUS_LINK_HOLD_FRAMES; i++) {
     hold &= joybus_link_step(&link, 1, frozen) == JOYBUS_LINK_HOLD;
   }
   require(hold, "frozen sequence holds the last live frame");
@@ -188,12 +193,26 @@ static void recovery_and_corruption(void) {
   require(mode == JOYBUS_LINK_LIVE, "valid repeats do not reset recovery and seq wraps 63 -> 0");
 }
 
+static void slow_host_stays_live(void) {
+  joybus_link_t link;
+  uint8_t seq = go_live(&link);
+  int live = 1;
+
+  /* Host at half the ROM poll rate: each sequence is seen twice. */
+  for (int i = 0; i < 300; i++) {
+    uint8_t s = (uint8_t)(seq + i / 2);
+    live &= step_seq(&link, s, (uint8_t)s) == JOYBUS_LINK_LIVE;
+  }
+  require(live, "a sequence repeating every other frame stays live");
+}
+
 int main(void) {
   marker();
   no_device_and_idle_pad();
   silent_and_active_live();
   stale_hold_then_procedural();
   recovery_and_corruption();
+  slow_host_stays_live();
   printf("n64 joybus link tests: %u checks, %u failures\n", checks, failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -62,6 +62,10 @@ N64 controller plug, front view:
 The Pico is powered over USB. Do not power the Pico from the N64 controller-port
 3.3 V pin.
 
+Wire all four controller ports for live mode. Ports 1 to 3 carry the v1 frame
+marker. Port 4 carries the scene, palette, beat, energy and MIDI data, which
+the marker checksum covers. With a port missing, the ROM stays procedural.
+
 ## Data format and budget
 
 See [`../shared/specs/n64-joybus-transport-v0.md`](../shared/specs/n64-joybus-transport-v0.md).

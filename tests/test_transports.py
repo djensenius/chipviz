@@ -32,7 +32,7 @@ class TransportTests(unittest.TestCase):
 
   def test_n64_joybus_packet_is_16_bytes(self) -> None:
     decoded = n64_joybus.decode_control_frame(self.wire)
-    packet = n64_joybus.pack_joybus_frame(decoded)
+    packet = n64_joybus.pack_joybus_frame(decoded, 0)
 
     self.assertEqual(len(packet), n64_joybus.JOYBUS_SIZE)
     self.assertEqual(packet[2], self.frame.spectrum[0])
@@ -48,7 +48,7 @@ class TransportTests(unittest.TestCase):
 
   def _joybus_packet(self, frame_index: int) -> bytes:
     wire = chipviz_bridge.pack_frame(chipviz_bridge.make_procedural_frame(frame_index))
-    return n64_joybus.pack_joybus_frame(n64_joybus.decode_control_frame(wire))
+    return n64_joybus.pack_joybus_frame(n64_joybus.decode_control_frame(wire), frame_index)
 
   def test_n64_joybus_marker_golden_vectors_match_rom_tests(self) -> None:
     # Mirrored in tests/n64_joybus_link_tests.c so host and ROM agree.
@@ -74,6 +74,34 @@ class TransportTests(unittest.TestCase):
     self.assertEqual(unmarked[2], decoded.spectrum[0])
     self.assertEqual(unmarked[14], decoded.energy)
     self.assertFalse(n64_joybus.joybus_marker_valid(bytes(unmarked)))
+
+  def test_n64_joybus_stream_sequence_is_per_packet(self) -> None:
+    converted = n64_joybus.convert_stream(self.wire * 3, first_sequence=62)
+    packets = [converted[i:i + 16] for i in range(0, len(converted), 16)]
+
+    self.assertEqual([packet[5] for packet in packets], [62, 63, 0])
+    self.assertTrue(all(n64_joybus.joybus_marker_valid(packet) for packet in packets))
+
+  def test_n64_serial_sink_advances_sequence_for_repeated_frames(self) -> None:
+    class _Port:
+      def __init__(self) -> None:
+        self.written: list[bytes] = []
+
+      def write(self, data: bytes) -> None:
+        self.written.append(data)
+
+      def flush(self) -> None:
+        pass
+
+    sink = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
+    sink._port = _Port()
+    sink._sequence = 0
+    for _ in range(66):
+      sink.send(self.wire)
+
+    sequences = [packet[5] for packet in sink._port.written]
+    self.assertEqual(sequences, [index & 0x3F for index in range(66)])
+    self.assertTrue(all(n64_joybus.joybus_marker_valid(packet) for packet in sink._port.written))
 
   def test_n64_joybus_marker_silent_frame_is_valid(self) -> None:
     silent = bytearray(16)

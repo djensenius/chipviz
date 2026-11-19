@@ -42,13 +42,19 @@ buttons-low, so each marker field is six bits and the top two bits must be `0`.
 | Byte | Field | Value |
 | --- | --- | --- |
 | 1 | magic | `0x2D` |
-| 5 | sequence | control-frame `frame` counter `& 0x3F` |
+| 5 | sequence | sender's per-packet counter `& 0x3F` |
 | 9 | checksum | six-bit checksum below |
 
 Checksum: start with `c = 0xA5`. For every byte `b` at index `0..15` except 9
 (so including the magic and sequence), set `c = rotl8(c, 1) ^ b`. The checksum
 is `(c ^ (c >> 6)) & 0x3F`. A frame is marked when byte 1 is the magic, byte 5
 has no bits above `0x3F`, and byte 9 equals the checksum.
+
+The sequence must advance once per emitted packet, whatever the control-frame
+`frame` counter does. A sequence that stops advancing makes the ROM hold and
+then fall back to procedural. `convert_stream` numbers packets from
+`first_sequence`. The live bridge serial sink (`N64SerialSink`) keeps its own
+counter across sends.
 
 The host encoder is `host/bridge/n64_joybus.py`. The ROM state machine is
 `cores/n64/homebrew/joybus_link.h`. Both are tested against the same golden
@@ -65,10 +71,13 @@ The ROM chooses one of three sources every frame:
   (changed) sequence. The ROM then uses each advancing valid frame, even if
   every data byte is zero. A valid frame that repeats its sequence neither
   advances nor resets that count. An unmarked or corrupt frame resets it.
-- **Hold** while live, when a frame is not an advancing valid frame (repeated
-  sequence or lost marker). The ROM keeps drawing the last live frame. After 45
-  such frames it returns to procedural and needs the 4-frame recovery again.
-  Any advancing valid frame during hold resumes live at once.
+- Live also tolerates up to 2 consecutive valid repeats of the same sequence,
+  for example a host polled faster than it sends. Those repeats stay live.
+- **Hold** while live, when a frame is not an advancing valid frame (a lost
+  marker or a repeat beyond the 2-frame grace). The ROM keeps drawing the last
+  live frame. After 45 frames without an advance it returns to procedural and
+  needs the 4-frame recovery again. Any advancing valid frame during hold
+  resumes live at once.
 
 The 30-frame start-up warm-up still forces procedural output.
 
@@ -79,6 +88,15 @@ The 30-frame start-up warm-up still forces procedural output.
 - v0 host with a v1 ROM: v0 frames carry no marker, so the ROM treats them as an
   ordinary pad and stays procedural. Update the host to show live data.
 - The Pico firmware copies the 16 bytes unchanged and needs no change.
+- Live mode needs all four controller ports wired to the Pico. Ports 1, 2 and
+  3 carry the marker in their buttons-low bytes. Port 4 carries scene, palette,
+  beat, energy and MIDI data, and the checksum covers those bytes. A missing
+  port reads as zeros, so the marker fails unless that port's data happens to
+  be zero, and the ROM stays procedural.
+- The Pico's serial framing has no resync. If the byte stream slips (a dropped
+  or extra byte), every packet straddles two frames and fails the marker. The
+  link then stays procedural until the Pico is reset. Hardware validation is
+  tracked in #31.
 - A real pad can only forge a marker by pressing the exact L, R and C-button
   pattern on ports 1 to 3 with a matching checksum and a changing sequence for
   several frames in a row.

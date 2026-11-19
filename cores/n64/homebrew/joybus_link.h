@@ -16,6 +16,10 @@
 #define JOYBUS_LINK_CHECKSUM_SEED 0xA5u
 /* Marker loss while live: hold the last live packet this many frames. */
 #define JOYBUS_LINK_HOLD_FRAMES 45
+/* Live tolerates this many consecutive valid repeats of the same sequence (a
+ * host slower than the ROM poll) before reporting hold.
+ */
+#define JOYBUS_LINK_REPEAT_GRACE 2
 /* Advancing valid frames needed to leave procedural (no flapping). */
 #define JOYBUS_LINK_RECOVER_FRAMES 4
 
@@ -66,8 +70,10 @@ static inline void joybus_link_init(joybus_link_t *link) {
  * - No device: procedural immediately, state reset.
  * - Live: a valid marker whose sequence differs from the previous valid one
  *   keeps live (even if every data byte is zero) and refreshes the held packet.
- *   Anything else (repeat, invalid marker) holds the last live packet for
- *   JOYBUS_LINK_HOLD_FRAMES frames, then falls back to procedural.
+ *   Up to JOYBUS_LINK_REPEAT_GRACE consecutive valid repeats stay live. Anything
+ *   else (longer repeats, invalid marker) holds the last live packet. After
+ *   JOYBUS_LINK_HOLD_FRAMES frames without an advance it falls back to
+ *   procedural.
  * - Procedural: an unmarked (ordinary) pad never goes live. Live resumes after
  *   JOYBUS_LINK_RECOVER_FRAMES advancing valid frames; an invalid frame resets
  *   that count, a valid repeat neither advances nor resets it.
@@ -83,6 +89,7 @@ static inline joybus_link_mode_t joybus_link_step(joybus_link_t *link, int conne
   int valid = joybus_link_marker_valid(packet);
   uint8_t seq = joybus_link_sequence(packet);
   int advancing = valid && link->has_seq && seq != link->last_seq;
+  int repeat = valid && link->has_seq && seq == link->last_seq;
   link->has_seq = valid;
   link->last_seq = valid ? seq : 0;
 
@@ -98,6 +105,9 @@ static inline joybus_link_mode_t joybus_link_step(joybus_link_t *link, int conne
       link->stale = 0;
       link->streak = 0;
       return JOYBUS_LINK_PROCEDURAL;
+    }
+    if (repeat && link->stale <= JOYBUS_LINK_REPEAT_GRACE) {
+      return JOYBUS_LINK_LIVE;
     }
     return JOYBUS_LINK_HOLD;
   }
