@@ -101,7 +101,9 @@ The effective palette `p_eff` comes from one of three sources:
     been received unchanged for `P_STABLE = 30` consecutive steps. A wire 3 or
     7 held for 30 steps from entry therefore arms on its 30th step and, when
     the change budget allows (as in F10), runs from the 31st.
-  - A stable 3 or 7 arms flash (see [arming](#arming-and-operator-inputs)).
+  - A stable 3 or 7 becomes an *armed request* (see
+    [arming](#arming-and-operator-inputs)). The flash latch is set only when
+    that request is applied under the change budget, never before.
 - **Precedence:** a later event overrides an earlier one, whatever its source.
   - An operator pulse sets `p_req` and consumes the current wire value: that
     value never becomes `p_req` again, however long it stays.
@@ -283,7 +285,8 @@ confirm them with emulator captures.
 
 ## Step clock and inputs
 
-**Full control-frame path:** one step runs for each new `frame` counter value.
+**Full control-frame path:** one step runs for each new `frame` counter value,
+subject to the 60 steps per second cap below.
 
 **Local sources** (procedural, demo): one step runs per generated frame.
 
@@ -392,9 +395,14 @@ unarmed 3→2 rule) or the family of `p_eff` changes. `layout`, `combo` and `rot
 2. Update silence:
    - If `silent`: when `e >= SIL_EXIT`, set `silent = 0` and `quiet = 0`.
    - Otherwise: set `quiet` to `quiet + 1` when the new `avg_e <= SIL_AVG`, else
-     to 0. When `quiet >= SIL_HOLD`, set `silent = 1`. On that entry, spectral
-     and flash/gate modes go black: all `lvl = 0`, the gate rests dark, and
-     `pulse = 0`. Held and cuts hold their state.
+     to 0. When `quiet >= SIL_HOLD`, set `silent = 1`. On that entry,
+     flash/gate goes black at once: the gate rests dark and `pulse = 0`. Held
+     and cuts hold their state.
+   - **Spectral blackout:** in spectral mode, on every step where `silent` is
+     set and any `lvl > 0`, set all `lvl = 0` and `lg = 0` if `lg >=
+     LEVEL_OPP`. Otherwise wait for a later silent step. The blackout is a
+     visible change and uses the budget; if silence ends first, it is
+     cancelled.
 3. Check for transients:
    - `hit = e >= T_FLOOR && (de >= T_E_ON || any db[i] >= T_B_ON || flux >=
      FLUX_ON)`
@@ -435,18 +443,25 @@ not touch `lg`, so a request to leave mode 3 is never starved.
 At the end of step 7, a pending request is applied only when `lg >= LEVEL_OPP`
 and `since_cut >= CUT_MIN`:
 
-- A `p_req` whose effective mode or family differs from the current one runs
-  mode entry, which sets `lg = 0` and `since_cut = 0`. A `p_req` with the same
-  effective mode and family just replaces `p_eff`.
+- A request is a pair `(p, armed)`. Its effective mode is `p & 3`, except
+  that 3 counts as 2 unless the request is armed. Requests are compared by
+  effective mode and family, never by raw `p`.
+- A `p_req` whose effective mode or family differs from the current one is
+  applied: `p_eff = p`, the flash latch is set if the request is armed and its
+  effective mode is 3 (cleared otherwise), and mode entry runs, which sets
+  `lg = 0` and `since_cut = 0`.
 - Otherwise, a `pin_req` that changes the layout applies the pin and sets `lg =
   0` and `since_cut = 0`.
 - Otherwise, the request stays pending. Only the latest `p_req` and `pin_req`
-  are kept; a newer request replaces an older one, and a request equal to the
-  current value is cleared.
+  are kept; a newer request replaces an older one, and a request whose
+  effective mode and family equal the current ones is cleared without
+  effect. When an unapplied armed request is replaced or cleared, its arming
+  is discarded with it, so a later unarmed 3 or 7 still runs as 2 or 6 (and
+  shows the warning screen in `operator` builds).
 
 Operator- and host-driven mode, family and pin changes are therefore at most 3
-per second, the same as hard cuts. Arming or clearing the flash latch changes
-the effective mode and goes through the same rule.
+per second, the same as hard cuts. The flash latch is only ever set by applying
+a request, so arming always goes through the budget.
 
 ## Modes
 
@@ -506,8 +521,9 @@ Flash is armed only by a deliberate source.
 - **(a) Operator arming:** only in the `operator` input role (see
   [Input roles](#input-roles)).
   - **modern:** the `--allow-flash` CLI flag prints the full warning to stderr
-    when the renderer starts. While the process runs, it re-arms automatically
-    each time mode 3 is selected again after the latch has cleared.
+    when the renderer starts. While the process runs, every operator request
+    for 3 or 7 is an armed request, so it re-arms each time mode 3 is applied
+    again after the latch has cleared.
   - **Consoles built with the `operator` role:** use the warning screen below,
     confirmed with the target's confirm input: controller 1 `start` as the port
     maps it for interface-v0, or the `RETURN` key on C64, which has no Start
@@ -516,7 +532,9 @@ Flash is armed only by a deliberate source.
     Pad input there may be a HID feed, and the N64's Joybus ports carry
     controller 4 Start/Z as scene bits.
 - **(b) Deliberate host selection:** a wire `p` of 3 or 7 that passes the
-  `P_STABLE` gate while scene is 7.
+  `P_STABLE` gate while scene is 7 becomes an armed request. This includes a 3
+  or 7 present at scene entry: it runs as 2 or 6, and after 30 stable steps its
+  armed request differs in effective mode, so it is applied under the budget.
   - Hosts emit 3 or 7 only when that host process was started with
     `--allow-flash` (see [Requirements for scene sources](#scene-index-7-is-the-colour-field)).
     A host with that flag prints the full warning when it starts.
@@ -536,8 +554,9 @@ flow, with no wire change. It exists only in `operator` builds.
   unarmed.
 - **While it is shown:**
   - The detector is paused and the projection shows the text below.
-  - The confirm input (`start`, or `RETURN` on C64) arms flash and returns
-    to the visualizer. It is consumed there, so
+  - The confirm input (`start`, or `RETURN` on C64) turns the pending
+    request into an armed request and returns to the visualizer; the latch is
+    set when the change budget applies it. It is consumed there, so
     it does not trigger interface-v0's visualizer-to-`scene_select`
     transition.
   - Any other input, or 600 steps without input, cancels. The target then
@@ -601,3 +620,4 @@ OTHER = CANCEL
 | F10 wire gate | F1 input without `drop`. Wire `p` is 0 for steps 0–99, 2 for 100–109, 0 for 110–199, and 3 from 200 on. | `p_eff` is 0 through step 229 and 3 from step 230, when mode 3 enters resting dim (armed by host selection). Steps 100–109 have no effect. |
 | F11 pinned | F5 input, pinned to H3. | Layout is always H3. 19 cuts, and every fourth cut rotates instead of changing layout. |
 | F12 mode toggle | F0 input, starting at `p = 0`. Operator pulses request `p = 1` at steps `60 + 12k` and `p = 0` at `66 + 12k`, through step 594. | Requests apply at the end of steps 60, 80, 100, 126, 146, 166, 192, … (20 or 26 steps apart; a request equal to the current `p_eff` is cleared). The field alternates held level 3 and spectral black, visible from the next step. Never more than 3 changes in any 60 steps. |
+| F13 silence spikes | `e = 0` except `e = 30` at steps `31k` (`k = 1..19`). Bands 250, spectrum 0. | Spectral (`p = 1` and 5): black at 30; levels step up at 40, 50 and 60 (the spike at 31 waits for `lg`); the silence at 61 does not black out until `lg` allows, and silence ends at 62 first; black again at 92, up at 102, 112 and 122, and so on every 62 steps. Never more than 4 changes in any 60 steps. Other modes: no change. |
