@@ -743,8 +743,51 @@ static void keys(void) {
   require(key_shown, "keys", "8 shows scene 7 from the 31st step");
 }
 
+/* The raster IRQ's on-time check for every line of a PAL (312 lines, IRQ at
+ * 300) and an NTSC (263 lines, IRQ at 16) frame: the main loop reads D012 and
+ * then D011, so bit 8 may also come from the next line. */
+static int irq_window(uint16_t line, uint16_t frame_lines) {
+  return frame_lines == 312u ? (line >= 300u || line <= 3u) : (line >= 16u && line <= 31u);
+}
+
+static uint8_t irq_read(uint16_t low_line, uint16_t high_line, uint16_t irq_line, uint16_t frame_lines) {
+  return cf_irq_on_time((uint8_t)low_line, (uint8_t)((high_line >> 1) & 0x80u), irq_line, frame_lines);
+}
+
+static void irq_lines(void) {
+  static const uint16_t models[2][2] = {{300u, 312u}, {16u, 263u}};
+  uint8_t m;
+  for (m = 0; m < 2u; m++) {
+    uint16_t irq_line = models[m][0];
+    uint16_t frame_lines = models[m][1];
+    uint16_t line;
+    uint16_t accepted = 0;
+    int exact = 1;
+    int race = 1;
+    for (line = 0; line < frame_lines; line++) {
+      uint16_t next = (uint16_t)((line + 1u) % frame_lines);
+      uint8_t on_time = irq_read(line, line, irq_line, frame_lines);
+      exact &= on_time == irq_window(line, frame_lines);
+      accepted = (uint16_t)(accepted + on_time);
+      /* The line moved on between the two reads (bit 8 from the next line):
+       * accept only when the line read from D012 is inside the window, so a
+       * 255 -> 256 or last-line -> 0 mix can never pass. */
+      if (irq_read(line, next, irq_line, frame_lines)) {
+        race &= irq_window(line, frame_lines);
+      }
+    }
+    require(exact && accepted == 16u, m ? "irq NTSC" : "irq PAL", "accepted lines are exactly the window");
+    require(race, m ? "irq NTSC" : "irq PAL", "a D012/D011 read race is never accepted outside the window");
+  }
+  /* The overrun the window must reject: about a frame late, at the bottom of
+   * the display or the lower border (PAL 244-255 with bit 8 clear). */
+  require(!irq_read(244u, 244u, 300u, 312u) && !irq_read(255u, 255u, 300u, 312u), "irq PAL",
+          "lines 244-255 are late");
+}
+
 int main(void) {
   geometry();
+  irq_lines();
   colours();
   keys();
   fixture_f0();

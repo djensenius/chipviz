@@ -97,4 +97,13 @@ uint8_t cf_cell_region(uint8_t layout, uint8_t column, uint8_t row);
 extern uint8_t cf_keys[8];
 void cf_read_keys(uint8_t fallback_scene);
 
+/* Raster IRQ lateness check. d012 and d011 are the raster register reads
+ * (D011 bit 7 is line bit 8, read after D012, so the line may have moved on
+ * between them). Returns 1 when the 9-bit line is a real line of the frame
+ * and fewer than CF_IRQ_WINDOW lines after irq_line, counting across the
+ * frame wrap. On-time IRQs reach the check about 6 lines late; the window
+ * stays in the vertical blank (PAL 300-311 and 0-3, NTSC 16-31). */
+#define CF_IRQ_WINDOW 16u
+uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines);
+
 #endif

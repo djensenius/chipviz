@@ -575,3 +575,14 @@ void cf_read_keys(uint8_t fallback_scene) {
   }
   cf_previous_beat_keys = beat_keys;
 }
+
+uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines) {
+  uint16_t line = (uint16_t)(d012 | ((uint16_t)(d011 & 0x80u) << 1));
+  uint16_t late;
+
+  if (line >= frame_lines) {
+    return 0u;
+  }
+  late = line >= irq_line ? (uint16_t)(line - irq_line) : (uint16_t)(line + frame_lines - irq_line);
+  return (uint8_t)(late < CF_IRQ_WINDOW);
+}

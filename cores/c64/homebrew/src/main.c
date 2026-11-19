@@ -26,14 +26,9 @@
  * line 300 does not exist). Bit 8 of the line is D011 bit 7. */
 #define CHIPVIZ_IRQ_LINE_PAL 300u
 #define CHIPVIZ_IRQ_LINE_NTSC 16u
-/* An IRQ that starts this many lines late or more (after a step overran a
- * frame) does not write the registers, so they never change mid-screen.
- * On-time IRQs reach the check about 6 lines late; lines 300-315 (PAL,
- * wrapping to 3) and 16-31 (NTSC) are all in the vertical blank. */
-#define CHIPVIZ_IRQ_WINDOW 16u
-/* Lines from 256 to the end of a PAL frame: a PAL check after the wrap to
- * line 0 (raster bit 8 clear) adds this to stay a line count. */
-#define CHIPVIZ_PAL_WRAP (312u - 256u)
+/* Raster lines per frame. */
+#define CHIPVIZ_LINES_PAL 312u
+#define CHIPVIZ_LINES_NTSC 263u
 /* D011: display on, 25 rows, scroll 3; bit 6 adds extended colour mode. */
 #define CHIPVIZ_D011_NATIVE 0x1Bu
 #define CHIPVIZ_ECM 0x40u
@@ -63,9 +58,9 @@ static volatile uint8_t native_scene;
 static volatile uint8_t field_shown;
 static volatile uint8_t irq_frames;
 static uint8_t irq_stack[128];
-static uint8_t irq_line_low;
+static uint16_t irq_line;
+static uint16_t irq_frame_lines;
 static uint8_t irq_line_bit8;
-static uint8_t irq_line_wrap;
 
 typedef struct {
   uint8_t spectrum[8];
@@ -198,22 +193,21 @@ static void stage_native(void) {
  * these functions, so cc65's static locals are never shared with the main
  * loop; cc65's IRQ wrapper saves the runtime zero page and uses irq_stack. */
 static uint8_t raster_irq(void) {
-  uint8_t late;
+  uint8_t raster_low;
+  uint8_t raster_high;
 
   if (!(CHIPVIZ_VIC_IRQ_STATUS & 1u)) {
     return IRQ_NOT_HANDLED;
   }
   /* Acknowledge first: an overrun step is then delayed, not lost. */
   CHIPVIZ_VIC_IRQ_STATUS = 1u;
-  /* A late IRQ skips this frame's writes. The next IRQ writes the step
-   * staged after it, so the skipped step is never shown. Lines past the
-   * wrap count on from the IRQ line on PAL; on NTSC lines 256-262 come
-   * before line 16 and the unsigned difference is too large. */
-  late = (uint8_t)(CHIPVIZ_RASTER_LINE - irq_line_low);
-  if ((CHIPVIZ_VIC_CONTROL1 & 0x80u) != irq_line_bit8) {
-    late = (uint8_t)(late + irq_line_wrap);
-  }
-  if (late < CHIPVIZ_IRQ_WINDOW) {
+  /* A late IRQ (one that starts CF_IRQ_WINDOW lines after its line or more,
+   * after a step overran a frame) skips this frame's writes, so they never
+   * change mid-screen. The next IRQ writes the step staged after it, so the
+   * skipped step is never shown. */
+  raster_low = CHIPVIZ_RASTER_LINE; /* D012 first, as cf_irq_on_time expects */
+  raster_high = CHIPVIZ_VIC_CONTROL1;
+  if (cf_irq_on_time(raster_low, raster_high, irq_line, irq_frame_lines)) {
     present();
   }
   scan_keyboard();
@@ -299,17 +293,17 @@ int main(void) {
   native_background = pending.background[0];
   native_scene = demo_scene(frame);
   if (get_tv() == TV_NTSC) {
-    irq_line_low = (uint8_t)CHIPVIZ_IRQ_LINE_NTSC;
-    irq_line_bit8 = 0u;
+    irq_line = CHIPVIZ_IRQ_LINE_NTSC;
+    irq_frame_lines = CHIPVIZ_LINES_NTSC;
   } else {
-    irq_line_low = (uint8_t)(CHIPVIZ_IRQ_LINE_PAL & 0xFFu);
-    irq_line_bit8 = 0x80u;
-    irq_line_wrap = (uint8_t)CHIPVIZ_PAL_WRAP;
+    irq_line = CHIPVIZ_IRQ_LINE_PAL;
+    irq_frame_lines = CHIPVIZ_LINES_PAL;
   }
   __asm__("sei");
   set_irq(raster_irq, irq_stack, sizeof(irq_stack));
   CHIPVIZ_IRQ_VECTOR = (uint16_t)irq_entry;
-  CHIPVIZ_RASTER_LINE = irq_line_low;
+  irq_line_bit8 = (uint8_t)((irq_line >> 1) & 0x80u);
+  CHIPVIZ_RASTER_LINE = (uint8_t)irq_line;
   CHIPVIZ_VIC_CONTROL1 = (uint8_t)(CHIPVIZ_D011_NATIVE | irq_line_bit8);
   CHIPVIZ_VIC_IRQ_STATUS = 0x0Fu;
   CHIPVIZ_VIC_IRQ_ENABLE = 1u;
