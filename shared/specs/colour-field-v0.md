@@ -94,8 +94,9 @@ same trace on every target. Reduced transports have their own oracle (see
   `chipviz_interface` next/prev inputs, and local rings such as the GBA
   `GBA_SCENE_COUNT`. Auto mode advances through the same ring.
 - **Requirements for scene sources:**
-  - Procedural and demo generators never emit scene 7. That includes the N64
-    `procedural_packet`, which currently can.
+  - Procedural and demo generators never emit scene 7. The N64
+    `procedural_packet` cycles scenes 0..6 and 8..15 (`procedural_scene` in
+    `visual_math.h`).
   - `chipsynth_stream.py` never maps a chip ID to scene 7. When the operator
     forces scene 7, it sends a fixed, operator-chosen palette instead of the
     dominant channel.
