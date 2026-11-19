@@ -152,10 +152,13 @@ change the control-frame wire format.
   so steady tones hold still; the crossing is searched for in the newest
   period of a 30 Hz tone (at least 1,024 samples; 1,600 at 48 kHz), so the
   window can end up to about 33 ms (at 44.1 kHz and above) before the newest
-  sample. It is peak-normalised with a floor so room hiss stays flat, and
-  silence flattens it smoothly. It is drawn in three near-opaque layers: a
-  dimmed palette-tinted halo, a black backing inside it, and a near-white
-  tinted core, which keep it readable over scenes of the same colour.
+  sample. Its 256 points each cover 8 samples; tones too fast for them to
+  follow (a few kHz and up) are drawn as a zigzag between each point's
+  extremes, so they keep their loudness. It is peak-normalised with a floor
+  so room hiss stays flat, and silence flattens it smoothly. It is drawn in
+  three near-opaque layers: a dimmed palette-tinted halo, a black backing
+  inside it, and a near-white tinted core, which keep it readable over scenes
+  of the same colour.
 - `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
   rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
   one arriving less than 0.5 s after the last burst started is skipped, and

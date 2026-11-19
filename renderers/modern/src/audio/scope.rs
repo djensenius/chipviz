@@ -132,10 +132,14 @@ pub fn trigger(history: &[f32]) -> usize {
 
 /// Click-preserving decimation: each output point is `max + min - mean` of
 /// its share of `samples`, i.e. the mean plus both extremes' deviations from
-/// it. A ramp or a full cycle deviates evenly both ways and keeps its mean, so
-/// steep tones do not alias or flicker with sub-sample shifts, while a short
-/// one-sided click keeps most of its height. Empty shares (more points than
-/// samples) repeat the nearest sample.
+/// it. A ramp deviates evenly both ways and keeps its mean, so steep tones do
+/// not flicker with sub-sample shifts, while a short one-sided click keeps
+/// most of its height. Where the signal oscillates faster than the points can
+/// follow (at least three large swings, see [`swings`], around the share), a
+/// full cycle would cancel to its mean and a loud tone would look silent, so
+/// the points instead alternate between each share's maximum and minimum,
+/// drawing the tone's envelope. Empty shares (more points than samples)
+/// repeat the nearest sample.
 pub fn decimate(samples: &[f32], out: &mut [f32]) {
     let points = out.len();
     for (index, point) in out.iter_mut().enumerate() {
@@ -152,8 +156,63 @@ pub fn decimate(samples: &[f32], out: &mut [f32]) {
             (f32::INFINITY, f32::NEG_INFINITY, 0.0),
             |(low, high, sum), &sample| (low.min(sample), high.max(sample), sum + sample),
         );
-        *point = high + low - sum / share.len() as f32;
+        // The share plus one and a half shares either side, so tones of up to
+        // about two points per cycle show their swings whatever the phase.
+        let margin = share.len() * 3 / 2;
+        let around = &samples[start.saturating_sub(margin)..(end + margin).min(samples.len())];
+        *point = if swings(around) >= 3 {
+            if index % 2 == 0 { high } else { low }
+        } else {
+            high + low - sum / share.len() as f32
+        };
     }
+}
+
+/// Monotone runs in `window` that each travel at least half its range, up to
+/// 3. A ramp has 1 and a click or a half cycle 2, while noise smaller than
+/// half the range never starts a run, so slow tones with hiss keep their
+/// shape; 3 means at least one full oscillation.
+fn swings(window: &[f32]) -> usize {
+    let Some(&first) = window.first() else {
+        return 0;
+    };
+    let (low, high) = window
+        .iter()
+        .fold((first, first), |(low, high), &v| (low.min(v), high.max(v)));
+    let step = 0.5 * (high - low);
+    if step <= 0.0 {
+        return 0;
+    }
+    // Before the first run, `low..high` is the range seen so far; after it,
+    // `extreme` is the furthest point of the current run.
+    let (mut low, mut high) = (first, first);
+    let mut rising: Option<bool> = None;
+    let mut extreme = first;
+    let mut runs = 0;
+    for &value in window {
+        match rising {
+            None => {
+                low = low.min(value);
+                high = high.max(value);
+                if value - low >= step || high - value >= step {
+                    rising = Some(value - low >= step);
+                    (extreme, runs) = (value, 1);
+                }
+            }
+            Some(up) => {
+                if (value - extreme) * if up { 1.0 } else { -1.0 } > 0.0 {
+                    extreme = value;
+                } else if (extreme - value).abs() >= step {
+                    rising = Some(!up);
+                    (extreme, runs) = (value, runs + 1);
+                    if runs == 3 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    runs
 }
 
 /// Wait-free single-writer publication of the latest [`ScopeSnapshot`].
@@ -224,6 +283,67 @@ mod tests {
         let mut out = [9.0; 4];
         decimate(&[], &mut out);
         assert_eq!(out, [0.0; 4]);
+    }
+
+    /// The weakest, over start phases within one sample of a rising zero
+    /// crossing, of the largest absolute point of a full-scale `hz` tone at
+    /// `rate`.
+    fn weakest_view(rate: f32, hz: f32) -> f32 {
+        let step = std::f32::consts::TAU * hz / rate;
+        (0..8)
+            .map(|offset| {
+                let phase = step * offset as f32 / 8.0;
+                let tone: Vec<f32> = (0..SPAN).map(|n| (step * n as f32 + phase).sin()).collect();
+                let mut points = [0.0; POINTS];
+                decimate(&tone, &mut points);
+                points
+                    .iter()
+                    .fold(0.0_f32, |peak, point| peak.max(point.abs()))
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn decimation_keeps_tones_tied_to_the_point_spacing_visible() {
+        // Eight samples per point at 48 kHz: 6 kHz puts exactly one cycle in
+        // each share, 12 kHz two, and 6.01 kHz drifts slowly across them.
+        // 2 to 4 kHz are a few points per cycle. The span starts anywhere
+        // within the sample after a rising crossing, as the trigger leaves it.
+        for hz in [
+            2_000.0, 3_000.0, 4_000.0, 6_000.0, 6_010.0, 12_000.0, 18_000.0,
+        ] {
+            let seen = weakest_view(48_000.0, hz);
+            assert!(seen >= 0.5, "{hz} Hz at full scale shows only {seen}");
+        }
+        // At 96 kHz the share is 8 samples too, so 12 kHz is one cycle each.
+        let seen = weakest_view(96_000.0, 12_000.0);
+        assert!(seen >= 0.5, "12 kHz at 96 kHz shows only {seen}");
+        // Slow tones keep their shape rather than turning into an envelope.
+        let mut points = [0.0; POINTS];
+        let slow: Vec<f32> = (0..SPAN)
+            .map(|n| (std::f32::consts::TAU * 440.0 * n as f32 / 48_000.0).sin())
+            .collect();
+        decimate(&slow, &mut points);
+        let jump = points
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0, f32::max);
+        // One point is 8 samples: 2 pi 440 * 8 / 48000 = 0.46 at most.
+        assert!(jump < 0.5, "a 440 Hz tone zigzags by {jump}");
+    }
+
+    #[test]
+    fn swings_count_oscillations_not_clicks_or_hiss() {
+        assert_eq!(swings(&[]), 0);
+        assert_eq!(swings(&[0.3; 8]), 0);
+        assert_eq!(swings(&[0.0, 0.1, 0.2, 0.3]), 1);
+        assert_eq!(swings(&[0.1, 0.1, -0.9, 0.1, 0.1]), 2);
+        assert_eq!(swings(&[0.0, 1.0, 0.0, -1.0, 0.0, 1.0]), 3);
+        // A ramp with small hiss on it is still one run.
+        let hissy: Vec<f32> = (0..32)
+            .map(|n| n as f32 * 0.1 + if n % 2 == 0 { 0.05 } else { -0.05 })
+            .collect();
+        assert_eq!(swings(&hissy), 1);
     }
 
     #[test]

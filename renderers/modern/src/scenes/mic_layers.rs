@@ -157,6 +157,13 @@ pub fn burst_envelope(age: f32) -> f32 {
     ((-(age - ATTACK_S) / DECAY_S).exp() - tail) / (1.0 - tail)
 }
 
+/// Root mean square of `wave`, at most 1.
+fn rms(wave: &[f32; POINTS]) -> f32 {
+    (wave.iter().map(|point| point * point).sum::<f32>() / POINTS as f32)
+        .sqrt()
+        .min(1.0)
+}
+
 /// The no-mic ribbon: each spectrum band is a sine with its own number of
 /// cycles across the ribbon and its own drift, weighted by its level; the sum
 /// is normalised by the total level and scaled by energy, so silence is flat.
@@ -204,6 +211,8 @@ pub struct MicLayers {
     mode: Mode,
     wave: [f32; POINTS],
     level: f32,
+    /// Whether the ribbon was drawn last step; `wave` is stale otherwise.
+    ribbon_shown: bool,
     bursts: [Option<Burst>; MAX_BURSTS],
     serial: u32,
     last_trigger: Option<Trigger>,
@@ -221,6 +230,7 @@ impl MicLayers {
             mode,
             wave: [0.0; POINTS],
             level: 0.0,
+            ribbon_shown: false,
             bursts: [None; MAX_BURSTS],
             serial: 0,
             last_trigger: None,
@@ -241,8 +251,10 @@ impl MicLayers {
 
     /// Advances to `elapsed`: eases the ribbon towards this frame's waveform
     /// (`live`, or synthesised from `frame`) and starts a burst on a new onset
-    /// (live) or beat (fallback). The ribbon eases whatever the mode, so
-    /// toggling it on shows its current state, but bursts only start while
+    /// (live) or beat (fallback). The ribbon is only updated while it is drawn
+    /// (`shown` and the mode includes the scope), so nothing is synthesised
+    /// for a hidden ribbon; when it reappears it starts at the current
+    /// waveform instead of easing from a stale one. Bursts only start while
     /// they are drawn (`shown`, see [`shown`], and the mode includes
     /// bursts), so none pop in mid-fade. Live bursts are dropped while hidden
     /// (the start-rate cap is kept), so none reappear mid-fade either. Time
@@ -259,16 +271,24 @@ impl MicLayers {
         let delta = now - previous;
         self.last_elapsed = Some(now);
 
-        let target = match live {
-            Some(snapshot) => snapshot.points,
-            None => synthesise(frame, now),
-        };
-        let blend = -(-delta / SMOOTH_S).exp_m1();
-        for (point, target) in self.wave.iter_mut().zip(target) {
-            *point += (target - *point) * blend;
+        let ribbon = shown && self.mode.scope();
+        if ribbon {
+            let target = match live {
+                Some(snapshot) => snapshot.points,
+                None => synthesise(frame, now),
+            };
+            if self.ribbon_shown {
+                let blend = -(-delta / SMOOTH_S).exp_m1();
+                for (point, target) in self.wave.iter_mut().zip(target) {
+                    *point += (target - *point) * blend;
+                }
+                self.level += (rms(&self.wave) - self.level) * -(-delta / LEVEL_S).exp_m1();
+            } else {
+                self.wave = target;
+                self.level = rms(&self.wave);
+            }
         }
-        let rms = (self.wave.iter().map(|point| point * point).sum::<f32>() / POINTS as f32).sqrt();
-        self.level += (rms.min(1.0) - self.level) * -(-delta / LEVEL_S).exp_m1();
+        self.ribbon_shown = ribbon;
 
         let trigger = match live {
             Some(snapshot) => Trigger::Onsets(snapshot.onsets),
@@ -628,6 +648,43 @@ mod tests {
             fallback.step(quiet(), None, step as f32 / FPS, true);
         }
         assert!(amplitude(&fallback) < 1e-4);
+    }
+
+    #[test]
+    fn a_hidden_ribbon_is_not_synthesised_and_starts_current_when_shown() {
+        let frame = ControlFrame::procedural(40);
+        // Off, bursts only, or over the colour field: nothing is computed.
+        for (mode, visible) in [(Mode::Off, true), (Mode::Bursts, true), (Mode::Both, false)] {
+            let mut layers = MicLayers::new(mode);
+            for step in 0..30 {
+                layers.step(frame, None, step as f32 / FPS, visible);
+            }
+            assert_eq!(layers.wave, [0.0; POINTS], "{mode:?} shown={visible}");
+            assert_eq!(layers.level, 0.0);
+            // Shown: the first drawn frame is the current waveform, not an
+            // ease from the stale (flat) one.
+            layers.set_mode(Mode::Scope);
+            layers.step(frame, None, 0.5, true);
+            assert_eq!(layers.wave, synthesise(frame, 0.5), "{mode:?}");
+            assert_eq!(layers.level, rms(&layers.wave));
+            // Then it eases as usual: one frame towards silence keeps
+            // exp(-1 / (60 SMOOTH_S)) of it.
+            let shown_at = amplitude(&layers);
+            layers.step(quiet(), None, 0.5 + 1.0 / FPS, true);
+            let kept = amplitude(&layers) / shown_at;
+            let expected = (-1.0 / (FPS * SMOOTH_S)).exp();
+            assert!((kept - expected).abs() < 1e-3, "{mode:?}: {kept}");
+        }
+        // Hiding again keeps the last waveform untouched, and live input also
+        // starts current on return.
+        let mut layers = MicLayers::new(Mode::Scope);
+        layers.step(quiet(), Some(&snapshot(0.8, 0)), 0.0, true);
+        assert_eq!(layers.wave, snapshot(0.8, 0).points);
+        let held = layers.wave;
+        layers.step(quiet(), Some(&snapshot(0.2, 0)), 0.1, false);
+        assert_eq!(layers.wave, held);
+        layers.step(quiet(), Some(&snapshot(0.2, 0)), 0.2, true);
+        assert_eq!(layers.wave, snapshot(0.2, 0).points);
     }
 
     #[test]
