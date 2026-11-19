@@ -265,7 +265,11 @@ ENDC
   xor a
   ld [wEntryPending], a
   call SceneEntry
-  jr .output
+  call BuildField
+IF DEF(CHIPVIZ_INPUT_ROLE_OPERATOR)
+  call EntryPulse
+ENDC
+  jr .debounce
 .field
   ; Steps 1-7 and the render, then requests: a request applied at the end
   ; of step t is visible from t + 1.
@@ -478,7 +482,9 @@ IF DEF(CHIPVIZ_INPUT_ROLE_OPERATOR)
   add [hl]
   and 7
   ld [hl], a
-  ld a, 1
+  ld a, [wShown7]        ; outside scene 7 nothing is shown: no pulse
+  or a
+  jr z, .pin
   ld [wOpPal], a
 ELSE
   ld hl, wPalRing
@@ -502,8 +508,12 @@ IF DEF(CHIPVIZ_INPUT_ROLE_OPERATOR)
   ld [wOpPin], a
   ld a, [wShown7]
   or a
-  jr nz, .done
-  ld a, [wPinReq]        ; not shown: nothing visible, apply now
+  jr z, .pinNow
+  ld a, [wEntryPending]  ; entering this step: the entry uses wPin
+  or a
+  jr z, .done
+.pinNow
+  ld a, [wPinReq]        ; nothing visible yet: apply now
   ld [wPin], a
   xor a
   ld [wOpPin], a
@@ -612,7 +622,6 @@ SceneEntry:
   ld [wLatch], a
   ld [wReqPending], a
   ld [wPinPending], a
-  ld [wOpPal], a
   ld [wOpPin], a
   ld [wSinceLay], a
   ld [wSinceLay + 1], a
@@ -657,9 +666,14 @@ IF DEF(CHIPVIZ_FIXTURE)
   jr .peff
 .wire
 ENDC
-  ld a, [wPalIn]         ; wire: the entry value counts as step 1
-  ld [wWireVal], a
-  ld a, 1
+  ld a, [wPalIn]         ; wire: the entry value counts as step 1, but
+  ld [wWireVal], a       ; only inside the scene-7 window
+  ld a, [wSceneIn]
+  cp 7
+  ld a, 0
+  jr nz, .wireN
+  inc a
+.wireN
   ld [wWireN], a
   xor a
   ld [wWireUsed], a
@@ -1781,6 +1795,24 @@ BuildField:
 
 ; ---------------------------------------------------------------------------
 IF DEF(CHIPVIZ_INPUT_ROLE_OPERATOR)
+; Operator role: a palette press on the entry step is already in wPEff; an
+; unarmed 3 or 7 still opens the warning after the scene is initialised.
+EntryPulse:
+  ld a, [wOpPal]
+  or a
+  ret z
+  xor a
+  ld [wOpPal], a
+  ld a, [wPalSel]
+  and 3
+  cp 3
+  ret nz
+  ld a, [wSceneIn]       ; leaving again this step (exempt): no warning
+  cp 7
+  ret nz
+  ld a, [wPalSel]
+  jp StartWarning
+
 ; Console warning screen (operator role only). The detector is paused.
 StartWarning:
   ld [wWarnP], a
@@ -1811,6 +1843,9 @@ WarnStep:
   ld c, 0
   cp PAD_START
   jr nz, .leave          ; any other input cancels: unarmed, runs as mode 2
+  ld a, [wShownShow]     ; Start before the warning reached the display:
+  cp SHOW_WARN           ; ignored, it cannot confirm unseen text
+  jr nz, .timer
   inc c                  ; Start: armed request, applied under the budget
   jr .leave
 .timer

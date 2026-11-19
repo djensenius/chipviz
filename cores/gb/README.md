@@ -90,9 +90,12 @@ or analogue input.
   through P_STABLE, so it never arms (F24). Modes 3 and 7 run as 2 and 6.
 - **Operator role** (`make INPUT_ROLE=operator`, `chipviz-gb-operator.gb`):
   scene presses apply at once; palette presses are operator pulses. Choosing 3
-  or 7 while unarmed shows the photosensitivity warning: Start arms, any other
-  press cancels (runs unarmed as mode 2/6), and it times out after 600 steps.
-  Pulses last 4 steps and start at least 8 steps apart.
+  or 7 while unarmed shows the photosensitivity warning: Start arms (only once
+  the warning is on screen), any other press cancels (runs unarmed as mode
+  2/6), and it times out after 600 steps. A palette or Select press on the
+  scene-entry step applies to the entry (an unarmed 3 or 7 opens the warning);
+  palette presses in a native scene only set the entry palette. Pulses last
+  4 steps and start at least 8 steps apart.
 
 `just gb-rom` builds both roles. `make FIXTURE=1` builds
 `chipviz-gb-fixture.gb` for the emulator tests only: each step takes one

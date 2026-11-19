@@ -32,6 +32,7 @@ SEQ, CTL, LOCAL_P, ARMED, PIN, SCENE, PAL, OP_REQ, OP_P, OP_ARMED, FX_IN = range
 CTL_WIRE, CTL_PAD = 1, 2
 BEAT, BAR, DROP = 1, 2, 4
 PIN_AUTO = 0xFF
+PAD_SELECT, PAD_RIGHT = 0x04, 0x10  # wPad: buttons low nibble, directions high
 
 # Spec DMG table: shade per region entry for each combo, and the grey levels.
 COMBOS = {2: [(0, 3), (1, 3), (0, 2), (3, 1)], 3: [(0, 3, 1), (3, 0, 2), (1, 3, 0), (0, 2, 3)]}
@@ -457,6 +458,17 @@ class GbColourFieldFixtures(unittest.TestCase):
     self.assertTrue(all(s[0] == 3 for s in trace[330:]))
     self.assertEqual(trace[330][5:7], (1, 1))
 
+  def test_entry_frame_outside_window(self):
+    # Scene 7 is debounced at step 39; the entry frame (40) carries scene 6,
+    # then scene 7 with palette 3 returns. The wire count starts at 41, so
+    # the request is made on its 30th frame (70) and shows from 71.
+    def inputs(t):
+      return {"in": flat(100), "scene": 6 if t < 10 or t == 40 else 7, "pal": 3}
+    trace = self.rom.run(inputs, steps=120, wire=True)
+    self.assertTrue(all(s is None for s in trace[:40]))
+    self.assertEqual(next(t for t, s in enumerate(trace) if s and s[0] == 3), 71)
+    self.assertTrue(all(s[0] == 3 for s in trace[71:]))
+
   def test_f24_relative_palette(self):
     def inputs(t):
       buttons = ("right",) if t in (10, 20, 30) else ("left",) if t == 130 else ()
@@ -473,9 +485,10 @@ class Pad(Rom):
     lo, hi = self.gb.read(STEP, 2)
     return lo | hi << 8
 
-  def run(self, steps, buttons=lambda t: ()):
+  def run(self, steps, buttons=lambda t: (), probe=()):
     """trace[t] is step t's trace; shown[t] and frames[t] are the shown
-    trace (copied at VBlank with the registers) and the frame drawn with it."""
+    trace (copied at VBlank with the registers) and the frame drawn with it.
+    probe names WRAM variables recorded with each trace in self.probes."""
     self.gb.reset()  # the core may fill WRAM; Main clears it before step 0
     for _ in range(600):
       self.gb.run_frame()
@@ -484,6 +497,7 @@ class Pad(Rom):
     else:
       raise AssertionError("ROM never stepped")
     self.trace = [self.gb.read(TRACE, 9)]
+    self.probes = {name: [self.gb.read(self.symbols[name])[0]] for name in probe}
     self.shown, self.frames = [], []
     while len(self.trace) < steps:
       # The core latches the pad a frame early, so the next step reads these.
@@ -491,6 +505,8 @@ class Pad(Rom):
       if self.step() != len(self.trace) + 1:
         raise AssertionError(f"step clock {self.step()} after {len(self.trace)} steps")
       self.trace.append(self.gb.read(TRACE, 9))
+      for name, values in self.probes.items():
+        values.append(self.gb.read(self.symbols[name])[0])
       self.shown.append(self.gb.read(SHOWN, 9))
       self.frames.append(self.gb.frame)
 
@@ -507,7 +523,8 @@ class GbColourFieldCaptures(unittest.TestCase):
     CAPTURES.mkdir(parents=True, exist_ok=True)
 
   def start(self, role="data"):
-    rom = Pad(HOMEBREW / ("chipviz-gb-operator.gb" if role == "operator" else "chipviz-gb.gb"), video=True)
+    rom = Pad(HOMEBREW / ("chipviz-gb-operator.gb" if role == "operator" else "chipviz-gb.gb"), video=True,
+              symbols=HOMEBREW / "build" / role / "chipviz-gb.sym")
     self.addCleanup(rom.close)
     return rom
 
@@ -591,7 +608,6 @@ class GbColourFieldCaptures(unittest.TestCase):
     i = next(i for i, s in enumerate(rom.shown) if s[0] == 2)
     self.assertLess(i, 40)
     (CAPTURES / "operator-warning.png").write_bytes(rom.frames[i + 2].png())
-    rom = self.start("operator")
     beats = {t: "b" for t in range(100, 300, 20)}
     rom.run(300, held({10: "up", 14: "b", 20: "right", 24: "right", 28: "right", 40: "start", **beats}))
     self.assertEqual({s[1] for s in rom.trace[100:]}, {3})
@@ -633,6 +649,56 @@ class GbColourFieldCaptures(unittest.TestCase):
     trace, warning = self.operator_warning(200, {**held_start, 28: ("start", "right"), 29: ("start", "right"), 90: "start"})
     self.assertIn(warning[-1], (89, 90, 91))
     self.assertTrue(all(s[1] == 3 for s in trace[warning[-1] + 10:]))
+
+  def test_operator_start_before_warning_shown(self):
+    # A fresh Start on the step after mode 3 is chosen comes before the
+    # warning reaches the display: it must not confirm unseen text.
+    rom = self.start("operator")
+    press = {10: "up", 14: "b", 20: "right", 24: "right", 28: "right", 29: ("right", "start"), 30: "start"}
+    rom.run(120, held(press))
+    self.assertNotIn(3, {s[1] for s in rom.trace})
+    warning = [t for t, s in enumerate(rom.trace) if s[0] == 2]
+    self.assertTrue(warning)
+    self.assertEqual(warning, list(range(warning[0], 120)))
+    self.assertTrue(any(s[0] == 2 for s in rom.shown))
+
+  def press_on_entry(self, rom, button, bit, setup=None, steps=60):
+    """Up at step 20, then button a few steps later: the pad reaches the ROM
+    up to a frame late, so try delays until the button's new edge lands on
+    the scene-entry step. Returns the entry step."""
+    setup = setup or (lambda t: ())
+    for delay in range(4):
+      rom.run(steps, lambda t: setup(t) + (("up",) if t in (20, 21) else ())
+              + ((button,) if t in (20 + delay, 21 + delay) else ()), probe=("wPad",))
+      entry = next(t for t, s in enumerate(rom.trace) if s[0] == 1)
+      pad = rom.probes["wPad"]
+      if pad[entry] & bit and not pad[entry - 1] & bit:
+        return entry
+    self.fail(f"{button} never landed on the entry step")
+
+  def test_operator_entry_step_select(self):
+    # Select on the scene-entry step pins the layout (auto -> V2) for the entry.
+    rom = self.start("operator")
+    self.press_on_entry(rom, "select", PAD_SELECT)
+    self.assertEqual(rom.gb.read(rom.symbols["wPin"])[0], V2)
+    self.assertEqual(rom.gb.read(rom.symbols["wPinReq"])[0], V2)
+
+  def test_operator_entry_step_mode3(self):
+    # Palette 2 in the native scene, Up, then Right on the entry step: the
+    # unarmed mode 3 opens the warning instead of running as mode 2.
+    rom = self.start("operator")
+    entry = self.press_on_entry(rom, "right", PAD_RIGHT, held({10: "right", 14: "right"}))
+    self.assertEqual([t for t, s in enumerate(rom.trace) if s[0] == 2], list(range(entry + 1, 60)))
+    self.assertNotIn(3, {s[1] for s in rom.trace})
+
+  def test_operator_native_palette_is_not_a_pulse(self):
+    # Palette 3 chosen in the native scene is stale: entry runs it unarmed as
+    # mode 2 and shows no warning.
+    rom = self.start("operator")
+    rom.run(60, held({10: "right", 14: "right", 18: "right", 30: "up"}))
+    entry = next(t for t, s in enumerate(rom.trace) if s[0] == 1)
+    self.assertNotIn(2, {s[0] for s in rom.trace})
+    self.assertEqual({s[1] for s in rom.trace[entry:]}, {2})
 
   def test_fixture_black_rests(self):
     # Silence (F0) on the fixture build: spectral black, and the flash/gate
