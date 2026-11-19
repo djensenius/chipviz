@@ -30,6 +30,20 @@
 //! two falls fit in 0.8 s, and a pixel can reach 3.) Where the scene moves,
 //! the added light also changes by up to the scene's own change (above).
 //!
+//! The bound is on the added light, not on the output: a scene animating in
+//! step with the layers can combine with them into flashes neither makes
+//! alone (a grey pixel alternating 0 and 0.09084 at 5 Hz under emission
+//! alternating 0 and 10/255 in step flashes 5 times in 1 s at 120 fps; see
+//! the `a_scene_animating_in_step_with_the_layers_can_flash_the_output`
+//! test). Added light cannot show over white, where the output is the
+//! scene; darkening the scene would make the layers' falls depend on it.
+//!
+//! A resize drops the display at once (it no longer lines up), a fall of
+//! at most [`Fading::brightest`]; [`Settle`] then holds the layers dark for
+//! as long as the decay would have taken to fade that much, so the drop and
+//! hold together take no less time than the decay and the bound above
+//! still holds across stepped resizes.
+//!
 //! Red flashes are not bounded. They need a saturated red
 //! (`R / (R + G + B) >= 0.8`, linear) at one end of a change of
 //! `max(R - G - B, 0)` by more than 20/320, and green or blue rising over a
@@ -42,8 +56,9 @@
 //! layer that is relit as soon as it has faded makes 3 red flashes in 1 s.
 //! Masking the layers out over red scene pixels would need a steep
 //! function of the scene, which turns small scene changes into large
-//! changes of the layers, so the mic layers are built only with the
-//! `unmeasured-flash` feature (see `scenes::mic_layers`).
+//! changes of the layers. So, for red and for the combined output, the mic
+//! layers are built only with the `unmeasured-flash` feature (see
+//! `scenes::mic_layers`).
 //!
 //! Only the composite reads the scene; the display (and so capture replay)
 //! never depends on it. With a target that is not sRGB, the composite
@@ -51,7 +66,8 @@
 //! either kind of surface.
 //!
 //! Nothing here runs while the layers draw nothing and the display is
-//! dark, so layers `off` render exactly as before them.
+//! dark, so layers `off` render exactly as before them, and the textures
+//! are freed once the display is dark.
 
 use crate::scene::QUAD_VERTICES;
 
@@ -113,33 +129,153 @@ impl DecayClock {
     }
 }
 
-/// Waits for a resized target to hold still, so an interactive drag does
-/// not reallocate the phosphor every frame.
-#[derive(Clone, Copy, Debug, Default)]
+/// The display's decay clock and how far it has decayed since the layers
+/// last drew, which bounds its brightest pixel on the CPU.
+#[derive(Clone, Copy, Debug)]
+pub struct Fading {
+    clock: DecayClock,
+    /// Decay steps since the layers last drew: from `GRID` the display is
+    /// black (the red floor never lifts green or blue above red).
+    faded: u32,
+}
+
+impl Default for Fading {
+    fn default() -> Self {
+        Self {
+            clock: DecayClock::default(),
+            faded: GRID as u32,
+        }
+    }
+}
+
+impl Fading {
+    /// The decay, in grid steps, for a frame at overlay time `now` that
+    /// emits light when `drew`.
+    pub fn tick(&mut self, now: f64, drew: bool) -> u32 {
+        let amount = self.clock.tick(now);
+        self.faded = if drew {
+            0
+        } else {
+            self.faded.saturating_add(amount)
+        };
+        amount
+    }
+
+    /// Every pixel is black, so skipping the passes draws the same.
+    pub fn is_dark(&self) -> bool {
+        self.faded >= GRID as u32
+    }
+
+    /// An upper bound on any display channel: at most 1 when last drawn,
+    /// less each decay step since.
+    pub fn brightest(&self) -> f32 {
+        (GRID - self.faded as f32).max(0.0) / GRID
+    }
+}
+
+/// What the phosphor does this frame (see [`Settle::plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Run no pass and hold no phosphor: free any (it is dark, or was just
+    /// dropped for a resize) and draw the scene alone.
+    Idle,
+    /// Make a dark phosphor at the current size, then run the passes.
+    Make,
+    /// Run the passes on the phosphor held.
+    Draw,
+}
+
+/// Decides when the phosphor is made, kept and freed. It waits for a
+/// resized target to hold still, so an interactive drag does not
+/// reallocate it every frame, and after a resize drops a lit display it
+/// holds the layers dark for as long as the decay would have taken to fade
+/// that display. The hold is kept here, on the CPU, not in the textures.
+#[derive(Clone, Copy, Debug)]
 pub struct Settle {
     pending: Option<((u32, u32), f64)>,
+    /// No new layer light before this overlay time.
+    dark_until: f64,
+    /// The fall rate the hold assumes: `DECAY_PER_S`, except in tests that
+    /// show what happens without the hold.
+    hold_rate: f32,
+}
+
+impl Default for Settle {
+    fn default() -> Self {
+        Self::with_hold_rate(DECAY_PER_S)
+    }
 }
 
 impl Settle {
+    pub fn with_hold_rate(hold_rate: f32) -> Self {
+        Self {
+            pending: None,
+            dark_until: f64::NEG_INFINITY,
+            hold_rate,
+        }
+    }
+
+    /// The plan for a frame at overlay time `now` with `count` overlay
+    /// instances at target `size`, given the size and fading of the
+    /// phosphor held, if any.
+    ///
+    /// A dark phosphor with nothing to draw is freed (all four textures),
+    /// so the next one is made at once at the size then current. A resize
+    /// drops the phosphor (its afterglow no longer lines up). When it was
+    /// lit, that drop is a fall of at most [`Fading::brightest`], so no new
+    /// light is drawn until the decay would have faded that much (at most
+    /// `1 / DECAY_PER_S`, about 6.7 s): stepped resizes cannot blink the
+    /// layers on and off faster than the decay lets them fade.
+    pub fn plan(
+        &mut self,
+        held: Option<((u32, u32), &Fading)>,
+        count: usize,
+        size: (u32, u32),
+        now: f64,
+    ) -> Plan {
+        if count == 0 && held.is_none_or(|(_, fading)| fading.is_dark()) {
+            if held.is_some() {
+                self.pending = None;
+            }
+            return Plan::Idle;
+        }
+        let resized = match held {
+            Some((held_size, fading)) if held_size != size => {
+                if !fading.is_dark() {
+                    let hold = f64::from(fading.brightest() / self.hold_rate);
+                    self.dark_until = self.dark_until.max(now + hold);
+                }
+                true
+            }
+            Some(_) => return Plan::Draw,
+            None => false,
+        };
+        if self.ready(resized, size, now) {
+            Plan::Make
+        } else {
+            Plan::Idle
+        }
+    }
+
     /// Called when no phosphor matches `size` at overlay time `now`;
     /// `resized` when one of another size was just dropped. Returns whether
     /// to make one now: at once the first time, otherwise once the size
-    /// has stayed the same for `SETTLE_S`.
-    pub fn ready(&mut self, resized: bool, size: (u32, u32), now: f64) -> bool {
-        match self.pending {
+    /// has stayed the same for `SETTLE_S`, and in either case not while a
+    /// dropped display is held dark.
+    fn ready(&mut self, resized: bool, size: (u32, u32), now: f64) -> bool {
+        let settled = match self.pending {
             None if !resized => true,
-            Some((pending, since)) if !resized && pending == size => {
-                let ready = now - since >= SETTLE_S;
-                if ready {
-                    self.pending = None;
-                }
-                ready
-            }
+            Some((pending, since)) if !resized && pending == size => now - since >= SETTLE_S,
             _ => {
                 self.pending = Some((size, now));
                 false
             }
+        };
+        let ready = settled && now >= self.dark_until;
+        if ready {
+            self.pending = None;
         }
+        ready
     }
 }
 
@@ -308,10 +444,7 @@ pub struct Phosphor {
     displays: [wgpu::TextureView; 2],
     /// The display holding the latest frame.
     current: usize,
-    clock: DecayClock,
-    /// Decay steps since the layers last drew: from `GRID` the display is
-    /// black (the red floor never lifts green or blue above red).
-    faded: u32,
+    fading: Fading,
 }
 
 impl Phosphor {
@@ -376,8 +509,7 @@ impl Phosphor {
             composite_groups,
             displays,
             current: 0,
-            clock: DecayClock::default(),
-            faded: GRID as u32,
+            fading: Fading::default(),
         }
     }
 
@@ -385,9 +517,8 @@ impl Phosphor {
         self.size
     }
 
-    /// Every pixel is black, so skipping the passes draws the same.
-    pub fn is_dark(&self) -> bool {
-        self.faded >= GRID as u32
+    pub fn fading(&self) -> &Fading {
+        &self.fading
     }
 
     /// Where to draw the scene for a frame that [`Phosphor::encode`] then
@@ -411,12 +542,7 @@ impl Phosphor {
         view: Option<&wgpu::TextureView>,
     ) {
         let count = overlay.count;
-        let amount = self.clock.tick(now);
-        self.faded = if count > 0 {
-            0
-        } else {
-            self.faded.saturating_add(amount)
-        };
+        let amount = self.fading.tick(now, count > 0);
         pipelines.write_params(queue, amount);
         {
             let mut pass = begin(encoder, "chipviz phosphor emit", &self.emitted);
@@ -538,6 +664,78 @@ mod tests {
         assert!(!settle.ready(false, (890, 600), held + SETTLE_S - 0.01));
         assert!(settle.ready(false, (890, 600), held + SETTLE_S + 0.001));
         assert!(settle.ready(false, (890, 600), held + 1.0));
+    }
+
+    #[test]
+    fn a_dark_phosphor_is_freed_and_remade_at_once_at_the_current_size() {
+        let mut settle = Settle::default();
+        let mut fading = Fading::default();
+        assert_eq!(settle.plan(None, 0, (800, 600), 0.0), Plan::Idle);
+        assert_eq!(settle.plan(None, 5, (800, 600), 0.0), Plan::Make);
+        fading.tick(0.0, true);
+        assert_eq!(
+            settle.plan(Some(((800, 600), &fading)), 0, (800, 600), 0.1),
+            Plan::Draw
+        );
+        // Faded out: freed, though nothing is drawn.
+        let mut now = 0.0;
+        while !fading.is_dark() {
+            now += 1.0 / 60.0;
+            fading.tick(now, false);
+        }
+        assert!(now >= 1.0 / f64::from(DECAY_PER_S) - 0.02, "{now}");
+        assert_eq!(
+            settle.plan(Some(((800, 600), &fading)), 0, (800, 600), now),
+            Plan::Idle
+        );
+        // Remade at once at another size: a dark display had nothing to
+        // drop, so neither settle nor hold applies.
+        assert_eq!(settle.plan(None, 5, (640, 480), now), Plan::Make);
+    }
+
+    #[test]
+    fn a_resize_that_drops_light_holds_the_layers_dark_while_it_would_decay() {
+        for (since_drawn, brightest) in [(0.0, 1.0), (2.0, 0.7), (6.0, 0.1)] {
+            let mut settle = Settle::default();
+            let mut fading = Fading::default();
+            fading.tick(0.0, true);
+            let mut now = 0.0;
+            while now < since_drawn {
+                now += 0.01;
+                fading.tick(now, false);
+            }
+            // The bound is the light left, give or take the clock's carry.
+            assert!(
+                (fading.brightest() - brightest).abs() < 0.01,
+                "{}",
+                fading.brightest()
+            );
+            let hold = f64::from(fading.brightest() / DECAY_PER_S);
+            assert_eq!(
+                settle.plan(Some(((800, 600), &fading)), 5, (640, 480), now),
+                Plan::Idle
+            );
+            // Settled long since, but held until the hold has passed.
+            for wait in [0.2, hold - 0.01] {
+                assert_eq!(
+                    settle.plan(None, 5, (640, 480), now + wait),
+                    Plan::Idle,
+                    "{wait}"
+                );
+            }
+            assert_eq!(
+                settle.plan(None, 5, (640, 480), now + hold.max(SETTLE_S)),
+                Plan::Make
+            );
+        }
+        // A dark phosphor dropped for a resize holds nothing back.
+        let mut settle = Settle::default();
+        let fading = Fading::default();
+        assert_eq!(
+            settle.plan(Some(((800, 600), &fading)), 5, (640, 480), 0.0),
+            Plan::Idle
+        );
+        assert_eq!(settle.plan(None, 5, (640, 480), SETTLE_S), Plan::Make);
     }
 
     #[test]

@@ -204,25 +204,30 @@ cover far more of the screen than the 13% one frame draws; a burst lingers
 for a few seconds after it ends; and turning the layers off fades them out
 over up to about 6.7 s rather than cutting. Entering the colour field (scene
 7), which is already a full-screen change, clears the afterglow at once, so
-nothing is ever drawn over it. A window resize clears the afterglow too, and
-the layers return once the size has held still for 0.15 s, so a drag does not
-reallocate anything each frame. Resizing in steps (each held for over
-0.15 s) therefore makes the layers blink off and back on, and their trails
-restart each time. Being added light, the layers brighten the scene beneath
-them and never darken it, and red layer colours are drawn slightly pink (see
-below).
+nothing is ever drawn over it. A window resize clears the afterglow too.
+That sudden fall is one the decay would have allowed, given time, so the
+layers then stay dark for as long as the decay would have taken to fade
+what was cleared (up to about 6.7 s after full brightness) and until the
+size has held still for 0.15 s, so a drag does not reallocate anything each
+frame. Resizing in steps therefore makes the layers vanish and return, with
+their trails restarted, but no faster than they could fade. Being added
+light, the layers brighten the scene beneath them and never darken it, so
+they cannot be seen where the scene is white (Static's white sections, for
+example); darkening the scene beneath them would make their falls depend on
+the scene, outside the bound below. Red layer colours are drawn slightly
+pink (see below).
 
 While the layers glow, the scene is drawn into a texture of its own and a
-final pass writes it with the layers added, in linear light; on a surface
-that is not sRGB, that pass decodes and encodes sRGB itself. The phosphor
-needs four 8-bit RGBA textures at the window size (the layers, two for the
+final pass writes it with the layers added, in linear light; on a surface that
+is not sRGB, that pass decodes and encodes sRGB itself. The phosphor needs
+four 8-bit RGBA textures at the window size (the layers, two for the
 afterglow, and the scene copy): about 33 MB at 1920x1080 and 133 MB at
 3840x2160. Nothing is allocated, and no pass runs, until the layers first
-draw. On an M1 Max, with scene 0 and both layers, a frame took about 0.3 ms
-longer at 1920x1080 (2.09 ms against 1.80 ms with layers off) and 1.8 ms
-longer at 3840x2160 (3.64 ms against 1.80 ms). The Pi 5 has not been
-measured; check its frame rate with the layers on before relying on them
-there, especially at 4K.
+draw, and the textures are freed again once the afterglow has faded out. On an
+M1 Max, with scene 0 and both layers, a frame took about 0.3 ms longer at
+1920x1080 (2.09 ms against 1.80 ms with layers off) and 1.8 ms longer at
+3840x2160 (3.64 ms against 1.80 ms). The Pi 5 has not been measured; check its
+frame rate with the layers on before relying on them there, especially at 4K.
 
 The layers' added light (the output minus the scene) depends on the scene
 only where a channel saturates at full brightness, so a scene change alters
@@ -238,6 +243,13 @@ the limit of three, with about 28% to spare for output rounding and frame
 timing. Where the scene moves, the added light also moves by up to the
 scene's own change.
 
+That bound is on the light the layers add, not on what reaches the screen.
+A scene that animates in step with the layers can combine with them into
+flashes neither makes alone: a grey scene point alternating between black
+and 0.091 at 5 Hz, under layers alternating between black and 10/255 in
+step, changes by more than 0.1 five times a second, at 120 fps. This is one
+reason the layers are gated (below).
+
 Red flashes are not bounded. A red flash needs a saturated red, at least 80%
 of a point's light, at one end of a change of its redness, and green or blue
 rising over a red point lowers its redness as much as red falling. The
@@ -248,28 +260,31 @@ relit as soon as they fade, make three red flashes in 1 s. Fading the layers
 out over red scene points would avoid that, but only with a steep switch on
 the scene's colour, which turns small, harmless scene changes (one level of
 noise near black, say) into large changes of the layers. Until there is a
-design with a stated bound, and the layers have been measured, they stay
-behind `unmeasured-flash`.
+design with a stated bound for red and for the combined output, and the
+layers have been measured, they stay behind `unmeasured-flash`.
 
-Unit tests run a CPU model of the phosphor against adversarial per-pixel
-input at 60, 120 and 240 fps, steady and jittered. For luminance (alternating
-every frame, square waves of every period, random colours, and input that
-relights a pixel as soon as it has dimmed by 0.1) they find at most two
-flashes in any 1 s; at 0.25 per second the relighting input reaches three.
-For red (red against white, red and green squares, relighting in red, green
-or white, a red and green staircase, and random colours) they find no
-saturated red over black, grey, orange, duller red and blue scenes, where
-per-channel decay with no floor allows three red flashes in 1 s, and they
-find three over saturated red scenes. Over animated scenes (one-level noise
-near black, a dark red changing every frame, and red and grey alternating at
-two flashes per second), the output never has more luminance or red flashes
-in 1 s than the larger of two and the scene's own; the earlier switch on the
-scene's colour turned the dark red into over 100 flashes in 1 s. GPU tests
-check that the composite matches its model on sRGB and non-sRGB targets;
-that the light added at any unsaturated pixel of an animated scene falls no
-faster than the decay; that a replayed still matches a live run; that the
-colour field is never drawn over; and that layers `off` render exactly as
-before the layers existed.
+Unit tests run a CPU model of the phosphor against adversarial per-pixel input
+at 60, 120 and 240 fps, steady and jittered. For luminance (alternating every
+frame, square waves of every period, random colours, and input that relights a
+pixel as soon as it has dimmed by 0.1) they find at most two flashes in any 1
+s; at 0.25 per second the relighting input reaches three. For red (red against
+white, red and green squares, relighting in red, green or white, a red and
+green staircase, and random colours) they find no saturated red over black,
+grey, orange, duller red and blue scenes, where per-channel decay with no
+floor allows three red flashes in 1 s, and they find three over saturated red
+scenes. Over animated scenes (one-level noise near black, a dark red changing
+every frame, and red and grey alternating at two flashes per second), the
+output never has more luminance or red flashes in 1 s than the larger of two
+and the scene's own for those inputs; the earlier switch on the scene's colour
+turned the dark red into over 100 flashes in 1 s. A regression test keeps the
+in-step counterexample above (five flashes in 1 s), and another pins the
+output to the scene over white. Windows alternating between two sizes every
+0.16 to 8 s give at most two flashes in 1 s; without the hold after a resize,
+every 0.2 s gives five. GPU tests check that the composite matches its model
+on sRGB and non-sRGB targets; that the light added at any unsaturated pixel of
+an animated scene falls no faster than the decay; that a replayed still
+matches a live run; that the colour field is never drawn over; and that layers
+`off` render exactly as before the layers existed.
 
 The design keeps the layers calm well within the luminance bound. Each burst
 is a single smooth, partly transparent rise and fall (glow at most 30% and

@@ -137,7 +137,8 @@ impl InputDevices {
 /// both.
 pub struct MicSource {
     shared: Arc<SharedFeatures>,
-    scope: Arc<SharedScope>,
+    /// Only in builds that can draw the mic layers, its sole reader.
+    scope: Option<Arc<SharedScope>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     // Dropped after `Drop::drop` has joined the analysis thread.
@@ -169,7 +170,7 @@ impl MicSource {
             .map_err(|error| describe(&name, "could not start capturing", &error))?;
 
         let shared = Arc::new(SharedFeatures::default());
-        let scope = Arc::new(SharedScope::default());
+        let scope = scope_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let shared = shared.clone();
@@ -180,7 +181,7 @@ impl MicSource {
                 .spawn(move || {
                     let outputs = Outputs {
                         features: &shared,
-                        scope: &scope,
+                        scope: scope.as_deref(),
                     };
                     analysis_loop(&mut analyzer, consumer, &dropped, outputs, &stop)
                 })
@@ -201,8 +202,9 @@ impl MicSource {
         self.shared.load()
     }
 
-    /// The waveform and onset side channel for the mic layers.
-    pub fn scope(&self) -> Arc<SharedScope> {
+    /// The waveform and onset side channel for the mic layers; `None` in
+    /// builds that never draw them.
+    pub fn scope(&self) -> Option<Arc<SharedScope>> {
         self.scope.clone()
     }
 }
@@ -710,10 +712,17 @@ fn feed(
     heard
 }
 
+/// The mic layers' waveform and onset side channel, made only when they
+/// can be drawn (`mic_layers::LAYERS_BUILD`): nothing else reads it, so
+/// default builds skip building and publishing a snapshot every poll.
+fn scope_channel() -> Option<Arc<SharedScope>> {
+    crate::scenes::mic_layers::LAYERS_BUILD.then(|| Arc::new(SharedScope::default()))
+}
+
 /// Where the analysis thread publishes each poll's results.
 struct Outputs<'a> {
     features: &'a SharedFeatures,
-    scope: &'a SharedScope,
+    scope: Option<&'a SharedScope>,
 }
 
 fn analysis_loop(
@@ -744,10 +753,12 @@ fn analysis_loop(
         );
         outputs.features.store(analyzer.features());
         // The onset count wraps; the mic layers only look for changes.
-        outputs.scope.store(&ScopeSnapshot {
-            onset_age_s: analyzer.onset_age_s(),
-            ..tap.snapshot(analyzer.onsets() as u32)
-        });
+        if let Some(scope) = outputs.scope {
+            scope.store(&ScopeSnapshot {
+                onset_age_s: analyzer.onset_age_s(),
+                ..tap.snapshot(analyzer.onsets() as u32)
+            });
+        }
 
         if !warned && !heard_signal && now.duration_since(started) > SILENCE_WARNING {
             warned = true;
@@ -763,6 +774,14 @@ fn analysis_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scope_is_published_only_in_builds_that_draw_the_mic_layers() {
+        assert_eq!(
+            scope_channel().is_some(),
+            crate::scenes::mic_layers::LAYERS_BUILD
+        );
+    }
 
     #[test]
     fn error_limiter_reports_once_per_interval_with_suppressed_count() {

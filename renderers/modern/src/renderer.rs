@@ -485,9 +485,11 @@ impl ScenePipeline {
     /// Steps the mic layers and uploads their instances. Returns the
     /// instance count when the phosphor passes should run this frame: while
     /// the layers draw or the phosphor still glows. With nothing drawn and a
-    /// dark phosphor (always, for layers `off`) no pass or texture is
-    /// touched. Over the colour field the phosphor is dropped at once, as
-    /// it is while a resized target settles.
+    /// dark phosphor (always, for layers `off`) no pass runs and the
+    /// phosphor's textures are freed. Over the colour field the phosphor is
+    /// dropped at once; a resize drops it and holds the layers dark while
+    /// the target settles and the dropped light would have decayed (see
+    /// `phosphor::Settle::plan`).
     fn prepare_mic_layers(
         &mut self,
         frame: ControlFrame,
@@ -510,32 +512,23 @@ impl ScenePipeline {
             self.mic_layers.build(frame, aspect, &mut overlay);
         }
         let count = overlay.len().min(mic_layers::MAX_INSTANCES);
-        if count == 0
-            && self
-                .phosphor
-                .as_ref()
-                .is_none_or(phosphor::Phosphor::is_dark)
-        {
-            return None;
-        }
-        // A new size starts dark (the old afterglow no longer lines up),
-        // once the size has held still.
-        let resized = self
+        let held = self
             .phosphor
             .as_ref()
-            .is_some_and(|glow| glow.size() != size);
-        if resized {
-            self.phosphor = None;
-        }
-        if self.phosphor.is_none() {
-            if !self.settle.ready(resized, size, elapsed) {
+            .map(|glow| (glow.size(), glow.fading()));
+        match self.settle.plan(held, count, size, elapsed) {
+            phosphor::Plan::Idle => {
+                self.phosphor = None;
                 return None;
             }
-            self.phosphor = Some(phosphor::Phosphor::new(
-                &self.device,
-                &self.phosphor_pipelines,
-                size,
-            ));
+            phosphor::Plan::Make => {
+                self.phosphor = Some(phosphor::Phosphor::new(
+                    &self.device,
+                    &self.phosphor_pipelines,
+                    size,
+                ));
+            }
+            phosphor::Plan::Draw => {}
         }
         if count > 0 {
             self.queue.write_buffer(

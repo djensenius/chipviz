@@ -39,9 +39,11 @@
 //! WCAG 2.3.1 general flash limit that `shared/specs/colour-field-v0.md`
 //! also follows, for any input, frame rate or geometry; where the scene
 //! moves, the added light changes by at most the scene's own change
-//! (1-Lipschitz, through saturation only). Red flashes are not bounded: the
-//! layers never make a saturated red where the scene has none, but over a
-//! scene pixel that is already saturated red they can make 3 in 1 s (the
+//! (1-Lipschitz, through saturation only). That bounds the light the layers
+//! add, not the output: a scene animating in step with them can combine
+//! with them into flashes neither makes alone. Red flashes are not bounded:
+//! the layers never make a saturated red where the scene has none, but over
+//! a scene pixel that is already saturated red they can make 3 in 1 s (the
 //! `phosphor_model` tests show both). Until that is solved and the layers
 //! are measured, they are built only with the `unmeasured-flash` feature,
 //! like flash/gate; default builds accept `--mic-layers` and `M`, print
@@ -50,8 +52,7 @@
 //! and exponential fall, its colour and peak strength fixed when it starts,
 //! and bursts start at most once every `MIN_BURST_GAP_S` however fast
 //! onsets arrive. The `phosphor_model` and `flash_model` tests check CPU
-//! models; they are not photometric measurements of a display or
-//! projector.
+//! models; they are not photometric measurements of a display or projector.
 //!
 //! Geometry is built in aspect space (x spans `-aspect..aspect`, y `-1..1`)
 //! and flattened by [`transform`], so rotated ribbon segments and round
@@ -1501,9 +1502,12 @@ mod tests {
     /// - a still saturated red.
     ///
     /// The layers' added light follows the scene one to one (C = 1, see
-    /// `phosphor`), so the output never has more luminance flashes in 1 s
-    /// than the larger of 2 and the scene's own, and, except over the still
-    /// saturated red, no more red flashes than that either (none over the
+    /// `phosphor`), so for these scenes the output never has more luminance
+    /// flashes in 1 s than the larger of 2 and the scene's own (a scene
+    /// animating in step with the layers can exceed that; see
+    /// `a_scene_animating_in_step_with_the_layers_can_flash_the_output`),
+    /// and, except over the still saturated red, no more red flashes than
+    /// that either (none over the
     /// dark red, which is never saturated). The earlier step mask turns the
     /// dark red's small changes into over 100 flashes in 1 s. Over the still
     /// saturated red, green blips make 3 red flashes in 1 s: not bounded
@@ -1678,6 +1682,175 @@ mod tests {
         let still_red = worst.iter().find(|entry| entry.0 == "still red").unwrap();
         assert!(still_red.3 >= 3, "{still_red:?}");
         eprintln!("step mask over the dark red: {masked_worst} flashes in 1 s");
+    }
+
+    /// One pixel's relative luminance per frame over black, through the
+    /// phosphor as the renderer keeps it (`Settle::plan`, `Fading`,
+    /// `decay_pixel`, `composite_pixel`), while the target alternates
+    /// between two sizes every `period` s and the layers draw every frame.
+    fn resized_pixel(
+        mut settle: crate::phosphor::Settle,
+        times: &[f64],
+        period: f64,
+        mut emit: impl FnMut(usize, [f32; 3]) -> [f32; 3],
+    ) -> Vec<f32> {
+        use crate::phosphor::{Fading, Plan, composite_pixel, decay_pixel};
+        let mut held: Option<((u32, u32), Fading, [f32; 3])> = None;
+        times
+            .iter()
+            .enumerate()
+            .map(|(step, &now)| {
+                let size = if ((now / period) as u64).is_multiple_of(2) {
+                    (800, 600)
+                } else {
+                    (640, 480)
+                };
+                let plan = settle.plan(
+                    held.as_ref().map(|(size, fading, _)| (*size, fading)),
+                    1,
+                    size,
+                    now,
+                );
+                match plan {
+                    Plan::Idle => {
+                        held = None;
+                        return 0.0;
+                    }
+                    Plan::Make => held = Some((size, Fading::default(), [0.0; 3])),
+                    Plan::Draw => {}
+                }
+                let (_, fading, display) = held.as_mut().expect("made above");
+                let amount = fading.tick(now, true);
+                *display = decay_pixel(*display, emit(step, *display), amount);
+                relative_luminance(composite_pixel([0.0; 3], *display))
+            })
+            .collect()
+    }
+
+    /// Stepped resizes drop the afterglow at once; the hold after a lit
+    /// drop (no new light until the decay would have faded it) keeps a
+    /// pixel to 2 flashes in any 1 s however the sizes alternate. Without
+    /// the hold, sizes alternating every 0.2 s blink the layers about 5
+    /// times a second.
+    #[test]
+    fn stepped_resizes_blink_the_layers_no_faster_than_the_decay() {
+        use crate::phosphor::Settle;
+        const SECONDS: f64 = 20.0;
+        let steady = || |_: usize, _: [f32; 3]| [1.0_f32; 3];
+        let greedy = || {
+            let mut peak = 0.0_f32;
+            move |_: usize, display: [f32; 3]| {
+                if peak == 0.0 || relative_luminance(display) <= peak - 0.1 {
+                    peak = 1.0;
+                    [1.0; 3]
+                } else {
+                    [0.0; 3]
+                }
+            }
+        };
+        let mut worst = (0, String::new());
+        let mut unheld = 0;
+        for fps in [60.0, 120.0, 240.0] {
+            for jitter in [false, true] {
+                let times = frame_times(fps, jitter, SECONDS);
+                for period in [0.16, 0.2, 0.25, 0.4, 0.7, 1.0, 1.5, 2.0, 2.5, 3.0, 7.0, 8.0] {
+                    let runs = [
+                        (
+                            "steady",
+                            resized_pixel(Settle::default(), &times, period, steady()),
+                        ),
+                        (
+                            "greedy",
+                            resized_pixel(Settle::default(), &times, period, greedy()),
+                        ),
+                    ];
+                    for (what, series) in runs {
+                        let (flashes, _) = most_flashes(&series, &times);
+                        if flashes > worst.0 {
+                            worst = (flashes, format!("{what} every {period} s at {fps} fps"));
+                        }
+                    }
+                    let series = resized_pixel(
+                        Settle::with_hold_rate(f32::INFINITY),
+                        &times,
+                        period,
+                        steady(),
+                    );
+                    if period == 0.2 {
+                        unheld = unheld.max(most_flashes(&series, &times).0);
+                    }
+                }
+            }
+        }
+        eprintln!("stepped resizes: at most {worst:?} flashes in 1 s; {unheld} without the hold");
+        assert!(worst.0 <= 2, "{worst:?}");
+        assert!(unheld >= 3, "{unheld}");
+    }
+
+    /// The bound is on the light the layers add, not on the output. A grey
+    /// scene alternating 0 and 0.09084 at 5 Hz and grey emission of 0 and
+    /// 10/255 in step with it each stay under 0.1, yet together swing the
+    /// output by more than 0.1 five times a second. This counterexample is
+    /// why the layers are drawn only in `unmeasured-flash` builds.
+    #[test]
+    fn a_scene_animating_in_step_with_the_layers_can_flash_the_output() {
+        let times = frame_times(120.0, false, 10.0);
+        let high = |step: usize| ((times[step] * 10.0) as u64).is_multiple_of(2);
+        let scene = |step: usize| [if high(step) { 0.09084 } else { 0.0 }; 3];
+        let emit = |step: usize, _: [f32; 3]| [if high(step) { 10.0 / 255.0 } else { 0.0 }; 3];
+        let output: Vec<f32> = moving_output(
+            Model::Phosphor,
+            crate::phosphor::DECAY_PER_S,
+            &times,
+            scene,
+            emit,
+        )
+        .into_iter()
+        .map(relative_luminance)
+        .collect();
+        let alone: Vec<f32> = (0..times.len()).map(|step| scene(step)[0]).collect();
+        let layers: Vec<f32> = moving_output(
+            Model::Phosphor,
+            crate::phosphor::DECAY_PER_S,
+            &times,
+            |_| [0.0; 3],
+            emit,
+        )
+        .into_iter()
+        .map(relative_luminance)
+        .collect();
+        let (combined, _) = most_flashes(&output, &times);
+        eprintln!("scene and layers in step: {combined} flashes in 1 s");
+        assert_eq!(most_flashes(&alone, &times).0, 0);
+        assert_eq!(most_flashes(&layers, &times).0, 0);
+        assert!(combined > 2, "{combined}");
+    }
+
+    /// Added light cannot show over white: wherever the scene is white
+    /// (Static's white sections, say) the output is the scene exactly,
+    /// whatever the layers emit. This is a known limitation; darkening
+    /// would make the layers' falls depend on the scene.
+    #[test]
+    fn the_layers_are_invisible_over_white() {
+        let times = frame_times(60.0, true, 5.0);
+        type Emit = Box<dyn FnMut(usize, [f32; 3]) -> [f32; 3]>;
+        let emits: [Emit; 2] = [
+            Box::new(|step, _| [if step % 2 == 0 { 1.0 } else { 0.0 }, 0.5, 0.25]),
+            Box::new(|step, _| {
+                let seed = step as u32 * 3 + 7;
+                [hash(seed), hash(seed + 1), hash(seed + 2)]
+            }),
+        ];
+        for emit in emits {
+            let output = phosphor_output(
+                Model::Phosphor,
+                crate::phosphor::DECAY_PER_S,
+                &times,
+                [1.0; 3],
+                emit,
+            );
+            assert!(output.iter().all(|&pixel| pixel == [1.0; 3]));
+        }
     }
 
     /// The phosphor bounds flashes for any emitted input: adversarial

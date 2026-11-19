@@ -121,7 +121,8 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     } else {
         None
     };
-    let scope = mic.as_ref().map(MicSource::scope);
+    // `None` in default builds, which draw no mic layers.
+    let scope = mic.as_ref().and_then(MicSource::scope);
 
     let mut builder = WindowBuilder::new()
         .with_title(profile.window_title)
