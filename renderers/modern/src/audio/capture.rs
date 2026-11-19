@@ -5,8 +5,10 @@
 //! the ring, discards any backlog older than `MAX_BACKLOG_S` (so analysis
 //! tracks "now" after a stall), runs [`Analyzer`], and publishes the result to
 //! [`SharedFeatures`]. If the ring overflows (the callback had to drop audio),
-//! the ring holds only audio older than the dropped samples, so the whole
-//! ring snapshot is discarded and skipped rather than analysed out of order.
+//! the callback commits the samples it accepted before reporting the drop, so
+//! the next ring snapshot holds all audio accepted before the drop (plus
+//! possibly a few ms committed after it); that whole snapshot is discarded
+//! and skipped rather than analysed out of order.
 //! Samples dropped on either side are reported to the
 //! analyzer with [`Analyzer::skip`] so its beat clock keeps real time. If the
 //! device stops delivering, the thread feeds silence so the published levels
@@ -236,20 +238,11 @@ where
     device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            let frames = data.len() / channels;
-            // When the ring is full (analysis stalled) the newest audio is
-            // dropped here and counted; the analysis thread drops stale
-            // backlog itself.
-            let count = frames.min(producer.slots());
-            if count < frames {
-                dropped.fetch_add(frames - count, Ordering::Relaxed);
-            }
-            if let Ok(chunk) = producer.write_chunk_uninit(count) {
-                let mono = data.chunks_exact(channels).map(|frame| {
-                    frame.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
-                });
-                chunk.fill_from_iter(mono);
-            }
+            // Release pairs with the analysis thread's Acquire swap: once it
+            // sees this drop, it also sees the samples committed before it.
+            push_frames(&mut producer, data, channels, |count| {
+                dropped.fetch_add(count, Ordering::Release);
+            });
         },
         {
             let mut limiter = ErrorLimiter::default();
@@ -266,6 +259,37 @@ where
         },
         None,
     )
+}
+
+/// Downmixes interleaved `data` to mono and pushes it into the ring. When the
+/// ring is full (analysis stalled) the newest frames are dropped and passed to
+/// `report_drop`; the analysis thread drops stale backlog itself.
+///
+/// The accepted frames are committed *before* the drop is reported. A poll
+/// that sees the drop discards its whole ring snapshot; if the drop were
+/// reported first, a poll could discard the snapshot and then analyse the
+/// late-committed accepted frames on the next poll, out of order with the
+/// time already skipped.
+fn push_frames<T>(
+    producer: &mut rtrb::Producer<f32>,
+    data: &[T],
+    channels: usize,
+    report_drop: impl FnOnce(usize),
+) where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let frames = data.len() / channels;
+    let count = frames.min(producer.slots());
+    if let Ok(chunk) = producer.write_chunk_uninit(count) {
+        let mono = data.chunks_exact(channels).map(|frame| {
+            frame.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
+        });
+        chunk.fill_from_iter(mono);
+    }
+    if count < frames {
+        report_drop(frames - count);
+    }
 }
 
 /// Lets at most one error through per `ERROR_REPORT_INTERVAL`.
@@ -462,7 +486,11 @@ fn analysis_loop(
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
-        let dropped = dropped.swap(0, Ordering::Relaxed);
+        // The drop count must be read before `slots()`: Acquire pairs with the
+        // callback's Release, so the snapshot below includes every sample
+        // accepted before the drops counted here (plus possibly a few
+        // committed just after), and all of it is discarded on overflow.
+        let dropped = dropped.swap(0, Ordering::Acquire);
         // One snapshot bounds the whole poll; the callback may publish more
         // meanwhile, and those samples wait for the next poll's clock.
         let available = consumer.slots();
@@ -556,6 +584,25 @@ mod tests {
         assert!(analysed.is_empty());
         assert_eq!(consumer.slots(), 0);
         assert_eq!(drain.skip, 11);
+    }
+
+    #[test]
+    fn push_frames_commits_accepted_frames_before_reporting_a_drop() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(8);
+        // Stereo: frames (1, 3) downmix to 2.0, and so on.
+        let stereo: Vec<f32> = (0..6).flat_map(|i| [i as f32, i as f32 + 2.0]).collect();
+        push_frames(&mut producer, &stereo, 2, |_| panic!("ring had room"));
+        assert_eq!(consumer.slots(), 6);
+
+        let mut reported = None;
+        push_frames(&mut producer, &stereo, 2, |count| {
+            // Whenever a drop is visible, the accepted frames already are.
+            assert_eq!(consumer.slots(), 8);
+            reported = Some(count);
+        });
+        assert_eq!(reported, Some(4));
+        let ring: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+        assert_eq!(ring, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 2.0]);
     }
 
     #[test]
