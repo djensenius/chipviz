@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::colour_field;
+use crate::scenes::{SceneConfig, colour_field};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -145,6 +145,9 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     renderer
         .pipeline_mut()
         .configure_colour_field(colour_field_config(&args));
+    renderer.pipeline_mut().configure_scenes(SceneConfig {
+        lines_drop_cuts: args.lines_drop_cuts,
+    });
     renderer.pipeline_mut().limit_colour_field_steps();
     let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
@@ -234,7 +237,7 @@ fn print_monitors(monitors: &[MonitorHandle]) {
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
-       [--layout auto|v2|h2|v3|h3] [--allow-flash]
+       [--layout auto|v2|h2|v3|h3] [--allow-flash] [--lines-drop-cuts]
        {program} --list-monitors | --list-audio-devices
 
 Options:
@@ -254,6 +257,8 @@ Options:
                           --allow-flash arm flash/gate without it. Only builds with
                           the unmeasured-flash feature can flash; default builds run
                           3 and 7 as hard cuts and print a notice instead
+  --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
+                          flag, at most once per bar (default: drops are ignored)
   -h, --help              print this help
 
 Keys:
@@ -443,6 +448,7 @@ struct AppArgs {
     /// Colour-field layout pin; `None` is `auto`.
     layout: Option<u8>,
     allow_flash: bool,
+    lines_drop_cuts: bool,
 }
 
 /// Wire palettes go through the stability gate, and a stable absolute 3 or 7
@@ -503,6 +509,7 @@ impl AppArgs {
                     parsed.layout = parse_layout(&value)?;
                 }
                 "--allow-flash" => parsed.allow_flash = true,
+                "--lines-drop-cuts" => parsed.lines_drop_cuts = true,
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
@@ -1257,6 +1264,12 @@ mod tests {
     }
 
     #[test]
+    fn lines_drop_cuts_are_opt_in() {
+        assert!(!AppArgs::default().lines_drop_cuts);
+        assert!(parse_run(&["--lines-drop-cuts"]).lines_drop_cuts);
+    }
+
+    #[test]
     fn colour_field_config_arms_locally_only_with_the_flag() {
         let config = colour_field_config(&AppArgs::default());
         assert!(!config.allow_flash);
@@ -1307,6 +1320,7 @@ mod tests {
             "--list-audio-devices",
             "--layout auto|v2|h2|v3|h3",
             "--allow-flash",
+            "--lines-drop-cuts",
             "cycle the colour-field layout pin",
             "Esc",
             "Cmd+Q",

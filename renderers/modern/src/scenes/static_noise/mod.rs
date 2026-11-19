@@ -31,7 +31,7 @@
 pub(super) mod font;
 mod text;
 
-use super::{CameraMode, SceneEntry, palette};
+use super::{CameraMode, SceneBuild, SceneEntry, palette};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -42,7 +42,7 @@ use text::{Embedded, TextSource};
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "Static",
     camera: CameraMode::ScreenSpace,
-    build,
+    build: SceneBuild::Stateless(build),
 };
 
 /// Divides the u16 frame counter's wrap.
