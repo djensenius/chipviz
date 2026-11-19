@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import os
 import pathlib
@@ -192,6 +193,41 @@ class RustNoticesTests(unittest.TestCase):
     self.add_shipped("broken", "MIT WITH AND", {"LICENSE": "broken text\n"})
     with self.assertRaisesRegex(ValueError, r"^broken 1\.0\.0: expected an exception id after WITH"):
       rust_notices.render(self.metadata, self.fallback)
+
+  def test_attribution_only_notice_keeps_licence_fallback(self) -> None:
+    self.add_shipped("noticed", "Apache-2.0", {"NOTICE": "Noticed Project\nCopyright 2024 Noticed Authors\n"})
+    self.add_shipped("noticed-mit", "MIT", {"COPYRIGHT": "Copyright 2024 Someone\n"})
+    content = rust_notices.render(self.metadata, self.fallback)
+    self.assertIn("noticed 1.0.0 (NOTICE)", content)
+    self.assertIn("noticed 1.0.0 (fallback SPDX Apache-2.0 text)", content)
+    self.assertIn("noticed-mit 1.0.0 (COPYRIGHT)", content)
+    self.assertIn("- noticed-mit 1.0.0: no licence file in package; no verified copyright holder for MIT.", content)
+
+  def test_asset_notice_override_and_unverified_assets(self) -> None:
+    write(self.fallback / "OFL-1.1.txt", "SIL OPEN FONT LICENSE\n")
+    font = b"font bytes"
+    package = self.add_shipped("fonty", "MIT", {"LICENSE": "fonty MIT\n"})
+    directory = pathlib.Path(package["manifest_path"]).parent
+    (directory / "src").mkdir(exist_ok=True)
+    (directory / "src" / "Font.ttf").write_bytes(font)
+    (directory / "src" / "Other.otf").write_bytes(b"other")
+    (directory / "tests").mkdir(exist_ok=True)
+    (directory / "tests" / "Test.ttf").write_bytes(b"test")
+    override = {"versions": ("1.0.0",), "path": "src/Font.ttf", "sha256": hashlib.sha256(font).hexdigest(),
+                "licence": "OFL-1.1", "copyright": "Copyright (c) 2020 Font Authors.", "source": "verified"}
+    with mock.patch.object(rust_notices, "ASSET_NOTICES", {"fonty": [override]}):
+      content = rust_notices.render(self.metadata, self.fallback)
+      self.assertIn("| fonty | 1.0.0 | MIT (also contains OFL-1.1) |", content)
+      self.assertIn("Copyright (c) 2020 Font Authors.\n\nSIL OPEN FONT LICENSE", content)
+      self.assertIn("fonty 1.0.0 (embedded src/Font.ttf, OFL-1.1; verified)", content)
+      self.assertIn("- fonty 1.0.0: embedded asset src/Other.otf has no verified notice.", content)
+      self.assertNotIn("tests/Test.ttf", content)
+      (directory / "src" / "Font.ttf").write_bytes(b"changed")
+      content = rust_notices.render(self.metadata, self.fallback)
+      self.assertIn("- fonty 1.0.0: embedded src/Font.ttf changed (SHA-256", content)
+      self.assertNotIn("Font Authors", content)
+    content = rust_notices.render(self.metadata, self.fallback)
+    self.assertIn("- fonty 1.0.0: embedded asset src/Font.ttf has no verified notice.", content)
 
   def test_fence_for_is_longer_than_any_backtick_run(self) -> None:
     self.assertEqual(rust_notices.fence_for("plain text"), "```")

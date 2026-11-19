@@ -30,6 +30,13 @@ OUTPUT = ROOT / "THIRD_PARTY_NOTICES" / "rust.md"
 PLATFORMS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin")
 NOTICE_FILE = re.compile(r"^(licen[cs]e|copying|notice|unlicense|copyright)([-._].*)?$", re.IGNORECASE)
 NOTICE_DIR = re.compile(r"^licen[cs]es$", re.IGNORECASE)
+# Files that carry licence terms, as opposed to attribution-only NOTICE or
+# COPYRIGHT files, which are reproduced but do not replace the licence text.
+LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|unlicense)([-._].*)?$", re.IGNORECASE)
+# Embedded font files are compiled into the binary with include_bytes! and
+# need their own notice. Files under these directories are not shipped code.
+ASSET_SUFFIXES = {".ttf", ".otf", ".ttc", ".woff", ".woff2"}
+NON_SHIPPED_DIRS = {"tests", "examples", "benches", "docs", "doc"}
 # Source files whose names happen to match NOTICE_FILE (e.g. src/copying.rs).
 SOURCE_SUFFIXES = {".rs", ".c", ".h", ".py", ".js", ".sh", ".toml", ".xml", ".json"}
 SPDX_ID = re.compile(r"SPDX-License-Identifier:\s*([A-Za-z0-9.+-]+)")
@@ -52,6 +59,25 @@ MIT_COPYRIGHT = {
   ("objc2-encode", "3.0.0"): ("Copyright (c) Steven Sheldon", "https://github.com/madsmtm/objc2/blob/3d9b6864af05592fc18b1ab27b3da9ed3896bc53/LICENSE.txt"),
   ("wayland-protocols-plasma", "0.2.0"): ("Copyright (c) 2015 Elinor Berger", "https://github.com/smithay/wayland-rs/blob/ea4c856cca609bf658cc7945ffa7e4b4aa268171/LICENSE.txt"),
   ("wayland-protocols-wlr", "0.2.0"): ("Copyright (c) 2015 Elinor Berger", "https://github.com/smithay/wayland-rs/blob/8050a7bd668154f99ebfed805705cd10a1435b5a/LICENSE.txt"),
+}
+# Notices for embedded assets whose licence differs from the crate's. Keyed by
+# crate name; each override applies only to the listed versions and only if
+# the file's SHA-256 matches, so any upgrade must be re-verified.
+ASSET_NOTICES = {
+  "sctk-adwaita": [{
+    "versions": ("0.8.3",),
+    "path": "src/title/Cantarell-Regular.ttf",
+    "sha256": "d15f25bcdaba2e25f54c32d4e29e68fedeb1b7a1d8fbc83f7c4475916e93b55f",
+    "licence": "OFL-1.1",
+    "copyright": (
+      "Copyright (c) 2009-2011, Understanding Limited (dave@understandinglimited.com),\n"
+      "Copyright (c) 2010-2011, Jakub Steiner (jimmac@gmail.com)."
+    ),
+    "source": (
+      "copyright from the font's name table (nameID 0); embedded with include_bytes! as documented at "
+      "https://github.com/PolyMeilex/sctk-adwaita/blob/1ff9a966a386b4850f28c78ceda50899346dc398/src/title/ab_glyph_renderer.rs#L1-L12"
+    ),
+  }],
 }
 # Why the remaining MIT crates have no verified copyright line.
 OBJC2_MIT_NOTE = "upstream LICENSE.md at the crate's commit states MIT but names no copyright holder"
@@ -145,9 +171,48 @@ def dedent(text: str) -> str:
   return "\n".join(line[margin:] for line in lines)
 
 
+def is_own_licence(path: Path, directory: Path, package: dict) -> bool:
+  """True for the crate's own licence text: a root LICENSE/COPYING/UNLICENSE file,
+  its root LICENSES/ directory, or its declared license_file."""
+  if package.get("license_file") and path == directory / package["license_file"]:
+    return True
+  if path.parent == directory:
+    return bool(LICENCE_FILE.match(path.name))
+  return path.parent.parent == directory and bool(NOTICE_DIR.match(path.parent.name))
+
+
 def is_top_level(path: Path, directory: Path) -> bool:
-  """True for the crate's own licence files: in its root or its root LICENSES/ directory."""
+  """True for files in the crate root or its root LICENSES/ directory."""
   return path.parent == directory or (path.parent.parent == directory and bool(NOTICE_DIR.match(path.parent.name)))
+
+
+def asset_notices(package: dict, directory: Path, fallback_dir: Path) -> tuple[list[tuple[str, str, str]], list[str]]:
+  """Return (label, licence id, text) notices for embedded assets, and gap reasons."""
+  notices: list[tuple[str, str, str]] = []
+  gaps: list[str] = []
+  covered: set[str] = set()
+  for override in ASSET_NOTICES.get(package["name"], []):
+    path = directory / override["path"]
+    if package["version"] not in override["versions"] or not path.is_file():
+      continue
+    covered.add(override["path"])
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    licence_path = fallback_dir / f"{override['licence']}.txt"
+    if digest != override["sha256"]:
+      gaps.append(f"embedded {override['path']} changed (SHA-256 {digest}); re-verify its notice")
+    elif not licence_path.is_file():
+      gaps.append(f"no canonical text for {override['licence']}, the licence of embedded {override['path']}")
+    else:
+      text = override["copyright"] + "\n\n" + normalise(licence_path.read_text(encoding="utf-8"))
+      notices.append((f"embedded {override['path']}, {override['licence']}; {override['source']}", override["licence"], text))
+  for path in sorted(directory.rglob("*"), key=lambda path: display_path(path, directory)):
+    relative = path.relative_to(directory)
+    if not path.is_file() or path.suffix.lower() not in ASSET_SUFFIXES or relative.as_posix() in covered:
+      continue
+    if NON_SHIPPED_DIRS.intersection(relative.parts[:-1]) or "target" in relative.parts[:-1]:
+      continue
+    gaps.append(f"embedded asset {relative.as_posix()} has no verified notice")
+  return notices, gaps
 
 
 def display_path(path: Path, directory: Path) -> str:
@@ -307,15 +372,15 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     label = f"{package['name']} {package['version']}"
     directory = Path(package["manifest_path"]).parent
     refs: list[str] = []
-    top_level = False
+    own_licence = False
     embedded: set[str] = set()
     for path in notice_files(package):
       text = normalise(path.read_text(encoding="utf-8", errors="replace"))
       if text:
         refs.append(add(text, f"{label} ({display_path(path, directory)})"))
-        if is_top_level(path, directory) or path == directory / (package.get("license_file") or ""):
-          top_level = True
-        else:
+        if is_own_licence(path, directory, package):
+          own_licence = True
+        elif not is_top_level(path, directory):
           embedded.update(SPDX_ID.findall(text))
           if any(NOTICE_DIR.match(part) for part in path.relative_to(directory).parts[:-1]):
             embedded.add(path.stem)
@@ -325,8 +390,13 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
       refs.append(add(combined, f"{label} (<copyright> blocks of {len(protocols)} protocol XML files)"))
       for _, text in protocols:
         embedded.update(SPDX_ID.findall(text))
+    assets, asset_gaps = asset_notices(package, directory, fallback_dir)
+    for asset_label, asset_licence, text in assets:
+      refs.append(add(text, f"{label} ({asset_label})"))
+      embedded.add(asset_licence)
+    gaps += [(label, gap) for gap in asset_gaps]
     fallback: list[str] = []
-    if not top_level:
+    if not own_licence:
       found, gap = fallback_texts(package, fallback_dir)
       fallback = [add(text, f"{label} ({fallback_label})") for fallback_label, text in found]
       if gap:
@@ -371,11 +441,14 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     "Each crate is distributed under its own licence. Where a crate offers a",
     "choice of licences, every licence file shipped in its package is reproduced,",
     "including files in vendored subdirectories and the `<copyright>` blocks of",
-    "embedded Wayland protocol XML files. Licences found only in those vendored",
-    "files are listed as \"also contains\" in the table.",
+    "embedded Wayland protocol XML files. Embedded assets under a different",
+    "licence, such as fonts, get their own notice with a verified copyright.",
+    "Licences found only in vendored files or assets are listed as \"also",
+    "contains\" in the table. NOTICE and COPYRIGHT files are always reproduced.",
     "Notice numbers marked \"(fallback)\" are canonical SPDX licence texts used",
-    "because the published crate ships no licence file. For MIT crates, the",
-    "copyright line comes from the upstream repository at the crate's commit.",
+    "because the published crate ships no licence text (only attribution files",
+    "or none at all). For MIT crates, the copyright line comes from the",
+    "upstream repository at the crate's commit.",
     "",
     "## Crates",
     "",
@@ -399,13 +472,15 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
   lines += ["", "## Known gaps", ""]
   if gaps:
     lines += [
-      "These crates ship no licence file, and the committed fallback texts do",
-      "not fully cover the licence they declare: either no copyright holder could",
-      "be verified upstream (the copyright line is left as the SPDX template) or",
-      "no canonical text is committed for a required licence or exception.",
+      "The notices for these crates are incomplete. Either an embedded asset has",
+      "no verified notice, or the crate ships no licence text and the committed",
+      "fallback texts do not fully cover the licence it declares: no copyright",
+      "holder could be verified upstream (the copyright line is left as the SPDX",
+      "template) or no canonical text is committed for a required licence or",
+      "exception.",
       "",
     ]
-    lines += [f"- {label}: {reason}." for label, reason in gaps]
+    lines += [f"- {label}: {reason}." for label, reason in sorted(gaps)]
   else:
     lines.append("None.")
   lines += ["", "## Licence and notice texts", ""]
