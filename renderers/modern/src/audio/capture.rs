@@ -32,7 +32,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
 
 use super::analysis::Analyzer;
-use super::scope::{ScopeTap, SharedScope};
+use super::scope::{ScopeSnapshot, ScopeTap, SharedScope};
 use super::{AudioFeatures, SharedFeatures};
 
 const RING_S: f32 = 1.0;
@@ -744,7 +744,10 @@ fn analysis_loop(
         );
         outputs.features.store(analyzer.features());
         // The onset count wraps; the mic layers only look for changes.
-        outputs.scope.store(&tap.snapshot(analyzer.onsets() as u32));
+        outputs.scope.store(&ScopeSnapshot {
+            onset_age_s: analyzer.onset_age_s(),
+            ..tap.snapshot(analyzer.onsets() as u32)
+        });
 
         if !warned && !heard_signal && now.duration_since(started) > SILENCE_WARNING {
             warned = true;

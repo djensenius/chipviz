@@ -3,14 +3,15 @@
 //! The control frame carries no waveform, so the analysis thread also feeds
 //! its mono samples to a [`ScopeTap`]. After each poll it publishes a
 //! [`ScopeSnapshot`] (a trigger-aligned, decimated, gain-normalised
-//! waveform envelope plus the analyzer's onset count) to [`SharedScope`]. Both sides
+//! waveform envelope plus the analyzer's onset count and the newest
+//! onset's age) to [`SharedScope`]. Both sides
 //! are wait-free: the writer stores one atomic per point and the reader loads
 //! them, so the render thread never waits on audio and memory stays bounded.
 //! A read that races a publish can mix points from two consecutive snapshots;
 //! they are a few milliseconds apart, and the drawn ribbon's limiter bounds
 //! whatever the mix draws.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Points in a published waveform.
 pub const POINTS: usize = 256;
@@ -52,12 +53,16 @@ const REVERSAL_STEP: f32 = 0.05;
 /// minimum (`lower`) of each point's samples (see [`decimate`]), turned
 /// into an envelope where they would fill a band (see [`limit_coverage`]),
 /// in -1..=1 (normalised by the recent peak); `onsets` counts the
-/// analyzer's onsets (wrapping).
+/// analyzer's onsets (wrapping), and `onset_age_s` is how much audio (in
+/// seconds) the analyzer had processed since the newest of them when this
+/// was published (infinite before the first), so a reader that resumes
+/// after a pause can tell a stale onset from a fresh one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScopeSnapshot {
     pub upper: [f32; POINTS],
     pub lower: [f32; POINTS],
     pub onsets: u32,
+    pub onset_age_s: f32,
 }
 
 impl Default for ScopeSnapshot {
@@ -66,6 +71,7 @@ impl Default for ScopeSnapshot {
             upper: [0.0; POINTS],
             lower: [0.0; POINTS],
             onsets: 0,
+            onset_age_s: f32::INFINITY,
         }
     }
 }
@@ -135,6 +141,7 @@ impl ScopeTap {
             upper,
             lower,
             onsets,
+            onset_age_s: f32::INFINITY,
         }
     }
 }
@@ -304,7 +311,9 @@ pub fn envelope(upper: &[f32; POINTS], lower: &[f32; POINTS]) -> ([f32; POINTS],
 pub struct SharedScope {
     upper: [AtomicU32; POINTS],
     lower: [AtomicU32; POINTS],
-    onsets: AtomicU32,
+    /// The onset count (low 32 bits) and age (high 32, f32 bits) in one
+    /// atomic, so a count is never read with another snapshot's age.
+    onset: AtomicU64,
 }
 
 impl Default for SharedScope {
@@ -312,7 +321,7 @@ impl Default for SharedScope {
         Self {
             upper: std::array::from_fn(|_| AtomicU32::new(0)),
             lower: std::array::from_fn(|_| AtomicU32::new(0)),
-            onsets: AtomicU32::new(0),
+            onset: AtomicU64::new(pack_onset(&ScopeSnapshot::default())),
         }
     }
 }
@@ -323,11 +332,11 @@ impl SharedScope {
         for (slot, point) in slots.zip(snapshot.upper.iter().chain(&snapshot.lower)) {
             slot.store(point.to_bits(), Ordering::Relaxed);
         }
-        self.onsets.store(snapshot.onsets, Ordering::Release);
+        self.onset.store(pack_onset(snapshot), Ordering::Release);
     }
 
     pub fn load(&self) -> ScopeSnapshot {
-        let onsets = self.onsets.load(Ordering::Acquire);
+        let onset = self.onset.load(Ordering::Acquire);
         ScopeSnapshot {
             upper: std::array::from_fn(|index| {
                 f32::from_bits(self.upper[index].load(Ordering::Relaxed))
@@ -335,9 +344,14 @@ impl SharedScope {
             lower: std::array::from_fn(|index| {
                 f32::from_bits(self.lower[index].load(Ordering::Relaxed))
             }),
-            onsets,
+            onsets: onset as u32,
+            onset_age_s: f32::from_bits((onset >> 32) as u32),
         }
     }
+}
+
+fn pack_onset(snapshot: &ScopeSnapshot) -> u64 {
+    u64::from(snapshot.onset_age_s.to_bits()) << 32 | u64::from(snapshot.onsets)
 }
 
 #[cfg(test)]
@@ -619,6 +633,7 @@ mod tests {
         assert_eq!(shared.load(), ScopeSnapshot::default());
         let mut snapshot = ScopeSnapshot {
             onsets: 42,
+            onset_age_s: 0.125,
             ..ScopeSnapshot::default()
         };
         for (index, point) in snapshot.upper.iter_mut().enumerate() {
@@ -652,6 +667,7 @@ mod tests {
                         upper: [onsets as f32; POINTS],
                         lower: [onsets as f32; POINTS],
                         onsets,
+                        onset_age_s: 0.0,
                     });
                 }
                 onsets

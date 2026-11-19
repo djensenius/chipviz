@@ -10,7 +10,8 @@
 //! Input, per rendered frame:
 //! - with live microphone frames, a [`ScopeSnapshot`] from the audio thread's
 //!   side channel: the trigger-aligned waveform's upper and lower outlines,
-//!   and an onset count whose changes fire bursts;
+//!   and an onset count whose changes fire bursts (unless the newest onset
+//!   is older than `STALE_ONSET_S`, as after a rendering pause);
 //! - otherwise (procedural or UDP frames, or a mic that UDP has taken over)
 //!   the layers degrade to a ribbon synthesised from the eight spectrum bands
 //!   and scaled by energy, and bursts fire when `beat_count` changes.
@@ -25,23 +26,25 @@
 //! the screen, at any aspect. The limit tightens at once but relaxes over
 //! `LIMIT_RELAX_S`, so input hovering at the budget does not jitter.
 //!
-//! Flash design (not a measured compliance claim): a burst is one smooth rise
-//! (`ATTACK_S`) and exponential fall, so each is at most one flash. Its
-//! colour and peak strength are fixed when it starts, so later palette or
-//! energy changes cannot make a live burst flicker. Bursts
-//! start at most once every `MIN_BURST_GAP_S` (2 per second, below the
-//! 3-per-second WCAG 2.3.1 general flash limit that
-//! `shared/specs/colour-field-v0.md` also follows) however fast onsets
-//! arrive, and they are soft, partly transparent glows over a small part of
-//! the screen. Nothing here inverts or flips the whole screen, so the layers
-//! have no `unmeasured-flash` gate. The `flash_model` test checks a CPU model
-//! of the burst shapes over black at the maximum onset rate; it is not a
-//! photometric measurement of a display or projector.
+//! Flashes: the renderer draws the layers through a per-pixel phosphor
+//! (`crate::phosphor`) added onto the scene. Each pixel's added light rises
+//! at once but falls by at most `phosphor::DECAY_PER_S` per second, which
+//! allows at most 2 flashes (pairs of opposing changes of 0.1 relative
+//! luminance) in any 1 s at any point, below the 3-per-second WCAG 2.3.1
+//! general flash limit that `shared/specs/colour-field-v0.md` also follows,
+//! for any input, frame rate or geometry. The design below keeps the layers
+//! calm before that bound: a burst is one smooth rise (`ATTACK_S`) and
+//! exponential fall, its colour and peak strength fixed when it starts, and
+//! bursts start at most once every `MIN_BURST_GAP_S` however fast onsets
+//! arrive. Nothing here inverts or flips the whole screen, so the layers
+//! have no `unmeasured-flash` gate. The `phosphor_model` and `flash_model`
+//! tests check CPU models; they are not photometric measurements of a
+//! display or projector.
 //!
 //! Geometry is built in aspect space (x spans `-aspect..aspect`, y `-1..1`)
 //! and flattened by [`transform`], so rotated ribbon segments and round
 //! bursts keep their shape at any aspect ratio. In portrait the whole ribbon
-//! scales with the width. Overlay time is f64 seconds, so burst timing stays
+//! and the bursts scale with the width. Overlay time is f64 seconds, so burst timing stays
 //! exact however long the renderer runs.
 
 use std::cell::Cell;
@@ -59,6 +62,9 @@ pub const LIFETIME_S: f32 = 1.6;
 /// Half a second: at most two starts in any 1 s, with margin under the
 /// 3-per-second limit for dark rooms and projection.
 pub const MIN_BURST_GAP_S: f32 = 0.5;
+/// A live onset count that changes when the newest onset is older than this
+/// (rendering paused, then resumed after the sound) starts no burst.
+pub const STALE_ONSET_S: f32 = 0.25;
 /// Enough slots for every burst alive at once under the start-rate cap.
 const MAX_BURSTS: usize = 4;
 const GLOW_ALPHA: f32 = 0.3;
@@ -494,14 +500,17 @@ impl MicLayers {
             Some(snapshot) => Trigger::Onsets(snapshot.onsets),
             None => Trigger::Beat(frame.beat_count),
         };
-        // A change of source re-seeds instead of counting as an onset.
-        let onset = matches!(
-            (self.last_trigger, trigger),
-            (Some(Trigger::Onsets(a)), Trigger::Onsets(b)) if a != b
-        ) || matches!(
-            (self.last_trigger, trigger),
-            (Some(Trigger::Beat(a)), Trigger::Beat(b)) if a != b
-        );
+        // A change of source re-seeds instead of counting as an onset, and a
+        // stale live onset is dropped (its count still re-seeds).
+        let fresh = live.is_none_or(|snapshot| snapshot.onset_age_s <= STALE_ONSET_S);
+        let onset = fresh
+            && (matches!(
+                (self.last_trigger, trigger),
+                (Some(Trigger::Onsets(a)), Trigger::Onsets(b)) if a != b
+            ) || matches!(
+                (self.last_trigger, trigger),
+                (Some(Trigger::Beat(a)), Trigger::Beat(b)) if a != b
+            ));
         self.last_trigger = Some(trigger);
 
         let hidden = !shown || !self.mode.bursts();
@@ -545,15 +554,6 @@ impl MicLayers {
         }
         if self.mode.scope() {
             self.build_ribbon(frame, aspect, instances);
-        }
-    }
-
-    /// For a frame that is stepped but not drawn: advances the ribbon's
-    /// limiter as [`MicLayers::build`] would at `aspect`, so a later drawn
-    /// frame (a capture still) matches a live run while the limit relaxes.
-    pub fn advance_limit(&self, aspect: f32) {
-        if self.ribbon_shown {
-            self.limited(aspect.max(0.01));
         }
     }
 
@@ -643,6 +643,8 @@ impl MicLayers {
         };
         let mut bursts: Vec<Burst> = self.bursts.iter().flatten().copied().collect();
         bursts.sort_by(|a, b| a.born.total_cmp(&b.born));
+        // In portrait, bursts shrink with the width as the ribbon does.
+        let scale = ribbon_scale(aspect);
         for burst in bursts {
             let age = (now - burst.born) as f32;
             let envelope = burst_envelope(age) * burst.strength;
@@ -656,7 +658,7 @@ impl MicLayers {
             ];
             #[cfg(test)]
             let center = self.pinned.unwrap_or(center);
-            let radius = 0.06 + 0.42 * (1.0 - (-age / 0.3).exp());
+            let radius = (0.06 + 0.42 * (1.0 - (-age / 0.3).exp())) * scale;
             let [red, green, blue] = burst.color;
             let mut color = [red, green, blue, envelope * GLOW_ALPHA];
             instances.push(Instance {
@@ -671,7 +673,7 @@ impl MicLayers {
             let spin = hash(seed + 2) * std::f32::consts::TAU;
             for spark in 0..SPARKS {
                 let angle = spin + spark as f32 / SPARKS as f32 * std::f32::consts::TAU;
-                let size = 0.05 * (0.4 + envelope);
+                let size = 0.05 * (0.4 + envelope) * scale;
                 instances.push(Instance {
                     center: [
                         center[0] + angle.cos() * radius,
@@ -712,6 +714,7 @@ mod tests {
             upper: points,
             lower: points,
             onsets,
+            onset_age_s: 0.0,
         }
     }
 
@@ -1021,6 +1024,7 @@ mod tests {
             upper: zigzag,
             lower: zigzag.map(|point| -point),
             onsets: 0,
+            onset_age_s: 0.0,
         };
         for step in 0..120 {
             layers.step(quiet(), Some(&steep), step as f64 / f64::from(FPS), true);
@@ -1114,6 +1118,137 @@ mod tests {
         let series = [0.0, 0.2, 0.25, 0.1, 0.0, 0.05, 0.3, 0.3];
         assert_eq!(transitions(&series, 0.1), [1, 3, 6]);
         assert!(transitions(&[0.0, 0.05, 0.0, 0.09], 0.1).is_empty());
+    }
+
+    /// The most flashes (pairs of opposing changes of at least 0.1, see
+    /// [`transitions`]) completing in any 1 s of `series`, sampled at `times`.
+    fn most_flashes(series: &[f32], times: &[f64]) -> (usize, usize) {
+        let found = transitions(series, 0.1);
+        let mut worst = 0;
+        for (index, &start) in found.iter().enumerate() {
+            let within = found[index..]
+                .iter()
+                .take_while(|&&later| times[later] - times[start] < 1.0)
+                .count();
+            worst = worst.max(within);
+        }
+        (worst / 2, worst)
+    }
+
+    /// One pixel through the phosphor's CPU model (`DecayClock` and
+    /// `decay_pixel`, as the GPU passes run them) over a static `scene`
+    /// level, added and saturated as the composite does: the displayed
+    /// relative luminance per frame. `emit` gives each frame's emitted
+    /// linear RGB from the frame index and the display's current RGB.
+    fn phosphor_pixel(
+        rate: f32,
+        times: &[f64],
+        scene: f32,
+        mut emit: impl FnMut(usize, [f32; 3]) -> [f32; 3],
+    ) -> Vec<f32> {
+        let mut clock = crate::phosphor::DecayClock::with_rate(rate);
+        let mut display = [0.0_f32; 3];
+        times
+            .iter()
+            .enumerate()
+            .map(|(step, &now)| {
+                let amount = clock.tick(now);
+                let emitted = emit(step, display);
+                for (channel, lit) in display.iter_mut().zip(emitted) {
+                    *channel = crate::phosphor::decay_pixel(*channel, lit, amount);
+                }
+                let [red, green, blue] = display.map(|channel| (scene + channel).min(1.0));
+                0.2126 * red + 0.7152 * green + 0.0722 * blue
+            })
+            .collect()
+    }
+
+    /// The phosphor bounds flashes for any emitted input: adversarial
+    /// per-pixel sequences (every-frame alternation, square waves of every
+    /// period, random colours, and a greedy input that re-lights the pixel
+    /// as soon as it has dimmed by 0.1) at 60, 120 and 240 fps, steady or
+    /// jittered, over black and over a mid-grey scene, never exceed 2
+    /// flashes in any 1 s. At 0.25 per second the greedy input reaches 3,
+    /// which is why `DECAY_PER_S` is lower (see `phosphor`).
+    #[test]
+    fn phosphor_model_keeps_any_input_to_two_flashes_per_second() {
+        const SECONDS: f64 = 20.0;
+        let white = |on: bool| if on { [1.0; 3] } else { [0.0; 3] };
+        // Lights the pixel again once its luminance has fallen by 0.1.
+        let greedy = || {
+            let mut peak = 0.0_f32;
+            move |_: usize, display: [f32; 3]| {
+                let level = 0.2126 * display[0] + 0.7152 * display[1] + 0.0722 * display[2];
+                if level <= peak - 0.1 || peak == 0.0 {
+                    peak = 1.0;
+                    [1.0; 3]
+                } else {
+                    [0.0; 3]
+                }
+            }
+        };
+        let mut worst = (0, 0, String::new());
+        for fps in [60.0, 120.0, 240.0] {
+            for jitter in [false, true] {
+                let mut times = Vec::new();
+                let mut now = 0.0;
+                while now < SECONDS {
+                    times.push(now);
+                    let wobble = if jitter {
+                        f64::from(hash(times.len() as u32)) - 0.5
+                    } else {
+                        0.0
+                    };
+                    now += (1.0 + wobble) / fps;
+                }
+                for scene in [0.0, 0.5] {
+                    let mut cases: Vec<(String, Vec<f32>)> = Vec::new();
+                    let rate = crate::phosphor::DECAY_PER_S;
+                    for period in 1..=fps as usize {
+                        cases.push((
+                            format!("square {period}"),
+                            phosphor_pixel(rate, &times, scene, |step, _| {
+                                white((step / period).is_multiple_of(2))
+                            }),
+                        ));
+                    }
+                    cases.push((
+                        "random".into(),
+                        phosphor_pixel(rate, &times, scene, |step, _| {
+                            let seed = step as u32 * 3;
+                            [hash(seed), hash(seed + 1), hash(seed + 2)]
+                        }),
+                    ));
+                    cases.push((
+                        "random on/off".into(),
+                        phosphor_pixel(rate, &times, scene, |step, _| {
+                            white(hash(step as u32 + 7) < 0.5)
+                        }),
+                    ));
+                    cases.push((
+                        "greedy".into(),
+                        phosphor_pixel(rate, &times, scene, greedy()),
+                    ));
+                    for (name, series) in cases {
+                        let (flashes, changes) = most_flashes(&series, &times);
+                        if flashes > worst.0 || worst.2.is_empty() {
+                            worst = (flashes, changes, format!("{name} at {fps} fps"));
+                        }
+                        assert!(
+                            flashes <= 2,
+                            "{name}, {fps} fps, jitter {jitter}, scene {scene}: \
+                             {flashes} flashes ({changes} opposing changes) in 1 s"
+                        );
+                    }
+                }
+                // The constant matters: faster decay lets the greedy input
+                // complete 3 flashes in under 1 s.
+                let fast = phosphor_pixel(0.25, &times, 0.0, greedy());
+                assert_eq!(most_flashes(&fast, &times).0, 3, "{fps} fps at 0.25/s");
+            }
+        }
+        // The adversaries do reach the bound, so the model sees flashes.
+        assert_eq!(worst.0, 2, "{worst:?}");
     }
 
     /// The most flashes (pairs of opposing changes of at least 0.1 relative
@@ -1229,6 +1364,62 @@ mod tests {
                     assert!(
                         flashes <= 2,
                         "{case}: {flashes} flashes ({worst} opposing changes) in 1 s"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rendering paused (minimised, or no surface) while an onset arrived
+    /// and silence followed: the first frame after it sees a changed count,
+    /// but the onset is stale, so no burst starts in the silence. A fresh
+    /// onset (within `STALE_ONSET_S`) still starts one.
+    #[test]
+    fn stale_live_onsets_start_no_burst() {
+        let live = |onsets, onset_age_s| ScopeSnapshot {
+            onset_age_s,
+            ..snapshot(0.5, onsets)
+        };
+        let mut layers = MicLayers::new(Mode::Bursts);
+        layers.step(quiet(), Some(&live(0, f32::INFINITY)), 0.0, true);
+        layers.step(quiet(), Some(&live(1, 3.0)), 5.0, true);
+        assert_eq!(layers.bursts.iter().flatten().count(), 0, "stale onset");
+        layers.step(quiet(), Some(&live(2, STALE_ONSET_S)), 5.1, true);
+        assert_eq!(layers.bursts.iter().flatten().count(), 1, "fresh onset");
+    }
+
+    /// In a narrow portrait window bursts shrink with the width, as the
+    /// ribbon does: at the 80 ms peak every burst's glow and sparks stay on
+    /// screen at 1:10 and 9:16 (and landscape sizes are unchanged).
+    #[test]
+    fn bursts_stay_on_screen_in_narrow_portrait() {
+        for aspect in PORTRAITS.into_iter().chain([ASPECT]) {
+            let mut layers = MicLayers::new(Mode::Bursts);
+            for serial in 0..40_u32 {
+                // One burst at a time, each built at its peak.
+                let born = f64::from(serial) * 2.0;
+                let fresh = ScopeSnapshot {
+                    onset_age_s: 0.0,
+                    ..snapshot(0.5, serial)
+                };
+                layers.step(quiet(), Some(&fresh), born, true);
+                layers.step(quiet(), Some(&fresh), born + f64::from(ATTACK_S), true);
+                let mut instances = Vec::new();
+                layers.build(quiet(), aspect, &mut instances);
+                if serial == 0 {
+                    // The first step only seeds the onset count.
+                    assert!(instances.is_empty());
+                    continue;
+                }
+                assert_eq!(instances.len(), 1 + SPARKS, "{aspect}: serial {serial}");
+                for instance in &instances {
+                    let reach = [
+                        instance.center[0].abs() + instance.size[0] / 2.0,
+                        instance.center[1].abs() + instance.size[1] / 2.0,
+                    ];
+                    assert!(
+                        reach[0] <= aspect && reach[1] <= 1.0,
+                        "{aspect}: serial {serial} reaches {reach:?}"
                     );
                 }
             }
@@ -1446,6 +1637,7 @@ mod tests {
             upper: zigzag,
             lower: zigzag,
             onsets: 0,
+            onset_age_s: 0.0,
         };
         layers.step(quiet(), Some(&band), 0.0, true);
         let mut instances = Vec::new();
@@ -1937,6 +2129,7 @@ mod tests {
                 upper: line,
                 lower: line,
                 onsets: 0,
+                onset_age_s: 0.0,
             })
         };
         type Input<'a> = Box<dyn FnMut(usize) -> (ControlFrame, Option<ScopeSnapshot>) + 'a>;
@@ -1997,10 +2190,10 @@ mod tests {
         }
     }
 
-    /// A capture still replays earlier frames with `step` and
-    /// `advance_limit` only, then builds one: while the limit relaxes after
-    /// a loud filled band, it draws exactly what a live run (building every
-    /// frame) draws at that frame. Without the replayed limit it would not.
+    /// A capture still replays earlier frames with `step` and `build` (for
+    /// the phosphor), then builds one: while the limit relaxes after a loud
+    /// filled band, it draws exactly what a live run draws at that frame.
+    /// Replaying `step` alone would not.
     #[test]
     fn a_replayed_limit_matches_a_live_run() {
         let zigzag = std::array::from_fn(|index| if index % 2 == 0 { 0.9 } else { -0.9 });
@@ -2008,6 +2201,7 @@ mod tests {
             upper: zigzag,
             lower: zigzag,
             onsets: 0,
+            onset_age_s: 0.0,
         };
         let input = |step: usize| if step < 30 { band } else { snapshot(0.9, 0) };
         let at = |step: usize| step as f64 / f64::from(FPS);
@@ -2027,7 +2221,7 @@ mod tests {
                 for step in 0..still {
                     layers.step(quiet(), Some(&input(step)), at(step), true);
                     if replay {
-                        layers.advance_limit(ASPECT);
+                        layers.build(quiet(), ASPECT, &mut Vec::new());
                     }
                 }
                 layers.step(quiet(), Some(&input(still)), at(still), true);

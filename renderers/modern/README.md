@@ -172,43 +172,64 @@ change the control-frame wire format.
   input hovering at the limit does not jitter, and just after a loud burst
   even a 440 Hz tone stays briefly reduced. In portrait windows the whole
   ribbon (amplitude and stroke widths as well as length) scales with the
-  width. Each line is drawn in three near-opaque layers: a dimmed
-  palette-tinted halo, a black backing inside it, and a near-white tinted
-  core, which keep it readable over scenes of the same colour.
+  width. Each line is drawn as a dimmed palette-tinted halo with a dark gap
+  inside it and a near-white tinted core, so the core is its brightest part.
 - `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
   rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
   one arriving less than 0.5 s after the last burst started is skipped, and
   onsets while bursts are hidden (layers `off` or `scope`, or scene 7) start
   nothing. Hiding bursts drops any still fading, so none reappear mid-fade.
+  In portrait windows bursts shrink with the width, as the ribbon does.
 
-With `--mic`, the analysis thread publishes the samples and onset count
-through a lock-free side channel (atomics only), which the render thread reads
-without waiting. When frames come from the procedural source or over UDP, the
-ribbon is synthesised from the eight spectrum bands and the energy, and bursts
-fire when `beat_count` changes.
+With `--mic`, the analysis thread publishes the samples, the onset count and
+the newest onset's age (in analysed audio) through a lock-free side channel
+(atomics only), which the render thread reads without waiting. An onset older
+than 0.25 s when the renderer sees it, as after rendering was paused, starts
+no burst. When frames come from the procedural source or over UDP, the ribbon
+is synthesised from the eight spectrum bands and the energy, and bursts fire
+when `beat_count` changes.
 
-Bursts are not gated by the `unmeasured-flash` feature. This rests on their
-design, not on a photometric measurement: each one is a single smooth, partly
-transparent rise and fall (glow at most 30% and sparks at most 50% opacity),
-with its colour and peak fixed when it starts, over a small part of the screen
-rather than a full-screen change, and new bursts start at most once every
-0.5 s (two per second, with margin under the three-per-second limit for dark
-rooms and projection), with at most four alive at once. A unit test
-composites a CPU model of the bursts over black at the maximum onset rate,
-including input whose palette and energy change every frame at 60, 120 and
-240 fps, and finds at most two flashes (opposing changes of 0.1 relative
-luminance) in any 1 s at any sampled point. The scope ribbon is outside that
-model; its exemption rests on staying thin lines. Unit tests
-rasterise the ribbon for a loud 4 kHz tone and white noise gated at 3, 5 and
-10 Hz, and for loud tones every 100 Hz from 0.5 to 8 kHz (plus those that
-divide the point spacing) at 44.1, 48 and 96 kHz, steady and gated. They check
-that it never draws more area than a steady full-scale 440 Hz ribbon, nor more
-than 13% of the screen. Further tests pass a sparse pulse train, mixed
-snapshots (a read racing a publish), the densest synthesised ribbon, portrait
-windows (9:16 and 1:10) and a thousand seeded random outlines through the
-final limit, and check each stays within 13% of the screen. Overlay timing is
-kept in f64 seconds, so burst timing and the 0.5 s cap hold however long the
-renderer runs (a test checks after 30 days). Measure the actual display
+The layers glow like a long-persistence oscilloscope. They are drawn into
+their own target, and a per-pixel phosphor follows it in linear light: each
+channel rises at once to what is drawn but falls by at most 0.18 per second
+of full brightness, and the result is added onto the scene. So the ribbon
+leaves a fading trail where it has been, a burst lingers for a few seconds
+after it ends, and turning the layers off (or entering scene 7) fades them
+out over up to about 5.6 s rather than cutting. A window resize restarts the
+afterglow. Being added light, the layers brighten the scene beneath them and
+never darken it.
+
+The layers are not gated by the `unmeasured-flash` feature. The phosphor
+bounds their flashes for any input, frame rate or geometry: a flash (WCAG
+2.3.1) is a pair of opposing changes of at least 0.1 relative luminance, and
+relative luminance falls no faster than the fastest channel. Three flashes in
+1 s would need three falls of 0.1 ending in that second, the last two wholly
+inside it, and 0.2 of fall takes over 1.1 s at 0.18 per second. So the light
+the layers add to any point flashes at most twice in any 1 s, under the limit
+of three; red flashes also need opposing changes, and every channel falls
+equally slowly. A unit test runs a CPU model of the phosphor against
+adversarial per-pixel input (alternating every frame, square waves of every
+period, random colours, and input that relights a pixel as soon as it has
+dimmed by 0.1) at 60, 120 and 240 fps, steady and jittered, and finds at most
+two flashes in any 1 s; at 0.25 per second the last of those reaches three. A
+GPU test checks that the light added at any pixel falls no faster than the
+decay, and that layers `off` render exactly as before the layers existed.
+
+The design keeps the layers calm well within that bound. Each burst is a
+single smooth, partly transparent rise and fall (glow at most 30% and sparks
+at most 50% opacity), with its colour and peak fixed when it starts, new
+bursts start at most once every 0.5 s, and at most four are alive at once.
+Unit tests rasterise the ribbon for a loud 4 kHz tone and white noise gated
+at 3, 5 and 10 Hz, and for loud tones every 100 Hz from 0.5 to 8 kHz (plus
+those that divide the point spacing) at 44.1, 48 and 96 kHz, steady and
+gated. They check that it never draws more area than a steady full-scale
+440 Hz ribbon, nor more than 13% of the screen. Further tests pass a sparse
+pulse train, mixed snapshots (a read racing a publish), the densest
+synthesised ribbon, portrait windows (9:16 and 1:10) and a thousand seeded
+random outlines through the final limit, and check each stays within 13% of
+the screen. Overlay timing is kept in f64 seconds, so burst timing and the
+0.5 s cap hold however long the renderer runs (a test checks after 30 days).
+These are models, not photometric measurements: measure the actual display
 before relying on this for a photosensitive audience.
 
 ```sh

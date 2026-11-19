@@ -396,6 +396,13 @@ impl Analyzer {
         self.onsets
     }
 
+    /// Seconds of analysed audio since the newest onset; infinite before
+    /// the first.
+    pub fn onset_age_s(&self) -> f32 {
+        self.last_onset_s
+            .map_or(f32::INFINITY, |last| (self.time_s - last) as f32)
+    }
+
     /// Feeds mono samples, running one analysis step per completed hop.
     pub fn push(&mut self, samples: &[f32]) {
         for &sample in samples {
@@ -743,6 +750,21 @@ mod tests {
         assert_eq!(features.spectrum, [0; BANDS]);
         assert_eq!(features.bpm, 0);
         assert_eq!(analyzer.onsets(), 0);
+    }
+
+    /// The newest onset's age counts analysed audio, so silence after it
+    /// (as the mic layers see after a rendering pause) ages it.
+    #[test]
+    fn onset_age_counts_audio_since_the_newest_onset() {
+        let mut analyzer = Analyzer::new(RATE).unwrap();
+        analyzer.push_silence(RATE as usize);
+        assert_eq!(analyzer.onset_age_s(), f32::INFINITY);
+        analyzer.push(&click_train(120.0, 0.5, 2.0));
+        let fresh = analyzer.onset_age_s();
+        assert!(fresh < 0.6, "{fresh}");
+        analyzer.push_silence(3 * RATE as usize);
+        let stale = analyzer.onset_age_s();
+        assert!((stale - fresh - 3.0).abs() < 0.05, "{fresh} then {stale}");
     }
 
     #[test]

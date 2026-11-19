@@ -245,7 +245,11 @@ impl SynthMic {
         let features = self.analyzer.features();
         let frame = mic_frame(base, features, self.beat_count);
         self.beat_count = Some(features.beat_count);
-        (frame, self.tap.snapshot(self.analyzer.onsets() as u32))
+        let snapshot = ScopeSnapshot {
+            onset_age_s: self.analyzer.onset_age_s(),
+            ..self.tap.snapshot(self.analyzer.onsets() as u32)
+        };
+        (frame, snapshot)
     }
 }
 
@@ -316,7 +320,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     for &index in &args.frames {
         // Replay camera smoothing and the colour field from frame 0 so stills
         // match a live run.
-        let aspect = renderer.aspect();
+        let size = renderer.size();
         let mut synth = match args.input {
             Input::SynthMic => Some(SynthMic::new()?),
             _ => None,
@@ -325,7 +329,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         pipeline.reset_state();
         for previous in 0..index {
             let frame = feed(pipeline, synth.as_mut(), source.frame(previous)?, previous);
-            pipeline.advance_state(frame, elapsed(previous), aspect);
+            pipeline.advance_state(frame, elapsed(previous), size);
         }
         let frame = feed(pipeline, synth.as_mut(), source.frame(index)?, index);
         let rgb = renderer
@@ -420,6 +424,7 @@ pub fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::phosphor;
 
     fn parse(args: &[&str]) -> Result<CaptureArgs, String> {
         match parse_args(args.iter().map(|arg| arg.to_string()))? {
@@ -639,6 +644,130 @@ mod tests {
         let native = render(0, None);
         assert_eq!(render(0, off), native, "off differs from the baseline");
         assert_ne!(render(0, both), native, "both drew nothing over scene 0");
+    }
+
+    /// The GPU phosphor behaves as its CPU model: over scene 0, with both
+    /// layers drawing and then turned off, the light the layers add to any
+    /// pixel (the capture minus the layer-free baseline, in linear light)
+    /// falls by at most `DECAY_PER_S` per second (plus 8-bit rounding), and
+    /// once it has faded the capture matches the baseline byte for byte.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn phosphor_falls_no_faster_than_its_decay_and_fades_to_the_baseline() {
+        let (width, height) = (160, 90);
+        let new = || {
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height)).unwrap()
+        };
+        let (mut layered, mut baseline) = (new(), new());
+        layered
+            .pipeline_mut()
+            .set_mic_layers(mic_layers::Mode::Both);
+        let linear = |byte: u8| {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let fps = CAPTURE_FPS as u64;
+        // 3 s drawing, then 7 s off: longer than the 1 / DECAY_PER_S fade.
+        let (lit, total) = (3 * fps, 10 * fps);
+        let window = fps / 2;
+        let mut excess: Vec<Vec<f32>> = Vec::new();
+        let mut last = (Vec::new(), Vec::new());
+        for index in 0..total {
+            if index == lit {
+                layered.pipeline_mut().set_mic_layers(mic_layers::Mode::Off);
+            }
+            let frame = ControlFrame {
+                scene: 0,
+                ..ControlFrame::procedural(index)
+            };
+            let elapsed = elapsed(index);
+            let drawn = layered.render(frame, elapsed).unwrap();
+            baseline.pipeline_mut().observe(&frame);
+            let base = baseline
+                .render_with(|pipeline, encoder, view| {
+                    pipeline.encode_without_mic_layers(
+                        encoder,
+                        view,
+                        frame,
+                        elapsed,
+                        (width, height),
+                    );
+                })
+                .unwrap();
+            // Saturated channels hide the added light; mark them unknown.
+            excess.push(
+                drawn
+                    .iter()
+                    .zip(&base)
+                    .map(|(&drawn, &base)| {
+                        if drawn == 255 {
+                            f32::NAN
+                        } else {
+                            linear(drawn) - linear(base)
+                        }
+                    })
+                    .collect(),
+            );
+            if index == lit {
+                assert_ne!(drawn, base, "no afterglow just after turning off");
+            }
+            last = (drawn, base);
+        }
+        assert_eq!(last.0, last.1, "the afterglow never faded to the baseline");
+        // Half-second windows: at most DECAY_PER_S / 2, plus a rounding
+        // margin for two 8-bit encodes per frame.
+        let bound = phosphor::DECAY_PER_S * 0.5 + 0.02;
+        let mut steepest = 0.0_f32;
+        for (earlier, later) in excess.iter().zip(&excess[window as usize..]) {
+            for (&before, &after) in earlier.iter().zip(later) {
+                if before.is_finite() && after.is_finite() {
+                    steepest = steepest.max(before - after);
+                }
+            }
+        }
+        assert!(
+            steepest <= bound,
+            "fell {steepest} in 0.5 s (bound {bound})"
+        );
+        assert!(
+            steepest > 0.02,
+            "the afterglow should visibly fade: {steepest}"
+        );
+    }
+
+    /// A capture still replays earlier frames with `advance_state`, which
+    /// runs the phosphor passes too: it matches a live run byte for byte.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn replayed_stills_match_a_live_run_with_the_phosphor() {
+        let (width, height) = (160, 90);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        renderer
+            .pipeline_mut()
+            .set_mic_layers(mic_layers::Mode::Both);
+        let frame = |index| ControlFrame {
+            scene: 0,
+            ..ControlFrame::procedural(index)
+        };
+        let still = 150;
+        let mut live = Vec::new();
+        for index in 0..=still {
+            live = renderer.render(frame(index), elapsed(index)).unwrap();
+        }
+        renderer.pipeline_mut().reset_state();
+        for index in 0..still {
+            renderer
+                .pipeline_mut()
+                .advance_state(frame(index), elapsed(index), (width, height));
+        }
+        let replayed = renderer.render(frame(still), elapsed(still)).unwrap();
+        assert!(replayed == live, "replayed still differs from the live run");
     }
 
     /// Scene 7 enters the colour field at power-on and draws flat regions

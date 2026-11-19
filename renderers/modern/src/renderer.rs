@@ -6,6 +6,7 @@ use winit::dpi::PhysicalSize;
 
 use crate::audio::scope::ScopeSnapshot;
 use crate::control_frame::ControlFrame;
+use crate::phosphor;
 use crate::profile::RenderProfile;
 use crate::scene::{
     Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
@@ -45,6 +46,11 @@ pub struct ScenePipeline {
     uniform_bind_group: wgpu::BindGroup,
     overlay_uniform_buffer: wgpu::Buffer,
     overlay_bind_group: wgpu::BindGroup,
+    /// Draws the mic layers into the phosphor's emitted target.
+    overlay_pipeline: wgpu::RenderPipeline,
+    phosphor_pipelines: phosphor::Pipelines,
+    /// The mic layers' afterglow; made when they first draw, see `phosphor`.
+    phosphor: Option<phosphor::Phosphor>,
 }
 
 pub struct Renderer {
@@ -219,34 +225,39 @@ impl ScenePipeline {
             bind_group_layouts: &[&uniform_bind_group_layout],
             push_constant_ranges: &[],
         });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("chipviz render pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[Vertex::layout(), Instance::layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
+        let instance_pipeline = |label, format| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[Vertex::layout(), Instance::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
+        };
+        let render_pipeline = instance_pipeline("chipviz render pipeline", format);
+        let overlay_pipeline = instance_pipeline("chipviz mic layers pipeline", phosphor::FORMAT);
+        let phosphor_pipelines = phosphor::Pipelines::new(&device, format);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chipviz quad vertices"),
             contents: bytemuck::cast_slice(&QUAD_VERTICES),
@@ -281,6 +292,9 @@ impl ScenePipeline {
             uniform_bind_group,
             overlay_uniform_buffer,
             overlay_bind_group,
+            overlay_pipeline,
+            phosphor_pipelines,
+            phosphor: None,
         }
     }
 
@@ -291,23 +305,28 @@ impl ScenePipeline {
         self.colour_field = colour_field::ColourField::new(self.colour_field.config());
         self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
         self.scene_state = SceneState::new(self.scene_state.config());
+        self.phosphor = None;
     }
 
     /// Steps camera smoothing, the colour field and the mic layers for a
-    /// frame that is not drawn.
+    /// frame that is not drawn, at a target of `size` pixels.
+    ///
+    /// The mic layers are built and run through the phosphor as when drawn
+    /// (only the final composite is skipped), so the ribbon's limiter and
+    /// the afterglow of a later drawn frame (a capture still) match a live
+    /// run.
     ///
     /// `elapsed` is f64 seconds: the mic layers time bursts with it exactly
     /// however long the renderer runs; scenes take it as f32.
-    pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, aspect: f32) {
+    pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame);
         let (frame, display) = self.dispatch(frame);
         self.camera
-            .build_uniforms(&self.profile, frame, elapsed as f32, aspect);
-        let shown = mic_layers::shown(self.mic_layers.mode(), display);
-        self.mic_layers
-            .step(frame, self.live_scope.as_ref(), elapsed, shown);
-        // As a drawn frame builds it, so the ribbon's limiter is replayed.
-        self.mic_layers.advance_limit(aspect);
+            .build_uniforms(&self.profile, frame, elapsed as f32, size_aspect(size));
+        let mut encoder = self.command_encoder();
+        if self.encode_mic_layers(&mut encoder, None, frame, display, elapsed, size) {
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
     }
 
     pub fn set_mic_layers(&mut self, mode: mic_layers::Mode) {
@@ -415,7 +434,7 @@ impl ScenePipeline {
         let overlay_elapsed = elapsed;
         let elapsed = elapsed as f32;
         let (width, height) = size;
-        let aspect = width as f32 / height.max(1) as f32;
+        let aspect = size_aspect(size);
         let (frame, display) = self.dispatch(frame);
         let (instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
@@ -436,16 +455,89 @@ impl ScenePipeline {
             elapsed,
             aspect,
         );
-        let mut overlay = Vec::new();
+        self.encode_layers(encoder, view, &instances, &uniforms);
         if mic_layers {
-            let shown = mic_layers::shown(self.mic_layers.mode(), display);
-            self.mic_layers
-                .step(frame, self.live_scope.as_ref(), overlay_elapsed, shown);
-            if shown {
-                self.mic_layers.build(frame, aspect, &mut overlay);
-            }
+            self.encode_mic_layers(encoder, Some(view), frame, display, overlay_elapsed, size);
         }
-        self.encode_layers(encoder, view, &instances, &uniforms, &overlay, aspect);
+    }
+
+    /// Steps the mic layers and, while they draw or the phosphor still
+    /// glows, records their phosphor passes, adding the result onto `view`
+    /// when given. Returns whether anything was recorded: with nothing
+    /// drawn and a dark phosphor (always, for layers `off`) no pass or
+    /// texture is touched.
+    fn encode_mic_layers(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: Option<&wgpu::TextureView>,
+        frame: ControlFrame,
+        display: colour_field::Display,
+        elapsed: f64,
+        size: (u32, u32),
+    ) -> bool {
+        let aspect = size_aspect(size);
+        let shown = mic_layers::shown(self.mic_layers.mode(), display);
+        self.mic_layers
+            .step(frame, self.live_scope.as_ref(), elapsed, shown);
+        let mut overlay = Vec::new();
+        if shown {
+            self.mic_layers.build(frame, aspect, &mut overlay);
+        }
+        let count = overlay.len().min(mic_layers::MAX_INSTANCES);
+        if count == 0
+            && self
+                .phosphor
+                .as_ref()
+                .is_none_or(phosphor::Phosphor::is_dark)
+        {
+            return false;
+        }
+        // A new size starts dark: the old afterglow no longer lines up.
+        if self
+            .phosphor
+            .as_ref()
+            .is_none_or(|glow| glow.size() != size)
+        {
+            self.phosphor = Some(phosphor::Phosphor::new(
+                &self.device,
+                &self.phosphor_pipelines,
+                size,
+            ));
+        }
+        let offset = (self.instance_capacity * std::mem::size_of::<Instance>()) as u64;
+        if count > 0 {
+            self.queue.write_buffer(
+                &self.instance_buffer,
+                offset,
+                bytemuck::cast_slice(&overlay[..count]),
+            );
+            // Flat screen-space instances use no other uniform.
+            let flat = Uniforms {
+                view_projection: mic_layers::transform(aspect),
+                time: 0.0,
+                energy: 0.0,
+                beat: 0.0,
+                screen_space: 1.0,
+            };
+            self.queue
+                .write_buffer(&self.overlay_uniform_buffer, 0, bytemuck::bytes_of(&flat));
+        }
+        let overlay = phosphor::Overlay {
+            pipeline: &self.overlay_pipeline,
+            uniforms: &self.overlay_bind_group,
+            quad: &self.vertex_buffer,
+            instances: self.instance_buffer.slice(offset..),
+            count: count as u32,
+        };
+        self.phosphor.as_mut().expect("made above").encode(
+            encoder,
+            &self.queue,
+            &self.phosphor_pipelines,
+            overlay,
+            elapsed,
+            view,
+        );
+        true
     }
 
     /// What the latest colour-field step shows.
@@ -462,19 +554,16 @@ impl ScenePipeline {
         instances: &[Instance],
         uniforms: &Uniforms,
     ) {
-        self.encode_layers(encoder, view, instances, uniforms, &[], 1.0);
+        self.encode_layers(encoder, view, instances, uniforms);
     }
 
-    /// Records the scene's instances, then `overlay` (aspect-space instances
-    /// drawn flat on top, with their own uniforms) in one pass.
+    /// Uploads the scene's instances and uniforms and records their pass.
     fn encode_layers(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         instances: &[Instance],
         uniforms: &Uniforms,
-        overlay: &[Instance],
-        aspect: f32,
     ) {
         let instance_count = instances.len().min(self.instance_capacity);
         self.queue.write_buffer(
@@ -484,23 +573,6 @@ impl ScenePipeline {
         );
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-        let overlay_count = overlay.len().min(mic_layers::MAX_INSTANCES);
-        let overlay_offset = (self.instance_capacity * std::mem::size_of::<Instance>()) as u64;
-        if overlay_count > 0 {
-            self.queue.write_buffer(
-                &self.instance_buffer,
-                overlay_offset,
-                bytemuck::cast_slice(&overlay[..overlay_count]),
-            );
-            let flat = Uniforms {
-                view_projection: mic_layers::transform(aspect),
-                beat: 0.0,
-                screen_space: 1.0,
-                ..*uniforms
-            };
-            self.queue
-                .write_buffer(&self.overlay_uniform_buffer, 0, bytemuck::bytes_of(&flat));
-        }
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("chipviz render pass"),
@@ -521,11 +593,6 @@ impl ScenePipeline {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         render_pass.draw(0..QUAD_VERTICES.len() as u32, 0..instance_count as u32);
-        if overlay_count > 0 {
-            render_pass.set_bind_group(0, &self.overlay_bind_group, &[]);
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(overlay_offset..));
-            render_pass.draw(0..QUAD_VERTICES.len() as u32, 0..overlay_count as u32);
-        }
     }
 
     fn command_encoder(&self) -> wgpu::CommandEncoder {
@@ -655,8 +722,13 @@ impl OffscreenRenderer {
         })
     }
 
+    #[cfg(test)]
     pub fn aspect(&self) -> f32 {
         self.width as f32 / self.height as f32
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     pub fn pipeline_mut(&mut self) -> &mut ScenePipeline {
@@ -780,7 +852,11 @@ fn surface_config(
 }
 
 fn aspect(size: PhysicalSize<u32>) -> f32 {
-    size.width.max(1) as f32 / size.height.max(1) as f32
+    size_aspect((size.width, size.height))
+}
+
+fn size_aspect((width, height): (u32, u32)) -> f32 {
+    width.max(1) as f32 / height.max(1) as f32
 }
 
 #[cfg(test)]
