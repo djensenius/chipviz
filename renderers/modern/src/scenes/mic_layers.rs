@@ -1075,10 +1075,8 @@ mod tests {
                 for pair in quads.chunks(segments).flat_map(|line| line.windows(2)) {
                     let end = |quad: &Instance, sign: f32| {
                         let half = quad.size[0] * 0.5 * sign;
-                        [
-                            quad.center[0] + half * quad.rotation.cos(),
-                            quad.center[1] + half * quad.rotation.sin(),
-                        ]
+                        let (sin, cos) = sin_cos(quad.rotation);
+                        [quad.center[0] + half * cos, quad.center[1] + half * sin]
                     };
                     let (a, b) = (end(&pair[0], 1.0), end(&pair[1], -1.0));
                     let gap = (a[0] - b[0]).hypot(a[1] - b[1]);
@@ -2280,7 +2278,7 @@ mod tests {
         for quad in instances {
             assert_eq!(quad.pattern, [0.0; 2]);
             assert!(quad.color[3] >= 0.95);
-            let (cos, sin) = (quad.rotation.cos(), quad.rotation.sin());
+            let (sin, cos) = sin_cos(quad.rotation);
             // The rotated rectangle's bounding box.
             let (half_width, half_height) = (0.5 * quad.size[0], 0.5 * quad.size[1]);
             let reach_x = cos.abs() * half_width + sin.abs() * half_height + cell;

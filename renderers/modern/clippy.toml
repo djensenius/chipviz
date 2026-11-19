@@ -1,3 +1,4 @@
 disallowed-methods = [
-    { path = "f32::sin_cos", reason = "fuses to __sincosf_stret in release; use scenes::sin_cos (see #112)" },
+    { path = "f32::sin_cos", reason = "fuses to __sincosf_stret in release; use scenes::sin_cos (see #112, #114)" },
+    { path = "f32::cos", reason = "pairs with sin to fuse into __sincosf_stret in release; use scenes::sin_cos or scenes::cos (see #112, #114)" },
 ]

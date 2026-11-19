@@ -2,7 +2,7 @@
 //! flat `ScreenSpace` quads in NDC (`-1..1`, `+y` up).
 
 use super::super::static_noise::font::glyph;
-use super::super::{hash, sin_cos};
+use super::super::{cos, hash, sin_cos};
 use super::models::{Kind, Vec3, hue};
 use super::{Background, Shape, quad};
 use crate::scene::Instance;
@@ -122,7 +122,7 @@ pub(super) fn background(
             out.push(solid([0.0; 2], [2.0; 2], rgba(key, 1.0)));
             for index in 0..3 {
                 let drift = stage.clock * 0.004 + index as f32 * 2.1;
-                let center = [drift.sin() * 0.8, (drift * 1.3).cos() * 0.6];
+                let center = [drift.sin() * 0.8, cos(drift * 1.3) * 0.6];
                 let color = rgba(hue(stage.clock / 600.0 + index as f32 / 3.0), 0.18);
                 out.push(shape(center, 1.4, stage.aspect, color, Shape::Glow));
             }
@@ -137,7 +137,7 @@ fn stars(stage: &Stage, budget: usize, out: &mut Vec<Instance>) {
     gradient(1.0, -1.0, &stops, 12, out);
     for index in 0..4 {
         let drift = stage.clock * 0.002 + index as f32 * 1.7;
-        let center = [drift.sin() * 0.7, (drift * 0.8).cos() * 0.5];
+        let center = [drift.sin() * 0.7, cos(drift * 0.8) * 0.5];
         let color = rgba(hue(0.6 + 0.12 * index as f32), 0.22);
         out.push(shape(center, 1.8, stage.aspect, color, Shape::Glow));
     }
