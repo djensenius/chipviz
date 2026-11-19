@@ -387,8 +387,8 @@ no events. This happens at power-on and every time scene 7 is entered again.
   `notes[0..min(note_count,4)-1]` (the newest entry frame when resampling; the
   entry poll's mapped values, including N64 byte 15, on reduced transports).
   They are not cleared at entry, so a `beat`, `bar`, `drop` or qualifying note
-  already held when scene 7 is entered raises no `B`, `X` or `N` on step 1 on
-  any path (F18).
+  already held when scene 7 is entered raises no `B`, `X` or `N` on the first
+  step after entry, or on any later step while it stays held, on any path (F18).
 - **Detector state:** `armed = 1`, `silent = 0`, `quiet = 0`.
 - **Dominance:** `dom = argmax(b0, b1, b2)`, with ties going to the lowest
   index. `cand = none` and `cand_n = 0`.
