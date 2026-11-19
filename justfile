@@ -53,7 +53,9 @@ scaffold-check:
     @test -f host/fixtures/chipsynth/groove.cvz
     @test -f shared/tools/lint_docs.py
     @test -f shared/tools/build_homebrew.py
+    @test -f shared/tools/capture_assert.py
     @test -f shared/tools/cvz_to_c.py
+    @test -f tests/test_capture_assert.py
     @test -f tests/test_homebrew.py
     @test -f tests/control_frame_tests.c
     @test -f tests/connection_tests.c

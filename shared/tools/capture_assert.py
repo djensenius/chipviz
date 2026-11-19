@@ -132,7 +132,10 @@ def decode_png(data: bytes) -> Image:
     elif kind == b"IEND":
       saw_end = True
       break  # bytes after IEND are ignored
-    elif kind != b"PLTE" and not kind[0] & 0x20:
+    elif kind == b"PLTE":
+      if idat_open:
+        raise CaptureError("PLTE chunk after IDAT")
+    elif not kind[0] & 0x20:
       raise CaptureError(f"unknown critical PNG chunk {kind!r}")
     if kind != b"IDAT" and idat_open:
       idat_done = True
@@ -164,6 +167,8 @@ def decode_png(data: bytes) -> Image:
     raise CaptureError(f"corrupt PNG image data: {error}") from error
   if not decompressor.eof:
     raise CaptureError("PNG image data is truncated or longer than its dimensions")
+  if decompressor.unused_data:
+    raise CaptureError("unexpected bytes after the end of the PNG zlib stream")
   rows = _unfilter(raw, width, height, bpp)
   if bpp == 4:
     rgb_rows = []
@@ -275,8 +280,12 @@ def _display(stats: dict[str, object]) -> dict[str, object]:
   return shown
 
 
-def _exact(value: float) -> fractions.Fraction:
-  return fractions.Fraction(value)
+def parse_fraction(option: str, text: str) -> fractions.Fraction:
+  """Parse decimal or ratio text ("0.3", "1/3") exactly, without a float round trip."""
+  try:
+    return fractions.Fraction(text.strip())
+  except (ValueError, ZeroDivisionError) as error:
+    raise CaptureError(f"{option} must be a finite decimal or ratio such as 0.3 or 1/3") from error
 
 
 def validate(args: argparse.Namespace) -> None:
@@ -286,18 +295,28 @@ def validate(args: argparse.Namespace) -> None:
     raise CaptureError("--tolerance must be between 0 and 255")
   if not 0 <= args.lit_threshold <= 255:
     raise CaptureError("--lit-threshold must be between 0 and 255")
-  if not 0.0 <= args.change_fraction < 1.0:
+  exact: dict[str, fractions.Fraction | None] = {}
+  for option in ("change_fraction", "min_lit_fraction", "max_lit_fraction"):
+    text = getattr(args, option)
+    flag = f"--{option.replace('_', '-')}"
+    exact[option] = None if text is None else parse_fraction(flag, text)
+  if not 0 <= exact["change_fraction"] < 1:
     raise CaptureError("--change-fraction must be in [0, 1)")
   for option in ("min_lit_fraction", "max_lit_fraction"):
-    value = getattr(args, option)
-    if value is not None and not 0.0 <= value <= 1.0:
+    if exact[option] is not None and not 0 <= exact[option] <= 1:
       raise CaptureError(f"--{option.replace('_', '-')} must be in [0, 1]")
+  if exact["min_lit_fraction"] is not None and exact["max_lit_fraction"] is not None \
+      and exact["min_lit_fraction"] > exact["max_lit_fraction"]:
+    raise CaptureError("--min-lit-fraction must not exceed --max-lit-fraction")
   for option in ("min_colors", "max_colors"):
     value = getattr(args, option)
     if value is not None and value < 0:
       raise CaptureError(f"--{option.replace('_', '-')} must be non-negative")
-  if args.min_luma_stddev is not None and not args.min_luma_stddev >= 0.0:
-    raise CaptureError("--min-luma-stddev must be non-negative")
+  if args.min_colors is not None and args.max_colors is not None and args.min_colors > args.max_colors:
+    raise CaptureError("--min-colors must not exceed --max-colors")
+  if args.min_luma_stddev is not None and not (math.isfinite(args.min_luma_stddev) and args.min_luma_stddev >= 0):
+    raise CaptureError("--min-luma-stddev must be finite and non-negative")
+  args.exact = exact
 
 
 def _fraction_text(stats: dict[str, object]) -> str:
@@ -318,14 +337,15 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--min-colors", type=int, help="assert at least N distinct RGB colours in the region")
   parser.add_argument("--max-colors", type=int, help="assert at most N distinct RGB colours in the region")
   parser.add_argument("--min-luma-stddev", type=float, help="assert luma standard deviation >= F")
-  parser.add_argument("--min-lit-fraction", type=float, help="assert lit pixel fraction >= F (0..1)")
-  parser.add_argument("--max-lit-fraction", type=float, help="assert lit pixel fraction <= F (0..1)")
+  parser.add_argument("--min-lit-fraction", help="assert lit pixel fraction >= F (0..1; decimal or ratio, exact)")
+  parser.add_argument("--max-lit-fraction", help="assert lit pixel fraction <= F (0..1; decimal or ratio, exact)")
   parser.add_argument("--sequence", choices=SEQUENCE_MODES,
                       help="assert consecutive images are identical, change at least once, or change every step")
   parser.add_argument("--tolerance", type=int, default=0,
                       help="per-channel delta treated as unchanged in sequence comparisons (default 0)")
-  parser.add_argument("--change-fraction", type=float, default=0.0,
-                      help="a step counts as changed when changed_fraction exceeds this (default 0)")
+  parser.add_argument("--change-fraction", default="0",
+                      help="a step counts as changed when changed_fraction exceeds this "
+                           "(0 <= F < 1; decimal or ratio, exact; default 0)")
   parser.add_argument("--meta", type=parse_meta, action="append", default=[],
                       help="KEY=VALUE provenance echoed into the report (repeatable)")
   return parser
@@ -373,10 +393,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
              stats["luma_stddev"] >= args.min_luma_stddev)
     if args.min_lit_fraction is not None:
       _check(checks, "min-lit-fraction", name, f">= {args.min_lit_fraction}", _fraction_text(stats),
-             stats["lit_fraction"] >= _exact(args.min_lit_fraction))
+             stats["lit_fraction"] >= args.exact["min_lit_fraction"])
     if args.max_lit_fraction is not None:
       _check(checks, "max-lit-fraction", name, f"<= {args.max_lit_fraction}", _fraction_text(stats),
-             stats["lit_fraction"] <= _exact(args.max_lit_fraction))
+             stats["lit_fraction"] <= args.exact["max_lit_fraction"])
 
   steps: list[dict[str, object]] = []
   comparable: bool | None = None
@@ -386,7 +406,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if comparable:
       for index in range(1, len(regions)):
         step = compare(regions[index - 1], regions[index], args.tolerance)
-        changed = step["changed_fraction"] > _exact(args.change_fraction)
+        changed = step["changed_fraction"] > args.exact["change_fraction"]
         steps.append({"from": frames[index - 1]["path"], "to": frames[index]["path"], **_display(step), "changed": changed})
     elif args.sequence:
       raise CaptureError("sequence images/regions have different dimensions")
@@ -411,7 +431,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
       "region": None if args.region is None else [args.region.x, args.region.y, args.region.width, args.region.height],
       "lit_threshold": args.lit_threshold,
       "tolerance": args.tolerance,
-      "change_fraction": args.change_fraction,
+      "change_fraction": str(args.exact["change_fraction"]),
     },
     "frames": frames,
     "steps_comparable": comparable,

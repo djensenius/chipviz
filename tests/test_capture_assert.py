@@ -169,6 +169,19 @@ class DecodeTests(CaptureAssertCase):
     allowed = raw_png(2, 2, rows, chunks=[(b"PLTE", bytes(3)), (b"abCD", b"x"), (b"tIME", bytes(7))])
     self.assertEqual(capture_assert.decode_png(allowed).rows, rows)
 
+  def test_rejects_trailing_zlib_bytes_and_late_plte(self) -> None:
+    rows = [bytes(6), bytes(6)]
+    header = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
+    compressed = zlib.compress(b"".join(b"\x00" + row for row in rows))
+    trailing = (capture_assert.PNG_SIGNATURE + _chunk(b"IHDR", header) + _chunk(b"IDAT", compressed + b"junk")
+                + _chunk(b"IEND", b""))
+    with self.assertRaisesRegex(capture_assert.CaptureError, "after the end of the PNG zlib stream"):
+      capture_assert.decode_png(trailing)
+    late = (capture_assert.PNG_SIGNATURE + _chunk(b"IHDR", header) + _chunk(b"IDAT", compressed)
+            + _chunk(b"PLTE", bytes(3)) + _chunk(b"IEND", b""))
+    with self.assertRaisesRegex(capture_assert.CaptureError, "PLTE chunk after IDAT"):
+      capture_assert.decode_png(late)
+
   def test_rejects_corrupt_zlib_stream(self) -> None:
     header = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
     data = (capture_assert.PNG_SIGNATURE + _chunk(b"IHDR", header)
@@ -292,6 +305,42 @@ class LargeImageTests(CaptureAssertCase):
     self.assertEqual(code, 0)  # 1/2073600 is about 4.8e-7
 
 
+class ExactBoundaryTests(CaptureAssertCase):
+  """Thresholds are parsed exactly from text: 0.3 means 3/10, not float(0.3)."""
+
+  def setUp(self) -> None:
+    super().setUp()
+    lit = [(255, 255, 255)] * 3 + [(0, 0, 0)] * 7
+    self.image = self.write("lit3.png", make_png([lit]))
+    self.dark = self.write("dark.png", make_png(solid(10, 1, (0, 0, 0))))
+
+  def code(self, *argv: str) -> int:
+    return self.invoke(*argv)[0]
+
+  def test_max_lit_fraction_boundary(self) -> None:
+    for value, expected in (("0.3", 0), ("3/10", 0), ("0.30", 0), ("0.29", 1), ("29/100", 1), ("0.31", 0)):
+      with self.subTest(value=value):
+        self.assertEqual(self.code(self.image, "--max-lit-fraction", value), expected)
+
+  def test_min_lit_fraction_boundary(self) -> None:
+    for value, expected in (("0.3", 0), ("3/10", 0), ("0.29", 0), ("0.31", 1), ("1/3", 1)):
+      with self.subTest(value=value):
+        self.assertEqual(self.code(self.image, "--min-lit-fraction", value), expected)
+
+  def test_change_fraction_boundary(self) -> None:
+    # 3 of 10 pixels differ between dark and lit3.
+    pair = (self.dark, self.image)
+    for value, identical, changes in (("0.3", 0, 1), ("3/10", 0, 1), ("0.29", 1, 0), ("2/7", 1, 0)):
+      with self.subTest(value=value):
+        self.assertEqual(self.code(*pair, "--sequence", "identical", "--change-fraction", value), identical)
+        self.assertEqual(self.code(*pair, "--sequence", "changes", "--change-fraction", value), changes)
+
+  def test_parameters_report_exact_change_fraction(self) -> None:
+    _, report, _ = self.invoke(self.dark, self.image, "--change-fraction", "0.30")
+    self.assertEqual(report["parameters"]["change_fraction"], "3/10")
+    self.assertFalse(report["steps"][0]["changed"])
+
+
 class OptionValidationTests(CaptureAssertCase):
   def test_out_of_range_options_exit_2(self) -> None:
     path = self.write("img.png", make_png(solid(4, 4, (0, 0, 0))))
@@ -299,6 +348,15 @@ class OptionValidationTests(CaptureAssertCase):
       ["--change-fraction", "1"],
       ["--change-fraction", "-0.1"],
       ["--change-fraction", "nan"],
+      ["--change-fraction", "inf"],
+      ["--change-fraction", "1/0"],
+      ["--change-fraction", "abc"],
+      ["--max-lit-fraction", "nan"],
+      ["--min-lit-fraction", "4/3"],
+      ["--min-luma-stddev", "inf"],
+      ["--min-luma-stddev", "nan"],
+      ["--min-colors", "5", "--max-colors", "4"],
+      ["--min-lit-fraction", "0.5", "--max-lit-fraction", "0.4"],
       ["--min-lit-fraction", "1.5"],
       ["--max-lit-fraction", "-0.1"],
       ["--lit-threshold", "-1"],
@@ -375,7 +433,9 @@ class SequenceTests(CaptureAssertCase):
     code, _, _ = self.invoke(*paths, "--sequence", "identical", "--tolerance", "2")
     self.assertEqual(code, 0)
     code, _, _ = self.invoke(*paths, "--sequence", "identical", "--change-fraction", "0.01")
-    self.assertEqual(code, 0)
+    self.assertEqual(code, 0)  # exactly 1/100 changed is not above 0.01
+    code, _, _ = self.invoke(*paths, "--sequence", "identical", "--change-fraction", "0.0099")
+    self.assertEqual(code, 1)
 
   def test_region_limits_sequence_comparison(self) -> None:
     base = solid(10, 4, (0, 0, 0))

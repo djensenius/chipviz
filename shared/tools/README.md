@@ -53,7 +53,10 @@ delta between consecutive images. `steps_comparable` is `false` when image or
 region sizes differ (no steps are reported). Fractions in the JSON are rounded
 for display only; assertions compare exact pixel counts, so a single changed
 or lit pixel in a 1080p frame still counts. It applies only the assertions you
-request. Exit status is `0` when every requested assertion passes, `1` when
+request. Fraction options accept decimal or ratio text (`0.3`, `3/10`, `1/3`)
+and are parsed exactly, so `--max-lit-fraction 0.3` accepts exactly 3 of 10
+lit pixels. Trailing bytes after the zlib stream and `PLTE` after `IDAT` are
+rejected. Exit status is `0` when every requested assertion passes, `1` when
 one fails and `2` for invalid input, usage or out-of-range options.
 
 ```sh
@@ -75,9 +78,9 @@ python3 shared/tools/capture_assert.py --sequence changes \
 | --- | --- |
 | `--region X,Y,W,H` | Measure and compare only this rectangle |
 | `--expect-size WxH` | Each image has exactly these dimensions |
-| `--min-colors N`, `--max-colors N` | Distinct RGB colour bounds (non-negative) |
-| `--min-luma-stddev F` | Minimum luma standard deviation (0-255 scale) |
-| `--min-lit-fraction F`, `--max-lit-fraction F` | Lit-pixel fraction bounds (0-1) |
+| `--min-colors N`, `--max-colors N` | Distinct RGB colour bounds (non-negative, min <= max) |
+| `--min-luma-stddev F` | Minimum luma standard deviation (finite, 0-255 scale) |
+| `--min-lit-fraction F`, `--max-lit-fraction F` | Lit-pixel fraction bounds (0-1, min <= max) |
 | `--lit-threshold N` | A pixel is lit when its integer luma exceeds `N` (0-255, default 8) |
 | `--sequence identical` | No consecutive step changes |
 | `--sequence changes` | At least one consecutive step changes |
