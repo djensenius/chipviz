@@ -11,13 +11,28 @@ import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from chipviz_bridge import ControlFrame, Note, WIRE_SIZE, clamp_byte, make_procedural_frame, pack_frame, parse_udp_endpoint
+from chipviz_bridge import (
+  COLOUR_FIELD_SCENE,
+  ControlFrame,
+  Note,
+  WIRE_SIZE,
+  add_allow_flash_argument,
+  announce_allow_flash,
+  clamp_byte,
+  make_procedural_frame,
+  pack_frame,
+  parse_udp_endpoint,
+  sanitise_flash,
+)
 from chipsynth_stream import encode_event_log
 from n64_joybus import JOYBUS_MARKER_MASK, JOYBUS_SIZE, convert_stream
 
 
 DEFAULT_AUDIO_RATE = 48000
 DEFAULT_FPS = 60
+# Host CC1 debounce mirrors the colour-field-v0 target scene-7 debounce.
+SCENE_P_STABLE = 30
+SCENE_CUT_MIN = 20
 
 
 def require_module(module_name: str, install_hint: str):
@@ -79,7 +94,8 @@ def frame_from_bands(frame_index: int, bands: tuple[int, ...], midi_velocity: in
       mid=mid,
       treble=treble,
       spectrum=bands,
-      scene=(frame_index // 240) & 0x07,
+      # Skip colour-field scene 7: its palette would cycle every 60 frames.
+      scene=(frame_index // 240) % 7,
       palette=(frame_index // 60) & 0x07,
       flags=flags,
       notes=note,
@@ -117,6 +133,40 @@ def build_audio_frames(duration: float, sample_rate: int, fps: int, device: str 
   return frames
 
 
+class SceneDebounce:
+  """Debounce a continuous scene control (MIDI CC1) across scene 7.
+
+  A change into or out of scene 7 is sent only after the raw value has been
+  unchanged for ``SCENE_P_STABLE`` consecutive frames: the change is made at
+  the end of the 30th frame and sent from the next one. It is also never sent
+  sooner than ``SCENE_CUT_MIN`` frames after the previous scene-7 entry or
+  exit. Changes between other scenes are sent at once.
+  """
+
+  def __init__(self, scene: int = 0) -> None:
+    self.scene = scene
+    self._candidate = scene
+    self._count = 0
+    self._since_cut = SCENE_CUT_MIN
+
+  def step(self, raw: int) -> int:
+    """Advance one frame with the raw scene value; return the scene to send."""
+    if raw == self._candidate:
+      self._count += 1
+    else:
+      self._candidate = raw
+      self._count = 1
+    self._since_cut += 1
+    if (raw == COLOUR_FIELD_SCENE) == (self.scene == COLOUR_FIELD_SCENE):
+      self.scene = raw
+      return self.scene
+    sent = self.scene
+    if self._count >= SCENE_P_STABLE and self._since_cut >= SCENE_CUT_MIN:
+      self.scene = raw
+      self._since_cut = 0
+    return sent
+
+
 def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Iterator[bytes]:
   """Yield control frames captured from a MIDI port at real-time cadence.
 
@@ -128,7 +178,8 @@ def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Itera
     raise ValueError("MIDI frame count must be at least 1")
   mido = require_module("mido", "mido python-rtmidi")
   velocity = 0
-  scene = 0
+  raw_scene = 0
+  debounce = SceneDebounce()
   palette = 0
   interval = 1.0 / fps
   with mido.open_input(port_name) as port:
@@ -141,9 +192,10 @@ def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Itera
           velocity = 0
         elif message.type == "control_change":
           if message.control == 1:
-            scene = int(message.value) // 16
+            raw_scene = int(message.value) // 16
           elif message.control == 2:
             palette = int(message.value) // 16
+      scene = debounce.step(raw_scene)
       base = make_procedural_frame(frame_index)
       notes = (Note(60, clamp_byte(velocity * 2)),) if velocity > 0 else ()
       yield pack_frame(ControlFrame(
@@ -188,13 +240,15 @@ class FileSink:
   """Write the raw control-frame stream to disk; never paced."""
 
   paced = False
+  allow_flash = False
 
-  def __init__(self, path: Path) -> None:
+  def __init__(self, path: Path, allow_flash: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     self._handle = path.open("wb")
+    self.allow_flash = allow_flash
 
   def send(self, frame: bytes) -> None:
-    self._handle.write(frame)
+    self._handle.write(sanitise_flash(frame, "full", self.allow_flash))
 
   def close(self) -> None:
     self._handle.close()
@@ -204,13 +258,15 @@ class UdpSink:
   """Send each control frame to a UDP endpoint; paced on output."""
 
   paced = True
+  allow_flash = False
 
-  def __init__(self, endpoint: tuple[str, int]) -> None:
+  def __init__(self, endpoint: tuple[str, int], allow_flash: bool = False) -> None:
     self._endpoint = endpoint
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self.allow_flash = allow_flash
 
   def send(self, frame: bytes) -> None:
-    self._socket.sendto(frame, self._endpoint)
+    self._socket.sendto(sanitise_flash(frame, "full", self.allow_flash), self._endpoint)
 
   def close(self) -> None:
     self._socket.close()
@@ -220,16 +276,18 @@ class N64SerialSink:
   """Send packed 16-byte N64 Joybus frames over serial; paced on output."""
 
   paced = True
+  allow_flash = False
 
-  def __init__(self, device: str, baud: int) -> None:
+  def __init__(self, device: str, baud: int, allow_flash: bool = False) -> None:
     serial_module = require_module("serial", "pyserial")
     self._port = serial_module.Serial(device, baudrate=baud, timeout=1)
     self._sequence = 0
+    self.allow_flash = allow_flash
 
   def send(self, frame: bytes) -> None:
     # Own per-packet marker sequence: advances even if the source repeats or
     # stalls its control-frame counter.
-    packets = convert_stream(frame, self._sequence)
+    packets = convert_stream(frame, self._sequence, allow_flash=self.allow_flash)
     self._sequence = (self._sequence + len(packets) // JOYBUS_SIZE) & JOYBUS_MARKER_MASK
     self._port.write(packets)
     self._port.flush()
@@ -271,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--n64-serial", help="send packed 16-byte N64 Joybus frames to this serial device")
   parser.add_argument("--serial-baud", type=int, default=115200, help="serial baud for --n64-serial")
   parser.add_argument("--output", type=Path, help="write normalized control-frame-v0 stream")
+  add_allow_flash_argument(parser)
   return parser
 
 
@@ -284,16 +343,17 @@ def main() -> int:
     raise SystemExit("--audio-rate must be at least 8000")
   if not args.output and not args.udp and not args.n64_serial:
     raise SystemExit("choose --output, --udp, --n64-serial, or a combination")
+  announce_allow_flash(args.allow_flash)
 
   frames, realtime = open_frame_source(args)
   with contextlib.ExitStack() as stack:
     sinks: list = []
     if args.output:
-      sinks.append(stack.enter_context(contextlib.closing(FileSink(args.output))))
+      sinks.append(stack.enter_context(contextlib.closing(FileSink(args.output, args.allow_flash))))
     if args.udp:
-      sinks.append(stack.enter_context(contextlib.closing(UdpSink(args.udp))))
+      sinks.append(stack.enter_context(contextlib.closing(UdpSink(args.udp, args.allow_flash))))
     if args.n64_serial:
-      sinks.append(stack.enter_context(contextlib.closing(N64SerialSink(args.n64_serial, args.serial_baud))))
+      sinks.append(stack.enter_context(contextlib.closing(N64SerialSink(args.n64_serial, args.serial_baud, args.allow_flash))))
     stream_frames(frames, realtime, args.rate, sinks)
   return 0
 

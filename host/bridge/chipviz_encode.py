@@ -24,8 +24,11 @@ from chipviz_bridge import (
   SPECTRUM_BANDS,
   ControlFrame,
   Note,
+  add_allow_flash_argument,
+  announce_allow_flash,
   clamp_byte,
   pack_frame,
+  sanitise_stream,
 )
 from chipsynth_stream import encode_event_log
 
@@ -212,11 +215,13 @@ def build_parser() -> argparse.ArgumentParser:
     action="store_true",
     help="(re)generate the golden outputs from the checked-in inputs",
   )
+  add_allow_flash_argument(parser)
   return parser
 
 
 def main() -> int:
   args = build_parser().parse_args()
+  announce_allow_flash(args.allow_flash)
 
   if args.write_fixtures:
     write_fixtures()
@@ -236,6 +241,7 @@ def main() -> int:
     stream = encode_path("chipsynth", args.chipsynth_log)
   else:
     raise SystemExit("choose --music, --chipsynth-log, --verify-fixtures, or --write-fixtures")
+  stream = sanitise_stream(stream, "full", args.allow_flash)
 
   if args.output is None or str(args.output) == "-":
     sys.stdout.buffer.write(stream)
