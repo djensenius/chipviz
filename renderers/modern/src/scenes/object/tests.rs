@@ -225,10 +225,14 @@ fn overlay_text_uses_only_font_characters() {
 }
 
 #[test]
-fn overlay_text_stays_inside_the_frame() {
-    for aspect in [WIDE, 9.0 / 16.0] {
+fn overlay_text_and_discs_stay_inside_the_frame() {
+    let limit = 1.0 - backdrop::TEXT_MARGIN + 1e-4;
+    let span = |quad: &&Instance| [-0.5, 0.5].map(|side| quad.center[0] + side * quad.size[0]);
+    let top_left = |quad: &&Instance| quad.center[0] < 0.0 && quad.center[1] > 0.7;
+    let mut dots = 0;
+    for aspect in [WIDE, 9.0 / 16.0, 1.0 / 3.0] {
         for index in 0..12 {
-            for local in [0, 128, 256, 384] {
+            for local in [0, 30, 128, 256, 384] {
                 let frame = ControlFrame {
                     beat_phase: 0,
                     ..frame_in(index, local)
@@ -238,21 +242,29 @@ fn overlay_text_stays_inside_the_frame() {
                 backdrop::camcorder(&stage, &mut overlay);
                 backdrop::infomercial(&stage, section(frame).object, &mut overlay);
                 // Glyphs are the only quads with a non-negative, non-zero pattern.
-                let glyphs = overlay.iter().filter(|instance| {
-                    instance.pattern.iter().all(|&bits| bits >= 0.0) && instance.pattern != [0.0; 2]
+                let glyphs = overlay.iter().filter(|quad| {
+                    quad.pattern.iter().all(|&bits| bits >= 0.0) && quad.pattern != [0.0; 2]
                 });
-                let limit = 1.0 - backdrop::TEXT_MARGIN + 1e-4;
-                for glyph in glyphs {
-                    let [left, right] =
-                        [-0.5, 0.5].map(|side| glyph.center[0] + side * glyph.size[0]);
+                let discs = overlay
+                    .iter()
+                    .filter(|quad| quad.pattern == Shape::Disc.pattern());
+                for [left, right] in glyphs.clone().chain(discs.clone()).map(|quad| span(&quad)) {
                     assert!(
                         left >= -limit && right <= limit,
                         "{aspect} {index}: {left} {right}"
                     );
                 }
+                // The record dot never touches "REC".
+                let rec_left = glyphs.filter(top_left).map(|quad| span(&quad)[0]);
+                let rec_left = rec_left.fold(f32::MAX, f32::min);
+                for dot in discs.filter(top_left) {
+                    assert!(span(&dot)[1] < rec_left, "{aspect} {index}: dot meets REC");
+                    dots += 1;
+                }
             }
         }
     }
+    assert!(dots > 0);
 }
 
 #[test]

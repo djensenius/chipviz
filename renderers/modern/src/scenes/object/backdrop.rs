@@ -367,11 +367,16 @@ pub(super) fn camcorder(stage: &Stage, out: &mut Vec<Instance>) {
     let edge = [0.0, roll - height * 0.5];
     out.push(solid(edge, [2.0, 0.006], [1.0, 1.0, 1.0, 0.35]));
     let white = [0.95, 0.95, 0.95, 1.0];
+    // On narrow frames the record dot stays inside the edge and "REC"
+    // moves right to clear it (fitting only shrinks text towards its centre).
+    let dot = 0.0275 / stage.aspect;
+    let dot_x = (-0.88f32).max(-1.0 + TEXT_MARGIN + dot);
+    let rec_x = (-0.78f32).max(dot_x + dot + 0.02 + 17.0 * 0.065 / 16.0 / stage.aspect);
     if (stage.clock as u32 / 30).is_multiple_of(2) {
         let red = [1.0, 0.05, 0.05, 1.0];
-        out.push(shape([-0.88, 0.84], 0.055, stage.aspect, red, Shape::Disc));
+        out.push(shape([dot_x, 0.84], 0.055, stage.aspect, red, Shape::Disc));
     }
-    text(stage, "REC", [-0.78, 0.84], 0.065, white, out);
+    text(stage, "REC", [rec_x, 0.84], 0.065, white, out);
     text(stage, "SP", [0.86, 0.84], 0.065, white, out);
     let seconds = stage.clock as u32 / 60;
     let clock = format!("{:02}:{:02}:{:02} PM", 11, seconds / 60 % 60, seconds % 60);
@@ -387,7 +392,11 @@ pub(super) fn infomercial(stage: &Stage, object: Kind, out: &mut Vec<Instance>) 
     text(stage, object.caption(), [0.0, -0.74], 0.1, GOLD, out);
     let tagline = TAGLINES[(stage.t as usize / 128) % TAGLINES.len()];
     text(stage, tagline, [0.0, -0.885], 0.055, [1.0; 4], out);
-    let center = [0.72, 0.62];
+    // The burst's disc (at its largest punch) stays inside the right edge.
+    let center = [
+        (0.72f32).min(1.0 - TEXT_MARGIN - 0.184 / stage.aspect),
+        0.62,
+    ];
     let radius = 0.16 * (1.0 + 0.15 * stage.punch);
     for index in 0..16 {
         let angle = stage.clock * 0.01 + index as f32 * TAU / 16.0;
