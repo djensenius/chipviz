@@ -50,7 +50,9 @@ mode, and append that entry to `REGISTRY`. Appending keeps every byte below the
 old registry length on the same scene; wrapped bytes follow the new length.
 `Orbit3D` scenes use world coordinates and the smoothed orbit camera.
 `ScreenSpace` scenes draw flat: `center.xy` is NDC (`-1..1` spans the viewport,
-`+y` up), depth is ignored, and instances draw in order.
+`+y` up), depth is ignored, and instances draw in order with their colour
+unchanged (no quad-edge darkening or beat/energy pulse). Builders receive the
+viewport aspect (width / height) for laying out screen-space fields.
 
 The Pi 5 profile favors crisp geometry and predictable frame pacing. The M1
 profile favors density, deeper Z spacing, and more aggressive camera motion.
@@ -68,7 +70,9 @@ just modern-capture --input host/fixtures/musical/groove.cvz --frames 0,30 --out
 ```
 
 Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
-frame 0. `--scene` overrides each frame's scene byte; without it the input's
+frame 0, so very large frame indices take longer to capture.
+A `.cvz` input does not wrap: indices past its last frame are an error.
+`--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--input` is `procedural` (default) or a `.cvz` file of
 concatenated control-frame packets, such as the bridge's `--output`.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`

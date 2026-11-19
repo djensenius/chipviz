@@ -23,12 +23,14 @@ pub enum CameraMode {
     /// World-space instances viewed through the smoothed orbit camera.
     Orbit3D,
     /// Flat instances whose `center.xy` are NDC (-1..1 spans the viewport,
-    /// +y up) and whose depth is ignored; draw order is instance order.
+    /// +y up) and whose depth is ignored; draw order is instance order. The
+    /// shader draws their colour as-is: no quad-edge darkening or beat pulse.
     ScreenSpace,
 }
 
-/// Appends at most `profile.instance_count` instances for one frame.
-pub type SceneBuilder = fn(&RenderProfile, ControlFrame, f32, &mut Vec<Instance>);
+/// Appends at most `profile.instance_count` instances for one frame, given
+/// elapsed seconds and the viewport aspect (width / height).
+pub type SceneBuilder = fn(&RenderProfile, ControlFrame, f32, f32, &mut Vec<Instance>);
 
 pub struct SceneEntry {
     pub name: &'static str,
@@ -162,7 +164,9 @@ mod tests {
     fn registry_scenes_match_pre_registry_code_byte_for_byte() {
         for scene in 0..3 {
             assert_eq!(
-                fingerprint(scene, build_instances),
+                fingerprint(scene, |profile, frame, elapsed| {
+                    build_instances(profile, frame, elapsed, 16.0 / 9.0)
+                }),
                 fingerprint(scene, reference::build_instances),
                 "scene {scene}"
             );
@@ -170,9 +174,9 @@ mod tests {
     }
 
     // Recorded from the original scene.rs (commit 559ec5d) on Apple Silicon.
-    // Gated to macOS because platform libm sin/cos may differ in the last ulp;
+    // Gated to Apple Silicon macOS because platform libm sin/cos may differ in the last ulp;
     // the reference comparison above covers every platform.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn registry_scenes_match_recorded_pre_registry_golden() {
         let golden = [
@@ -182,7 +186,9 @@ mod tests {
         ];
         for (scene, expected) in golden.into_iter().enumerate() {
             assert_eq!(
-                fingerprint(scene as u8, build_instances),
+                fingerprint(scene as u8, |profile, frame, elapsed| {
+                    build_instances(profile, frame, elapsed, 16.0 / 9.0)
+                }),
                 expected,
                 "scene {scene}"
             );
@@ -215,6 +221,7 @@ mod tests {
         let flat = CameraMode::ScreenSpace;
         let actual = scene_uniforms(flat, &mut Camera::default(), &profile, frame, 1.0, 1.5);
         assert_eq!(actual.view_projection, SCREEN_SPACE_TRANSFORM);
+        assert_eq!((expected.screen_space, actual.screen_space), (0.0, 1.0));
         assert_eq!((actual.time, actual.beat), (expected.time, expected.beat));
     }
 }

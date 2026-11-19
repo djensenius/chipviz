@@ -58,7 +58,8 @@ pub struct Uniforms {
     pub time: f32,
     pub energy: f32,
     pub beat: f32,
-    pub _padding: f32,
+    /// 1.0 for ScreenSpace scenes: the shader skips edge darkening and pulse.
+    pub screen_space: f32,
 }
 
 pub const QUAD_VERTICES: [Vertex; 6] = [
@@ -86,9 +87,10 @@ pub fn build_instances(
     profile: &RenderProfile,
     frame: ControlFrame,
     elapsed: f32,
+    aspect: f32,
 ) -> Vec<Instance> {
     let mut instances = Vec::with_capacity(profile.instance_count);
-    (scenes::select(frame.scene).build)(profile, frame, elapsed, &mut instances);
+    (scenes::select(frame.scene).build)(profile, frame, elapsed, aspect, &mut instances);
     instances
 }
 
@@ -114,6 +116,7 @@ pub fn scene_uniforms(
     let mut uniforms = camera.build_uniforms(profile, frame, elapsed, aspect);
     if mode == CameraMode::ScreenSpace {
         uniforms.view_projection = SCREEN_SPACE_TRANSFORM;
+        uniforms.screen_space = 1.0;
     }
     uniforms
 }
@@ -170,7 +173,7 @@ impl Camera {
             time: elapsed,
             energy,
             beat,
-            _padding: 0.0,
+            screen_space: 0.0,
         }
     }
 }

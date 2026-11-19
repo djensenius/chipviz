@@ -15,6 +15,7 @@ fn build(
     profile: &RenderProfile,
     frame: ControlFrame,
     elapsed: f32,
+    _aspect: f32,
     instances: &mut Vec<Instance>,
 ) {
     let columns = 128usize;

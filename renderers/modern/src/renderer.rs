@@ -5,7 +5,9 @@ use winit::dpi::PhysicalSize;
 
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
-use crate::scene::{Camera, Instance, QUAD_VERTICES, Vertex, build_instances, scene_uniforms};
+use crate::scene::{
+    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
+};
 use crate::scenes;
 
 /// Offscreen capture format; sRGB like the window's preferred surface format.
@@ -51,6 +53,11 @@ pub enum RendererError {
     NoSurfaceFormat,
     Surface(wgpu::SurfaceError),
     Readback(wgpu::BufferAsyncError),
+    TargetTooLarge {
+        width: u32,
+        height: u32,
+        max_dimension: u32,
+    },
 }
 
 impl std::fmt::Display for RendererError {
@@ -66,6 +73,15 @@ impl std::fmt::Display for RendererError {
             }
             Self::Surface(error) => write!(formatter, "surface error: {error}"),
             Self::Readback(error) => write!(formatter, "texture readback failed: {error}"),
+            Self::TargetTooLarge {
+                width,
+                height,
+                max_dimension,
+            } => write!(
+                formatter,
+                "capture size {width}x{height} exceeds the GPU limit \
+                 ({max_dimension} px per side, or the readback buffer limit)"
+            ),
         }
     }
 }
@@ -245,13 +261,7 @@ impl ScenePipeline {
         elapsed: f32,
         aspect: f32,
     ) {
-        let instances = build_instances(&self.profile, frame, elapsed);
-        let instance_count = instances.len().min(self.instance_capacity);
-        self.queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&instances[..instance_count]),
-        );
+        let instances = build_instances(&self.profile, frame, elapsed, aspect);
         let uniforms = scene_uniforms(
             scenes::select(frame.scene).camera,
             &mut self.camera,
@@ -260,8 +270,25 @@ impl ScenePipeline {
             elapsed,
             aspect,
         );
+        self.encode_instances(encoder, view, &instances, &uniforms);
+    }
+
+    /// Uploads explicit instances and uniforms, then records the render pass.
+    pub(crate) fn encode_instances(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        instances: &[Instance],
+        uniforms: &Uniforms,
+    ) {
+        let instance_count = instances.len().min(self.instance_capacity);
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&instances[..instance_count]),
+        );
         self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("chipviz render pass"),
@@ -368,6 +395,7 @@ impl OffscreenRenderer {
     ) -> Result<Self, RendererError> {
         let (width, height) = (width.max(1), height.max(1));
         let (_, device, queue) = request_device(&gpu_instance(), &profile, None).await?;
+        check_target_size(width, height, &device.limits())?;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("chipviz offscreen target"),
             size: wgpu::Extent3d {
@@ -383,8 +411,7 @@ impl OffscreenRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let padded_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row = padded_row_bytes(width);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chipviz offscreen readback"),
             size: u64::from(padded_row) * u64::from(height),
@@ -416,9 +443,18 @@ impl OffscreenRenderer {
     /// Draws one frame and returns tightly packed RGB8 rows, top row first.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<Vec<u8>, RendererError> {
         let aspect = self.aspect();
+        self.render_with(|pipeline, encoder, view| {
+            pipeline.encode(encoder, view, frame, elapsed, aspect);
+        })
+    }
+
+    /// Records `draw` into the offscreen target, then reads back RGB8 rows.
+    pub(crate) fn render_with(
+        &mut self,
+        draw: impl FnOnce(&mut ScenePipeline, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+    ) -> Result<Vec<u8>, RendererError> {
         let mut encoder = self.pipeline.command_encoder();
-        self.pipeline
-            .encode(&mut encoder, &self.view, frame, elapsed, aspect);
+        draw(&mut self.pipeline, &mut encoder, &self.view);
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
                 texture: &self.texture,
@@ -468,6 +504,28 @@ impl OffscreenRenderer {
     }
 }
 
+fn padded_row_bytes(width: u32) -> u32 {
+    (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+}
+
+/// Rejects capture sizes the device cannot allocate, instead of letting wgpu
+/// validation panic.
+fn check_target_size(width: u32, height: u32, limits: &wgpu::Limits) -> Result<(), RendererError> {
+    let max_dimension = limits.max_texture_dimension_2d;
+    let fits = width <= max_dimension
+        && height <= max_dimension
+        && u64::from(padded_row_bytes(width)) * u64::from(height) <= limits.max_buffer_size;
+    if fits {
+        Ok(())
+    } else {
+        Err(RendererError::TargetTooLarge {
+            width,
+            height,
+            max_dimension,
+        })
+    }
+}
+
 fn surface_config(
     format: wgpu::TextureFormat,
     present_mode: wgpu::PresentMode,
@@ -492,4 +550,38 @@ fn surface_config(
 
 fn aspect(size: PhysicalSize<u32>) -> f32 {
     size.width.max(1) as f32 / size.height.max(1) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_size_check_follows_device_limits() {
+        let limits = wgpu::Limits::default();
+        let max = limits.max_texture_dimension_2d;
+        for (width, height) in [(1, 1), (1920, 1080), (3840, 2160), (max, max)] {
+            assert!(
+                check_target_size(width, height, &limits).is_ok(),
+                "{width}x{height}"
+            );
+        }
+        for (width, height) in [(max + 1, 10), (9000, 10), (10, max + 1)] {
+            let error = check_target_size(width, height, &limits).unwrap_err();
+            assert!(error.to_string().contains(&format!("{width}x{height}")));
+        }
+        let tight = wgpu::Limits {
+            max_buffer_size: 1024,
+            ..limits
+        };
+        assert!(check_target_size(64, 4, &tight).is_ok());
+        assert!(check_target_size(64, 5, &tight).is_err());
+    }
+
+    #[test]
+    fn readback_rows_are_padded_to_copy_alignment() {
+        assert_eq!(padded_row_bytes(64), 256);
+        assert_eq!(padded_row_bytes(100), 512);
+        assert_eq!(padded_row_bytes(1920), 7680);
+    }
 }

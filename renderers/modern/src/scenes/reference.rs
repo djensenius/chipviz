@@ -1,5 +1,7 @@
 //! Verbatim pre-registry scene code (from scene.rs before #70), kept only to
 //! prove the registry refactor produces byte-identical instance data.
+//! Intentional visual changes to an existing scene must re-baseline this copy
+//! and the recorded golden in `scenes/mod.rs`, or delete both checks.
 
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;

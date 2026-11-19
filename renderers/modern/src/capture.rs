@@ -398,4 +398,58 @@ mod tests {
             );
         }
     }
+
+    /// 100 px rows are 400 bytes, padded to 512 for readback, so a stride or
+    /// row-order bug moves the quadrant edges. Also checks that ScreenSpace
+    /// output has no quad-edge darkening or beat/energy pulse.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn offscreen_readback_preserves_rows_and_flat_screen_space_colour() {
+        use crate::scene::{Camera, Instance, scene_uniforms};
+
+        let (width, height) = (100, 30);
+        let profile = RenderProfile::pi5();
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height)).unwrap();
+        // Top-left quadrant in NDC; linear 0.5 grey encodes to sRGB ~188.
+        let quad = Instance {
+            center: [-0.5, 0.5, 0.0],
+            size: [1.0, 1.0],
+            color: [0.5, 0.5, 0.5, 1.0],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            _padding: [0.0; 2],
+        };
+        let frame = ControlFrame {
+            energy: 255,
+            flags: 0x01,
+            ..ControlFrame::procedural(0)
+        };
+        let uniforms = scene_uniforms(
+            CameraMode::ScreenSpace,
+            &mut Camera::default(),
+            &profile,
+            frame,
+            1.0,
+            renderer.aspect(),
+        );
+        assert_eq!(uniforms.beat, 1.0);
+        let rgb = renderer
+            .render_with(|pipeline, encoder, view| {
+                pipeline.encode_instances(encoder, view, &[quad], &uniforms);
+            })
+            .unwrap();
+        assert_eq!(rgb.len(), (width * height * 3) as usize);
+        for (row, line) in rgb.chunks_exact(width as usize * 3).enumerate() {
+            for (column, pixel) in line.chunks_exact(3).enumerate() {
+                let inside = column < width as usize / 2 && row < height as usize / 2;
+                let ok = if inside {
+                    pixel.iter().all(|value| (186..=190).contains(value))
+                } else {
+                    pixel == [0, 0, 0]
+                };
+                assert!(ok, "pixel ({column}, {row}) = {pixel:?}, inside {inside}");
+            }
+        }
+    }
 }
