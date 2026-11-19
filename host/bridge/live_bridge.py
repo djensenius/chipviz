@@ -226,12 +226,17 @@ class ColourFieldRateCap:
   ``(note, velocity)`` pair at ``NOTE_VEL`` or more on the full path; byte 15,
   the highest velocity, rising across ``NOTE_VEL`` on Joybus; none on HID).
   An event that the previous sent frame already shows is held for at most
-  ``CARRY_HOLD`` sends. Only valid frames (magic, version, reserved flag bits
+  ``CARRY_HOLD`` sends. A carried note goes into a free note slot, or else
+  replaces the quietest note below ``NOTE_VEL`` (on Joybus this raises byte 15
+  to the carried velocity). If every slot holds a louder note, it waits up to
+  ``CARRY_FULL_HOLD`` sends for room, and is dropped as soon as a sent frame
+  shows it. Only valid frames (magic, version, reserved flag bits
   clear, note count and checksum) raise events, act as the previous frame, or
   are rewritten; invalid frames pass through unchanged.
   """
 
   CARRY_HOLD = 2
+  CARRY_FULL_HOLD = 30
   _NOTE_EVENTS = {"full": "note", "joybus": "vel", "hid": None}
 
   def __init__(self, transport: str, clock: Callable[[], int] | None = None) -> None:
@@ -243,7 +248,7 @@ class ColourFieldRateCap:
     self._window: collections.deque[int] = collections.deque(maxlen=COLOUR_FIELD_MAX_FPS)
     self._last_sent = b""
     self._previous = b""
-    # Event key -> [payload, sends held].
+    # Event key -> [payload, sends held as already shown, sends without room].
     self._pending: dict[tuple, list] = {}
 
   def filter(self, wire: bytes) -> bytes | None:
@@ -257,7 +262,7 @@ class ColourFieldRateCap:
     if valid:
       if self._previous:
         for key, payload in self._events(self._previous, wire):
-          self._pending[key] = [payload, 0]
+          self._pending[key] = [payload, 0, 0]
       self._previous = wire
     if not send:
       return None
@@ -303,26 +308,38 @@ class ColourFieldRateCap:
   def _deliver(self, wire: bytes) -> bytes:
     out = bytearray(wire)
     for key, entry in list(self._pending.items()):
-      payload = entry[0]
-      if not (self._last_sent and self._shows(self._last_sent, key)):
-        if self._shows(out, key):
+      if self._last_sent and self._shows(self._last_sent, key):
+        entry[1] += 1
+        if entry[1] > self.CARRY_HOLD:
           del self._pending[key]
-          continue
-        if key[0] == "flag":
-          out[FLAGS_OFFSET] |= key[1]
-          del self._pending[key]
-          continue
-        count = out[NOTE_COUNT_OFFSET]
-        if count < MAX_NOTES:
-          out[24 + count * 2], out[25 + count * 2] = payload
-          out[NOTE_COUNT_OFFSET] = count + 1
-          del self._pending[key]
-          continue
-      entry[1] += 1
-      if entry[1] > self.CARRY_HOLD:
+      elif self._shows(out, key):
         del self._pending[key]
+      elif key[0] == "flag":
+        out[FLAGS_OFFSET] |= key[1]
+        del self._pending[key]
+      elif self._place_note(out, entry[0]):
+        del self._pending[key]
+      else:
+        entry[2] += 1
+        if entry[2] > self.CARRY_FULL_HOLD:
+          del self._pending[key]
     out[-1] = checksum(out[:-1])
     return bytes(out)
+
+  @staticmethod
+  def _place_note(out: bytearray, pair: tuple[int, int]) -> bool:
+    """Put a carried note in a free slot or the quietest sub-threshold one."""
+    count = out[NOTE_COUNT_OFFSET]
+    if count < MAX_NOTES:
+      slot = count
+      out[NOTE_COUNT_OFFSET] = count + 1
+    else:
+      quiet = [index for index in range(MAX_NOTES) if out[25 + index * 2] < NOTE_VEL]
+      if not quiet:
+        return False
+      slot = min(quiet, key=lambda index: out[25 + index * 2])
+    out[24 + slot * 2], out[25 + slot * 2] = pair
+    return True
 
 
 def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Iterator[bytes]:

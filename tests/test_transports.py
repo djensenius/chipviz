@@ -657,6 +657,38 @@ class ColourFieldRateCapTests(unittest.TestCase):
     self.assertEqual(outs[2], bytes(reserved))
     self.assertEqual([out[22] for out in outs], [0, 1, 0x21, 1, 0, 0])
 
+  def test_carried_onset_replaces_quietest_sub_threshold_note(self) -> None:
+    # Reviewer repro: loud note on dropped frame 1, four quiet notes after.
+    quiet = tuple(chipviz_bridge.Note(70 + index, velocity) for index, velocity in enumerate((40, 10, 30, 20)))
+    loud = chipviz_bridge.Note(60, 100)
+    frames = [_cf_frame(0), _cf_frame(1, notes=(loud,))] + [_cf_frame(i, notes=quiet) for i in range(2, 8)]
+    full = [out for out in self._cap("full", frames) if out]
+    self.assertEqual(full[1][23], 4)
+    self.assertEqual(full[1][24:32], bytes((70, 40, 60, 100, 72, 30, 73, 20)))
+    self.assertTrue(all((60, 100) not in live_bridge._wire_notes(out) for out in full[2:]))
+    joybus = [out for out in self._cap("joybus", frames) if out]
+    packets = n64_joybus.convert_stream(b"".join(joybus))
+    self.assertEqual([packets[i * 16 + 15] for i in range(len(joybus))], [0, 100, 40, 40])
+
+  def test_carried_note_waits_for_room_then_is_bounded(self) -> None:
+    def loud(*numbers: int) -> tuple:
+      return tuple(chipviz_bridge.Note(number, 100) for number in numbers)
+
+    held = loud(70, 71, 72)
+    frames = [_cf_frame(0, notes=held), _cf_frame(1, notes=held + loud(60))]
+    frames += [_cf_frame(i, notes=held + loud(80)) for i in range(2, 10)]
+    frames += [_cf_frame(i, notes=held) for i in range(10, 14)]
+    sent = [out for out in self._cap("full", frames) if out]
+    shown = [index for index, out in enumerate(sent) if (60, 100) in live_bridge._wire_notes(out)]
+    self.assertEqual(shown, [5], "the onset waits through 4 full sends, then takes the free slot")
+    # Full for longer than CARRY_FULL_HOLD sends: the onset is dropped.
+    limit = live_bridge.ColourFieldRateCap.CARRY_FULL_HOLD
+    frames = [_cf_frame(0, notes=held), _cf_frame(1, notes=held + loud(60))]
+    frames += [_cf_frame(i, notes=held + loud(80)) for i in range(2, 2 * limit + 4)]
+    frames += [_cf_frame(i, notes=held) for i in range(2 * limit + 4, 2 * limit + 8)]
+    sent = [out for out in self._cap("full", frames) if out]
+    self.assertFalse(any((60, 100) in live_bridge._wire_notes(out) for out in sent))
+
 
 class MidiRateTests(unittest.TestCase):
   def test_iter_midi_frames_scales_cc1_debounce_with_rate(self) -> None:

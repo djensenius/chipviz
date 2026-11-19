@@ -173,9 +173,14 @@ as the flash guard) are limited; other frames always go out.
   edges, and note onsets (a new note at velocity 64 or more on the full path;
   byte 15, the highest velocity, rising across 64 on Joybus). An event the
   previous sent frame already shows cannot be an edge yet, so it is held for
-  at most 2 sends and then dropped. Invalid frames (bad magic, version, note
-  count or checksum, or reserved flag bits set) never raise or receive carried events and go out as
-  they are.
+  at most 2 sends and then dropped.
+- A carried note goes into a free note slot, or else replaces the quietest
+  note below velocity 64; on Joybus that raises byte 15 to the carried
+  velocity. If all 4 slots hold louder notes, it waits up to 30 sends for
+  room, and is dropped as soon as a sent frame shows that note.
+- Invalid frames (bad magic, version, note count or checksum, or reserved
+  flag bits set) never raise or receive carried events, are never the edge
+  reference, and go out as they are.
 - `--output` files are not capped: a `.cvz` file has no wall-clock rate, and
   whatever replays it paces and caps it. The other host tools only write
   files or burst procedural frames that never use scene 7.
