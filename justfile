@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/c64_colour_field_capture.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
 
 default:
     just --list
@@ -115,6 +115,7 @@ c-test:
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_input_tests.c -o build/tests/gba_input_tests
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_visual_tests.c -o build/tests/n64_visual_tests
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_joybus_link_tests.c -o build/tests/n64_joybus_link_tests
+    @${CC:-cc} {{ cflags }} -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_tests
     @build/tests/control_frame_tests
     @build/tests/connection_tests
     @build/tests/interface_tests
@@ -122,6 +123,7 @@ c-test:
     @build/tests/gba_input_tests
     @build/tests/n64_visual_tests
     @build/tests/n64_joybus_link_tests
+    @build/tests/c64_colour_field_tests
     @echo "chipviz C tests OK"
 
 python-lint:
@@ -271,6 +273,10 @@ c64-debug: c64-rom
     @mkdir -p build/retroarch-smoke
     @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; rom="$(pwd)/cores/c64/homebrew/chipviz-c64.prg"; \
       "$ra" -L "$cores/vice_x64sc_libretro.dylib" "$rom" --verbose 2>&1 | tee build/retroarch-smoke/c64.log
+
+# Headless VICE libretro captures of the C64 colour field (needs the local core).
+c64-colour-field-capture: c64-rom
+    @${PYTHON:-python3} scripts/c64_colour_field_capture.py
 
 snes-debug: snes-rom
     @mkdir -p build/retroarch-smoke
