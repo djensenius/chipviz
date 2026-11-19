@@ -115,8 +115,12 @@ visualization loop.
 Copyright David Jensenius. chipviz is dual licensed:
 
 - **Noncommercial use is free** under the
-  [PolyForm Noncommercial License 1.0.0](LICENSE): personal, hobby, research,
-  educational, and charitable use as defined by that licence.
+  [PolyForm Noncommercial License 1.0.0](LICENSE): personal use without any
+  anticipated commercial application (including hobby projects and research
+  for the benefit of public knowledge), and use by charitable organizations,
+  educational institutions, public research organizations, government
+  institutions, and the other noncommercial organizations the licence lists.
+  The licence text is authoritative.
 - **Commercial use needs a separate licence** from David Jensenius. See
   [COMMERCIAL.md](COMMERCIAL.md) for what counts and how to ask.
 
