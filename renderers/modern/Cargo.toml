@@ -7,8 +7,11 @@ publish = false
 
 [dependencies]
 bytemuck = { version = "1.24", features = ["derive"] }
+cpal = "0.18"
 png = "0.17"
 pollster = "0.4"
+realfft = "3.5"
+rtrb = "0.4"
 wgpu = "0.20"
 winit = "0.29"
 
