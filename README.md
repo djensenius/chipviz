@@ -59,6 +59,9 @@ See [`shared/specs/control-frame-v0.md`](shared/specs/control-frame-v0.md),
 [`shared/specs/chipsynth-source-v0.md`](shared/specs/chipsynth-source-v0.md).
 See [`shared/specs/interface-v0.md`](shared/specs/interface-v0.md) for the
 cross-target title/scene-select/auto/demo interface model.
+See [`shared/specs/colour-field-v0.md`](shared/specs/colour-field-v0.md) for the
+projection colour-field scene (scene 7) shared by the modern and console
+renderers.
 See [`docs/connections.md`](docs/connections.md) for the planned hardware,
 ESP32 bridge, and Raspberry Pi sender/audio-analysis paths.
 See [`docs/homebrew-targets.md`](docs/homebrew-targets.md) for the target policy:
