@@ -146,7 +146,11 @@ library `libasound2` (e.g. `sudo apt install libasound2`).
 Two overlay layers can be drawn on top of any native scene (never over the
 colour field, scene 7, whose colours depend only on its trace). They are off by
 default; choose them with `--mic-layers` or cycle them with `M`. They do not
-change the control-frame wire format.
+change the control-frame wire format. Their red flashes are not yet bounded
+(see below), so like flash/gate they are drawn only in builds with the
+`unmeasured-flash` Cargo feature, for measurement and development. Default
+builds (including release packages) accept `--mic-layers` and `M`, print a
+notice, and draw nothing.
 
 - `scope`: an oscilloscope ribbon across the lower part of the screen. With
   `--mic`, it shows a 2,048-sample window aligned on a rising zero crossing,
@@ -202,9 +206,11 @@ over up to about 6.7 s rather than cutting. Entering the colour field (scene
 7), which is already a full-screen change, clears the afterglow at once, so
 nothing is ever drawn over it. A window resize clears the afterglow too, and
 the layers return once the size has held still for 0.15 s, so a drag does not
-reallocate anything each frame. Being added light, the layers brighten the
-scene beneath them and never darken it, except that they fade out over red
-scene areas (see below), and red layer colours are drawn slightly pink.
+reallocate anything each frame. Resizing in steps (each held for over
+0.15 s) therefore makes the layers blink off and back on, and their trails
+restart each time. Being added light, the layers brighten the scene beneath
+them and never darken it, and red layer colours are drawn slightly pink (see
+below).
 
 While the layers glow, the scene is drawn into a texture of its own and a
 final pass writes it with the layers added, in linear light; on a surface
@@ -218,25 +224,32 @@ longer at 3840x2160 (3.64 ms against 1.80 ms). The Pi 5 has not been
 measured; check its frame rate with the layers on before relying on them
 there, especially at 4K.
 
-The layers are not gated by the `unmeasured-flash` feature. The phosphor
-bounds their flashes for any input, frame rate or geometry, at any point
-where the scene holds still. A flash (WCAG 2.3.1) is a pair of opposing
+The layers' added light (the output minus the scene) depends on the scene
+only where a channel saturates at full brightness, so a scene change alters
+it by at most the same amount in each linear channel; nothing about the
+layers switches on the scene's colour. Luminance flashes are bounded for any
+input, frame rate or geometry. A flash (WCAG 2.3.1) is a pair of opposing
 changes of at least 0.1 relative luminance, and relative luminance falls no
 faster than the fastest channel. Three flashes in 1 s would need three falls
 of 0.1 ending in that second, the last two wholly inside it, and 0.2 of fall
 takes at least 1.28 s at 0.15 per second (counting the decay's rounding), so
 the light the layers add to any point flashes at most twice in any 1 s, under
 the limit of three, with about 28% to spare for output rounding and frame
-timing. Red flashes are bounded differently, since green or blue rising over
-a red point lowers its redness as much as red falling: a red flash needs a
-saturated red, at least 80% of a point's light, at one end of a change, and
-the layers never make one. Their afterglow keeps green plus blue at least a
-third of its red (at most 75% red), and they fade out over scene points that
-are 60% to 75% red and are not drawn at all over redder ones. Wherever they
-add light, then, they mix with a scene colour at most 75% red, so the result
-is at most 75% red too; elsewhere the scene is shown unchanged. Where the
-scene changes under the layers, their light follows it: a moving red shape
-cuts through the afterglow as if in front of it.
+timing. Where the scene moves, the added light also moves by up to the
+scene's own change.
+
+Red flashes are not bounded. A red flash needs a saturated red, at least 80%
+of a point's light, at one end of a change of its redness, and green or blue
+rising over a red point lowers its redness as much as red falling. The
+afterglow keeps green plus blue at least a third of its red (at most 75%
+red), so where the scene is not a saturated red, the layers never make one.
+But over a scene point that is already a saturated red, small green blips,
+relit as soon as they fade, make three red flashes in 1 s. Fading the layers
+out over red scene points would avoid that, but only with a steep switch on
+the scene's colour, which turns small, harmless scene changes (one level of
+noise near black, say) into large changes of the layers. Until there is a
+design with a stated bound, and the layers have been measured, they stay
+behind `unmeasured-flash`.
 
 Unit tests run a CPU model of the phosphor against adversarial per-pixel
 input at 60, 120 and 240 fps, steady and jittered. For luminance (alternating
@@ -244,19 +257,25 @@ every frame, square waves of every period, random colours, and input that
 relights a pixel as soon as it has dimmed by 0.1) they find at most two
 flashes in any 1 s; at 0.25 per second the relighting input reaches three.
 For red (red against white, red and green squares, relighting in red, green
-or white, a red and green staircase, and random colours, over black, grey,
-red, dark red, orange, partly red and blue scenes) they find no saturated
-red that is not the scene itself, so no red flashes, where per-channel decay
-alone allows three in 1 s. GPU tests check that the composite matches its
-model on sRGB and non-sRGB targets; that the light added at a pixel where
-the scene holds still falls no faster than the decay; that a replayed still
-matches a live run; that the colour field is never drawn over; and that
-layers `off` render exactly as before the layers existed.
+or white, a red and green staircase, and random colours) they find no
+saturated red over black, grey, orange, duller red and blue scenes, where
+per-channel decay with no floor allows three red flashes in 1 s, and they
+find three over saturated red scenes. Over animated scenes (one-level noise
+near black, a dark red changing every frame, and red and grey alternating at
+two flashes per second), the output never has more luminance or red flashes
+in 1 s than the larger of two and the scene's own; the earlier switch on the
+scene's colour turned the dark red into over 100 flashes in 1 s. GPU tests
+check that the composite matches its model on sRGB and non-sRGB targets;
+that the light added at any unsaturated pixel of an animated scene falls no
+faster than the decay; that a replayed still matches a live run; that the
+colour field is never drawn over; and that layers `off` render exactly as
+before the layers existed.
 
-The design keeps the layers calm well within that bound. Each burst is a
-single smooth, partly transparent rise and fall (glow at most 30% and sparks
-at most 50% opacity), with its colour and peak fixed when it starts, new
-bursts start at most once every 0.5 s, and at most four are alive at once.
+The design keeps the layers calm well within the luminance bound. Each burst
+is a single smooth, partly transparent rise and fall (glow at most 30% and
+sparks at most 50% opacity), with its colour and peak fixed when it starts,
+new bursts start at most once every 0.5 s, and at most four are alive at
+once.
 Unit tests rasterise the ribbon for a loud 4 kHz tone and white noise gated
 at 3, 5 and 10 Hz, and for loud tones every 100 Hz from 0.5 to 8 kHz (plus
 those that divide the point spacing) at 44.1, 48 and 96 kHz, steady and
@@ -271,7 +290,8 @@ These are models, not photometric measurements: measure the actual display
 before relying on this for a photosensitive audience.
 
 ```sh
-just modern-m1 -- --mic --mic-layers both
+cargo run --manifest-path renderers/modern/Cargo.toml \
+  --features unmeasured-flash --bin chipviz-m1 -- --mic --mic-layers both
 ```
 
 ## Scene plan
@@ -434,6 +454,9 @@ by default and must not be enabled for releases:
   `--allow-flash` only prints a notice.
 - **`--features unmeasured-flash`** runs flash/gate as the spec describes, for
   measurement and development only.
+
+The same feature gates the mic layers, whose red flashes are not yet bounded
+(see [Mic layers](#mic-layers)): default builds never draw them.
 
 `just rust-lint` and `just rust-test` run clippy and the tests for both
 builds. The default build's tests check that every armed fixture equals hard

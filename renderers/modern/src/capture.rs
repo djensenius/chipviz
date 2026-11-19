@@ -30,7 +30,8 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
              through the live analyzer and waveform tap) or a raw .cvz file
   --size     output size in pixels (default: the profile's target size)
   --mic-layers
-             overlay the mic layers: off (default), scope, bursts or both
+             overlay the mic layers: off (default), scope, bursts or both;
+             only builds with the unmeasured-flash feature draw them
   --lines-drop-cuts
              Lines (scene 3) cuts on a rising drop flag, as the renderer's
              flag of the same name (default: drops are ignored); only
@@ -311,7 +312,12 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
             },
             ..colour_field::Config::default()
         });
-    renderer.pipeline_mut().set_mic_layers(args.mic_layers);
+    // Default builds draw no mic layers (see `mic_layers::LAYERS_BUILD`).
+    let layers = mic_layers::allowed(args.mic_layers);
+    if layers != args.mic_layers {
+        eprintln!("{}", mic_layers::NO_LAYERS_NOTICE);
+    }
+    renderer.pipeline_mut().set_mic_layers(layers);
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
     });
@@ -366,7 +372,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         "{{\n  \"profile\": {},\n  \"input\": {},\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"captures\": [\n{}\n  ]\n}}\n",
         json_string(args.profile.name),
         json_string(&input),
-        json_string(args.mic_layers.name()),
+        json_string(layers.name()),
         captures.join(",\n"),
     );
     let path = args.out.join("manifest.json");
@@ -648,11 +654,10 @@ mod tests {
 
     /// The GPU phosphor behaves as its CPU model: over scene 0, with both
     /// layers drawing and then turned off, the light the layers add to any
-    /// pixel where the scene holds still (the capture minus the layer-free
-    /// baseline, in linear light) falls by at most `DECAY_PER_S` per second
-    /// (plus 8-bit rounding), and once it has faded the capture matches the
-    /// baseline byte for byte. (Where the scene changes, the red mask
-    /// follows it, see `phosphor`.)
+    /// unsaturated pixel (the capture minus the layer-free baseline, in
+    /// linear light), whether the animated scene there moves or not, falls
+    /// by at most `DECAY_PER_S` per second (plus 8-bit rounding), and once
+    /// it has faded the capture matches the baseline byte for byte.
     /// This holds on an sRGB target and on one that is not sRGB (shown as
     /// sRGB-coded), where the composite encodes for itself.
     #[test]
@@ -694,9 +699,6 @@ mod tests {
         let (lit, total) = (3 * fps, 10 * fps);
         let window = fps / 2;
         let mut excess: Vec<Vec<f32>> = Vec::new();
-        // Per frame and pixel, the first frame of the baseline's current
-        // unchanged run there.
-        let mut still_since: Vec<Vec<u64>> = Vec::new();
         let mut last = (Vec::new(), Vec::new());
         for index in 0..total {
             if index == lit {
@@ -734,15 +736,6 @@ mod tests {
                     })
                     .collect(),
             );
-            still_since.push(
-                base.chunks_exact(3)
-                    .enumerate()
-                    .map(|(pixel, colour)| match still_since.last() {
-                        Some(since) if last.1[pixel * 3..pixel * 3 + 3] == *colour => since[pixel],
-                        _ => index,
-                    })
-                    .collect(),
-            );
             if index == lit {
                 assert_ne!(
                     drawn, base,
@@ -759,23 +752,21 @@ mod tests {
         // margin for two 8-bit encodes per frame.
         let bound = phosphor::DECAY_PER_S * 0.5 + 0.02;
         let (mut steepest, mut measured) = (0.0_f32, 0_usize);
-        for (start, (earlier, later)) in excess.iter().zip(&excess[window as usize..]).enumerate() {
-            let since = &still_since[start + window as usize];
-            for (channel, (&before, &after)) in earlier.iter().zip(later).enumerate() {
-                let still = since[channel / 3] <= start as u64;
-                if still && before.is_finite() && after.is_finite() {
+        for (earlier, later) in excess.iter().zip(&excess[window as usize..]) {
+            for (&before, &after) in earlier.iter().zip(later) {
+                if before.is_finite() && after.is_finite() {
                     steepest = steepest.max(before - after);
                     measured += 1;
                 }
             }
         }
-        assert!(
-            measured > 100_000,
-            "{format:?}: only {measured} still samples"
-        );
+        assert!(measured > 100_000, "{format:?}: only {measured} samples");
         assert!(
             steepest <= bound,
             "{format:?}: fell {steepest} in 0.5 s (bound {bound})"
+        );
+        eprintln!(
+            "{format:?}: steepest fall {steepest} in 0.5 s over {measured} samples (bound {bound})"
         );
         assert!(
             steepest > 0.02,

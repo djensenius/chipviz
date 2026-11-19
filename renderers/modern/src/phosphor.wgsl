@@ -5,9 +5,9 @@ struct Params {
   steps: f32,
   // 1 when the target is not sRGB, so the composite encodes it itself.
   encode: f32,
-  // `RED_SHARE` and `MASK_FROM` from phosphor.rs.
-  red_share: f32,
-  mask_from: f32,
+  // Unused padding.
+  unused_0: f32,
+  unused_1: f32,
 };
 
 // Binding 0 is the emitted light for the decay pass and the scene copy for
@@ -58,15 +58,7 @@ fn encode(linear: vec3<f32>) -> vec3<f32> {
   return select(high, low, linear <= vec3<f32>(0.0031308));
 }
 
-// The layers' share of a scene pixel (linear): 1 up to a red share of
-// `mask_from`, 0 from `red_share`. Keep in sync with `mask` in phosphor.rs.
-fn mask(scene: vec3<f32>) -> f32 {
-  let sum = scene.r + scene.g + scene.b;
-  let share = select(0.0, scene.r / max(sum, 1e-20), sum > 0.0);
-  return clamp((params.red_share - share) / (params.red_share - params.mask_from), 0.0, 1.0);
-}
-
-// scene + mask(scene) * display, saturating, in linear light; the scene
+// scene + display, saturating, in linear light; the scene
 // unchanged where the display is black. Keep in sync with
 // `composite_pixel` in phosphor.rs.
 @fragment
@@ -79,6 +71,6 @@ fn fs_composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32
   }
   let coded = params.encode > 0.5;
   let scene = select(stored.rgb, decode(stored.rgb), coded);
-  let out = min(scene + mask(scene) * display, vec3<f32>(1.0));
+  let out = min(scene + display, vec3<f32>(1.0));
   return vec4<f32>(select(out, encode(out), coded), stored.a);
 }

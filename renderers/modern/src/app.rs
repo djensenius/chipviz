@@ -150,7 +150,12 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         lines_drop_cuts: args.lines_drop_cuts,
     });
     renderer.pipeline_mut().limit_colour_field_steps();
-    renderer.pipeline_mut().set_mic_layers(args.mic_layers);
+    if mic_layers::allowed(args.mic_layers) != args.mic_layers {
+        eprintln!("{}", mic_layers::NO_LAYERS_NOTICE);
+    }
+    renderer
+        .pipeline_mut()
+        .set_mic_layers(mic_layers::allowed(args.mic_layers));
     let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
@@ -179,6 +184,9 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                     Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
                     Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
                     Some(KeyAction::CycleLayoutPin) => renderer.pipeline_mut().cycle_layout_pin(),
+                    Some(KeyAction::CycleMicLayers) if !mic_layers::LAYERS_BUILD => {
+                        eprintln!("{}", mic_layers::NO_LAYERS_NOTICE);
+                    }
                     Some(KeyAction::CycleMicLayers) => {
                         let mode = renderer.pipeline_mut().cycle_mic_layers();
                         eprintln!("mic layers: {}", mode.name());
@@ -274,7 +282,9 @@ Options:
   --mic-layers MODE       overlay an oscilloscope ribbon and/or onset bursts on the
                           native scenes: off (default), scope, bursts or both. With
                           --mic they follow the microphone; otherwise they are
-                          synthesised from the spectrum, energy and beats
+                          synthesised from the spectrum, energy and beats. Only
+                          builds with the unmeasured-flash feature draw them;
+                          default builds print a notice and draw nothing
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
   -h, --help              print this help
@@ -282,7 +292,8 @@ Options:
 Keys:
   F, Cmd+F, Ctrl+Cmd+F    toggle fullscreen
   L                       cycle the colour-field layout pin (auto, V2, H2, V3, H3)
-  M                       cycle the mic layers (off, scope, bursts, both)
+  M                       cycle the mic layers (off, scope, bursts, both) in builds
+                          with the unmeasured-flash feature
   Esc                     exit fullscreen
   Cmd+Q                   quit (macOS application menu)"
     )

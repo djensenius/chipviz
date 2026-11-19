@@ -6,40 +6,48 @@
 //! add up to at most [`DECAY_PER_S`] per second. Rises are instant; falls
 //! leave an afterglow, like a long-persistence oscilloscope. While the
 //! layers glow the scene is drawn into a texture of its own, and a last
-//! pass writes `scene + mask(scene) * display` (saturating, in linear light)
-//! to the screen, so the layers' contribution to any pixel falls no faster
-//! than the display does.
+//! pass writes `min(scene + display, 1)` per channel, in linear light, to
+//! the screen.
 //!
-//! The general flash guarantee, for any input, frame rate or geometry over
-//! a still scene: a WCAG 2.3.1 flash is a pair of opposing changes, each of
-//! at least 0.1 relative luminance. Relative luminance is a convex
-//! combination of the linear channels, and each channel of the output is
-//! the scene's plus a fixed share (the mask) of the display's, saturating,
-//! so luminance falls no faster than the fastest display channel. Three
+//! The layers' added light, `min(scene + display, 1) - scene`, depends on
+//! the scene only through that saturation, so it is 1-Lipschitz in the
+//! linear scene: a scene change of `d` in a channel alters the added light
+//! in that channel by at most `d` (C = 1). There is no ratio or step of
+//! the scene anywhere, so no small scene change is amplified.
+//!
+//! Luminance flashes, for any input, frame rate or geometry: a WCAG 2.3.1
+//! flash is a pair of opposing changes, each of at least 0.1 relative
+//! luminance. Relative luminance is a convex combination of the linear
+//! channels, and over a still scene each channel of the added light falls
+//! no faster than the display's, so the added luminance does too. Three
 //! flashes in a 1 s window need three falls of 0.1 ending in it, and the
 //! last two lie wholly inside it (each starts after the rise that follows
 //! the one before): 0.2 of falls. With the decay carried in whole grid
 //! steps any span of `t` seconds falls by at most `DECAY_PER_S * t + 1/255`,
-//! so those falls take at least `(0.2 - 2/255) / 0.15` = 1.28 s. So there
-//! are at most 2 flashes in any 1 s at any point, with 28 % headroom for
-//! output rounding and frame timing. (At 0.25 per second the two falls fit
-//! in 0.8 s, and a pixel can reach 3.)
+//! so those falls take at least `(0.2 - 2/255) / 0.15` = 1.28 s. So the
+//! added light makes at most 2 flashes in any 1 s at any point, with 28 %
+//! headroom for output rounding and frame timing. (At 0.25 per second the
+//! two falls fit in 0.8 s, and a pixel can reach 3.) Where the scene moves,
+//! the added light also changes by up to the scene's own change (above).
 //!
-//! Red flashes need a saturated red (`R / (R + G + B) >= 0.8`, linear) at
-//! one end of a change, and green or blue rising over a red pixel is as
-//! much a red change as red falling, so a fall limit alone does not bound
-//! them. Instead the layers never make a saturated red: the display keeps
+//! Red flashes are not bounded. They need a saturated red
+//! (`R / (R + G + B) >= 0.8`, linear) at one end of a change of
+//! `max(R - G - B, 0)` by more than 20/320, and green or blue rising over a
+//! red pixel is as much a red change as red falling. The display keeps
 //! green plus blue at least a third of its red (a red share of at most
-//! [`RED_SHARE`]), and the layers fade out over scene pixels whose own red
-//! share reaches `RED_SHARE` ([`MASK_FROM`] to `RED_SHARE`). Wherever the
-//! layers add light, the output mixes two colours whose red shares are at
-//! most `RED_SHARE`, so its share is at most that too (saturating red only
-//! lowers it; saturating green or blue leaves at most 1/2); elsewhere the
-//! output is the scene unchanged. So the layers start no red transition.
+//! [`RED_SHARE`]), so wherever the scene is not a saturated red the output
+//! mixes two colours with red shares below 0.8 and is not one either
+//! (saturating red only lowers the share; saturating green or blue leaves
+//! at most 1/2). But over a scene pixel that is already a saturated red, a
+//! layer that is relit as soon as it has faded makes 3 red flashes in 1 s.
+//! Masking the layers out over red scene pixels would need a steep
+//! function of the scene, which turns small scene changes into large
+//! changes of the layers, so the mic layers are built only with the
+//! `unmeasured-flash` feature (see `scenes::mic_layers`).
 //!
 //! Only the composite reads the scene; the display (and so capture replay)
 //! never depends on it. With a target that is not sRGB, the composite
-//! decodes and encodes sRGB itself, so the bound holds in linear light on
+//! decodes and encodes sRGB itself, so the decay holds in linear light on
 //! either kind of surface.
 //!
 //! Nothing here runs while the layers draw nothing and the display is
@@ -55,13 +63,12 @@ pub const DECAY_PER_S: f32 = 0.15;
 pub const GRID: f32 = 255.0;
 /// Longest frame interval counted, so a stall decays no faster than this.
 pub const MAX_DT_S: f64 = 0.1;
-/// Largest red share (`R / (R + G + B)`) of the display, and the scene red
-/// share from which the layers are masked out entirely; WCAG's saturated
+/// Largest red share (`R / (R + G + B)`) of the display; WCAG's saturated
 /// red starts at 0.8. The display's floor (green plus blue at least a
 /// third of red) in phosphor.wgsl and `decay_pixel` is this share.
+/// Only the tests read it now that the composite has no red mask.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const RED_SHARE: f32 = 0.75;
-/// Scene red share up to which the layers are added in full.
-pub const MASK_FROM: f32 = 0.6;
 /// How long a resized target must hold still before the phosphor is made
 /// again at the new size (overlay seconds).
 pub const SETTLE_S: f64 = 0.15;
@@ -157,15 +164,6 @@ pub fn decay_pixel(previous: [f32; 3], emitted: [f32; 3], amount: u32) -> [f32; 
     .map(|value| value / GRID)
 }
 
-/// The layers' share of a scene pixel (linear): 1 up to a red share of
-/// `MASK_FROM`, 0 from `RED_SHARE`. The CPU model of `mask` in phosphor.wgsl.
-#[cfg(test)]
-pub fn mask(scene: [f32; 3]) -> f32 {
-    let sum: f32 = scene.iter().sum();
-    let share = if sum > 0.0 { scene[0] / sum } else { 0.0 };
-    ((RED_SHARE - share) / (RED_SHARE - MASK_FROM)).clamp(0.0, 1.0)
-}
-
 /// The output for a scene pixel and display pixel, both linear; the CPU
 /// model of `fs_composite` in phosphor.wgsl.
 #[cfg(test)]
@@ -173,8 +171,7 @@ pub fn composite_pixel(scene: [f32; 3], display: [f32; 3]) -> [f32; 3] {
     if display == [0.0; 3] {
         return scene;
     }
-    let share = mask(scene);
-    std::array::from_fn(|channel| (scene[channel] + share * display[channel]).min(1.0))
+    std::array::from_fn(|channel| (scene[channel] + display[channel]).min(1.0))
 }
 
 /// Pipelines and the bind group layout, created once per [`ScenePipeline`]
@@ -185,8 +182,7 @@ pub struct Pipelines {
     decay: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    /// `[decay steps, 1 when the composite encodes sRGB itself, RED_SHARE,
-    /// MASK_FROM]`.
+    /// `[decay steps, 1 when the composite encodes sRGB itself, 0, 0]`.
     params: wgpu::Buffer,
     /// The scene target's format, which the scene copy uses too.
     format: wgpu::TextureFormat,
@@ -281,7 +277,7 @@ impl Pipelines {
         queue.write_buffer(
             &self.params,
             0,
-            bytemuck::cast_slice(&[steps as f32, encode, RED_SHARE, MASK_FROM]),
+            bytemuck::cast_slice(&[steps as f32, encode, 0.0, 0.0]),
         );
     }
 }
@@ -587,19 +583,36 @@ mod tests {
     }
 
     #[test]
-    fn the_mask_drops_the_layers_over_red_scene_pixels_only() {
-        assert_eq!(mask([0.0; 3]), 1.0);
-        assert_eq!(mask([0.5; 3]), 1.0);
-        assert_eq!(mask([0.0, 0.3, 1.0]), 1.0);
-        assert_eq!(mask([1.0, 0.0, 0.0]), 0.0);
-        assert_eq!(mask([0.02, 0.0, 0.0]), 0.0);
-        assert_eq!(mask([0.75, 0.25, 0.0]), 0.0);
-        let half = mask([0.675, 0.325, 0.0]);
-        assert!((half - 0.5).abs() < 1e-3, "{half}");
+    fn the_composite_adds_the_display_and_follows_the_scene_one_to_one() {
         assert_eq!(
             composite_pixel([1.0, 0.0, 0.0], [0.0, 0.9, 0.9]),
-            [1.0, 0.0, 0.0]
+            [1.0, 0.9, 0.9]
         );
         assert_eq!(composite_pixel([0.3; 3], [0.9, 0.1, 0.5]), [1.0, 0.4, 0.8]);
+        assert_eq!(composite_pixel([0.2, 0.7, 0.1], [0.0; 3]), [0.2, 0.7, 0.1]);
+        // C = 1: a scene change of `d` in a channel changes the added light
+        // in that channel by at most `d`.
+        let added = |scene: [f32; 3], display| {
+            let out = composite_pixel(scene, display);
+            std::array::from_fn::<f32, 3, _>(|channel| out[channel] - scene[channel])
+        };
+        for step in 0..20_000_u32 {
+            let seed = step * 9;
+            let pick = |offset: u32| -> [f32; 3] {
+                std::array::from_fn(|channel| crate::scenes::hash(seed + offset + channel as u32))
+            };
+            let (scene, display, nudge) = (pick(0), pick(3), pick(6));
+            let moved: [f32; 3] = std::array::from_fn(|channel| {
+                (scene[channel] + 0.05 * (nudge[channel] - 0.5)).clamp(0.0, 1.0)
+            });
+            let (before, after) = (added(scene, display), added(moved, display));
+            for channel in 0..3 {
+                let change = (after[channel] - before[channel]).abs();
+                assert!(
+                    change <= (moved[channel] - scene[channel]).abs() + 1e-6,
+                    "{scene:?} -> {moved:?} under {display:?}"
+                );
+            }
+        }
     }
 }
