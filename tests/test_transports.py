@@ -1,10 +1,13 @@
 import contextlib
 import io
+import itertools
 import json
+import math
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -100,6 +103,7 @@ class TransportTests(unittest.TestCase):
     sink = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
     sink._port = _Port()
     sink._sequence = 0
+    sink._cap = live_bridge.ColourFieldRateCap("joybus")
     for _ in range(66):
       sink.send(self.wire)
 
@@ -329,6 +333,7 @@ class FlashGuardTests(unittest.TestCase):
       serial_sink = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
       serial_sink._port = _Port()
       serial_sink._sequence = 0
+      serial_sink._cap = live_bridge.ColourFieldRateCap("joybus", clock=itertools.count(0, 20_000_000).__next__)
       live_bridge.stream_frames([_scene_frame(23, 3), _scene_frame(7, 3)], True, 60, [file_sink, serial_sink])
       file_sink.close()
       written = path.read_bytes()
@@ -408,6 +413,17 @@ class FlashGuardTests(unittest.TestCase):
     debounce = live_bridge.SceneDebounce()
     self.assertEqual([debounce.step(scene) for scene in (1, 2, 5, 0)], [1, 2, 5, 0])
 
+  def test_cc1_debounce_lasts_at_least_500_ms_at_any_rate(self) -> None:
+    for rate, frames in ((30, 30), (60, 30), (90, 45), (120, 60), (240, 120)):
+      with self.subTest(rate=rate):
+        debounce = live_bridge.SceneDebounce(rate=rate)
+        sent = [debounce.step(7) for _ in range(frames + 1)]
+        self.assertEqual(sent[:frames], [0] * frames)
+        self.assertEqual(sent[frames], 7)
+        self.assertGreaterEqual(frames / rate, 0.5)
+        exits = [debounce.step(0) for _ in range(frames + 1)]
+        self.assertEqual(exits.index(0), frames)
+
   def test_allow_flash_cli_warning_only_with_flag(self) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
       root = pathlib.Path(temp_dir)
@@ -442,6 +458,433 @@ class FlashGuardTests(unittest.TestCase):
               self.assertEqual(run(extra), 0)
             self.assertEqual(chipviz_bridge.FLASH_WARNING in stderr.getvalue(), expect_warning)
 
+
+def _cf_frame(index: int, scene: int = 7, flags: int = 0, notes: tuple = ()) -> bytes:
+  return chipviz_bridge.pack_frame(chipviz_bridge.ControlFrame(
+    frame=index & 0xFFFF, bpm=120, beat_phase=0, beat_count=0, energy=100, bass=100, mid=100, treble=100,
+    spectrum=(100,) * 8, scene=scene, palette=0, flags=flags, notes=notes,
+  ))
+
+
+class _FakeClock:
+  """Integer-nanosecond clock that advances only when the code sleeps."""
+
+  def __init__(self) -> None:
+    self.ns = 0
+
+  def monotonic(self) -> float:
+    return self.ns / 1e9
+
+  def monotonic_ns(self) -> int:
+    return self.ns
+
+  def sleep(self, delay: float) -> None:
+    self.ns += math.ceil(delay * 1e9)
+
+
+def _counter(wire: bytes) -> int:
+  return int.from_bytes(wire[2:4], "little")
+
+
+class ColourFieldRateCapTests(unittest.TestCase):
+  """colour-field-v0 "Step rate": at most 60 colour-field frames per second."""
+
+  def _stream(self, frames: list[bytes], rate: int):
+    class _Socket:
+      def __init__(self, clock: _FakeClock) -> None:
+        self.sent: list[tuple[int, bytes]] = []
+        self._clock = clock
+
+      def sendto(self, data: bytes, endpoint) -> None:
+        self.sent.append((self._clock.ns, data))
+
+      def write(self, data: bytes) -> None:
+        self.sent.append((self._clock.ns, data))
+
+      def flush(self) -> None:
+        pass
+
+      def close(self) -> None:
+        pass
+
+    clock = _FakeClock()
+    with contextlib.ExitStack() as stack:
+      for name in ("monotonic", "monotonic_ns", "sleep"):
+        stack.enter_context(mock.patch.object(live_bridge.time, name, getattr(clock, name)))
+      udp = live_bridge.UdpSink(("127.0.0.1", 9))
+      udp._socket.close()
+      udp._socket = _Socket(clock)
+      serial = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
+      serial._port = _Socket(clock)
+      serial._sequence = 0
+      serial._cap = live_bridge.ColourFieldRateCap("joybus")
+      live_bridge.stream_frames(frames, realtime=False, rate=rate, sinks=[udp, serial])
+    return udp._socket.sent, serial._port.sent
+
+  def _cap(self, transport: str, frames: list[bytes], step_ns: int = 8_333_334) -> list[bytes | None]:
+    cap = live_bridge.ColourFieldRateCap(transport, clock=itertools.count(0, step_ns).__next__)
+    return [cap.filter(frame) for frame in frames]
+
+  def _assert_at_most_60_per_second(self, times: list[int]) -> None:
+    # Half-open reading: any window [t, t + 1 s) holds at most 60 sends.
+    for first, later in zip(times, times[60:]):
+      self.assertGreaterEqual(later - first, 1_000_000_000)
+
+  def test_rate_120_scene_7_drops_to_60_on_every_output(self) -> None:
+    udp, serial = self._stream([_cf_frame(index) for index in range(240)], rate=120)
+    for sent in (udp, serial):
+      self.assertEqual(len(sent), 120)
+      self._assert_at_most_60_per_second([at for at, _ in sent])
+    self.assertEqual([_counter(data) for _, data in udp], list(range(0, 240, 2)))
+
+  def test_rate_60_scene_7_is_not_decimated(self) -> None:
+    udp, serial = self._stream([_cf_frame(index) for index in range(120)], rate=60)
+    self.assertEqual((len(udp), len(serial)), (120, 120))
+
+  def test_jitter_keeps_60_without_exceeding_it(self) -> None:
+    # 120 Hz with up to 3 ms of late jitter: the slot grid absorbs it.
+    times = [index * 8_333_334 + (index * 7919 % 3) * 1_000_000 for index in range(1200)]
+    cap = live_bridge.ColourFieldRateCap("full", clock=iter(times).__next__)
+    sent = [at for at, index in zip(times, range(1200)) if cap.filter(_cf_frame(index)) is not None]
+    self.assertGreaterEqual(len(sent), 590)
+    self._assert_at_most_60_per_second(sent)
+
+  def test_rates_between_61_and_119_never_exceed_60(self) -> None:
+    for rate, expected in ((90, 45), (100, 50), (110, 55)):
+      with self.subTest(rate=rate):
+        times = [math.ceil(index * 1e9 / rate) for index in range(rate * 5)]
+        cap = live_bridge.ColourFieldRateCap("full", clock=iter(times).__next__)
+        sent = [at for at, index in zip(times, range(len(times))) if cap.filter(_cf_frame(index)) is not None]
+        self.assertEqual(len(sent), expected * 5)
+        self._assert_at_most_60_per_second(sent)
+
+  def test_leaving_and_entering_scene_7_at_rate_120(self) -> None:
+    scenes = [7] * 60 + [6] * 60 + [7] * 60
+    udp, _ = self._stream([_cf_frame(index, scene) for index, scene in enumerate(scenes)], rate=120)
+    counters = [_counter(data) for _, data in udp]
+    # Native-scene frames are not limited; scene-7 frames keep a 60 Hz grid.
+    self.assertEqual(counters, list(range(0, 60, 2)) + list(range(60, 120)) + list(range(120, 180, 2)))
+    sent_7 = [at for at, data in udp if data[20] == 7]
+    self.assertTrue(all((b - a) * 60 >= 1_000_000_000 for a, b in zip(sent_7, sent_7[1:])))
+
+  def test_cap_follows_each_transport_decoded_scene(self) -> None:
+    # Scene 23 is native on the full path but scene 7 on Joybus (23 & 0x0F).
+    udp, serial = self._stream([_cf_frame(index, 23) for index in range(240)], rate=120)
+    self.assertEqual((len(udp), len(serial)), (240, 120))
+
+  def test_dropped_edges_and_onsets_carry_to_next_sent_frame(self) -> None:
+    note = chipviz_bridge.Note(60, 100)
+    frames = []
+    for index in range(40):
+      flags = 0x01 if index % 2 else 0x00  # F15: beat on odd 120 Hz frames only.
+      if index == 5:
+        flags |= 0x02 | 0x04  # One-off bar and drop on a dropped frame.
+      frames.append(_cf_frame(index, flags=flags, notes=(note,) if index == 9 else ()))
+    sent = [out for out in self._cap("full", frames) if out is not None]
+    self.assertEqual([_counter(out) for out in sent], list(range(0, 40, 2)))
+    for out in sent:
+      n64_joybus.decode_control_frame(out)
+    self.assertEqual([out[22] & 0x01 for out in sent], [0, 1] * 10, "beat must not be held high")
+    self.assertEqual([index for index, out in enumerate(sent) if out[22] & 0x06], [3])
+    self.assertEqual([index for index, out in enumerate(sent) if out[23]], [5])
+    self.assertEqual(sent[5][24:26], bytes((60, 100)))
+
+  def test_edge_shown_by_previous_sent_frame_is_held_not_lost(self) -> None:
+    # Reviewer repro: drop 1,0,1,0,0 at 120 Hz; the second rise is frame 2.
+    drops = [1, 0, 1, 0, 0, 0, 0, 0]
+    sent = [out[22] for out in self._cap("full", [_cf_frame(i, flags=f * 4) for i, f in enumerate(drops)]) if out]
+    self.assertEqual(sent, [4, 4, 0, 4])
+    # Beats on frames 1 and 3: the second is held one send, not lost.
+    beats = [0, 1, 0, 1, 0, 0, 0, 0]
+    sent = [out[22] for out in self._cap("full", [_cf_frame(i, flags=f) for i, f in enumerate(beats)]) if out]
+    self.assertEqual(sent, [0, 1, 0, 1])
+
+  def test_held_event_expires_after_carry_hold_sends(self) -> None:
+    # A rise on dropped frame 1 while beat stays high on every sent frame can
+    # never become an edge, so it must not surface after CARRY_HOLD sends.
+    beats = [1, 0, 1, 1] + [1] * 8 + [0] * 8
+    outs = self._cap("full", [_cf_frame(i, flags=0x01 if f else 0) for i, f in enumerate(beats)])
+    sent = [out[22] & 0x01 for out in outs if out]
+    self.assertEqual(sent, [1] * 6 + [0] * 4)
+
+  def test_pending_note_also_on_next_frame_is_not_doubled(self) -> None:
+    note = chipviz_bridge.Note(60, 100)
+    frames = [_cf_frame(0), _cf_frame(1, notes=(note,)), _cf_frame(2, notes=(note,))]
+    sent = [out for out in self._cap("full", frames) if out]
+    self.assertEqual([out[23] for out in sent], [0, 1])
+    self.assertEqual(sent[1], frames[2])
+
+  def test_joybus_note_carry_uses_byte_15_edges(self) -> None:
+    # Reviewer repro: A(60,100), B(64,100) dropped, C none, D dropped, E(60,100).
+    notes = [((60, 100),), ((64, 100),), (), (), ((60, 100),)]
+    frames = [_cf_frame(i, notes=tuple(chipviz_bridge.Note(*n) for n in pairs)) for i, pairs in enumerate(notes)]
+    udp_like = [out for out in self._cap("joybus", frames) if out]
+    packets = n64_joybus.convert_stream(b"".join(udp_like))
+    self.assertEqual([packets[i * 16 + 15] for i in range(len(udp_like))], [100, 0, 100])
+    # A Joybus onset on a dropped frame is carried as byte 15 rising.
+    notes = [(), ((60, 100),), (), ()]
+    frames = [_cf_frame(i, notes=tuple(chipviz_bridge.Note(*n) for n in pairs)) for i, pairs in enumerate(notes)]
+    sent = [out for out in self._cap("joybus", frames) if out]
+    packets = n64_joybus.convert_stream(b"".join(sent))
+    self.assertEqual([packets[i * 16 + 15] for i in range(len(sent))], [0, 100])
+
+  def test_corrupt_frames_are_not_laundered(self) -> None:
+    corrupt = bytearray(_cf_frame(1, flags=0x04))
+    corrupt[-1] ^= 0x40
+    frames = [_cf_frame(0), bytes(corrupt), _cf_frame(2), _cf_frame(3), _cf_frame(4)]
+    sent = [out for out in self._cap("full", frames) if out]
+    self.assertEqual([out[22] for out in sent], [0, 0, 0], "a dropped corrupt drop flag must not be carried")
+    # A corrupt frame that is sent goes out unchanged, and is not the edge reference.
+    corrupt_low = bytearray(_cf_frame(2))
+    corrupt_low[-1] ^= 0x40
+    frames = [_cf_frame(0), _cf_frame(1, flags=0x04), bytes(corrupt_low), _cf_frame(3, flags=0x04), _cf_frame(4), _cf_frame(5)]
+    outs = self._cap("full", frames, step_ns=16_666_667)
+    self.assertEqual(outs[2], bytes(corrupt_low))
+    self.assertEqual([out[22] for out in outs], [0, 4, 0, 4, 0, 0])
+
+  def test_reserved_flag_bits_make_a_frame_invalid(self) -> None:
+    # Checksum is correct, but bit 5 is reserved: targets reject the frame.
+    reserved = bytearray(_cf_frame(1))
+    reserved[22] = 0x21
+    reserved[-1] = chipviz_bridge.checksum(reserved[:-1])
+    frames = [_cf_frame(0), bytes(reserved), _cf_frame(2), _cf_frame(3), _cf_frame(4)]
+    sent = [out for out in self._cap("full", frames) if out]
+    self.assertEqual([out[22] for out in sent], [0, 0, 0], "a reserved-bit frame must not inject a beat")
+    # Sent, it goes out unchanged and is not the edge reference: frame 3's
+    # beat is not an edge against frame 1, so nothing is held or carried.
+    frames = [_cf_frame(0), _cf_frame(1, flags=0x01), bytes(reserved), _cf_frame(3, flags=0x01), _cf_frame(4), _cf_frame(5)]
+    outs = self._cap("full", frames, step_ns=16_666_667)
+    self.assertEqual(outs[2], bytes(reserved))
+    self.assertEqual([out[22] for out in outs], [0, 1, 0x21, 1, 0, 0])
+
+  def test_carried_onset_replaces_quietest_sub_threshold_note(self) -> None:
+    # Reviewer repro: loud note on dropped frame 1, four quiet notes after.
+    quiet = tuple(chipviz_bridge.Note(70 + index, velocity) for index, velocity in enumerate((40, 10, 30, 20)))
+    loud = chipviz_bridge.Note(60, 100)
+    frames = [_cf_frame(0), _cf_frame(1, notes=(loud,))] + [_cf_frame(i, notes=quiet) for i in range(2, 8)]
+    full = [out for out in self._cap("full", frames) if out]
+    self.assertEqual(full[1][23], 4)
+    self.assertEqual(full[1][24:32], bytes((70, 40, 60, 100, 72, 30, 73, 20)))
+    self.assertTrue(all((60, 100) not in live_bridge._wire_notes(out) for out in full[2:]))
+    joybus = [out for out in self._cap("joybus", frames) if out]
+    packets = n64_joybus.convert_stream(b"".join(joybus))
+    self.assertEqual([packets[i * 16 + 15] for i in range(len(joybus))], [0, 100, 40, 40])
+
+  def test_onset_shown_by_another_note_satisfies_pending_note(self) -> None:
+    # Reviewer repro: note 60 on dropped frame 1, new note 80 on sent frame 2.
+    held = _loud(70, 71, 72)
+    frames = [_cf_frame(0, notes=held), _cf_frame(1, notes=held + _loud(60))]
+    frames += [_cf_frame(i, notes=held + _loud(80)) for i in range(2, 10)]
+    frames += [_cf_frame(i, notes=held) for i in range(10, 14)]
+    outs = self._cap("full", frames)
+    target = [events[2] for events in _target_events([out for out in outs if out])]
+    self.assertEqual(target, [events[2] for events in _resampled_events(frames, outs)])
+    self.assertEqual(target, [1, 1, 0, 0, 0, 0, 0])
+
+  def test_beat_satisfies_pending_bar_and_vice_versa(self) -> None:
+    for name, flags in (("bar then beat", [2, 0, 3, 0, 0, 0, 0, 0]), ("beat then bar", [1, 0, 3, 0, 0, 0, 0, 0])):
+      with self.subTest(name):
+        frames = [_cf_frame(i, flags=f) for i, f in enumerate(flags)]
+        outs = self._cap("full", frames)
+        target = [events[0] for events in _target_events([out for out in outs if out])]
+        self.assertEqual(target, [events[0] for events in _resampled_events(frames, outs)])
+        self.assertEqual(target, [1, 1, 0, 0])
+
+  def test_carried_note_waits_for_room_then_is_bounded(self) -> None:
+    # Every sent frame holds four loud notes and shows no onset, so the onset
+    # from dropped frame 1 is delayed (not doubled) until a slot frees up.
+    full = _loud(70, 71, 72, 73)
+    for full_frames, expected in ((10, [1, 0, 0, 0, 0, 1, 0]), (2 * live_bridge.ColourFieldRateCap.CARRY_FULL_HOLD + 4, None)):
+      with self.subTest(full_frames=full_frames):
+        frames = [_cf_frame(0, notes=full), _cf_frame(1, notes=_loud(60, 71, 72, 73))]
+        frames += [_cf_frame(i, notes=full) for i in range(2, full_frames)]
+        frames += [_cf_frame(i, notes=full[:3]) for i in range(full_frames, full_frames + 4)]
+        outs = self._cap("full", frames)
+        target = [events[2] for events in _target_events([out for out in outs if out])]
+        resampled = [events[2] for events in _resampled_events(frames, outs)]
+        if expected:
+          self.assertEqual(target, expected)
+          self.assertEqual(sum(target), sum(resampled))
+        else:
+          self.assertEqual(sum(target), 1, "past CARRY_FULL_HOLD the onset is dropped")
+
+
+def _loud(*numbers: int) -> tuple:
+  return tuple(chipviz_bridge.Note(number, 100) for number in numbers)
+
+
+def _frame_events(previous: bytes | None, wire: bytes) -> tuple[int, int, int]:
+  """Full-path target (B, X, N) for ``wire`` after ``previous`` (None at start)."""
+  previous_flags = previous[22] if previous else 0
+  previous_notes = live_bridge._wire_notes(previous) if previous else []
+  rises = wire[22] & ~previous_flags
+  onset = any(pair[1] >= 64 and pair not in previous_notes for pair in live_bridge._wire_notes(wire))
+  return int(bool(rises & 0x03)), int(bool(rises & 0x04)), int(onset)
+
+
+def _target_events(sent: list[bytes]) -> list[tuple[int, int, int]]:
+  return [_frame_events(sent[index - 1] if index else None, wire) for index, wire in enumerate(sent)]
+
+
+def _resampled_events(frames: list[bytes], outs: list[bytes | None]) -> list[tuple[int, int, int]]:
+  """Resample the input like a target would: OR each raw frame's events into the next sent step."""
+  steps, mask = [], (0, 0, 0)
+  for index, (wire, out) in enumerate(zip(frames, outs)):
+    events = _frame_events(frames[index - 1] if index else None, wire)
+    mask = tuple(a | b for a, b in zip(mask, events))
+    if out is not None:
+      steps.append(mask)
+      mask = (0, 0, 0)
+  return steps
+
+class MidiRateTests(unittest.TestCase):
+  def test_iter_midi_frames_scales_cc1_debounce_with_rate(self) -> None:
+    class _Message:
+      type = "control_change"
+      control = 1
+      value = 127
+
+    class _Port:
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc) -> None:
+        return None
+
+      def iter_pending(self):
+        return [_Message()]
+
+    fake_mido = type(sys)("mido")
+    fake_mido.open_input = lambda name: _Port()
+    for fps, frames in ((60, 30), (120, 60)):
+      with self.subTest(fps=fps), mock.patch.dict(sys.modules, {"mido": fake_mido}), \
+          mock.patch.object(live_bridge.time, "sleep"):
+        scenes = [frame[20] for frame in live_bridge.iter_midi_frames("fake", frames + 1, fps)]
+      self.assertEqual(scenes, [0] * frames + [7])
+
+  def test_cc1_debounce_counts_frames_per_output(self) -> None:
+    # Two outputs that transmit alternate frames: each must reach 30 frames.
+    debounce = live_bridge.SceneDebounce(scene=7, rate=90)
+    sent = [0, 0]
+    for frame in range(200):
+      if debounce.begin(0) != 7:
+        break
+      transmitted = [frame % 2 == 0, frame % 2 == 1]
+      sent = [count + flag for count, flag in zip(sent, transmitted)]
+      debounce.end(transmitted)
+    self.assertEqual(debounce.scene, 0)
+    self.assertEqual(min(sent), 30)
+    self.assertGreaterEqual(frame, 45)
+
+  def test_cc1_debounce_counts_transmitted_frames_end_to_end(self) -> None:
+    # CC1 selects scene 7 at poll 1 and scene 0 at poll 150. Each output must
+    # transmit at least 30 frames, over at least 500 ms, before it changes.
+    for rate in (60, 90, 120):
+      with self.subTest(rate=rate):
+        outputs = self._run_midi_main(rate, frames=300, exit_poll=150)
+        changes = outputs.pop("changes")
+        for name, sent in outputs.items():
+          for change_at, before in ((changes[0], 0), (changes[1], 7)):
+            after = [(at, scene) for at, scene in sent if at >= change_at]
+            first_new = next(index for index, (_, scene) in enumerate(after) if scene != before)
+            self.assertGreaterEqual(first_new, 30, f"{name}: only {first_new} frames transmitted before the change")
+            self.assertGreaterEqual(after[first_new][0] - change_at, 500_000_000, name)
+
+  def test_cc1_debounce_counts_each_output_when_caps_alternate(self) -> None:
+    # From 0.6 s the serial cap reads the clock 1.5 ms after the UDP cap, so at
+    # 90 Hz the two caps lock into passing alternate scene-7 frames. The exit
+    # must still come once each output has sent 30 frames over 500 ms.
+    for lag_from in (511_000_000, 533_000_000):
+      with self.subTest(lag_from=lag_from):
+        outputs = self._run_midi_main(90, frames=300, exit_poll=150, joybus_lag=(lag_from, 1_500_000))
+        exit_at = outputs.pop("changes")[1]
+        udp_times = {at for at, scene in outputs["udp"] if scene == 7 and at >= exit_at}
+        joybus_times = {at for at, scene in outputs["joybus"] if scene == 7 and at >= exit_at}
+        self.assertFalse(udp_times & joybus_times, "the caps should pass different frames")
+        for name, sent in outputs.items():
+          after = [(at, scene) for at, scene in sent if at >= exit_at]
+          first_new = next((index for index, (_, scene) in enumerate(after) if scene != 7), None)
+          self.assertIsNotNone(first_new, f"{name}: scene 7 never exited")
+          self.assertGreaterEqual(first_new, 30, name)
+          self.assertGreaterEqual(after[first_new][0] - exit_at, 500_000_000, name)
+
+  def _run_midi_main(self, rate: int, frames: int, exit_poll: int, joybus_lag: tuple[int, int] = (0, 0)) -> dict:
+    # ``joybus_lag`` is (from_ns, lag_ns): from ``from_ns`` on, the serial
+    # sink's cap reads the clock ``lag_ns`` later than the UDP sink's, as when
+    # the two reads straddle a scheduling delay.
+    clock = _FakeClock()
+    real_cap = live_bridge.ColourFieldRateCap
+
+    def make_cap(transport: str):
+      if transport != "joybus":
+        return real_cap(transport, clock.monotonic_ns)
+      lag_from, lag_ns = joybus_lag
+      return real_cap(transport, lambda: clock.ns + (lag_ns if clock.ns >= lag_from else 0))
+    outputs: dict = {"udp": [], "joybus": [], "changes": []}
+
+    class _Message:
+      type = "control_change"
+      control = 1
+
+      def __init__(self, value: int) -> None:
+        self.value = value
+
+    class _Port:
+      polls = 0
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc) -> None:
+        return None
+
+      def iter_pending(self):
+        self.polls += 1
+        if self.polls in (1, exit_poll):
+          outputs["changes"].append(clock.ns)
+          return [_Message(127 if self.polls == 1 else 0)]
+        return []
+
+    class _Socket:
+      def __init__(self, *args) -> None:
+        pass
+
+      def sendto(self, data: bytes, endpoint) -> None:
+        outputs["udp"].append((clock.ns, data[20]))
+
+      def close(self) -> None:
+        pass
+
+    class _Serial:
+      def __init__(self, *args, **kwargs) -> None:
+        pass
+
+      def write(self, packet: bytes) -> None:
+        scene = ((packet[13] >> 2) & 0x0C) | ((packet[12] >> 4) & 0x03)
+        outputs["joybus"].append((clock.ns, scene))
+
+      def flush(self) -> None:
+        pass
+
+      def close(self) -> None:
+        pass
+
+    fake_mido = type(sys)("mido")
+    fake_mido.open_input = lambda name: _Port()
+    fake_serial = type(sys)("serial")
+    fake_serial.Serial = _Serial
+    argv = ["live_bridge", "--midi-port", "fake", "--rate", str(rate), "--frames", str(frames),
+            "--udp", "127.0.0.1:9", "--n64-serial", "fake"]
+    with contextlib.ExitStack() as stack:
+      for name in ("monotonic", "monotonic_ns"):
+        stack.enter_context(mock.patch.object(live_bridge.time, name, getattr(clock, name)))
+      stack.enter_context(mock.patch.object(live_bridge.time, "sleep", clock.sleep))
+      stack.enter_context(mock.patch.object(live_bridge, "ColourFieldRateCap", make_cap))
+      stack.enter_context(mock.patch.object(live_bridge.socket, "socket", _Socket))
+      stack.enter_context(mock.patch.dict(sys.modules, {"mido": fake_mido, "serial": fake_serial}))
+      stack.enter_context(mock.patch.object(sys, "argv", argv))
+      self.assertEqual(live_bridge.main(), 0)
+    return outputs
 
 if __name__ == "__main__":
   unittest.main()

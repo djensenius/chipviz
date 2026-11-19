@@ -136,14 +136,62 @@ CC2: selecting palette 3 or 7 while in scene 7 needs `--allow-flash`.
 
 `live_bridge.py` MIDI mode maps CC1 to `scene = value // 16`. A control
 resting near the 6/7 boundary must not toggle the sent scene across 7, so the
-bridge debounces with the target's scene-7 constants, counted in sent frames:
+bridge debounces with the target's scene-7 constants, counted in 60 Hz steps:
 
 - A change into or out of scene 7 is sent only after the CC1-derived scene
-  has been unchanged for 30 consecutive frames (`P_STABLE`). It takes effect
-  at the end of the 30th frame and is sent from the next one. Any change
+  has been unchanged for 30 consecutive steps (`P_STABLE`). It takes effect
+  at the end of the 30th step and is sent from the next frame. Any change
   restarts the count.
-- No scene-7 entry or exit is sent sooner than 20 frames (`CUT_MIN`) after
+- No scene-7 entry or exit is sent sooner than 20 steps (`CUT_MIN`) after
   the previous one.
 - Changes between other scenes are sent at once.
 
-Targets apply their own scene-7 debounce as a backstop.
+Both minimums must hold. Each output must have transmitted at least 30
+frames (20 for `CUT_MIN`), because targets count one step per received frame;
+frames dropped by the 60 fps cap below do not count. Outputs are counted
+separately, so two caps that pass alternate frames each still reach 30. The
+wait must also last at least 500 ms (333 ms for `CUT_MIN`): above 60 Hz the
+source frame counts scale with the rate (60 frames at `--rate 120`). At `--rate 90`, entering
+scene 7 takes 45 frames (500 ms), and leaving takes 30 transmitted frames
+(about 60 frames, roughly 660 ms), because the cap passes only about 45
+scene-7 frames per second. Targets apply their own scene-7 debounce as a
+backstop.
+
+### Colour-field frame-rate cap
+
+Hosts must not send more than 60 colour-field frames per second (see
+"Step rate" in [`colour-field-v0`](../../shared/specs/colour-field-v0.md)).
+`live_bridge.py` caps each real-time output (`--udp`, `--n64-serial`)
+separately. Only frames whose *decoded scene* on that output is 7 (same table
+as the flash guard) are limited; other frames always go out.
+
+- Scene-7 frames follow a 60 Hz slot grid. A frame is sent once it is no more
+  than a quarter slot early, which absorbs pacing jitter, and never when 60
+  scene-7 frames were already sent in the second before it (half-open
+  window: any `[t, t + 1 s)` holds at most 60). Other frames are dropped.
+- While the scene is 7, `--rate` 120 (or any multiple of 60) gives 60
+  frames/s. Other rates above 60 give between about rate/2 and 60 (45 at 90,
+  50 at 100, 55 at 110, about 58 at 144). Rates up to 60 are unchanged.
+- Frames are only dropped, never reordered or renumbered, so the frame
+  counter stays monotonic and skips values; targets step once per new value.
+- Events on dropped frames are carried per target event class, so the
+  target sees each class at most once per sent frame, as if it had resampled
+  the input itself: `B` (a `beat` or `bar` rising edge), `X` (a `drop`
+  rising edge) and `N` (a note onset: a new note at velocity 64 or more on the
+  full path; byte 15, the highest velocity, rising across 64 on Joybus).
+- A pending class is cleared as soon as a sent frame already shows that class
+  against the previous sent frame, whichever event caused it (a new beat
+  satisfies a pending bar; any new loud note satisfies a pending note).
+  Otherwise one pending event is written in: a flag bit, or a note in a free
+  slot or in place of the quietest note below velocity 64 (on Joybus that
+  raises byte 15 to the carried velocity).
+- A class that the previous sent frame already shows cannot be an edge yet,
+  so it is held for at most 2 sends and then dropped. A note that only lacks
+  a slot (all 4 hold louder notes) waits up to 30 sends, so it can arrive late
+  but never doubles an onset.
+- Invalid frames (bad magic, version, note count or checksum, or reserved
+  flag bits set) never raise or receive carried events, are never the edge
+  reference, and go out as they are.
+- `--output` files are not capped: a `.cvz` file has no wall-clock rate, and
+  whatever replays it paces and caps it. The other host tools only write
+  files or burst procedural frames that never use scene 7.
