@@ -51,7 +51,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
   return output;
 }
 
-// Same integer finalizer as `scenes::hash`.
+// Same integer finalizer as `scenes::hash`; keep in sync with it and with
+// `mix` in scenes/static_noise/mod.rs.
 fn mix32(value: u32) -> u32 {
   var v = value;
   v = v ^ (v >> 16u);

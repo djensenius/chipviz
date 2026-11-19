@@ -452,4 +452,117 @@ mod tests {
             }
         }
     }
+
+    /// Renders `instances` flat (ScreenSpace) into a `width` x `height` RGB
+    /// readback.
+    fn render_screen_space(
+        width: u32,
+        height: u32,
+        instances: &[crate::scene::Instance],
+    ) -> Vec<u8> {
+        use crate::scene::{Camera, scene_uniforms};
+
+        let profile = RenderProfile::pi5();
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height)).unwrap();
+        let uniforms = scene_uniforms(
+            CameraMode::ScreenSpace,
+            &mut Camera::default(),
+            &profile,
+            ControlFrame::procedural(0),
+            0.0,
+            renderer.aspect(),
+        );
+        renderer
+            .render_with(|pipeline, encoder, view| {
+                pipeline.encode_instances(encoder, view, instances, &uniforms);
+            })
+            .unwrap()
+    }
+
+    fn full_screen(color: [f32; 4], pattern: [f32; 2]) -> crate::scene::Instance {
+        crate::scene::Instance {
+            center: [0.0; 3],
+            size: [2.0, 2.0],
+            color,
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern,
+        }
+    }
+
+    /// A full-screen Static glyph quad: each of the 5x8 font pixels covers a
+    /// 20x20 block, which must be white exactly where the CPU bitmap is set.
+    /// 'L' has a lit left column and bottom row and a dark top right, so a
+    /// flipped or transposed decode fails.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn static_glyph_pattern_decodes_upright_on_gpu() {
+        let (bits, pattern) = scenes::static_gpu_reference::glyph_bits('L');
+        let rgb = render_screen_space(100, 160, &[full_screen([1.0; 4], pattern)]);
+        let at = |x: usize, y: usize| &rgb[(y * 100 + x) * 3..][..3];
+        for row in 0..8 {
+            for column in 0..5 {
+                let lit = bits >> (row * 5 + column) & 1 == 1;
+                // Skip the block edges, where rasterisation may round.
+                for y in row * 20 + 2..row * 20 + 18 {
+                    for x in column * 20 + 2..column * 20 + 18 {
+                        let expected = if lit { [255; 3] } else { [0; 3] };
+                        assert_eq!(at(x, y), expected, "({column}, {row}) pixel ({x}, {y})");
+                    }
+                }
+            }
+        }
+        // Spot checks spelled out: left column, bottom row, top right.
+        assert_eq!(at(10, 70), [255; 3]);
+        assert_eq!(at(90, 150), [255; 3]);
+        assert_eq!(at(90, 30), [0; 3]);
+    }
+
+    /// A full-screen Static pixel-noise quad matches the CPU prediction at
+    /// every pixel (blank or lit, and the lit level), its blank share is near
+    /// the requested chance, and rendering is repeatable.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn static_pixel_noise_matches_cpu_prediction_on_gpu() {
+        use scenes::static_gpu_reference::{noise, pixel};
+
+        let (width, height) = (128, 96);
+        let pattern = noise(0.5, 4, 1234, 3);
+        let quad = [full_screen([1.0; 4], pattern)];
+        let rgb = render_screen_space(width, height, &quad);
+        assert_eq!(rgb, render_screen_space(width, height, &quad));
+
+        let srgb = |linear: f32| {
+            let encoded = if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (encoded * 255.0).round() as i32
+        };
+        let mut blank = 0;
+        for y in 0..height {
+            for x in 0..width {
+                let actual = &rgb[((y * width + x) * 3) as usize..][..3];
+                match pixel(x, y, pattern) {
+                    None => {
+                        blank += 1;
+                        assert_eq!(actual, [0; 3], "pixel ({x}, {y}) should be blank");
+                    }
+                    Some(level) => {
+                        let expected = srgb(level);
+                        assert!(
+                            actual
+                                .iter()
+                                .all(|&value| (i32::from(value) - expected).abs() <= 2),
+                            "pixel ({x}, {y}) = {actual:?}, expected ~{expected}"
+                        );
+                    }
+                }
+            }
+        }
+        let share = f64::from(blank) / f64::from(width * height);
+        assert!((0.45..=0.55).contains(&share), "blank share {share}");
+    }
 }

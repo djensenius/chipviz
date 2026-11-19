@@ -601,7 +601,9 @@ fn build_with(
     instances.extend(drawn);
 }
 
-/// Same finalizer as `scenes::hash`, keeping the integer.
+/// Same finalizer as `scenes::hash`, keeping the integer. Three copies must
+/// stay in sync: this one, `scenes::hash` in `scenes/mod.rs`, and `mix32` in
+/// `shader.wgsl` (`pixel_noise` there must also match `gpu_reference`).
 fn mix(mut value: u32) -> u32 {
     value ^= value >> 16;
     value = value.wrapping_mul(0x7feb_352d);
@@ -635,6 +637,45 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 fn normalize(value: [f32; 3]) -> [f32; 3] {
     let length = dot(value, value).sqrt().max(1e-6);
     value.map(|component| component / length)
+}
+
+/// CPU mirror of the shader's Static paths, for the offscreen GPU tests in
+/// `capture.rs`.
+#[cfg(test)]
+pub(crate) mod gpu_reference {
+    use super::{Noise, glyph, glyph_pattern, mix, noise_pattern, unit};
+
+    /// Glyph bitmap (bit `row * 5 + column`, row 0 on top) and its pattern.
+    pub(crate) fn glyph_bits(character: char) -> (u64, [f32; 2]) {
+        let bits = glyph(character).expect("glyph in font");
+        (bits, glyph_pattern(bits))
+    }
+
+    /// Pattern for monochrome pixel noise.
+    pub(crate) fn noise(blank: f32, longest: u32, clock: u32, beat: u32) -> [f32; 2] {
+        let noise = Noise {
+            blank,
+            longest,
+            clock,
+            beat,
+        };
+        noise_pattern(blank, false, noise)
+    }
+
+    /// `pixel_noise` in `shader.wgsl` for monochrome noise: `None` where the
+    /// pixel at integer coordinates (`x`, `y`) is discarded, else the alpha
+    /// level it is drawn with.
+    pub(crate) fn pixel(x: u32, y: u32, pattern: [f32; 2]) -> Option<f32> {
+        let blank = -pattern[0] - 1.0;
+        let packed = (pattern[1] + 0.5) as u32;
+        let longest = (packed & 15) + 1;
+        let clock = packed >> 4;
+        let seed = mix(x ^ mix(y.wrapping_add(0x9e37_79b9)));
+        let period = 1 + seed % longest;
+        let step = ((clock & 0xffff) + (seed >> 8) % period) / period;
+        let value = mix(seed ^ mix(step.wrapping_add((clock >> 16).wrapping_mul(0x85eb_ca6b))));
+        (unit(value) >= blank).then(|| unit(mix(value)))
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,8 @@ mod reference;
 mod signal_field;
 mod spectrum_volume;
 mod static_noise;
+#[cfg(test)]
+pub(crate) use static_noise::gpu_reference as static_gpu_reference;
 
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
@@ -91,6 +93,8 @@ pub(crate) fn note_emphasis(frame: ControlFrame) -> f32 {
     (sum / count as f32).clamp(0.0, 1.0)
 }
 
+/// Keep in sync with `mix` in `static_noise/mod.rs` and `mix32` in
+/// `shader.wgsl`.
 pub(crate) fn hash(mut value: u32) -> f32 {
     value ^= value >> 16;
     value = value.wrapping_mul(0x7feb_352d);
