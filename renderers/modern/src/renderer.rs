@@ -334,11 +334,15 @@ impl ScenePipeline {
         }
     }
 
+    /// Sets the mic layers' mode without applying the build gate. Callers
+    /// outside tests must filter the mode through `mic_layers::allowed()`
+    /// first, as `app` and `capture` do: default builds must draw no layers.
     pub fn set_mic_layers(&mut self, mode: mic_layers::Mode) {
         self.mic_layers.set_mode(mode);
     }
 
-    /// Operator control (`M`): cycles off, scope, bursts, both.
+    /// Operator control (`M`): cycles off, scope, bursts, both. Ungated,
+    /// like `set_mic_layers`; callers check the build gate first.
     pub fn cycle_mic_layers(&mut self) -> mic_layers::Mode {
         let mode = self.mic_layers.mode().next();
         self.mic_layers.set_mode(mode);
