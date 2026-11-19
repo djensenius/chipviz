@@ -156,17 +156,26 @@ debounce as a backstop.
 Hosts must not send more than 60 colour-field frames per second (see
 "Step rate" in [`colour-field-v0`](../../shared/specs/colour-field-v0.md)).
 `live_bridge.py` caps each real-time output (`--udp`, `--n64-serial`)
-separately. A frame whose *decoded scene* on that output is 7 (same table as
-the flash guard) is dropped when less than 1/60 s has passed since the
-previous frame sent on that output, so `--rate 120` drops to 60 while the
-scene is 7 and stays at 120 otherwise. Timing jitter can only lower the rate.
+separately. Only frames whose *decoded scene* on that output is 7 (same table
+as the flash guard) are limited; other frames always go out.
 
+- Scene-7 frames follow a 60 Hz slot grid. A frame is sent once it is no more
+  than a quarter slot early, which absorbs pacing jitter, and never when 60
+  scene-7 frames were already sent in the second before it (half-open
+  window: any `[t, t + 1 s)` holds at most 60). Other frames are dropped.
+- While the scene is 7, `--rate` 120 (or any multiple of 60) gives 60
+  frames/s. Other rates above 60 give between about rate/2 and 60 (45 at 90,
+  50 at 100, 55 at 110, about 58 at 144). Rates up to 60 are unchanged.
 - Frames are only dropped, never reordered or renumbered, so the frame
   counter stays monotonic and skips values; targets step once per new value.
-- A `beat`, `bar` or `drop` rising edge, or a note onset (velocity of at
-  least 64), on a dropped frame is carried into the next sent frame. It is
-  not carried when the previous sent frame already shows it, because that
-  would hold the flag high instead of making a new edge.
+- Events the target edge-detects are carried from dropped frames into a later
+  sent frame, as each transport sees them: `beat`, `bar` and `drop` rising
+  edges, and note onsets (a new note at velocity 64 or more on the full path;
+  byte 15, the highest velocity, rising across 64 on Joybus). An event the
+  previous sent frame already shows cannot be an edge yet, so it is held for
+  at most 2 sends and then dropped. Invalid frames (bad magic, version, note
+  count or checksum) never raise or receive carried events and go out as
+  they are.
 - `--output` files are not capped: a `.cvz` file has no wall-clock rate, and
   whatever replays it paces and caps it. The other host tools only write
   files or burst procedural frames that never use scene 7.

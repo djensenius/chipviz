@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import importlib
 import socket
@@ -13,9 +14,11 @@ from pathlib import Path
 
 from chipviz_bridge import (
   COLOUR_FIELD_SCENE,
+  MAGIC,
   MAX_NOTES,
   SCENE_OFFSET,
   TRANSPORT_SCENE_MASKS,
+  VERSION,
   ControlFrame,
   Note,
   WIRE_SIZE,
@@ -42,8 +45,6 @@ COLOUR_FIELD_MAX_FPS = 60
 NS_PER_SECOND = 1_000_000_000
 FLAGS_OFFSET = 22
 NOTE_COUNT_OFFSET = 23
-# beat, bar and drop: the flags the colour field edge-detects.
-EDGE_FLAGS = 0x07
 NOTE_VEL = 64
 
 
@@ -191,67 +192,133 @@ def _wire_notes(wire: bytes) -> list[tuple[int, int]]:
   return [(wire[24 + index * 2], wire[25 + index * 2]) for index in range(count)]
 
 
+def _wire_valid(wire: bytes) -> bool:
+  return (
+    len(wire) == WIRE_SIZE
+    and wire[0] == MAGIC
+    and wire[1] == VERSION
+    and wire[NOTE_COUNT_OFFSET] <= MAX_NOTES
+    and checksum(wire[:-1]) == wire[-1]
+  )
+
+
+def _max_velocity(wire: bytes) -> int:
+  return max((velocity for _, velocity in _wire_notes(wire)), default=0)
+
+
 class ColourFieldRateCap:
   """Send at most 60 colour-field frames per second on one output.
 
-  colour-field-v0 "Step rate": a frame whose decoded scene (per transport, as
-  in ``sanitise_flash``) is 7 is dropped when less than 1/60 s has passed since
-  the previous frame sent on this output. Other frames always pass, so the
-  frame counter stays monotonic and only skips values. Rising edges of beat,
-  bar and drop and note onsets on dropped frames are carried into the next
-  sent frame, unless the previous sent frame already shows them (no edge is
-  possible then). ``clock`` returns integer nanoseconds.
+  colour-field-v0 "Step rate": only frames whose decoded scene on this
+  transport (as in ``sanitise_flash``) is 7 are limited. They follow a 60 Hz
+  slot grid: a frame is sent once it is no more than a quarter slot early,
+  which absorbs pacing jitter, and never when 60 colour-field frames have
+  already been sent in the half-open second before it. Other frames always
+  pass. Frames are dropped, never renumbered, so the frame counter stays
+  monotonic and only skips values. ``clock`` returns integer nanoseconds.
+
+  Events the target edge-detects are kept pending until a sent frame can show
+  them as a new edge against the previous sent frame: rising edges of beat,
+  bar and drop, plus note onsets as each transport sees them (a new
+  ``(note, velocity)`` pair at ``NOTE_VEL`` or more on the full path; byte 15,
+  the highest velocity, rising across ``NOTE_VEL`` on Joybus; none on HID).
+  An event that the previous sent frame already shows is held for at most
+  ``CARRY_HOLD`` sends. Only valid frames (magic, version, note count and
+  checksum) raise events, act as the previous frame, or are rewritten;
+  invalid frames pass through unchanged.
   """
+
+  CARRY_HOLD = 2
+  _NOTE_EVENTS = {"full": "note", "joybus": "vel", "hid": None}
 
   def __init__(self, transport: str, clock: Callable[[], int] | None = None) -> None:
     self._mask = TRANSPORT_SCENE_MASKS[transport]
+    self._note_event = self._NOTE_EVENTS[transport]
     self._clock = clock or time.monotonic_ns
-    self._last_sent_ns: int | None = None
+    # Times are kept in units of 1/60 ns, so one slot is NS_PER_SECOND.
+    self._due: int | None = None
+    self._window: collections.deque[int] = collections.deque(maxlen=COLOUR_FIELD_MAX_FPS)
     self._last_sent = b""
     self._previous = b""
-    self._pending_flags = 0
-    self._pending_notes: list[tuple[int, int]] = []
+    # Event key -> [payload, sends held].
+    self._pending: dict[tuple, list] = {}
 
   def filter(self, wire: bytes) -> bytes | None:
     """Return the frame to send now, or ``None`` to drop it."""
     if len(wire) != WIRE_SIZE:
       return wire
     now = self._clock()
-    previous, self._previous = self._previous, wire
-    if (
-      wire[SCENE_OFFSET] & self._mask == COLOUR_FIELD_SCENE
-      and self._last_sent_ns is not None
-      and (now - self._last_sent_ns) * COLOUR_FIELD_MAX_FPS < NS_PER_SECOND
-    ):
-      self._pending_flags |= wire[FLAGS_OFFSET] & ~previous[FLAGS_OFFSET] & EDGE_FLAGS
-      previous_notes = _wire_notes(previous)
-      for pair in _wire_notes(wire):
-        if pair[1] >= NOTE_VEL and pair not in previous_notes and pair not in self._pending_notes:
-          self._pending_notes.append(pair)
+    colour_field = wire[SCENE_OFFSET] & self._mask == COLOUR_FIELD_SCENE
+    send = not colour_field or self._admit(now)
+    valid = _wire_valid(wire)
+    if valid:
+      if self._previous:
+        for key, payload in self._events(self._previous, wire):
+          self._pending[key] = [payload, 0]
+      self._previous = wire
+    if not send:
       return None
-    sent = self._carry(wire)
-    self._last_sent_ns = now
+    if colour_field:
+      self._due = max(self._due or 0, now * COLOUR_FIELD_MAX_FPS) + NS_PER_SECOND
+      self._window.append(now)
+    if not valid:
+      return wire
+    sent = self._deliver(wire)
     self._last_sent = sent
-    self._pending_flags = 0
-    self._pending_notes = []
     return sent
 
-  def _carry(self, wire: bytes) -> bytes:
-    if not self._last_sent or not (self._pending_flags or self._pending_notes):
-      return wire
+  def _admit(self, now: int) -> bool:
+    if len(self._window) == COLOUR_FIELD_MAX_FPS and now - self._window[0] < NS_PER_SECOND:
+      return False
+    return self._due is None or now * COLOUR_FIELD_MAX_FPS >= self._due - NS_PER_SECOND // 4
+
+  def _events(self, previous: bytes, wire: bytes) -> list[tuple[tuple, object]]:
+    events: list[tuple[tuple, object]] = [
+      (("flag", bit), None)
+      for bit in (0x01, 0x02, 0x04)
+      if wire[FLAGS_OFFSET] & bit and not previous[FLAGS_OFFSET] & bit
+    ]
+    if self._note_event == "note":
+      previous_notes = _wire_notes(previous)
+      events += [
+        (("note", pair), pair)
+        for pair in _wire_notes(wire)
+        if pair[1] >= NOTE_VEL and pair not in previous_notes
+      ]
+    elif self._note_event == "vel" and _max_velocity(previous) < NOTE_VEL <= _max_velocity(wire):
+      events.append((("vel",), max(_wire_notes(wire), key=lambda pair: pair[1])))
+    return events
+
+  @staticmethod
+  def _shows(wire: bytes, key: tuple) -> bool:
+    if key[0] == "flag":
+      return bool(wire[FLAGS_OFFSET] & key[1])
+    if key[0] == "note":
+      return key[1] in _wire_notes(wire)
+    return _max_velocity(wire) >= NOTE_VEL
+
+  def _deliver(self, wire: bytes) -> bytes:
     out = bytearray(wire)
-    out[FLAGS_OFFSET] |= self._pending_flags & ~self._last_sent[FLAGS_OFFSET]
-    held = _wire_notes(wire) + _wire_notes(self._last_sent)
-    for note, velocity in self._pending_notes:
-      count = out[NOTE_COUNT_OFFSET]
-      if count >= MAX_NOTES:
-        break
-      if (note, velocity) not in held:
-        out[24 + count * 2] = note
-        out[25 + count * 2] = velocity
-        out[NOTE_COUNT_OFFSET] = count + 1
-    # Adjust rather than recompute the XOR checksum so a corrupt frame stays corrupt.
-    out[-1] = wire[-1] ^ checksum(wire[:-1]) ^ checksum(out[:-1])
+    for key, entry in list(self._pending.items()):
+      payload = entry[0]
+      if not (self._last_sent and self._shows(self._last_sent, key)):
+        if self._shows(out, key):
+          del self._pending[key]
+          continue
+        if key[0] == "flag":
+          out[FLAGS_OFFSET] |= key[1]
+          del self._pending[key]
+          continue
+        count = out[NOTE_COUNT_OFFSET]
+        if count < MAX_NOTES:
+          out[24 + count * 2], out[25 + count * 2] = payload
+          out[NOTE_COUNT_OFFSET] = count + 1
+          del self._pending[key]
+          continue
+      entry[1] += 1
+      if entry[1] > self.CARRY_HOLD:
+        del self._pending[key]
+    out[-1] = checksum(out[:-1])
     return bytes(out)
 
 
