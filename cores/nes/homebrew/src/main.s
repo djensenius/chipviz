@@ -147,6 +147,7 @@ ReqArmed:     .res 1
 ; Scene-7 debounce.
 Shown7:       .res 1
 EntryPending: .res 1
+ExitPending:  .res 1
 DebVal:       .res 1
 DebN:         .res 1
 ; Wire palette gate (data role).
@@ -166,6 +167,7 @@ UploadFlags:  .res 1
 AttrShown:    .res 1
 AttrPtr:      .res 2
 PalBuf:       .res 16
+View:         .res 8   ; trace rendered by the last BuildField (Mode..Disp)
 
 .segment "BSS"
 ; RAM starts on a page boundary for OAM DMA; the stack uses $0100-$01ff.
@@ -392,6 +394,14 @@ StepInput:
 StepRings:
 .endif
   jsr UpdateRings
+  ; A scene change decided at the end of step t shows from step t + 1.
+  lda ExitPending
+  beq StepScene
+  lda #$00
+  sta ExitPending
+  jsr SceneExit
+  jmp StepDebounce
+StepScene:
   lda Shown7
   beq StepDebounce
   lda EntryPending
@@ -399,17 +409,12 @@ StepRings:
   lda #$00
   sta EntryPending
   jsr SceneEntry
+  jsr BuildField
   jmp StepDebounce
 StepField:
-  jsr FieldStep
+  jsr FieldStep          ; renders step t, then applies requests for t + 1
 StepDebounce:
-  jsr SceneDebounce
-  lda ShowMode
-  cmp #SHOW_FIELD
-  bne StepDone
-  jmp BuildField
-StepDone:
-  rts
+  jmp SceneDebounce
 
 ; Step input. Procedural until B or A is first held, then the pad as a
 ; digital-only USB HID receiver: energy and bands are HID_E_LO (the NES pad
@@ -428,6 +433,14 @@ PadVals:
   sta InVals,x
   dex
   bpl PadVals
+.ifdef CHIPVIZ_TEST_SILENCE
+  lda Pad
+  and #BTN_SELECT        ; test build only: Select zeroes the energy (bands stay)
+  beq PadLoud
+  lda #$00
+  sta InVals
+PadLoud:
+.endif
   lda #$00
   sta InNoteN
   ldx #7
@@ -578,7 +591,10 @@ RingPinSet:
   sta PinReq
   inc OpPin
   lda Shown7
-  bne RingDone
+  beq RingPinNow
+  lda EntryPending       ; entering this step: the entry uses Pin
+  beq RingDone
+RingPinNow:
   lda PinReq             ; not shown: nothing visible, apply now
   sta Pin
   lda #$00
@@ -614,7 +630,11 @@ DebWant:
 .endif
   stx Shown7
   txa
-  beq SceneExit
+  bne DebEnter
+  lda #1
+  sta ExitPending
+  rts
+DebEnter:
   sta EntryPending
 DebDone:
   rts
@@ -756,6 +776,7 @@ ModeEntry:
   lda Dom
   sta Combo
 ModeEntryLevels:
+  lda Mode
   cmp #1
   bne ModeEntryGate
   jsr InitLevels
@@ -1197,6 +1218,9 @@ Counters:
   sta SinceLayLo
   sta SinceLayHi
 Requests:
+  ; The output of step t is the state before its requests: a request applied
+  ; here is visible from step t + 1.
+  jsr BuildField
   jmp UpdateRequests
 
 ; SECTION = X || (D && since_layout >= SECTION_MIN), as carry.
@@ -1575,9 +1599,8 @@ LoadWarningText:
   ldy #$00               ; text offset
   ldx #$00               ; row 0..13
 WarnRow:
-  txa
-  and #1
-  bne WarnBlankRow
+  lda WarnRows,x
+  beq WarnBlankRow
   lda #$20
   jsr WarnSpaces6
   lda #20
@@ -1624,6 +1647,9 @@ WarnSpaces6:
   sta $2007
   rts
 
+; Text rows start 16 px down, inside the NTSC safe area.
+WarnRows:
+  .byte 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0
 WarningText:
   .byte "WARNING: FLASHING   "
   .byte "LIGHT. MAY TRIGGER  "
@@ -1737,6 +1763,12 @@ BuildStore:
   lda #(UPLOAD_ATTR | UPLOAD_PAL)
 BuildUpload:
   sta UploadFlags
+  ldx #7
+BuildView:
+  lda Mode,x
+  sta View,x
+  dex
+  bpl BuildView
   rts
 
 ; ---------------------------------------------------------------------------

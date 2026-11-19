@@ -223,6 +223,7 @@ nes-rom:
     @command -v ca65 >/dev/null 2>&1 || (echo "ca65 is required; install cc65" >&2; exit 1)
     @command -v ld65 >/dev/null 2>&1 || (echo "ld65 is required; install cc65" >&2; exit 1)
     @make -C cores/nes/homebrew
+    @make -C cores/nes/homebrew INPUT_ROLE=operator
 
 sms-rom:
     @make -C cores/sms/homebrew

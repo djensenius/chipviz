@@ -24,8 +24,12 @@ palette gate, the scene-7 window and the 30-step scene debounce. Flash/gate
 One step runs per NMI. The NMI first uploads the attribute table (64 bytes at
 `$23C0`, the only thing a layout change touches) and the 16-byte palette, then
 reads the pad and runs the step that prepares the next upload, so a change
-never tears. Region *i* uses background palette *i*; every background tile is
-solid colour 1, and the left column is not masked.
+never tears. Step *t* renders its buffers after the mode rule and before its
+requests: a request (or a scene exit) decided at the end of *t* shows from
+*t + 1*, and the buffers of *t* are on screen in the frame after the NMI that
+runs *t + 1*. Region *i* uses background palette *i*; every background tile is
+solid colour 1, and the left column is not masked. `View` in RAM holds the
+rendered trace (mode, family, layout, combo, rot, levels).
 
 ### NES colour indices
 
@@ -71,7 +75,13 @@ After that the pad is a digital-only source: energy and every band are fixed at
   scene presses apply at once; palette presses are operator pulses. Choosing
   3 or 7 while unarmed shows the photosensitivity warning: Start arms, any
   other press cancels (runs unarmed as mode 2/6), and it times out after 600
-  steps. Pulses last 4 steps and start at least 8 steps apart.
+  steps. The text starts 16 px down, inside the NTSC safe area. Pulses last
+  4 steps and start at least 8 steps apart. A Select press on the entry step
+  sets the pin used by the entry.
+
+`just nes-rom` builds both roles. `make INPUT_ROLE=test` builds
+`chipviz-nes-test.nes` for the emulator tests only: the data role, plus Select
+zeroes the pad energy so the silence path can be exercised.
 
 Not implemented on the NES: the interface-v0 screens, the HID auto/demo/manual
 combos and the `CUT_MIN` floor on scene changes (every scene change is already
@@ -82,7 +92,10 @@ debounced, or exempt in the operator role).
 `tests/test_nes_colour_field.py` drives the Mesen libretro core headlessly
 through `scripts/nes_libretro_capture.py`, reads the trace from CPU RAM (via
 the ld65 label files) and checks every pixel of each layout against the spec
-boundaries and colours. Captures go to `build/nes-colour-field/`. The tests
+boundaries and colours, using a fixed table of Mesen's default palette for the
+indices above. It also checks the change budget (at most 3 cuts, pins or
+requests, or 6 spectral level changes, in any 60 steps) and the silence
+blackout. Captures go to `build/nes-colour-field/`. The tests
 skip without cc65 or the Mesen core (`mesen_libretro` in `RETROARCH_CORES`, or
 the path in `NES_LIBRETRO_CORE`).
 
