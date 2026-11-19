@@ -5,6 +5,10 @@
 //! stateful, so it is not a registry entry. Every other byte keeps its
 //! registry scene.
 //!
+//! Registry scenes that need memory between frames (so far only Lines)
+//! keep it in [`SceneState`], which the renderer steps once per new frame
+//! and passes to [`SceneBuild::Stateful`] builders; other scenes ignore it.
+//!
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
 //! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
 //! with the current six entries scene 0/6/12... is SignalField, 1/7/13... is
@@ -51,10 +55,60 @@ pub enum CameraMode {
 /// elapsed seconds and the viewport aspect (width / height).
 pub type SceneBuilder = fn(&RenderProfile, ControlFrame, f32, f32, &mut Vec<Instance>);
 
+/// A [`SceneBuilder`] that also reads the state its scene keeps between
+/// frames (see [`SceneState`]).
+pub type StatefulBuilder =
+    fn(&RenderProfile, ControlFrame, f32, f32, &SceneState, &mut Vec<Instance>);
+
+/// How a registry scene builds its instances. Most scenes derive everything
+/// from the control frame and elapsed time; a stateful one also reads the
+/// state [`SceneState::observe`] kept from earlier frames.
+#[derive(Clone, Copy)]
+pub enum SceneBuild {
+    Stateless(SceneBuilder),
+    Stateful(StatefulBuilder),
+}
+
 pub struct SceneEntry {
     pub name: &'static str,
     pub camera: CameraMode,
-    pub build: SceneBuilder,
+    pub build: SceneBuild,
+}
+
+/// Opt-in scene behaviour chosen at start-up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneConfig {
+    /// Lines cuts straight to its other shape on a drop flag (at most once
+    /// per bar); see [`lines`].
+    pub lines_drop_cuts: bool,
+}
+
+/// State registry scenes keep between frames. [`observe`](Self::observe)
+/// steps every stateful scene once per new frame, whichever scene is shown,
+/// so a scene resumes in time when it is selected again; builders only read
+/// it, so a held redraw repeats the last step. Stateless scenes ignore it.
+#[derive(Clone, Debug, Default)]
+pub struct SceneState {
+    config: SceneConfig,
+    pub(crate) lines: lines::LinesState,
+}
+
+impl SceneState {
+    pub fn new(config: SceneConfig) -> Self {
+        Self {
+            config,
+            lines: lines::LinesState::new(config.lines_drop_cuts),
+        }
+    }
+
+    pub fn config(&self) -> SceneConfig {
+        self.config
+    }
+
+    /// Feeds one new (not held) frame to every stateful scene.
+    pub fn observe(&mut self, frame: &ControlFrame) {
+        self.lines.observe(frame);
+    }
 }
 
 pub const REGISTRY: &[SceneEntry] = &[
@@ -237,7 +291,7 @@ mod tests {
         for scene in 0..3 {
             assert_eq!(
                 fingerprint(scene, |profile, frame, elapsed| {
-                    build_instances(profile, frame, elapsed, 16.0 / 9.0)
+                    build_instances(profile, frame, elapsed, 16.0 / 9.0, &SceneState::default())
                 }),
                 fingerprint(scene, |profile, frame, elapsed| {
                     let scene = frame.scene % REGISTRY.len() as u8;
@@ -262,7 +316,7 @@ mod tests {
         for (scene, expected) in golden.into_iter().enumerate() {
             assert_eq!(
                 fingerprint(scene as u8, |profile, frame, elapsed| {
-                    build_instances(profile, frame, elapsed, 16.0 / 9.0)
+                    build_instances(profile, frame, elapsed, 16.0 / 9.0, &SceneState::default())
                 }),
                 expected,
                 "scene {scene}"

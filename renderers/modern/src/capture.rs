@@ -10,7 +10,7 @@ use crate::audio::scope::{ScopeSnapshot, ScopeTap};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{OffscreenRenderer, ScenePipeline};
-use crate::scenes::{self, CameraMode, colour_field, mic_layers};
+use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers};
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
@@ -18,6 +18,7 @@ pub const CAPTURE_FPS: f32 = 60.0;
 const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scene N]
                        [--frames 0,60,120] [--input procedural|synth-mic|PATH.cvz]
                        [--size WxH] [--mic-layers off|scope|bursts|both]
+                       [--lines-drop-cuts]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
@@ -29,7 +30,11 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
              through the live analyzer and waveform tap) or a raw .cvz file
   --size     output size in pixels (default: the profile's target size)
   --mic-layers
-             overlay the mic layers: off (default), scope, bursts or both";
+             overlay the mic layers: off (default), scope, bursts or both
+  --lines-drop-cuts
+             Lines (scene 3) cuts on a rising drop flag, as the renderer's
+             flag of the same name (default: drops are ignored); only
+             .cvz inputs carry drop flags, procedural input never does";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -47,6 +52,7 @@ pub struct CaptureArgs {
     pub size: (u32, u32),
     pub out: PathBuf,
     pub mic_layers: mic_layers::Mode,
+    pub lines_drop_cuts: bool,
 }
 
 #[derive(Debug)]
@@ -63,6 +69,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     let mut size = None;
     let mut out = None;
     let mut layers = mic_layers::Mode::Off;
+    let mut lines_drop_cuts = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -119,6 +126,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                     format!("--mic-layers expects off|scope|bursts|both, got {text}")
                 })?;
             }
+            "--lines-drop-cuts" => lines_drop_cuts = true,
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -133,6 +141,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
         size,
         out,
         mic_layers: layers,
+        lines_drop_cuts,
     }))
 }
 
@@ -299,6 +308,9 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
             ..colour_field::Config::default()
         });
     renderer.pipeline_mut().set_mic_layers(args.mic_layers);
+    renderer.pipeline_mut().configure_scenes(SceneConfig {
+        lines_drop_cuts: args.lines_drop_cuts,
+    });
     let mut captures = Vec::new();
 
     for &index in &args.frames {
@@ -433,9 +445,11 @@ mod tests {
             "shots",
             "--mic-layers",
             "scope",
+            "--lines-drop-cuts",
         ])
         .unwrap();
         assert_eq!(args.mic_layers, mic_layers::Mode::Scope);
+        assert!(args.lines_drop_cuts);
         assert_eq!(args.profile.name, "pi5");
         assert_eq!(args.scene, Some(4));
         assert_eq!(args.frames, [0, 60, 120]);
@@ -455,6 +469,7 @@ mod tests {
         assert_eq!(args.mic_layers, mic_layers::Mode::Off);
         let synth = parse(&["--out", "o", "--input", "synth-mic"]).unwrap();
         assert_eq!(synth.input, Input::SynthMic);
+        assert!(!args.lines_drop_cuts);
     }
 
     #[test]

@@ -40,6 +40,7 @@ The renderer starts windowed by default.
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
 | `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
+| `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -262,18 +263,24 @@ the colour field, whatever the registry length; every other byte selects
 - `Lines`: lines of varied direction, speed, length and thickness travel
   across a mirrored plane; each spectrum band drives its own group and energy
   sets density (up to an eighth of the instance budget per half, fading lines
-  at the cutoff). Every 512 control frames (about 8.5 s at 60 fps) the plane
-  alternates with a hallway whose two walls mirror each other: the fold eases
-  in over 96 frames (1.6 s), but every fourth section cuts straight to it. The
-  fold follows the monotonic `frame` counter because the scene is stateless
-  and some sources wrap `beat_phase` before `beat_count` ticks; beat-synced
-  folds are follow-up [#80](https://github.com/djensenius/chipviz/issues/80).
-  The timings in seconds assume 60 control frames per second; the fold's real
-  speed follows the sender's frame rate.
-  The drop flag is not used. The camera swings around the plane and eases
-  into the hallway entrance. The scene projects its own camera on the CPU, so
+  at the cutoff). The plane alternates with a hallway whose two walls mirror
+  each other. The scene keeps its section between frames: a new section
+  starts when `beat_count` crosses a multiple of 16 (a four-bar phrase), and
+  the fold eases in over one bar at the frame's `bpm` (60 to 240 control
+  frames), counted in observed frames so it never moves backwards; every
+  fourth section cuts straight to the hallway. A backward or large jump in
+  `beat_count` (a restart, loop or source handover) resyncs without a section
+  change, and if the counter stalls for 4 s sections free-run every 512
+  frames. `beat_phase` is not used, because procedural input and
+  `live_bridge` wrap it before the count ticks. Section changes are at least
+  one bar apart. The timings in seconds assume 60 control frames per second.
+  The drop flag is ignored unless the renderer runs with `--lines-drop-cuts`;
+  then a rising drop flag cuts straight to the next section (a refold of the
+  same lines, not a screen flash). A drop (or phrase boundary) that arrives
+  within one bar of the last section change is ignored, not delayed. The camera
+  swings around the plane and eases into the hallway entrance. The scene projects its own camera on the CPU, so
   it uses `ScreenSpace`. Procedural input never selects it; use `--scene 3`
-  (frames 120, 560 and 800 show plane, mid-fold and hallway).
+  (procedural frames 250, 316 and 400 show plane, mid-fold and hallway).
 - `Static`: a grid of noise cells, each a random glyph, solid block or
   bitmap, or blank. Energy sets both the change rate (each cell changes every
   1 to 12 frames, faster when loud) and the chance of "nothing" (blank cells,
@@ -392,7 +399,9 @@ frame 0, so very large frame indices take longer to capture.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed
-from frame 0 like the camera. Procedural input never arms flash/gate; with
+from frame 0 like the camera. `--lines-drop-cuts` turns on Lines drop cuts
+as in the renderer, replayed from frame 0; only a `.cvz` input carries drop
+flags. Procedural input never arms flash/gate; with
 the `unmeasured-flash` feature, a recording arms it only as a target would,
 from a stable absolute wire 3 or 7 held in scene 7, and default builds never
 flash. Recorded inputs use

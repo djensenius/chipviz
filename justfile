@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/c64_colour_field_capture.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_nes_colour_field.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/gb_libretro_capture.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_nes_colour_field.py scripts/c64_colour_field_capture.py"
 
 default:
     just --list
@@ -219,6 +219,7 @@ gb-rom:
     @command -v rgblink >/dev/null 2>&1 || (echo "rgblink is required; install RGBDS" >&2; exit 1)
     @command -v rgbfix >/dev/null 2>&1 || (echo "rgbfix is required; install RGBDS" >&2; exit 1)
     @make -C cores/gb/homebrew
+    @make -C cores/gb/homebrew INPUT_ROLE=operator
 
 genesis-rom:
     @make -C cores/genesis/homebrew

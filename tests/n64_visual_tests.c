@@ -106,10 +106,42 @@ static void scene_colors(void) {
   require(bounded, "scene color channels are byte-bounded and never wrap");
 }
 
+static void procedural_scenes(void) {
+  unsigned counts[16] = {0};
+  int in_range = 1;
+  /* Over 1,000 full 1,440-frame cycles (about 6.7 hours at 60 fps). */
+  for (unsigned frame = 0; frame < 1440u * 1000u; frame++) {
+    uint8_t scene = procedural_scene(frame);
+    in_range &= scene <= 15;
+    if (scene <= 15) {
+      counts[scene]++;
+    }
+  }
+  require(in_range, "procedural scenes stay within the 4-bit Joybus scene nibble");
+  require(counts[7] == 0, "procedural mode never emits scene 7 (colour field)");
+  int uniform = 1;
+  for (int scene = 0; scene < 16; scene++) {
+    if (scene != 7) {
+      uniform &= counts[scene] == 96u * 1000u;
+    }
+  }
+  require(uniform, "procedural mode spends equal time in each of the 15 non-7 scenes");
+  require(procedural_scene(0) == 0 && procedural_scene(6 * 96) == 6 &&
+              procedural_scene(7 * 96) == 8 && procedural_scene(14 * 96) == 15 &&
+              procedural_scene(15 * 96) == 0,
+          "procedural scenes step 0..6, skip 7, continue 8..15, then wrap");
+  int wrap_safe = 1;
+  for (unsigned frame = 0xFFFFFFFFu - 2000u; frame != 0u; frame++) {
+    wrap_safe &= procedural_scene(frame) != 7;
+  }
+  require(wrap_safe, "procedural mode never emits scene 7 near the frame counter limit");
+}
+
 int main(void) {
   meter_bounds();
   reference_geometry();
   scene_colors();
+  procedural_scenes();
   printf("n64 visual tests: %u checks, %u failures\n", checks, failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

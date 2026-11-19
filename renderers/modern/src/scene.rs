@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
-use crate::scenes::{self, CameraMode};
+use crate::scenes::{self, CameraMode, SceneBuild, SceneState};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -95,9 +95,15 @@ pub fn build_instances(
     frame: ControlFrame,
     elapsed: f32,
     aspect: f32,
+    state: &SceneState,
 ) -> Vec<Instance> {
     let mut instances = Vec::with_capacity(profile.instance_count);
-    (scenes::select(frame.scene).build)(profile, frame, elapsed, aspect, &mut instances);
+    match scenes::select(frame.scene).build {
+        SceneBuild::Stateless(build) => build(profile, frame, elapsed, aspect, &mut instances),
+        SceneBuild::Stateful(build) => {
+            build(profile, frame, elapsed, aspect, state, &mut instances)
+        }
+    }
     instances
 }
 

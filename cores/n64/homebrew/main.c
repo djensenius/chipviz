@@ -121,6 +121,7 @@ static unsigned read_joybus_packet(uint8_t packet[16]) {
 static void procedural_packet(int frame, uint8_t packet[16]) {
   int phrase = (frame / 96) & 3;
   int pulse = frame & 255;
+  uint8_t scene = procedural_scene((unsigned)frame);
 
   for (int i = 0; i < 16; i++) {
     packet[i] = 0;
@@ -134,8 +135,8 @@ static void procedural_packet(int frame, uint8_t packet[16]) {
   packet[0] = (pulse & 31) < 4 ? 3 : 0;
   packet[4] = (pulse & 63) < 8 ? 2 : 0;
   packet[8] = (pulse & 127) < 16 ? 1 : 0;
-  packet[12] = (uint8_t)((phrase << 4) | ((pulse & 31) < 4 ? 1 : 0));
-  packet[13] = (uint8_t)(((frame / 32) & 7) | (((frame / 384) & 3) << 4));
+  packet[12] = (uint8_t)(((scene & 3) << 4) | ((pulse & 31) < 4 ? 1 : 0));
+  packet[13] = (uint8_t)(((frame / 32) & 7) | ((scene >> 2) << 4));
   packet[14] = (uint8_t)(96 + ((frame * 5 + phrase * 29) & 95));
   packet[15] = (uint8_t)(80 + ((frame * 7 + phrase * 41) & 127));
 }

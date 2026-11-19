@@ -21,6 +21,15 @@ static inline int scene_floor_green(uint8_t scene) {
   return green > 255 ? 255 : green;
 }
 
+/* Procedural mode steps one scene every 96 frames through the native Joybus
+ * scenes 0..15, skipping scene 7 (the colour field): procedural generators
+ * never select it. Each of the 15 remaining scenes gets an equal share.
+ */
+static inline uint8_t procedural_scene(unsigned frame) {
+  unsigned step = (frame / 96u) % 15u;
+  return (uint8_t)(step >= 7u ? step + 1u : step);
+}
+
 /* channel is 0..7; energy is a byte. Callers holding int scene/energy values
  * (decoded from packet bytes, so already 0..255) cast explicitly to uint8_t.
  * Rectangles have exclusive lower-right bounds, in draw order: cap, front,
