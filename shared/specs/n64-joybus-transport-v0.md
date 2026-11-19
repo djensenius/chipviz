@@ -64,7 +64,9 @@ vectors.
 
 The ROM chooses one of three sources every frame:
 
-- **Procedural** with no connected device, which also resets the state. It also
+- **Procedural** unless all four controller ports report a connected device.
+  A partial disconnect counts as no device: the ROM switches immediately and
+  resets its state. It also
   stays procedural while a connected pad sends no valid marker, which covers an
   idle pad, a pad in use, a v0 host or a corrupt marker.
 - **Live** after a valid frame followed by 4 valid frames with an advancing
@@ -91,8 +93,10 @@ The 30-frame start-up warm-up still forces procedural output.
 - Live mode needs all four controller ports wired to the Pico. Ports 1, 2 and
   3 carry the marker in their buttons-low bytes. Port 4 carries scene, palette,
   beat, energy and MIDI data, and the checksum covers those bytes. A missing
-  port reads as zeros, so the marker fails unless that port's data happens to
-  be zero, and the ROM stays procedural.
+  port reads as zeros, and the marker alone cannot always detect that. For
+  example, zeroing port 4 bytes `00 00 20 40` keeps the checksum. The ROM
+  therefore requires all four ports to be connected and stays procedural if any
+  is missing.
 - The Pico's serial framing has no resync. If the byte stream slips (a dropped
   or extra byte), every packet straddles two frames and fails the marker. The
   link then stays procedural until the Pico is reset. Hardware validation is

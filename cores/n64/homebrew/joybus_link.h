@@ -66,8 +66,20 @@ static inline void joybus_link_init(joybus_link_t *link) {
   memset(link, 0, sizeof(*link));
 }
 
+/* Bit p of `connected_mask` is set when controller port p+1 is connected. The
+ * link needs all four ports: an unplugged port reads as zeros and the marker
+ * cannot always detect that (zeroed port-4 data can keep the checksum), so a
+ * partial disconnect counts as no device.
+ */
+#define JOYBUS_LINK_ALL_PORTS 0x0Fu
+
+static inline int joybus_link_ports_ready(unsigned connected_mask) {
+  return (connected_mask & JOYBUS_LINK_ALL_PORTS) == JOYBUS_LINK_ALL_PORTS;
+}
+
 /* Pure per-frame selection: (connected, marker, sequence, packet) -> mode.
- * - No device: procedural immediately, state reset.
+ * - No device (connected false; pass joybus_link_ports_ready(mask), so any
+ *   missing port counts): procedural immediately, state reset.
  * - Live: a valid marker whose sequence differs from the previous valid one
  *   keeps live (even if every data byte is zero) and refreshes the held packet.
  *   Up to JOYBUS_LINK_REPEAT_GRACE consecutive valid repeats stay live. Anything

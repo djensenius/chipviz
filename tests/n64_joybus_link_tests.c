@@ -206,6 +206,45 @@ static void slow_host_stays_live(void) {
   require(live, "a sequence repeating every other frame stays live");
 }
 
+static void partial_disconnect(void) {
+  require(joybus_link_ports_ready(0x0F) && joybus_link_ports_ready(0xFF),
+          "all four ports connected is ready");
+  int partial = 1;
+  for (unsigned mask = 0; mask < 0x0F; mask++) {
+    partial &= !joybus_link_ports_ready(mask);
+  }
+  require(partial, "any missing port (including port 4 only) is not ready");
+
+  /* Port 4 bytes [0, 0, 32, 64]: byte 14 is rotated once, byte 15 not, so
+   * 64 ^ rotl(32) cancels and zeroing port 4 keeps the checksum. The marker
+   * alone cannot detect a missing port 4; the connected mask must.
+   */
+  uint8_t packet[16];
+  marked(packet, 9, 0);
+  packet[12] = 0;
+  packet[13] = 0;
+  packet[14] = 32;
+  packet[15] = 64;
+  packet[9] = joybus_link_checksum(packet);
+  uint8_t zeroed[16];
+  memcpy(zeroed, packet, sizeof(zeroed));
+  memset(&zeroed[12], 0, 4);
+  require(joybus_link_marker_valid(packet) && joybus_link_marker_valid(zeroed),
+          "zeroed port 4 can keep a valid marker (why the mask is required)");
+
+  joybus_link_t link;
+  uint8_t seq = go_live(&link);
+  int procedural = 1;
+  for (int i = 0; i < 100; i++) {
+    marked(zeroed, seq++, 0);
+    procedural &= joybus_link_step(&link, joybus_link_ports_ready(0x07), zeroed) ==
+                  JOYBUS_LINK_PROCEDURAL;
+  }
+  require(procedural, "live link with port 4 missing goes procedural immediately and stays there");
+  require(step_seq(&link, seq++, 0) == JOYBUS_LINK_PROCEDURAL,
+          "reconnecting all ports needs the full recovery again");
+}
+
 int main(void) {
   marker();
   no_device_and_idle_pad();
@@ -213,6 +252,7 @@ int main(void) {
   stale_hold_then_procedural();
   recovery_and_corruption();
   slow_host_stays_live();
+  partial_disconnect();
   printf("n64 joybus link tests: %u checks, %u failures\n", checks, failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

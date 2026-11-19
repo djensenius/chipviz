@@ -76,8 +76,9 @@ static void decode_transport_packet(const uint8_t packet[16], visual_state_t *st
   }
 }
 
-static bool read_joybus_packet(uint8_t packet[16]) {
-  bool has_controller = false;
+/* Returns a mask with bit p set when controller port p+1 is connected. */
+static unsigned read_joybus_packet(uint8_t packet[16]) {
+  unsigned connected_mask = 0;
 
   joypad_poll();
   for (int p = 0; p < 4; p++) {
@@ -107,10 +108,10 @@ static bool read_joybus_packet(uint8_t packet[16]) {
     packet[p * 4 + 2] = (uint8_t)inputs.stick_x;
     packet[p * 4 + 3] = (uint8_t)inputs.stick_y;
     if (joypad_is_connected(port)) {
-      has_controller = true;
+      connected_mask |= 1u << p;
     }
   }
-  return has_controller;
+  return connected_mask;
 }
 
 static void procedural_packet(int frame, uint8_t packet[16]) {
@@ -225,7 +226,7 @@ int main(void) {
     visual_state_t state;
     surface_t *disp = display_get();
 
-    bool connected = read_joybus_packet(packet);
+    bool connected = joybus_link_ports_ready(read_joybus_packet(packet));
     joybus_link_mode_t mode = joybus_link_step(&link, connected, packet);
 
     if (frame < 30 || mode == JOYBUS_LINK_PROCEDURAL) {
