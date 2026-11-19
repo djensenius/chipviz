@@ -31,7 +31,7 @@
 pub(super) mod font;
 mod text;
 
-use super::{CameraMode, SceneBuild, SceneEntry, palette};
+use super::{CameraMode, SceneBuild, SceneEntry, palette, sin_cos};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -465,10 +465,11 @@ fn camera_pose(section: Section) -> (f32, f32, f32) {
 
 impl View {
     fn new((yaw, pitch, distance): (f32, f32, f32), aspect: f32) -> Self {
+        let ((yaw_sin, yaw_cos), (pitch_sin, pitch_cos)) = (sin_cos(yaw), sin_cos(pitch));
         let eye = [
-            distance * yaw.sin() * pitch.cos(),
-            distance * pitch.sin(),
-            distance * yaw.cos() * pitch.cos(),
+            distance * yaw_sin * pitch_cos,
+            distance * pitch_sin,
+            distance * yaw_cos * pitch_cos,
         ];
         let forward = normalize(eye.map(|axis| -axis));
         let right = normalize(cross(forward, [0.0, 1.0, 0.0]));

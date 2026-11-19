@@ -203,6 +203,31 @@ pub(crate) fn hash(mut value: u32) -> f32 {
     value as f32 / u32::MAX as f32
 }
 
+/// `(x.sin(), x.cos())`, computed identically in debug and release builds.
+///
+/// With optimisation, LLVM merges a `sin` and `cos` of the same value into
+/// one `sincos` libm call (`__sincosf_stret` on Apple), which differs from
+/// separate `sinf`/`cosf` in the last ulp for some inputs, so instance data
+/// (and the recorded goldens) would depend on the build profile.
+/// Golden-covered scenes (Pulse Tunnel, Object, Static) use this instead of
+/// `f32::sin_cos` or a `sin`/`cos` pair; Lines and the camera still use the
+/// fusable forms, which have no goldens.
+pub(crate) fn sin_cos(x: f32) -> (f32, f32) {
+    (sin(x), cos(x))
+}
+
+// Out of line so LLVM never sees both calls on the same value, and so does
+// not fuse them (or constant-fold them differently from the runtime libm).
+#[inline(never)]
+fn sin(x: f32) -> f32 {
+    x.sin()
+}
+
+#[inline(never)]
+fn cos(x: f32) -> f32 {
+    x.cos()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

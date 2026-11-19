@@ -1,8 +1,8 @@
 //! Backgrounds, overlays and flourishes for the Object scene, all drawn as
 //! flat `ScreenSpace` quads in NDC (`-1..1`, `+y` up).
 
-use super::super::hash;
 use super::super::static_noise::font::glyph;
+use super::super::{hash, sin_cos};
 use super::models::{Kind, Vec3, hue};
 use super::{Background, Shape, quad};
 use crate::scene::Instance;
@@ -87,10 +87,8 @@ fn bar(a: [f32; 2], b: [f32; 2], width: f32, color: [f32; 4]) -> Instance {
 
 /// The end of a ray of `length` (NDC y units, round in pixels) at `angle`.
 fn ray(center: [f32; 2], angle: f32, length: f32, aspect: f32) -> [f32; 2] {
-    [
-        center[0] + angle.cos() * length / aspect,
-        center[1] + angle.sin() * length,
-    ]
+    let (sin, cos) = sin_cos(angle);
+    [center[0] + cos * length / aspect, center[1] + sin * length]
 }
 
 /// Horizontal strips from `top` to `bottom` through evenly spaced `stops`.
@@ -149,7 +147,8 @@ fn stars(stage: &Stage, budget: usize, out: &mut Vec<Instance>) {
         let speed = 0.5 + hash(seed + 2);
         let z = (hash(seed + 3) + stage.clock * 0.002 * speed).fract();
         let r = 0.03 + z * z * 1.9;
-        let center = [angle.cos() * r * 1.1, angle.sin() * r * 0.9];
+        let (sin, cos) = sin_cos(angle);
+        let center = [cos * r * 1.1, sin * r * 0.9];
         let twinkle = 1.0 + 0.6 * stage.treble * hash(seed ^ stage.clock as u32);
         let size = (0.004 + z * 0.014) * twinkle;
         let tint = hash(seed + 4);
@@ -251,7 +250,8 @@ fn rainbow(stage: &Stage, budget: usize, out: &mut Vec<Instance>) {
     let width = 3.4 / count.max(1) as f32;
     for stripe in 0..count {
         let d = -1.7 + (stripe as f32 + 0.5) * width;
-        let center = [angle.cos() * d, angle.sin() * d];
+        let (sin, cos) = sin_cos(angle);
+        let center = [cos * d, sin * d];
         let color = hue(d * 0.45 - stage.clock * 0.004).map(|channel| 0.15 + 0.7 * channel);
         let size = [width * 1.04, 4.0];
         out.push(quad(center, size, rgba(color, 1.0), angle, [0.0; 2]));

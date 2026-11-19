@@ -46,7 +46,7 @@ mod models;
 #[cfg(test)]
 mod tests;
 
-use super::{CameraMode, SceneBuild, SceneEntry, hash};
+use super::{CameraMode, SceneBuild, SceneEntry, hash, sin_cos};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -249,7 +249,7 @@ fn normalize(v: Vec3) -> Vec3 {
 /// down when brighter, or lifted towards white (exactly, as luminance is
 /// linear) when clamping leaves it darker.
 fn turn_hue(color: Vec3, angle: f32) -> Vec3 {
-    let (s, c) = angle.sin_cos();
+    let (s, c) = sin_cos(angle);
     let k = 1.0 / 3.0_f32.sqrt();
     let along = (color[0] + color[1] + color[2]) * k * k * (1.0 - c);
     let cross = [
@@ -362,8 +362,8 @@ fn draw_object(
     let target = (budget as f32 * OVERSAMPLE) as usize;
     let mut mesh = Mesh::new(step_for(section.object, target));
     section.object.build(&mut mesh, &look);
-    let (sy, cy) = pose.yaw.sin_cos();
-    let (sp, cp) = pose.pitch.sin_cos();
+    let (sy, cy) = sin_cos(pose.yaw);
+    let (sp, cp) = sin_cos(pose.pitch);
     let rotate = |v: Vec3| {
         let (x, z) = (v[0] * cy + v[2] * sy, v[2] * cy - v[0] * sy);
         [x, v[1] * cp - z * sp, v[1] * sp + z * cp]

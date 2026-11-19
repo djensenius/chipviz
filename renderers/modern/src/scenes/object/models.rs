@@ -11,8 +11,8 @@
 //! instance budget, so the Pi 5 draws the same shapes with fewer, larger
 //! splats. Models sit within about one unit of the origin, front facing +z.
 
-use super::super::hash;
 use super::super::static_noise::font::glyph;
+use super::super::{hash, sin_cos};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 pub(super) type Vec3 = [f32; 3];
@@ -88,7 +88,7 @@ impl Place {
     /// Rotates the axes by `angle` about local axis `axis` (right-handed).
     fn turned(mut self, axis: usize, angle: f32) -> Self {
         let (i, j) = ((axis + 1) % 3, (axis + 2) % 3);
-        let (s, c) = angle.sin_cos();
+        let (s, c) = sin_cos(angle);
         let (a, b) = (self.axes[i], self.axes[j]);
         self.axes[i] = std::array::from_fn(|k| a[k] * c + b[k] * s);
         self.axes[j] = std::array::from_fn(|k| b[k] * c - a[k] * s);
@@ -174,7 +174,7 @@ impl Mesh {
         let height = 2.0 * half / tall as f32;
         for i in 0..around {
             let angle = TAU * (i as f32 + 0.5) / around as f32;
-            let (s, c) = angle.sin_cos();
+            let (s, c) = sin_cos(angle);
             let arc = TAU * radius / around as f32;
             for j in 0..tall {
                 let y = -half + (j as f32 + 0.5) * height;
@@ -195,7 +195,7 @@ impl Mesh {
             let arc = TAU * r / count as f32;
             for i in 0..count {
                 let angle = TAU * (i as f32 + 0.5) / count as f32;
-                let (s, c) = angle.sin_cos();
+                let (s, c) = sin_cos(angle);
                 for sign in [-1.0, 1.0] {
                     let hit = Hit {
                         local: [c * r, sign * half, s * r],
@@ -214,12 +214,12 @@ impl Mesh {
         let dv = PI * radius / rows as f32;
         for row in 0..rows {
             let polar = PI * (row as f32 + 0.5) / rows as f32;
-            let (sp, cp) = polar.sin_cos();
+            let (sp, cp) = sin_cos(polar);
             let count = steps(TAU * radius * sp, self.step).max(3);
             let arc = TAU * radius * sp / count as f32;
             for i in 0..count {
                 let angle = TAU * (i as f32 + 0.5) / count as f32;
-                let (s, c) = angle.sin_cos();
+                let (s, c) = sin_cos(angle);
                 let normal = [sp * c, cp, sp * s];
                 let hit = Hit {
                     local: normal.map(|axis| axis * radius),
@@ -414,7 +414,8 @@ fn television(mesh: &mut Mesh, look: &Look) {
     mesh.cylinder(at([0.0, 0.72, -0.2]), [0.14, 0.0, 0.05], |_| BLACK_PLASTIC);
     for side in [-1.0f32, 1.0] {
         let angle = side * (0.55 + 0.05 * (look.t * 0.03).sin());
-        let up = [-angle.sin(), angle.cos(), 0.0];
+        let (sin, cos) = sin_cos(angle);
+        let up = [-sin, cos, 0.0];
         let along = |d: f32| [up[0] * d, 0.76 + up[1] * d, -0.2];
         let rod = at(along(0.5)).turned(2, angle);
         mesh.cylinder(rod, [0.018, 0.0, 0.5], |_| CHROME);
