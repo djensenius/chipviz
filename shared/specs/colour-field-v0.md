@@ -337,6 +337,9 @@ steps per second.
     `N`). The step's `B`, `X` and `N` are these masks, used directly; the step
     then clears them.
   - All other inputs (energy, bands, spectrum) come from the newest frame.
+  - At scene entry, the entry step's frames update the previous-frame state
+    (flags and notes) used for edge detection, and the onset masks are cleared
+    without raising events.
 - At 50 Hz the step counts are the same, which only lowers the rates. The flash
   limits therefore hold whatever the transport rate.
 
@@ -352,6 +355,8 @@ within a step is exact, so every port produces the same trace:
   mode-rule action needing `>= N` can happen at `t + 1 + N`, and the next
   request can be applied at the end of `t + N` (visible from `t + N + 1`).
   F12 follows from this: requests apply at the end of 60, 80, 100.
+- `since_pulse` follows the first rule: a pulse started at `t` resets it in
+  step 6, so it reads 1 at `t + 1` and the next start can be at `t + 8`.
 - The entry step runs no step 1–7 rules, so no counter is incremented on it.
 
 ## Detector (integer reference)
@@ -396,7 +401,9 @@ unarmed 3→2 rule) or the family of `p_eff` changes. `layout`, `combo` and `rot
 - **Spectral levels:** each region gets `lvl[i] = count(UP[k] <= v_i)`.
   `lvl[2] = 0` in 2-region layouts.
 - **Gate:** `pulse = 0`, `gate_off = GATE_OFF_MIN`, and `hyst = dim = avg_e
-  >= REST_DIM_ON`, where `avg_e` is the current average.
+  >= REST_DIM_ON`, where `avg_e` is the current average. `since_pulse` is not
+  touched by mode entry: it is set to `GATE_ON + GATE_OFF_MIN` (8) only on
+  scene entry.
 - **Silence:** in spectral or flash/gate mode, if `silent`, all regions are
   black (`lvl = 0`; `hyst = dim = 0`).
 
@@ -413,8 +420,9 @@ unarmed 3→2 rule) or the family of `p_eff` changes. `layout`, `combo` and `rot
    - Otherwise: set `quiet` to `quiet + 1` when the new `avg_e <= SIL_AVG`, else
      to 0. When `quiet >= SIL_HOLD`, set `silent = 1`. On that entry,
      flash/gate goes black at once: `dim = 0`, and if a pulse is lit it ends
-     early (`pulse = 0`, `gate_off = 0`), so the next pulse still waits
-     `GATE_OFF_MIN` steps. Held and cuts hold their state.
+     early (`pulse = 0`, `gate_off = 0`). `since_pulse` is not reset, so the
+     next pulse still starts no sooner than 8 steps after the previous start.
+     Held and cuts hold their state.
    - **Spectral blackout:** in spectral mode, on every step where `silent` is
      set and any `lvl > 0`, set all `lvl = 0` and `lg = 0` if `lg >=
      LEVEL_OPP`. Otherwise wait for a later silent step. The blackout is a
@@ -448,7 +456,7 @@ unarmed 3→2 rule) or the family of `p_eff` changes. `layout`, `combo` and `rot
    SECTION_MIN)`. Any `next_layout` sets `since_layout = 0`. In spectral mode,
    it also re-initialises `lvl` from the current values for the new region
    count, as in mode entry, and sets `lg = 0`.
-7. Increment `since_cut`, `since_layout`, `gate_off` and `lg`. Then update
+7. Increment `since_cut`, `since_layout`, `gate_off`, `since_pulse` and `lg`. Then update
    `p_req` (wire stability gate, operator pulses) and `pin_req`, and apply at
    most one pending request under the change budget, so it takes effect from
    the next step.
@@ -525,13 +533,34 @@ a request, so arming always goes through the budget.
     REST_DIM_OFF`. `hyst` is not displayed.
   - **Pulse:** if `pulse > 0`, decrement it; when it reaches 0, set
     `gate_off = 0` and `dim = hyst`. Otherwise, an `E` with `gate_off >=
-    GATE_OFF_MIN` starts a pulse: `pulse = GATE_ON`, rotate, and on `X` also
+    GATE_OFF_MIN` and `since_pulse >= GATE_ON + GATE_OFF_MIN` starts a pulse:
+    `pulse = GATE_ON`, `since_pulse = 0`, rotate, and on `X` also
     `next_combo`.
+  - **`since_pulse`:** a saturating counter of steps since the last pulse
+    start. It follows the counter-order rules: read in step 6, incremented in
+    step 7, so a start at `t` allows the next start at `t + 8` at the
+    earliest. Only scene entry (to 8) and a pulse start (to 0) set it; mode or
+    family entry and silence entry do not, so ending a pulse early never
+    shortens the gap.
   - **Lit:** the field shows level 3 while `pulse > 0`.
-  - **Limit:** at most 1 pulse per 8 steps. The displayed rest level `dim`
-    changes only at mode entry, at the end of a pulse and on silence entry, so
-    the shown field changes only at pulse start, pulse end and silence entry:
-    at most 7.5 light/dark cycles per second, whatever the energy does.
+  - **Rest is held on purpose:** `dim` reflects the energy at the last pulse
+    end. For safety the rest level only changes at bounded edges, so the rest
+    may stay dim through quiet passages until the next pulse end or silence
+    entry.
+  - **Limit (provable bound):** pulse starts are at least 8 steps apart, so any
+    60 consecutive steps contain at most 8 starts (7.5 Hz). The displayed field
+    changes only at:
+    - a pulse start, and that pulse's end (natural, or early through silence
+      entry or mode/family entry): at most 16 edges per 60 steps;
+    - silence entry from a dim rest (dim to dark): entries are at least 31
+      steps apart (exit, then 30 quiet steps), so at most 2 per 60 steps;
+    - an applied mode or family change, or a pin applied while lit or at rest:
+      requests are at least `CUT_MIN` = 20 steps apart, so at most 3 per 60
+      steps.
+
+    Flash cycles therefore never exceed 7.5 per second, and all displayed
+    changes together are at most 21 per 60 steps, whatever the energy or
+    operator does.
 
 **Trace:** each step records
 `(mode, family, layout, combo, rot, lvl0, lvl1, lvl2)`, where `lvl` is the
@@ -644,7 +673,9 @@ OTHER = CANCEL
 | F9 beat/bar | `e`, bands and spectrum 100. `beat` at `20 + 40k` (`k = 0..14`) and `bar` at `40 + 120k` (`k = 0..4`). | 20 cuts and 20 pulses, one at every beat and bar step. Held never changes. |
 | F10 wire gate | F1 input without `drop`. Wire `p` is 0 for steps 0–99, 2 for 100–109, 0 for 110–199, and 3 from 200 on. | `p_eff` is 0 through step 229 and 3 from step 230, when mode 3 enters resting dim (armed by host selection). Steps 100–109 have no effect. |
 | F11 pinned | F5 input, pinned to H3. | Layout is always H3. 19 cuts, and every fourth cut rotates instead of changing layout. |
-| F12 mode toggle | F0 input, starting at `p = 0`. Operator pulses request `p = 1` at steps `60 + 12k` and `p = 0` at `66 + 12k`, through step 594. | Requests apply at the end of steps 60, 80, 100, 126, 146, 166, 192, … (20 or 26 steps apart; a request equal to the current `p_eff` is cleared). The field alternates held level 3 and spectral black, visible from the next step. Never more than 3 changes in any 60 steps. |
+| F12 mode toggle | F0 input, starting at `p = 0`. Operator pulses request `p = 1` at steps `60 + 12k` and `p = 0` at `66 + 12k`, through step 594. | Requests apply at the end of steps 60, 80, 100, 126, 146, 166, 192, … (20 or 26 steps apart; a request whose effective mode and family equal the current ones is cleared). The field alternates held level 3 and spectral black, visible from the next step. Never more than 3 changes in any 60 steps. |
 | F13 silence spikes | `e = 0` except `e = 30` at steps `31k` (`k = 1..19`). Bands 250, spectrum 0. | Spectral (`p = 1` and 5): black at 30; levels step up at 40, 50 and 60 (the spike at 31 waits for `lg`); the silence at 61 does not black out until `lg` allows, and silence ends at 62 first; black again at 92, up at 102, 112 and 122, and so on every 62 steps. Never more than 4 changes in any 60 steps. Other modes: no change. |
-| F14 dim-rest attack | `e = 255` at steps `5k`, otherwise 0. Bands and spectrum 0. | Flash/gate (`p = 3`, 7): pulses at 5, 15, 25, … (one per 10 steps, 60 in total). The rest level changes only when a pulse ends: it rests at 1 (dim) through step 28, then from step 30 levels repeat `0,0,0,0,0,3,3,3,3,0`. At most 12 displayed level changes in any 60 steps (6 cycles per second). Spectral and held: no change. Cuts: 30, at 5, 25, 45, …, 585. |
+| F14 dim-rest attack | `e = 255` at steps `5k` (`k = 0..119`), otherwise 0. Bands and spectrum 0. | Flash/gate (`p = 3`, 7): pulses at 5, 15, 25, … (one per 10 steps, 60 in total). The rest level changes only when a pulse ends: it rests at 1 (dim) through step 28, then from step 30 levels repeat `0,0,0,0,0,3,3,3,3,0`. At most 12 displayed level changes in any 60 steps (6 cycles per second). Spectral and held: no change. Cuts: 30, at 5, 25, 45, …, 585. |
 | F15 resampled onsets | 120 Hz source: 1200 frames, `e`, bands and spectrum 100, `beat` set on odd frames only. Step `t` takes frames `2t` and `2t+1`. | Every step from 1 on has `B = 1` from the onset mask. Cuts at 1, 21, 41, …, 581 (30). Pulses at 1, 9, 17, …, 593 (75). Re-encoding the masks into `flags` would give a single edge at step 1, which is non-conforming. |
+| F16 armed 3↔7 toggle | `e`, bands and spectrum 100. `beat` set on odd steps only. `p = 3`, armed. The operator (with `--allow-flash`, so every request is armed) requests 7 at steps `98 + 60k` and 3 at `128 + 60k`. | Requests apply at the end of 98, 128, 158, …, 578. Pulse starts at `1 + 8k` (`k = 0..74`, 75 starts), never closer than 8 steps, even right after a mode entry (without `since_pulse` a start would land at 99). |
+| F17 silence cut-off | `e = 24` at steps `31k` (`k = 1..19`), otherwise 0. Bands and spectrum 0. `beat` set on odd steps only. | Flash/gate (`p = 3`, 7): silence entries at `31k - 1` (30, 61, …, 588); those at 92, 123, 154, 278, 309, 340, 464, 495 and 526 end a lit pulse early. 75 pulse starts, never closer than 8 steps: `1 + 8k` through 177, then 187, 195, … (without `since_pulse` a start would land at 127, 6 after 121). At most 16 displayed level changes in any 60 steps. |
