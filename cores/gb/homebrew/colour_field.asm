@@ -1507,7 +1507,22 @@ IF DEF(CHIPVIZ_FIXTURE)
   ld a, [wFxOpReq]
   or a
   jr z, .wireGate
-  ld a, 1                ; an operator pulse consumes the current wire value
+  ; An operator pulse consumes the current wire value. Record it as seen
+  ; first (a change starts a new run), so a change on this same step is
+  ; consumed too rather than cleared by the comparison below.
+  ld a, [wPalIn]
+  ld b, a
+  ld a, [wWireVal]
+  cp b
+  jr z, .consume
+  ld a, b
+  ld [wWireVal], a
+  xor a
+  ld [wWireN], a
+  ld a, [wInAbs]
+  ld [wWireAbs], a
+.consume
+  ld a, 1
   ld [wWireUsed], a
   ld a, [wFxOpP]
   and 7

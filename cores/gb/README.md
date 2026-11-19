@@ -81,9 +81,12 @@ greyscale shows shades 0-3 as `#FFFFFF`, `#AAAAAA`, `#555555` and `#000000`.
 
 Until B or A is first pressed the detector uses the procedural generator (a
 port of `chipviz_frame_make_procedural`; its scene and palette are ignored).
-After that the pad is a digital-only USB HID receiver: energy and every band
+After that the pad input uses a digital-only mapping: energy and every band
 are `HID_E_LO` (64) and the spectrum is 0, because the DMG pad has no shoulder
-or analogue input.
+or analogue input. The pad is a local controller, not a USB HID receiver. The
+spec reserves the operator ROM for a human at the controls and forbids feeding
+it from USB HID, so route any HID input to the data build (`chipviz-gb.gb`)
+only.
 
 - **Data role** (default, `chipviz-gb.gb`): scene changes are debounced (30
   stable steps), and the palette ring is a relative wire value that goes

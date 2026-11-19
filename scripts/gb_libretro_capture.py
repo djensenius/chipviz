@@ -188,6 +188,9 @@ class GbCore:
 
   def run_frame(self, buttons: Iterable[str] = ()) -> None:
     self.buttons = frozenset(buttons)
+    unknown = self.buttons - BUTTONS.keys()
+    if unknown:
+      raise ValueError(f"unknown button(s): {', '.join(sorted(unknown))}; expected one of {', '.join(BUTTONS)}")
     self.lib.retro_run()
 
   def read(self, address: int, size: int = 1) -> bytes:
@@ -220,7 +223,11 @@ def main(argv: list[str] | None = None) -> int:
   presses: dict[int, set[str]] = {}
   for item in args.press:
     frame, _, names = item.partition(":")
-    presses.setdefault(int(frame), set()).update(names.split("+"))
+    buttons = set(names.split("+"))
+    unknown = buttons - BUTTONS.keys()
+    if unknown:
+      parser.error(f"--press {item}: unknown button(s) {', '.join(sorted(unknown))}; expected one of {', '.join(BUTTONS)}")
+    presses.setdefault(int(frame), set()).update(buttons)
   gb = GbCore(args.rom, args.core)
   try:
     for frame in range(args.frames):

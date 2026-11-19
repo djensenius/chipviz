@@ -529,6 +529,19 @@ class GbColourFieldFixtures(unittest.TestCase):
     trace = self.rom.run(inputs, steps=100, wire=True)
     self.assertEqual(next((t for t, s in enumerate(trace) if s[0] == 1), None), 56)
 
+  def test_wire_change_with_operator_pulse(self):
+    # Wire 0 -> 1 on the same step as an operator pulse for 2: the pulse
+    # consumes the new 1, so the unchanged 1 never overrides the operator.
+    def inputs(t):
+      step = {"in": flat(100), "pal": 0 if t < 100 else 1}
+      if t == 100:
+        step["op"] = (2, 0)
+      return step
+    trace = self.rom.run(inputs, steps=250, wire=True)
+    self.assertNotIn(None, trace)
+    self.assertTrue(all(s[0] == 0 for s in trace[:101]))
+    self.assertTrue(all(s[0] == 2 for s in trace[101:]))
+
   def test_f24_relative_palette(self):
     def inputs(t):
       buttons = ("right",) if t in (10, 20, 30) else ("left",) if t == 130 else ()
@@ -643,10 +656,11 @@ class GbColourFieldCaptures(unittest.TestCase):
     press = {10: "up", 14: "b", 50: "right", 54: "right", 58: "right", **{t: "b" for t in range(100, 400, 9)},
              70: "start", 74: "select", 78: ("start", "b"), 82: ("start", "select"), 86: ("start", "a"),
              90: ("start", "left"), 94: ("start", "right")}
-    rom.run(400, held(press))
+    rom.run(400, held(press), probe=("wPin", "wPinReq"))
     self.assertEqual({s[1] for s in rom.trace[45:] if s[0] == 1}, {0, 2})
     self.assertNotIn(2, {s[0] for s in rom.trace})
-    self.assertEqual({s[2] for s in rom.trace[45:]}, {0})
+    self.assertEqual(set(rom.probes["wPin"]), {PIN_AUTO})
+    self.assertEqual(set(rom.probes["wPinReq"]), {PIN_AUTO})
     self.assertEqual(rom.trace[399][1], 2)
 
   def test_data_role_adversarial_cuts(self):
