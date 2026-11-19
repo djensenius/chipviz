@@ -28,6 +28,29 @@ it consumes `control-frame-v0` packets from the host bridge:
 python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
 ```
 
+## Controls
+
+The renderer starts windowed by default.
+
+| Option | Effect |
+| --- | --- |
+| `--fullscreen` | Start in borderless fullscreen (primary display unless `--monitor` is given). |
+| `--monitor INDEX\|NAME` | Choose the display by index or case-insensitive name substring. |
+| `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
+
+```sh
+just modern-m1 -- --list-monitors
+just modern-m1 -- --fullscreen --monitor "Studio Display"
+```
+
+| Key | Action |
+| --- | --- |
+| `F`, `Cmd+F`, `Ctrl+Cmd+F` | Toggle fullscreen on the window's current display. |
+| `Esc` | Exit fullscreen (does nothing when windowed). |
+| `Q`, `Cmd+Q` | Quit. |
+
+The cursor is hidden while fullscreen and restored when windowed.
+
 ## Scene plan
 
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D

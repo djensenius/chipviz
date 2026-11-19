@@ -17,3 +17,10 @@ path = "src/bin/chipviz-pi5.rs"
 [[bin]]
 name = "chipviz-m1"
 path = "src/bin/chipviz-m1.rs"
+
+# winit 0.29's macOS backend enumerates NSScreen through icrate 0.0.4, whose
+# debug-only objc2 encoding check panics on newer macOS (NSUInteger 'Q' vs
+# declared 'q'). The ABI is identical, so skip that check in dev builds to keep
+# fullscreen/monitor queries working with `cargo run`.
+[profile.dev.package.objc2]
+debug-assertions = false
