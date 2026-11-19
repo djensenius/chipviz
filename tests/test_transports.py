@@ -642,6 +642,21 @@ class ColourFieldRateCapTests(unittest.TestCase):
     self.assertEqual(outs[2], bytes(corrupt_low))
     self.assertEqual([out[22] for out in outs], [0, 4, 0, 4, 0, 0])
 
+  def test_reserved_flag_bits_make_a_frame_invalid(self) -> None:
+    # Checksum is correct, but bit 5 is reserved: targets reject the frame.
+    reserved = bytearray(_cf_frame(1))
+    reserved[22] = 0x21
+    reserved[-1] = chipviz_bridge.checksum(reserved[:-1])
+    frames = [_cf_frame(0), bytes(reserved), _cf_frame(2), _cf_frame(3), _cf_frame(4)]
+    sent = [out for out in self._cap("full", frames) if out]
+    self.assertEqual([out[22] for out in sent], [0, 0, 0], "a reserved-bit frame must not inject a beat")
+    # Sent, it goes out unchanged and is not the edge reference: frame 3's
+    # beat is not an edge against frame 1, so nothing is held or carried.
+    frames = [_cf_frame(0), _cf_frame(1, flags=0x01), bytes(reserved), _cf_frame(3, flags=0x01), _cf_frame(4), _cf_frame(5)]
+    outs = self._cap("full", frames, step_ns=16_666_667)
+    self.assertEqual(outs[2], bytes(reserved))
+    self.assertEqual([out[22] for out in outs], [0, 1, 0x21, 1, 0, 0])
+
 
 class MidiRateTests(unittest.TestCase):
   def test_iter_midi_frames_scales_cc1_debounce_with_rate(self) -> None:

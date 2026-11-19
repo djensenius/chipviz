@@ -45,6 +45,8 @@ COLOUR_FIELD_MAX_FPS = 60
 NS_PER_SECOND = 1_000_000_000
 FLAGS_OFFSET = 22
 NOTE_COUNT_OFFSET = 23
+# control-frame-v0 flag bits 5..7 are reserved and must be clear.
+RESERVED_FLAGS = 0xE0
 NOTE_VEL = 64
 
 
@@ -197,6 +199,7 @@ def _wire_valid(wire: bytes) -> bool:
     len(wire) == WIRE_SIZE
     and wire[0] == MAGIC
     and wire[1] == VERSION
+    and not wire[FLAGS_OFFSET] & RESERVED_FLAGS
     and wire[NOTE_COUNT_OFFSET] <= MAX_NOTES
     and checksum(wire[:-1]) == wire[-1]
   )
@@ -223,9 +226,9 @@ class ColourFieldRateCap:
   ``(note, velocity)`` pair at ``NOTE_VEL`` or more on the full path; byte 15,
   the highest velocity, rising across ``NOTE_VEL`` on Joybus; none on HID).
   An event that the previous sent frame already shows is held for at most
-  ``CARRY_HOLD`` sends. Only valid frames (magic, version, note count and
-  checksum) raise events, act as the previous frame, or are rewritten;
-  invalid frames pass through unchanged.
+  ``CARRY_HOLD`` sends. Only valid frames (magic, version, reserved flag bits
+  clear, note count and checksum) raise events, act as the previous frame, or
+  are rewritten; invalid frames pass through unchanged.
   """
 
   CARRY_HOLD = 2

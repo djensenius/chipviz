@@ -174,7 +174,7 @@ as the flash guard) are limited; other frames always go out.
   byte 15, the highest velocity, rising across 64 on Joybus). An event the
   previous sent frame already shows cannot be an edge yet, so it is held for
   at most 2 sends and then dropped. Invalid frames (bad magic, version, note
-  count or checksum) never raise or receive carried events and go out as
+  count or checksum, or reserved flag bits set) never raise or receive carried events and go out as
   they are.
 - `--output` files are not capped: a `.cvz` file has no wall-clock rate, and
   whatever replays it paces and caps it. The other host tools only write
