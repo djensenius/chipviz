@@ -47,16 +47,23 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
 - `PulseTunnel`: beat-driven planes and bars moving through depth.
 - `Lines`: lines of varied direction, speed, length and thickness travel
   across a mirrored plane; each spectrum band drives its own group and energy
-  sets density (up to an eighth of the instance budget per half). Every 16
-  beats the plane alternates with a hallway whose two walls mirror each other:
-  the fold eases in over 4 beats, but every fourth section, or a frame with the
-  drop flag, cuts straight to it. The scene projects its own orbiting camera
-  on the CPU, so it uses `ScreenSpace`. Procedural input never selects it;
-  use `--scene 3` (frames 120, 288 and 400 show plane, mid-fold and hallway).
+  sets density (up to an eighth of the instance budget per half, fading lines
+  at the cutoff). Every 256 control frames (about 4.3 s at 60 fps) the plane
+  alternates with a hallway whose two walls mirror each other: the fold eases
+  in over 96 frames (1.6 s), but every fourth section cuts straight to it. The
+  fold follows the monotonic `frame` counter because the scene is stateless
+  and some sources wrap `beat_phase` before `beat_count` ticks; the drop flag
+  is not used. The camera swings around the plane and eases into the hallway
+  entrance. The scene projects its own camera on the CPU, so it uses
+  `ScreenSpace`. Procedural input never selects it; use `--scene 3` (frames
+  120, 304 and 400 show plane, mid-fold and hallway).
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
 mode, and append that entry to `REGISTRY`. Appending keeps every byte below the
-old registry length on the same scene; wrapped bytes follow the new length.
+old registry length on the same scene; wrapped bytes follow the new length,
+because selection is `scene % REGISTRY.len()`. Appending `Lines` as the fourth
+scene shifted them: bytes 3, 4 and 5 (formerly `SignalField`, `SpectrumVolume`
+and `PulseTunnel`) now select `Lines`, `SignalField` and `SpectrumVolume`.
 `Orbit3D` scenes use world coordinates and the smoothed orbit camera.
 `ScreenSpace` scenes draw flat: `center.xy` is NDC (`-1..1` spans the viewport,
 `+y` up), depth is ignored, and instances draw in order with their colour

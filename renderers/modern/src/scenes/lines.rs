@@ -6,13 +6,19 @@
 //! shader can only draw quads facing the z axis, and the hallway walls face x.
 //!
 //! The plane is two mirrored halves (`x >= 0` and its reflection) running the
-//! same line animation. Every 16 beats a section starts: odd sections are a
-//! hallway (each half folds up about its outer edge into a wall, so the walls
-//! mirror each other) and even sections are the flat plane. A section change
-//! morphs smoothly over its first 4 beats, except that every fourth section
-//! (`section % 4 == 3`) and any frame with the drop flag cut straight to the
-//! section's shape. Everything derives from the control frame and elapsed
-//! time, so captures are reproducible.
+//! same line animation. Every 256 control frames (about 4.3 s at 60 fps) a
+//! section starts: odd sections are a hallway (each half folds up about its
+//! outer edge into a wall, so the walls mirror each other) and even sections
+//! are the flat plane. A section change morphs smoothly over its first 96
+//! frames (1.6 s), except that every fourth section (`section % 4 == 3`) cuts
+//! straight to the hallway.
+//!
+//! The fold is timed by the monotonic `frame` counter, not `beat_count` and
+//! `beat_phase`: the scene is stateless, and sources whose phase wraps before
+//! the count ticks (procedural input, `live_bridge`) would make a beat-timed
+//! fold step backwards. The drop flag is not used: it is a one-frame trigger,
+//! and without state it could only flash for that frame. Everything derives
+//! from the control frame and elapsed time, so captures are reproducible.
 
 use super::{CameraMode, SceneEntry, hash, note_emphasis, palette};
 use crate::control_frame::ControlFrame;
@@ -26,9 +32,20 @@ pub const ENTRY: SceneEntry = SceneEntry {
     build,
 };
 
-const FLAG_DROP: u8 = 0x04;
-const SECTION_BEATS: u16 = 16;
-const MORPH_BEATS: f32 = 4.0;
+/// Divides the u16 frame counter's wrap, so section parity survives it.
+const SECTION_FRAMES: u16 = 256;
+const MORPH_FRAMES: f32 = 96.0;
+/// Largest per-frame morph change: the smoothstep's peak slope.
+#[cfg(test)]
+const MAX_MORPH_STEP: f32 = 1.5 / MORPH_FRAMES;
+/// The orbit swings up to this far (radians) either side of the hallway
+/// entrance, so easing it to the entrance never wraps around the target.
+const SWING: f32 = 2.6;
+const SWING_RATE: f32 = 0.12;
+/// Fraction of line slots over which lines fade in at the density cutoff.
+const FADE_SHARE: f32 = 0.1;
+/// Shortest projected segment (NDC) worth drawing.
+const MIN_SEGMENT: f32 = 1e-4;
 /// Width of one plane half, which is also the hallway wall height.
 const HALF_WIDTH: f32 = 5.0;
 /// Half the plane's length along z.
@@ -45,21 +62,28 @@ pub(crate) fn line_slots(profile: &RenderProfile) -> usize {
     profile.instance_count / 8
 }
 
-/// Lines alive this frame: energy scales density from 35% to 100% of slots.
-pub(crate) fn active_lines(profile: &RenderProfile, frame: ControlFrame) -> usize {
+/// Fractional number of lines alive: energy scales density from 35% to
+/// 100% of slots. Lines near the cutoff fade instead of popping.
+pub(crate) fn active_lines(profile: &RenderProfile, frame: ControlFrame) -> f32 {
     let energy = f32::from(frame.energy) / 255.0;
-    (line_slots(profile) as f32 * (0.35 + 0.65 * energy)) as usize
+    line_slots(profile) as f32 * (0.35 + 0.65 * energy)
+}
+
+/// Brightness factor for line `index`: 1 well below the cutoff, falling to 0
+/// at it over `FADE_SHARE` of the slots.
+pub(crate) fn line_fade(profile: &RenderProfile, active: f32, index: usize) -> f32 {
+    let ramp = (line_slots(profile) as f32 * FADE_SHARE).max(1.0);
+    ((active - index as f32) / ramp).clamp(0.0, 1.0)
 }
 
 /// 0 = flat plane, 1 = full hallway.
 pub(crate) fn hallway_morph(frame: ControlFrame) -> f32 {
-    let section = frame.beat_count / SECTION_BEATS;
+    let section = frame.frame / SECTION_FRAMES;
     let target = if section % 2 == 1 { 1.0 } else { 0.0 };
-    if frame.flags & FLAG_DROP != 0 || section % 4 == 3 {
+    if section % 4 == 3 {
         return target;
     }
-    let beats = f32::from(frame.beat_count % SECTION_BEATS) + f32::from(frame.beat_phase) / 256.0;
-    let t = (beats / MORPH_BEATS).clamp(0.0, 1.0);
+    let t = (f32::from(frame.frame % SECTION_FRAMES) / MORPH_FRAMES).clamp(0.0, 1.0);
     let eased = t * t * (3.0 - 2.0 * t);
     (1.0 - target) + (2.0 * target - 1.0) * eased
 }
@@ -129,18 +153,28 @@ struct View {
     aspect: f32,
 }
 
+/// Camera eye and target. `swing` (within `±SWING`) is the orbit's angle
+/// from the hallway entrance at `-z`; the morph eases that angle, not the
+/// eye position, to the entrance, so the eye never passes over the target.
+fn camera_pose(swing: f32, sway: f32, energy: f32, morph: f32) -> ([f32; 3], [f32; 3]) {
+    let angle = -FRAC_PI_2 + swing * (1.0 - morph);
+    let radius = 16.0 + (HALF_LENGTH - 14.0) * morph;
+    let height = 9.0 + energy * 2.0 + (HALF_WIDTH * 0.45 - 9.0 - energy * 2.0) * morph;
+    let eye = [
+        angle.cos() * radius + sway * 1.2 * morph,
+        height,
+        angle.sin() * radius,
+    ];
+    let target = [sway * -0.6, HALF_WIDTH * 0.5, HALF_LENGTH].map(|axis| axis * morph);
+    (eye, target)
+}
+
 impl View {
-    /// Orbits above the plane, moving into the hallway as it forms.
+    /// Swings around the plane, moving into the hallway as it forms.
     fn new(frame: ControlFrame, elapsed: f32, morph: f32, aspect: f32) -> Self {
         let energy = f32::from(frame.energy) / 255.0;
-        let angle = elapsed * 0.15;
-        let orbit = [angle.cos() * 16.0, 9.0 + energy * 2.0, angle.sin() * 16.0];
-        let sway = (elapsed * 0.4).sin();
-        let hall = [sway * 1.2, HALF_WIDTH * 0.45, -HALF_LENGTH - 2.0];
-        let hall_target = [sway * -0.6, HALF_WIDTH * 0.5, HALF_LENGTH];
-        let ease = morph * morph * (3.0 - 2.0 * morph);
-        let eye = lerp3(orbit, hall, ease);
-        let target = lerp3([0.0; 3], hall_target, ease);
+        let swing = SWING * (elapsed * SWING_RATE).sin();
+        let (eye, target) = camera_pose(swing, (elapsed * 0.4).sin(), energy, morph);
         let forward = normalize(sub(target, eye));
         let right = normalize(cross(forward, [0.0, 1.0, 0.0]));
         Self {
@@ -201,7 +235,11 @@ impl View {
         }
         let depth = (a[2] + b[2]) * 0.5;
         let delta = [pb[0] - pa[0], pb[1] - pa[1]];
-        let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt().max(1e-6);
+        let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        // Also rejects NaN: a degenerate segment has no direction for its width.
+        if length.is_nan() || length < MIN_SEGMENT {
+            return None;
+        }
         // Keep the on-screen width even though NDC x and y scale differently.
         let normal = [-delta[1] / length * self.aspect, delta[0] / length];
         let stretch = (normal[0] * normal[0] + normal[1] * normal[1]).sqrt();
@@ -228,11 +266,34 @@ fn build(
     aspect: f32,
     instances: &mut Vec<Instance>,
 ) {
-    let morph = hallway_morph(frame);
+    build_with_morph(
+        profile,
+        frame,
+        elapsed,
+        aspect,
+        hallway_morph(frame),
+        instances,
+    );
+}
+
+fn build_with_morph(
+    profile: &RenderProfile,
+    frame: ControlFrame,
+    elapsed: f32,
+    aspect: f32,
+    morph: f32,
+    instances: &mut Vec<Instance>,
+) {
     let view = View::new(frame, elapsed, morph, aspect.max(0.01));
     let energy = f32::from(frame.energy) / 255.0;
-    let mut drawn = Vec::with_capacity(2 * active_lines(profile, frame));
-    for index in 0..active_lines(profile, frame) {
+    let active = active_lines(profile, frame);
+    let count = (active.ceil() as usize).min(line_slots(profile));
+    let mut drawn = Vec::with_capacity(2 * count);
+    for index in 0..count {
+        let fade = line_fade(profile, active, index);
+        if fade <= 0.0 {
+            continue;
+        }
         let line = line_params(index, frame, elapsed);
         let half = [
             line.direction[0] * line.length * 0.5,
@@ -244,7 +305,7 @@ fn build(
         );
         let color = palette(
             frame.palette.wrapping_add(line.band as u8 / 2),
-            line.brightness,
+            line.brightness * fade,
             energy,
         );
         for side in [1.0, -1.0] {
@@ -253,10 +314,11 @@ fn build(
             drawn.extend(view.segment(start, end, line.thickness, color));
         }
     }
-    // Painter's order: far lines first; stable sort keeps ties deterministic.
-    drawn.sort_by(|left, right| right.0.total_cmp(&left.0));
-    let room = profile.instance_count.saturating_sub(instances.len());
-    instances.extend(drawn.into_iter().take(room).map(|(_, instance)| instance));
+    // Keep the nearest lines if over budget, then draw far to near (painter's
+    // order); the stable sort keeps ties deterministic.
+    drawn.sort_by(|left, right| left.0.total_cmp(&right.0));
+    drawn.truncate(profile.instance_count.saturating_sub(instances.len()));
+    instances.extend(drawn.into_iter().rev().map(|(_, instance)| instance));
 }
 
 /// Clips a segment's `u` to the half's `0..HALF_WIDTH` so lines never cross
@@ -302,39 +364,160 @@ fn normalize(value: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::*;
 
-    fn at(beat_count: u16, beat_phase: u8, flags: u8) -> ControlFrame {
+    fn at(frame: u16) -> ControlFrame {
         ControlFrame {
-            beat_count,
-            beat_phase,
-            flags,
+            frame,
             ..ControlFrame::procedural(0)
         }
     }
 
     #[test]
     fn hallway_alternates_by_section_with_smooth_and_cut_transitions() {
-        assert_eq!(hallway_morph(at(5, 0, 0)), 0.0);
-        assert_eq!(hallway_morph(at(16, 0, 0)), 0.0);
-        let mid = hallway_morph(at(18, 0, 0));
-        assert!(mid > 0.4 && mid < 0.6, "{mid}");
-        assert_eq!(hallway_morph(at(20, 0, 0)), 1.0);
-        assert_eq!(hallway_morph(at(32, 0, 0)), 1.0);
-        assert_eq!(hallway_morph(at(36, 0, 0)), 0.0);
-        // Every fourth section cuts; a drop always cuts to the section shape.
-        assert_eq!(hallway_morph(at(48, 0, 0)), 1.0);
-        assert_eq!(hallway_morph(at(16, 0, FLAG_DROP)), 1.0);
-        assert_eq!(hallway_morph(at(32, 0, FLAG_DROP)), 0.0);
+        assert_eq!(hallway_morph(at(120)), 0.0);
+        assert_eq!(hallway_morph(at(256)), 0.0);
+        let mid = hallway_morph(at(256 + 48));
+        assert!((mid - 0.5).abs() < 1e-6, "{mid}");
+        assert_eq!(hallway_morph(at(256 + 96)), 1.0);
+        assert_eq!(hallway_morph(at(512)), 1.0);
+        assert_eq!(hallway_morph(at(512 + 96)), 0.0);
+        // Every fourth section cuts straight to the hallway.
+        assert_eq!(hallway_morph(at(768)), 1.0);
+        // Section parity survives the frame counter wrap.
+        assert_eq!(hallway_morph(at(u16::MAX)), 1.0);
+        assert_eq!(hallway_morph(at(0)), 1.0);
+        // The drop flag and beat fields are ignored.
+        let drop = ControlFrame {
+            flags: 0x04,
+            beat_count: 999,
+            beat_phase: 77,
+            ..at(300)
+        };
+        assert_eq!(hallway_morph(drop), hallway_morph(at(300)));
     }
 
     #[test]
-    fn smooth_morph_is_monotonic_within_ramp() {
-        let mut previous = 0.0;
-        for beat in 16..20 {
-            for phase in (0..=255).step_by(15) {
-                let morph = hallway_morph(at(beat, phase, 0));
-                assert!(morph >= previous, "beat {beat} phase {phase}");
-                previous = morph;
+    fn morph_never_steps_backwards_on_real_frame_sources() {
+        // Procedural input and a live_bridge-style source (phase 4/frame,
+        // count every 30 frames) both wrap phase before the count ticks.
+        let live = |index: u64| ControlFrame {
+            beat_phase: ((index * 4) & 0xFF) as u8,
+            beat_count: (index / 30) as u16,
+            ..ControlFrame::procedural(index)
+        };
+        for source in [ControlFrame::procedural, live] {
+            for index in 1..2048u64 {
+                let (before, after) = (source(index - 1), source(index));
+                let section = after.frame / SECTION_FRAMES;
+                if section != before.frame / SECTION_FRAMES {
+                    continue;
+                }
+                let step = hallway_morph(after) - hallway_morph(before);
+                let toward = if section % 2 == 1 { step } else { -step };
+                assert!(toward >= -1e-6, "frame {index}: step {step}");
+                assert!(
+                    step.abs() <= MAX_MORPH_STEP + 1e-6,
+                    "frame {index}: step {step}"
+                );
             }
+        }
+    }
+
+    #[test]
+    fn camera_heading_changes_less_than_ten_degrees_per_frame() {
+        let swing_step = SWING * SWING_RATE / 60.0;
+        let forward = |swing: f32, sway: f32, energy: f32, morph: f32| {
+            let (eye, target) = camera_pose(swing, sway, energy, morph);
+            normalize(sub(target, eye))
+        };
+        let mut worst: f32 = 0.0;
+        for energy in [0.0, 1.0] {
+            for swing_index in 0..=64 {
+                let swing = -SWING + swing_index as f32 * SWING / 32.0;
+                for sway in [-1.0, 0.0, 1.0] {
+                    let mut morph = 0.0;
+                    while morph < 1.0 {
+                        let next = (morph + MAX_MORPH_STEP).min(1.0);
+                        let next_swing = (swing + swing_step).min(SWING);
+                        let a = forward(swing, sway, energy, morph);
+                        let b = forward(next_swing, sway + 0.4 / 60.0, energy, next);
+                        worst = worst.max(dot(a, b).clamp(-1.0, 1.0).acos());
+                        morph = next;
+                    }
+                }
+            }
+        }
+        assert!(
+            worst.to_degrees() < 10.0,
+            "worst {} degrees",
+            worst.to_degrees()
+        );
+    }
+
+    #[test]
+    fn instances_stay_finite_and_bounded() {
+        let profile = RenderProfile::pi5();
+        for elapsed in [0.0, 0.37, 13.1, 600.0, 5000.0] {
+            for morph in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                for aspect in [0.5, 1.0, 16.0 / 9.0, 3.5] {
+                    let frame = ControlFrame::procedural((elapsed * 60.0) as u64);
+                    let mut instances = Vec::new();
+                    build_with_morph(&profile, frame, elapsed, aspect, morph, &mut instances);
+                    for instance in &instances {
+                        let values = instance
+                            .center
+                            .iter()
+                            .chain(&instance.size)
+                            .chain(&instance.color);
+                        for value in values.chain([&instance.rotation]) {
+                            assert!(value.is_finite(), "{instance:?}");
+                            assert!(value.abs() < 1e4, "{instance:?}");
+                        }
+                        assert!(instance.size[0] >= MIN_SEGMENT && instance.size[1] > 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_keeps_the_nearest_lines() {
+        let profile = RenderProfile::pi5();
+        let frame = ControlFrame::procedural(400);
+        let mut full = Vec::new();
+        build_with_morph(&profile, frame, 6.0, 1.5, 1.0, &mut full);
+        let filler = profile.instance_count - 10;
+        let mut tight = vec![full[0]; filler];
+        build_with_morph(&profile, frame, 6.0, 1.5, 1.0, &mut tight);
+        let near = &full[full.len() - 10..];
+        assert_eq!(
+            bytemuck::cast_slice::<Instance, u8>(&tight[filler..]),
+            bytemuck::cast_slice::<Instance, u8>(near)
+        );
+    }
+
+    #[test]
+    fn lines_fade_at_the_density_cutoff() {
+        let profile = RenderProfile::m1();
+        let active = 1000.5;
+        assert_eq!(line_fade(&profile, active, 0), 1.0);
+        assert_eq!(line_fade(&profile, active, 1001), 0.0);
+        let fades: Vec<_> = (700..1001)
+            .map(|index| line_fade(&profile, active, index))
+            .collect();
+        assert!(fades.windows(2).all(|pair| pair[1] <= pair[0]));
+        // One energy step moves any line's fade by only a small amount.
+        let frame = ControlFrame::procedural(0);
+        let louder = ControlFrame {
+            energy: frame.energy + 1,
+            ..frame
+        };
+        let (low, high) = (
+            active_lines(&profile, frame),
+            active_lines(&profile, louder),
+        );
+        for index in 0..line_slots(&profile) {
+            let change = line_fade(&profile, high, index) - line_fade(&profile, low, index);
+            assert!((0.0..0.05).contains(&change), "line {index}: {change}");
         }
     }
 
@@ -406,6 +589,6 @@ mod tests {
         };
         let profile = RenderProfile::m1();
         assert!(active_lines(&profile, quiet) < active_lines(&profile, loud));
-        assert_eq!(active_lines(&profile, loud), line_slots(&profile));
+        assert_eq!(active_lines(&profile, loud), line_slots(&profile) as f32);
     }
 }

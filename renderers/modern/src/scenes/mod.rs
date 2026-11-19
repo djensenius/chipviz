@@ -3,9 +3,12 @@
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
 //! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
 //! with the current four entries scene 0/4/8... is SignalField, 1/5/9... is
-//! SpectrumVolume, 2/6/10... is PulseTunnel and 3/7/11... is Lines. Adding a scene is one new module
-//! plus one `REGISTRY` entry. Appending keeps every index below the old length
-//! on the same scene; wrapped indices (>= length) move with the new length.
+//! SpectrumVolume, 2/6/10... is PulseTunnel and 3/7/11... is Lines. Adding a
+//! scene is one new module plus one `REGISTRY` entry. Appending keeps every
+//! index below the old length on the same scene; wrapped indices (>= length)
+//! move with the new length. Adding Lines shifted them: bytes 3, 4 and 5,
+//! formerly SignalField, SpectrumVolume and PulseTunnel, are now Lines,
+//! SignalField and SpectrumVolume.
 
 mod lines;
 mod pulse_tunnel;
