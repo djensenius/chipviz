@@ -1572,7 +1572,7 @@ RequestModeDone:
 ; Console warning screen (operator role only). The detector is paused.
 StartWarning:
   sta WarnP
-  lda #PIN_AUTO          ; drops any queued attribute upload: redo it on return
+  lda #PIN_AUTO          ; re-upload the field attributes on return
   sta AttrShown
   lda #$00
   sta WarnLo
@@ -1587,7 +1587,11 @@ WarnPalClear:
   bpl WarnPalClear
   lda #$30               ; text: palette 3, colour 1, white
   sta PalBuf+13
-  lda #UPLOAD_PAL
+  ; Keep a queued attribute upload: the warning scroll wraps into $2000 below
+  ; row 111, which must hold field attributes (palettes 0-2, all black here),
+  ; not the demo's palette-3 attributes.
+  lda UploadFlags
+  ora #UPLOAD_PAL
   sta UploadFlags
   rts
 

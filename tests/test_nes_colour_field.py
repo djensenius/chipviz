@@ -388,12 +388,24 @@ class NesColourFieldTests(unittest.TestCase):
     # PalSel is 2 before scene 7; Right on the entry step selects an unarmed 3.
     run = self.start("operator")
     table = {0: ("b",), 1: ("right",), 3: ("right",), 5: ("up",), 6: ("right",), 20: ("start",)}
-    run.run(80, presses(table))
+    shots = run.run(80, presses(table), {10})
     self.assertEqual(run.at(6, "PalSel"), 3)
     self.assertEqual(run.at(6, "ShowMode"), 2)  # warning after scene init
+    # Rows 112+ of the warning wrap into nametable $2000, so the field
+    # attributes queued on the entry step must land; all below the text is black.
+    self.assertEqual(shots[10].colors(0, 88, 256, 240), {(0, 0, 0)})
     self.assertEqual(run.at(20, "ShowMode"), 1)
     armed = next(s for s in range(20, 80) if run.trace(s)[0] == 3)
     self.assertEqual(run.at(armed, "Latch"), 1)
+
+  def test_operator_warning_on_reentry_step_keeps_field_attributes(self):
+    # Scene 7 at step 6, demo again from 13 (its attributes go back to $2000),
+    # re-entry at 21 with Right on that step: the warning must stay black below.
+    run = self.start("operator")
+    table = {0: ("b",), 1: ("right",), 3: ("right",), 5: ("up",), 12: ("down",), 20: ("up",), 21: ("right",)}
+    shots = run.run(40, presses(table), {26})
+    self.assertEqual([run.at(s, "ShowMode") for s in (12, 13, 21)], [1, 0, 2])
+    self.assertEqual(shots[26].colors(0, 88, 256, 240), {(0, 0, 0)})
 
   def test_operator_presses_outside_scene_7_are_not_pulses(self):
     run = self.start("operator")
