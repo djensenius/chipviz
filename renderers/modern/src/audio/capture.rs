@@ -4,12 +4,15 @@
 //! (`rtrb`); it never blocks or allocates. A dedicated analysis thread drains
 //! the ring, discards any backlog older than `MAX_BACKLOG_S` (so analysis
 //! tracks "now" after a stall), runs [`Analyzer`], and publishes the result to
-//! [`SharedFeatures`]. Samples dropped on either side are reported to the
+//! [`SharedFeatures`]. If the ring overflows (the callback had to drop audio),
+//! the ring holds only audio older than the dropped samples, so the whole
+//! ring snapshot is discarded and skipped rather than analysed out of order.
+//! Samples dropped on either side are reported to the
 //! analyzer with [`Analyzer::skip`] so its beat clock keeps real time. If the
 //! device stops delivering, the thread feeds silence so the published levels
 //! decay instead of freezing. [`SampleClock`] counts each stretch of time
-//! once: the stall threshold adapts to devices that deliver in large batches,
-//! and real samples that arrive late for time already filled with silence are
+//! once: the stall threshold adapts to devices that deliver in large batches
+//! (and returns to its base after a second of normal deliveries), and real samples that arrive late for time already filled with silence are
 //! discarded rather than analysed a second time.
 //!
 //! The stream is not reopened: if the device is unplugged or fails, cpal
@@ -32,6 +35,8 @@ const MAX_BACKLOG_S: f32 = 0.1;
 const POLL: Duration = Duration::from_millis(5);
 const STALL: Duration = Duration::from_millis(100);
 const MAX_STALL: Duration = Duration::from_millis(500);
+/// Deliveries this long with only normal gaps reset the stall threshold.
+const STALL_RESET: Duration = Duration::from_secs(1);
 const SILENCE_WARNING: Duration = Duration::from_secs(3);
 const ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const PERMISSION_HINT: &str = if cfg!(target_os = "macos") {
@@ -310,8 +315,12 @@ struct SampleClock {
     rate: f32,
     /// No audio for this long counts as a stall. It grows (up to `MAX_STALL`)
     /// to cover the longest gap seen between deliveries, so batched devices do
-    /// not trigger silence between their batches.
+    /// not trigger silence between their batches, and returns to `STALL` once
+    /// deliveries have had only normal gaps for `STALL_RESET`, so one
+    /// analysis-thread hiccup does not slow outage detection for good.
     stall: Duration,
+    /// Start of the current run of deliveries whose gaps fit within `STALL`.
+    normal_since: Option<Instant>,
     last_audio: Instant,
     /// Wall-clock time up to which the analyzer has been fed.
     covered_until: Instant,
@@ -325,6 +334,7 @@ impl SampleClock {
         Self {
             rate,
             stall: STALL,
+            normal_since: None,
             last_audio: now,
             covered_until: now,
             silence_debt: 0.0,
@@ -339,7 +349,13 @@ impl SampleClock {
         let rate = f64::from(self.rate);
         if real > 0 {
             let gap = now.duration_since(self.last_audio);
-            self.stall = self.stall.max((gap + gap / 2).min(MAX_STALL));
+            let needed = gap + gap / 2;
+            if needed > STALL {
+                self.normal_since = None;
+                self.stall = self.stall.max(needed.min(MAX_STALL));
+            } else if now.duration_since(*self.normal_since.get_or_insert(now)) >= STALL_RESET {
+                self.stall = STALL;
+            }
             let span = Duration::from_secs_f64(real as f64 / rate);
             let overlap = (self.covered_until + span).saturating_duration_since(now);
             let overlap = (overlap.as_secs_f64() * rate).round() as usize;
@@ -384,8 +400,18 @@ impl Drain {
     /// `dropped` were lost in the callback and `available` is the ring length
     /// snapshot that the clock was given. Late overlap is taken from the
     /// dropped samples first, then from the oldest ring samples; anything
-    /// beyond `max_backlog` is skipped as stale.
+    /// beyond `max_backlog` is skipped as stale. If the callback dropped
+    /// samples, the ring overflowed and holds only audio older than them, so
+    /// the whole snapshot is discarded and skipped.
     fn plan(dropped: usize, available: usize, overlap: usize, max_backlog: usize) -> Self {
+        if dropped > 0 {
+            let real = dropped + available;
+            return Self {
+                skip: real - overlap.min(real),
+                discard: available,
+                analyse: 0,
+            };
+        }
         let overlap_dropped = overlap.min(dropped);
         let mut skip = dropped - overlap_dropped;
         let mut discard = (overlap - overlap_dropped).min(available);
@@ -486,18 +512,49 @@ mod tests {
             analyse,
         };
         assert_eq!(plan(0, 50, 0), drain(0, 0, 50));
-        assert_eq!(plan(30, 50, 20), drain(10, 0, 50));
-        assert_eq!(plan(10, 50, 30), drain(0, 20, 30));
+        assert_eq!(plan(0, 50, 20), drain(0, 20, 30));
         assert_eq!(plan(0, 50, 80), drain(0, 50, 0));
-        assert_eq!(plan(5, 300, 40), drain(165, 200, 100));
-        for (dropped, available, overlap) in [(0, 50, 0), (30, 50, 20), (10, 50, 30), (5, 300, 40)]
-        {
+        assert_eq!(plan(0, 300, 40), drain(160, 200, 100));
+        // Any drop means the ring overflowed: nothing in it is analysed.
+        assert_eq!(plan(30, 50, 20), drain(60, 50, 0));
+        assert_eq!(plan(10, 50, 30), drain(30, 50, 0));
+        assert_eq!(plan(5, 300, 40), drain(265, 300, 0));
+        for (dropped, available, overlap) in [
+            (0, 50, 0),
+            (0, 50, 20),
+            (0, 300, 40),
+            (30, 50, 20),
+            (10, 50, 30),
+            (5, 300, 40),
+        ] {
             // The ring gives up exactly the snapshot; time advances by the
             // real samples minus the overlap.
             let d = plan(dropped, available, overlap);
             assert_eq!(d.discard + d.analyse, available);
             assert_eq!(d.skip + d.analyse, dropped + available - overlap);
         }
+    }
+
+    #[test]
+    fn overflowed_ring_is_skipped_not_analysed() {
+        let ring = 48_000;
+        for (dropped, overlap) in [(1, 0), (2_000, 0), (2_000, 500), (100, 5_000)] {
+            let d = Drain::plan(dropped, ring, overlap, 4_800);
+            assert_eq!(d.analyse, 0, "{d:?}");
+            assert_eq!(d.discard + d.analyse, ring);
+            assert_eq!(d.skip + d.analyse, dropped + ring - overlap);
+        }
+
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(8);
+        for i in 0..8 {
+            producer.push(i as f32).unwrap();
+        }
+        let drain = Drain::plan(3, consumer.slots(), 0, 4);
+        let mut analysed = Vec::new();
+        drain.apply(&mut consumer, |samples| analysed.extend_from_slice(samples));
+        assert!(analysed.is_empty());
+        assert_eq!(consumer.slots(), 0);
+        assert_eq!(drain.skip, 11);
     }
 
     #[test]
@@ -605,5 +662,43 @@ mod tests {
         let (accounted, silence) = replay(&callbacks, Duration::from_secs(2));
         assert_close(accounted, Duration::from_secs(2));
         assert!(silence >= samples(Duration::from_millis(950)), "{silence}");
+    }
+
+    /// Polls every 10 ms over `from..to`, delivering 10 ms of audio per poll
+    /// when `deliver`, and returns the silence synthesized.
+    fn poll_span(
+        clock: &mut SampleClock,
+        start: Instant,
+        span: (u64, u64),
+        deliver: bool,
+    ) -> usize {
+        let chunk = samples(Duration::from_millis(10));
+        (span.0 / 10 + 1..=span.1 / 10)
+            .map(|step| {
+                let at = start + Duration::from_millis(step * 10);
+                clock.poll(at, if deliver { chunk } else { 0 }).silence
+            })
+            .sum()
+    }
+
+    #[test]
+    fn stall_threshold_recovers_after_one_starvation() {
+        let start = Instant::now();
+        let mut clock = SampleClock::new(RATE, start);
+        // Steady audio, then the analysis thread is starved for 400 ms and
+        // finds all of it waiting at once, which widens the threshold.
+        poll_span(&mut clock, start, (0, 500), true);
+        let late = clock.poll(
+            start + Duration::from_millis(900),
+            samples(Duration::from_millis(400)),
+        );
+        assert_eq!(late.silence, 0);
+        assert!(clock.stall > STALL);
+        // After well over STALL_RESET of normal deliveries, a real outage is
+        // detected at the base threshold again.
+        poll_span(&mut clock, start, (900, 2500), true);
+        assert_eq!(clock.stall, STALL);
+        let silence = poll_span(&mut clock, start, (2500, 2750), false);
+        assert!(silence >= samples(Duration::from_millis(100)), "{silence}");
     }
 }
