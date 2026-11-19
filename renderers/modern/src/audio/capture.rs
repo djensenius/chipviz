@@ -39,9 +39,11 @@ const MAX_BACKLOG_S: f32 = 0.1;
 const POLL: Duration = Duration::from_millis(5);
 const STALL: Duration = Duration::from_millis(100);
 const MAX_STALL: Duration = Duration::from_millis(500);
-/// A shorter gap before a delivery than this (or half the delivery, for
-/// batched devices) is delivery jitter, not lost audio.
+/// Lag above the delivery latency smaller than this (or 1.5 times the recent
+/// delivery jitter, up to `STALL`) is jitter, not lost audio.
 const LOSS_MARGIN: Duration = Duration::from_millis(20);
+/// Lag must stay above the margin this long before it counts as lost audio.
+const LOSS_CONFIRM: Duration = Duration::from_millis(50);
 /// Deliveries this long with only normal gaps reset the stall threshold.
 const STALL_RESET: Duration = Duration::from_secs(1);
 const SILENCE_WARNING: Duration = Duration::from_secs(3);
@@ -336,9 +338,9 @@ struct Accounting {
 /// interval is counted twice.
 ///
 /// A delivery of `n` samples seen at `now` is taken to cover the
-/// `n / rate` seconds ending at `now`. Silence is synthesized only after a
-/// stall, from the end of the covered time up to `now`, or when a delivery
-/// leaves a gap after the covered time (the device lost audio). When real samples
+/// `n / rate` seconds ending at `now`. Silence is synthesized after a
+/// stall, from the end of the covered time up to `now`, and when
+/// [`LossDetector`] finds that the device lost audio without stalling. When real samples
 /// later turn up for time that silence already covered, that overlap is
 /// discarded, so it is never counted twice.
 #[derive(Debug)]
@@ -358,6 +360,10 @@ struct SampleClock {
     silence_debt: f64,
     /// Synthesized silence that late real samples may still overlap.
     unmatched_silence: usize,
+    start: Instant,
+    /// Samples the analyzer has accounted for since `start`.
+    fed: u64,
+    loss: LossDetector,
 }
 
 impl SampleClock {
@@ -370,6 +376,9 @@ impl SampleClock {
             covered_until: now,
             silence_debt: 0.0,
             unmatched_silence: 0,
+            start: now,
+            fed: 0,
+            loss: LossDetector::new(now),
         }
     }
 
@@ -390,20 +399,28 @@ impl SampleClock {
             let span = Duration::from_secs_f64(real as f64 / rate);
             let overlap = (self.covered_until + span).saturating_duration_since(now);
             let overlap = (overlap.as_secs_f64() * rate).round() as usize;
-            // Time between the covered end and this delivery's start that no
-            // sample accounts for: the device lost audio for less than a
-            // stall. Ring overflow drops are already in `real`, so they never
-            // look like a gap. A late delivery mistaken for a loss is undone
-            // by the overlap when the delayed samples catch up.
-            let gap = now.saturating_duration_since(self.covered_until + span);
-            if gap > LOSS_MARGIN.max(span / 2) {
-                accounting.silence = (gap.as_secs_f64() * rate).round() as usize;
-            }
             if overlap == 0 {
-                self.unmatched_silence = accounting.silence;
+                self.unmatched_silence = 0;
             } else {
                 accounting.overlap = overlap.min(self.unmatched_silence).min(real);
                 self.unmatched_silence -= accounting.overlap;
+            }
+            self.fed += (real - accounting.overlap) as u64;
+            self.loss.overlapped(accounting.overlap as f64 / rate);
+            // Ring overflow drops are already in `real`, so they never look
+            // like lost audio.
+            let lag = now.duration_since(self.start).as_secs_f64() - self.fed as f64 / rate;
+            let spare = (real - accounting.overlap) as f64 / rate;
+            let adjust = self.loss.check(now, lag, spare) * rate;
+            if adjust >= 0.0 {
+                accounting.silence = adjust.round() as usize;
+                self.fed += accounting.silence as u64;
+            } else {
+                // Taken-back fill: the oldest real samples are discarded.
+                let back = (-adjust).round() as usize;
+                let back = back.min(real - accounting.overlap);
+                accounting.overlap += back;
+                self.fed -= back as u64;
             }
             self.last_audio = now;
             self.covered_until = self.covered_until.max(now);
@@ -418,9 +435,114 @@ impl SampleClock {
             self.silence_debt -= whole;
             accounting.silence = whole as usize;
             self.unmatched_silence += accounting.silence;
+            self.fed += accounting.silence as u64;
+            self.loss.stalled(accounting.silence as f64 / rate);
             self.covered_until = self.covered_until.max(now);
         }
         accounting
+    }
+}
+
+/// Finds audio the device lost without stalling for long enough to trigger
+/// stall silence.
+///
+/// At each delivery, the lag is how far the analysed timeline (real samples
+/// plus silence since the start) trails the wall clock. Its minimum is the
+/// delivery latency. A late delivery raises the lag only until it catches up,
+/// but lost audio raises it for good. So lag above the latency is filled with
+/// silence only after it has stayed above the margin for `LOSS_CONFIRM`, and
+/// only by its smallest value in that run. Excess lag that goes away again is
+/// jitter, and it widens the margin. The fill comes `LOSS_CONFIRM` after the
+/// loss, so the beat phase is off by the loss length only for that long.
+/// Fill that later proves too large (a delivery lags less than the latency)
+/// is taken back by discarding real samples, so neither a jittery estimate
+/// nor a false alarm moves the timeline ahead of the wall clock for good.
+///
+/// Losses within the margin (`LOSS_MARGIN`, or 1.5 times the recent jitter up
+/// to `STALL`) are not detected, so jittery devices hide short losses, and
+/// a run that ends up within the margin after a partial fill keeps its
+/// residual. A large burst (for example after the analysis thread was
+/// starved) hides nothing: the lag counts every sample it delivers.
+#[derive(Debug)]
+struct LossDetector {
+    latency: Option<f64>,
+    /// Start, smallest and largest excess lag of the run above the margin.
+    excess: Option<(Instant, f64, f64)>,
+    /// Largest jitter seen in the current and the previous `STALL_RESET`.
+    jitter: f64,
+    previous_jitter: f64,
+    jitter_since: Instant,
+    /// Seconds filled that have not been taken back.
+    filled: f64,
+}
+
+impl LossDetector {
+    fn new(now: Instant) -> Self {
+        Self {
+            latency: None,
+            excess: None,
+            jitter: 0.0,
+            previous_jitter: 0.0,
+            jitter_since: now,
+            filled: 0.0,
+        }
+    }
+
+    /// Stall silence fills up to now, as if deliveries had no latency; any
+    /// of it that proves too much is taken back like a loss fill.
+    fn stalled(&mut self, silence: f64) {
+        self.excess = None;
+        self.filled += silence;
+    }
+
+    /// Late real samples already cancelled this much stall silence.
+    fn overlapped(&mut self, overlap: f64) {
+        self.filled = (self.filled - overlap).max(0.0);
+    }
+
+    fn margin(&self) -> f64 {
+        (1.5 * self.jitter.max(self.previous_jitter))
+            .clamp(LOSS_MARGIN.as_secs_f64(), STALL.as_secs_f64())
+    }
+
+    fn note_jitter(&mut self, now: Instant, excess: f64) {
+        if now.duration_since(self.jitter_since) >= STALL_RESET {
+            self.previous_jitter = std::mem::take(&mut self.jitter);
+            self.jitter_since = now;
+        }
+        self.jitter = self.jitter.max(excess);
+    }
+
+    /// Seconds to adjust the timeline by, given the lag (in seconds) after a
+    /// delivery: positive is lost audio to fill with silence, negative is
+    /// earlier fill to take back, at most `spare` seconds of this delivery.
+    fn check(&mut self, now: Instant, lag: f64, spare: f64) -> f64 {
+        let latency = *self.latency.get_or_insert(lag);
+        if lag < latency && self.filled > 0.0 {
+            let back = (latency - lag).min(self.filled).min(spare);
+            self.filled -= back;
+            return -back;
+        }
+        let latency = latency.min(lag);
+        self.latency = Some(latency);
+        let excess = lag - latency;
+        if excess <= self.margin() {
+            if let Some((_, _, largest)) = self.excess.take() {
+                self.note_jitter(now, largest);
+            }
+            self.note_jitter(now, excess);
+            return 0.0;
+        }
+        let (since, smallest, largest) = self.excess.get_or_insert((now, excess, excess));
+        *smallest = smallest.min(excess);
+        *largest = largest.max(excess);
+        if now.duration_since(*since) < LOSS_CONFIRM {
+            return 0.0;
+        }
+        let lost = *smallest;
+        self.excess = None;
+        self.filled += lost;
+        lost
     }
 }
 
@@ -732,7 +854,7 @@ mod tests {
     fn a_short_device_loss_is_filled_with_silence() {
         // 10 ms callbacks with `lost` ms of them never delivered.
         let chunk = samples(Duration::from_millis(10));
-        for lost in [30, 50, 80, 95] {
+        for lost in [30, 50, 80, 90] {
             let callbacks: Vec<_> = (1..=100)
                 .chain(101 + lost / 10..=200)
                 .map(|i| (Duration::from_millis(10 * i), chunk))
@@ -779,6 +901,78 @@ mod tests {
         let (accounted, silence) = replay(&jittered, Duration::from_secs(2));
         assert_close(accounted, Duration::from_secs(2));
         assert_eq!(silence, baseline);
+    }
+
+    /// `count` callbacks of `chunk` samples, the `k`th captured by
+    /// `k * chunk` and delivered `late(k)` after that, in delivery order.
+    fn jittered(
+        chunk: usize,
+        count: usize,
+        mut late: impl FnMut(usize) -> Duration,
+    ) -> Vec<(Duration, usize)> {
+        let mut callbacks: Vec<_> = (1..=count)
+            .map(|k| {
+                let captured = Duration::from_secs_f64((k * chunk) as f64 / f64::from(RATE));
+                (captured + late(k), chunk)
+            })
+            .collect();
+        callbacks.sort_by_key(|&(at, _)| at);
+        callbacks
+    }
+
+    /// Deterministic lateness in `0..=max_ms` ms.
+    fn random_lateness(seed: u64, max_ms: u64) -> impl FnMut(usize) -> Duration {
+        let mut state = seed;
+        move |_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            Duration::from_millis(state % (max_ms + 1))
+        }
+    }
+
+    /// Replays `callbacks` that hold `audio` of device time and checks that no
+    /// silence was added and the analysed timeline matches the device's.
+    fn assert_no_drift(callbacks: &[(Duration, usize)], audio: Duration) {
+        let end = callbacks.last().unwrap().0 + POLL;
+        let (accounted, silence) = replay(callbacks, end);
+        assert!(silence <= samples(Duration::from_millis(5)), "{silence}");
+        assert_close(accounted, audio);
+    }
+
+    #[test]
+    fn sustained_jitter_without_loss_does_not_drift() {
+        // 20 ms bursts every 20 ms, repeatedly up to 30 ms late, for 10 s.
+        let pattern = [15, 30, 5, 27, 15, 0, 30];
+        let burst = samples(Duration::from_millis(20));
+        let fixed = jittered(burst, 500, |k| {
+            Duration::from_millis(pattern[k % pattern.len()])
+        });
+        assert_no_drift(&fixed, Duration::from_secs(10));
+        // Random lateness up to 30 ms on 20 ms callbacks for 40 s.
+        let random = jittered(burst, 2000, random_lateness(0x9E37_79B9, 30));
+        assert_no_drift(&random, Duration::from_secs(40));
+        // 2048-frame callbacks with up to 30 ms lateness for about 40 s.
+        let frames = jittered(2048, 940, random_lateness(0xC0FF_EE11, 30));
+        assert_no_drift(&frames, Duration::from_secs_f64(940.0 * 2048.0 / 48_000.0));
+    }
+
+    #[test]
+    fn a_short_loss_amid_jitter_is_filled() {
+        // 20 ms callbacks up to 30 ms late for 10 s, with 80 ms lost at 5 s.
+        let burst = samples(Duration::from_millis(20));
+        let mut callbacks = jittered(burst, 500, random_lateness(0x5EED_1234, 30));
+        let lost = Duration::from_secs(5)..Duration::from_millis(5080);
+        callbacks.retain(|&(at, _)| !lost.contains(&at));
+        let delivered = callbacks.len();
+        assert!(delivered < 500, "{delivered}");
+        let end = callbacks.last().unwrap().0 + POLL;
+        let (accounted, silence) = replay(&callbacks, end);
+        assert_close(accounted, Duration::from_secs(10));
+        assert_close(
+            silence,
+            Duration::from_millis(20) * (500 - delivered) as u32,
+        );
     }
 
     /// Polls every 10 ms over `from..to`, delivering 10 ms of audio per poll
