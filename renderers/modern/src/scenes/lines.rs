@@ -242,10 +242,9 @@ impl View {
         if length.is_nan() || length < MIN_SEGMENT {
             return None;
         }
-        // Keep the on-screen width even though NDC x and y scale differently.
-        let normal = [-delta[1] / length * self.aspect, delta[0] / length];
-        let stretch = (normal[0] * normal[0] + normal[1] * normal[1]).sqrt();
-        let width = (thickness * FOCAL / depth).max(MIN_THICKNESS) / stretch;
+        let direction = [delta[0] / length, delta[1] / length];
+        let target = (thickness * FOCAL / depth).max(MIN_THICKNESS);
+        let width = ndc_width(direction, target, self.aspect);
         let fog = (1.0 - depth / 70.0).clamp(0.15, 1.0);
         Some((
             depth,
@@ -324,6 +323,21 @@ fn build_with_morph(
     drawn.sort_by(|left, right| left.0.total_cmp(&right.0));
     drawn.truncate(profile.instance_count.saturating_sub(instances.len()));
     instances.extend(drawn.into_iter().rev().map(|(_, instance)| instance));
+}
+
+/// NDC width for a screen-space quad along unit NDC `direction` whose long
+/// edges are `thickness` apart on screen (NDC y units) at any angle.
+///
+/// The shader rotates the quad in NDC, then the viewport scales x by
+/// `aspect`, turning the rectangle into a parallelogram. Its long edges stay
+/// parallel to the line, but its width edge leans off the perpendicular, so
+/// the gap between the long edges is `aspect * width / |S t|`, where
+/// `S = diag(aspect, 1)` and `t` is `direction`. Solving for `width` makes
+/// that gap exact; only the end caps stay slanted, which the quad's centre,
+/// size and rotation cannot express without a shear.
+pub(crate) fn ndc_width(direction: [f32; 2], thickness: f32, aspect: f32) -> f32 {
+    let tangent = (direction[0] * aspect).hypot(direction[1]);
+    thickness * tangent / aspect
 }
 
 /// Clips a segment's `u` to the half's `0..HALF_WIDTH` so lines never cross
@@ -480,6 +494,30 @@ mod tests {
                         assert!(instance.size[0] >= MIN_SEGMENT && instance.size[1] > 0.0);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn line_thickness_is_perpendicular_on_screen_at_any_angle_and_aspect() {
+        let thickness = 0.01;
+        for aspect in [1.0, 16.0 / 9.0, 3.5] {
+            for degrees in [0.0f32, 30.0, 45.0, 60.0, 90.0] {
+                // A line at `degrees` on screen, expressed in NDC.
+                let (sin, cos) = degrees.to_radians().sin_cos();
+                let delta = [cos / aspect, sin];
+                let length = delta[0].hypot(delta[1]);
+                let direction = [delta[0] / length, delta[1] / length];
+                let width = ndc_width(direction, thickness, aspect);
+                // Replay the shader: rotate the quad's edges in NDC, then
+                // scale x by aspect into screen units of NDC y.
+                let rotation = delta[1].atan2(delta[0]);
+                let (rs, rc) = rotation.sin_cos();
+                let long = [rc * aspect, rs];
+                let side = [-rs * width * aspect, rc * width];
+                let gap = (long[0] * side[1] - long[1] * side[0]).abs() / long[0].hypot(long[1]);
+                let error = (gap / thickness - 1.0).abs();
+                assert!(error < 0.02, "aspect {aspect} angle {degrees}: gap {gap}");
             }
         }
     }
