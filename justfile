@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/c64_colour_field_capture.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/c64_colour_field_capture.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_nes_colour_field.py"
 
 default:
     just --list
@@ -227,6 +227,7 @@ nes-rom:
     @command -v ca65 >/dev/null 2>&1 || (echo "ca65 is required; install cc65" >&2; exit 1)
     @command -v ld65 >/dev/null 2>&1 || (echo "ld65 is required; install cc65" >&2; exit 1)
     @make -C cores/nes/homebrew
+    @make -C cores/nes/homebrew INPUT_ROLE=operator
 
 sms-rom:
     @make -C cores/sms/homebrew
@@ -314,10 +315,12 @@ retroarch-smoke:
 rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check
     @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests -- -D warnings
+    @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests --features unmeasured-flash -- -D warnings
     @echo "chipviz Rust lint OK"
 
 rust-test:
     @cargo test --manifest-path {{ modern_manifest }} --bins --lib
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --features unmeasured-flash
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins

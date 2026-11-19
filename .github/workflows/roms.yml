@@ -101,8 +101,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cc65
       - name: Build NES ROM
         run: make -C cores/nes/homebrew
-      - name: Verify NES ROM
-        run: test -s cores/nes/homebrew/chipviz-nes.nes
+      - name: Build NES operator ROM
+        run: make -C cores/nes/homebrew INPUT_ROLE=operator
+      - name: Verify NES ROMs
+        run: test -s cores/nes/homebrew/chipviz-nes.nes && test -s cores/nes/homebrew/chipviz-nes-operator.nes
 
   sms:
     name: Master System ROM
