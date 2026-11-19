@@ -9,14 +9,17 @@
 //!
 //! Input, per rendered frame:
 //! - with live microphone frames, a [`ScopeSnapshot`] from the audio thread's
-//!   side channel: the trigger-aligned waveform, and an onset count whose
-//!   changes fire bursts;
+//!   side channel: the trigger-aligned waveform's upper and lower outlines,
+//!   and an onset count whose changes fire bursts;
 //! - otherwise (procedural or UDP frames, or a mic that UDP has taken over)
 //!   the layers degrade to a ribbon synthesised from the eight spectrum bands
 //!   and scaled by energy, and bursts fire when `beat_count` changes.
 //!
 //! The ribbon eases towards each new waveform (time constant `SMOOTH_S`), so
-//! silence decays it smoothly to a flat line instead of cutting.
+//! silence decays it smoothly to a flat line instead of cutting. It is two
+//! thin lines through the outlines: one line for slow sound, where they
+//! coincide, and two for tones too fast for the points, so loud high
+//! frequencies never fill a band (see `decimate` in `audio::scope`).
 //!
 //! Flash design (not a measured compliance claim): a burst is one smooth rise
 //! (`ATTACK_S`) and exponential fall, so each is at most one flash. Its
@@ -67,9 +70,12 @@ const RIBBON_PASSES: [(f32, f32, Pass); 3] = [
     (0.017, 1.0, Pass::Backing),
     (0.008, 0.95, Pass::Core),
 ];
-/// Upper bound on overlay instances: a quad per ribbon segment per pass,
-/// plus each burst's glow and sparks.
-pub const MAX_INSTANCES: usize = RIBBON_PASSES.len() * (POINTS - 1) + MAX_BURSTS * (1 + SPARKS);
+/// Ribbon lines: the waveform's upper and lower outlines.
+const OUTLINES: usize = 2;
+/// Upper bound on overlay instances: a quad per ribbon segment per outline
+/// per pass, plus each burst's glow and sparks.
+pub const MAX_INSTANCES: usize =
+    RIBBON_PASSES.len() * OUTLINES * (POINTS - 1) + MAX_BURSTS * (1 + SPARKS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pass {
@@ -157,9 +163,10 @@ pub fn burst_envelope(age: f32) -> f32 {
     ((-(age - ATTACK_S) / DECAY_S).exp() - tail) / (1.0 - tail)
 }
 
-/// Root mean square of `wave`, at most 1.
-fn rms(wave: &[f32; POINTS]) -> f32 {
-    (wave.iter().map(|point| point * point).sum::<f32>() / POINTS as f32)
+/// Root mean square of both outlines, at most 1.
+fn rms(wave: &[[f32; POINTS]; OUTLINES]) -> f32 {
+    let squares = wave.as_flattened().iter().map(|point| point * point);
+    (squares.sum::<f32>() / (OUTLINES * POINTS) as f32)
         .sqrt()
         .min(1.0)
 }
@@ -209,7 +216,8 @@ enum Trigger {
 #[derive(Clone, Debug)]
 pub struct MicLayers {
     mode: Mode,
-    wave: [f32; POINTS],
+    /// Upper and lower outlines.
+    wave: [[f32; POINTS]; OUTLINES],
     level: f32,
     /// Whether the ribbon was drawn last step; `wave` is stale otherwise.
     ribbon_shown: bool,
@@ -228,7 +236,7 @@ impl MicLayers {
     pub fn new(mode: Mode) -> Self {
         Self {
             mode,
-            wave: [0.0; POINTS],
+            wave: [[0.0; POINTS]; OUTLINES],
             level: 0.0,
             ribbon_shown: false,
             bursts: [None; MAX_BURSTS],
@@ -274,12 +282,13 @@ impl MicLayers {
         let ribbon = shown && self.mode.scope();
         if ribbon {
             let target = match live {
-                Some(snapshot) => snapshot.points,
-                None => synthesise(frame, now),
+                Some(snapshot) => [snapshot.upper, snapshot.lower],
+                None => [synthesise(frame, now); OUTLINES],
             };
             if self.ribbon_shown {
                 let blend = -(-delta / SMOOTH_S).exp_m1();
-                for (point, target) in self.wave.iter_mut().zip(target) {
+                let points = self.wave.as_flattened_mut().iter_mut();
+                for (point, target) in points.zip(target.as_flattened()) {
                     *point += (target - *point) * blend;
                 }
                 self.level += (rms(&self.wave) - self.level) * -(-delta / LEVEL_S).exp_m1();
@@ -351,9 +360,9 @@ impl MicLayers {
     fn build_ribbon(&self, frame: ControlFrame, aspect: f32, instances: &mut Vec<Instance>) {
         let energy = f32::from(frame.energy) / 255.0;
         let brightness = 0.55 + 0.45 * self.level.min(1.0);
-        let point = |index: usize| {
+        let point = |outline: &[f32; POINTS], index: usize| {
             let x = (index as f32 / (POINTS - 1) as f32 * 2.0 - 1.0) * RIBBON_HALF_WIDTH * aspect;
-            [x, RIBBON_Y + self.wave[index] * RIBBON_AMPLITUDE]
+            [x, RIBBON_Y + outline[index] * RIBBON_AMPLITUDE]
         };
         let tint = palette(frame.palette, brightness, energy);
         for (thickness, alpha, pass) in RIBBON_PASSES {
@@ -375,8 +384,14 @@ impl MicLayers {
                     thickness * 0.5,
                 ),
             };
-            for index in 0..POINTS - 1 {
-                let (a, b) = (point(index), point(index + 1));
+            // Each pass covers both outlines before the next, so a core is
+            // never hidden by the other outline's halo.
+            for (outline, index) in self
+                .wave
+                .iter()
+                .flat_map(|outline| (0..POINTS - 1).map(move |index| (outline, index)))
+            {
+                let (a, b) = (point(outline, index), point(outline, index + 1));
                 let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
                 instances.push(Instance {
                     center: [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, 0.0],
@@ -456,11 +471,14 @@ mod tests {
         }
     }
 
+    /// A slow tone: both outlines on one curve.
     fn snapshot(amplitude: f32, onsets: u32) -> ScopeSnapshot {
+        let points = std::array::from_fn(|index| {
+            amplitude * (index as f32 / POINTS as f32 * std::f32::consts::TAU * 4.0).sin()
+        });
         ScopeSnapshot {
-            points: std::array::from_fn(|index| {
-                amplitude * (index as f32 / POINTS as f32 * std::f32::consts::TAU * 4.0).sin()
-            }),
+            upper: points,
+            lower: points,
             onsets,
         }
     }
@@ -468,6 +486,7 @@ mod tests {
     fn amplitude(layers: &MicLayers) -> f32 {
         layers
             .wave
+            .as_flattened()
             .iter()
             .fold(0.0, |peak, point| peak.max(point.abs()))
     }
@@ -609,7 +628,10 @@ mod tests {
         let mut instances = Vec::new();
         let aspect = 16.0 / 9.0;
         layers.build(frame, aspect, &mut instances);
-        assert_eq!(instances.len(), RIBBON_PASSES.len() * (POINTS - 1));
+        assert_eq!(
+            instances.len(),
+            RIBBON_PASSES.len() * OUTLINES * (POINTS - 1)
+        );
         assert!(instances.iter().all(|instance| {
             instance.center[0].abs() <= aspect && instance.center[1].abs() <= 1.0
         }));
@@ -659,13 +681,16 @@ mod tests {
             for step in 0..30 {
                 layers.step(frame, None, step as f32 / FPS, visible);
             }
-            assert_eq!(layers.wave, [0.0; POINTS], "{mode:?} shown={visible}");
+            assert_eq!(
+                layers.wave, [[0.0; POINTS]; OUTLINES],
+                "{mode:?} shown={visible}"
+            );
             assert_eq!(layers.level, 0.0);
             // Shown: the first drawn frame is the current waveform, not an
             // ease from the stale (flat) one.
             layers.set_mode(Mode::Scope);
             layers.step(frame, None, 0.5, true);
-            assert_eq!(layers.wave, synthesise(frame, 0.5), "{mode:?}");
+            assert_eq!(layers.wave, [synthesise(frame, 0.5); OUTLINES], "{mode:?}");
             assert_eq!(layers.level, rms(&layers.wave));
             // Then it eases as usual: one frame towards silence keeps
             // exp(-1 / (60 SMOOTH_S)) of it.
@@ -679,12 +704,13 @@ mod tests {
         // starts current on return.
         let mut layers = MicLayers::new(Mode::Scope);
         layers.step(quiet(), Some(&snapshot(0.8, 0)), 0.0, true);
-        assert_eq!(layers.wave, snapshot(0.8, 0).points);
+        let outlines = |snapshot: ScopeSnapshot| [snapshot.upper, snapshot.lower];
+        assert_eq!(layers.wave, outlines(snapshot(0.8, 0)));
         let held = layers.wave;
         layers.step(quiet(), Some(&snapshot(0.2, 0)), 0.1, false);
         assert_eq!(layers.wave, held);
         layers.step(quiet(), Some(&snapshot(0.2, 0)), 0.2, true);
-        assert_eq!(layers.wave, snapshot(0.2, 0).points);
+        assert_eq!(layers.wave, outlines(snapshot(0.2, 0)));
     }
 
     #[test]
@@ -743,8 +769,10 @@ mod tests {
     #[test]
     fn ribbon_passes_overlap_opaquely_and_keep_their_width_at_any_aspect() {
         let mut layers = MicLayers::new(Mode::Scope);
+        let zigzag = std::array::from_fn(|index| if index % 2 == 0 { -1.0 } else { 1.0 });
         let steep = ScopeSnapshot {
-            points: std::array::from_fn(|index| if index % 2 == 0 { -1.0 } else { 1.0 }),
+            upper: zigzag,
+            lower: zigzag.map(|point| -point),
             onsets: 0,
         };
         for step in 0..120 {
@@ -754,15 +782,16 @@ mod tests {
         for aspect in [1.0, 16.0 / 9.0, 4.0 / 3.0, 0.5] {
             let mut instances = Vec::new();
             layers.build(quiet(), aspect, &mut instances);
-            assert_eq!(instances.len(), RIBBON_PASSES.len() * segments);
+            let lines = OUTLINES * segments;
+            assert_eq!(instances.len(), RIBBON_PASSES.len() * lines);
             for (pass, (thickness, alpha, kind)) in RIBBON_PASSES.into_iter().enumerate() {
                 // Overlapping translucent quads would stack into dashes.
                 assert!(alpha >= 0.95, "{kind:?} is too translucent to overlap");
-                let quads = &instances[pass * segments..(pass + 1) * segments];
+                let quads = &instances[pass * lines..(pass + 1) * lines];
                 // Every quad keeps the pass thickness in aspect space, which
                 // `transform` maps to the viewport uniformly in x and y.
                 assert!(quads.iter().all(|quad| quad.size[1] == thickness));
-                for pair in quads.windows(2) {
+                for pair in quads.chunks(segments).flat_map(|line| line.windows(2)) {
                     let end = |quad: &Instance, sign: f32| {
                         let half = quad.size[0] * 0.5 * sign;
                         [
@@ -975,7 +1004,10 @@ mod tests {
             let mut instances = Vec::new();
             layers.build(quiet(), 1.0, &mut instances);
             assert_eq!(live_bursts(&layers), 0, "{mode:?}: start cap kept");
-            assert_eq!(instances.len(), RIBBON_PASSES.len() * (POINTS - 1));
+            assert_eq!(
+                instances.len(),
+                RIBBON_PASSES.len() * OUTLINES * (POINTS - 1)
+            );
             layers.step(
                 quiet(),
                 Some(&snapshot(0.0, 3)),
@@ -984,5 +1016,121 @@ mod tests {
             );
             assert_eq!(live_bursts(&layers), 1, "{mode:?}: fires after the gap");
         }
+    }
+
+    /// Drawn area (aspect-space units squared) of the ribbon: every pass is
+    /// opaque or nearly so (`ScreenSpace` pattern 0 draws its colour), so
+    /// each covered pixel replaces the scene, as a bright core or halo over
+    /// dark scenes and a black backing over bright ones. Only the lower half
+    /// is sampled, which holds the whole ribbon.
+    fn ribbon_area(instances: &[Instance], aspect: f32) -> f32 {
+        const PIXEL: f32 = 0.004;
+        let (columns, rows) = ((2.0 * aspect / PIXEL) as usize, (1.0 / PIXEL) as usize);
+        let mut covered = vec![false; columns * rows];
+        for quad in instances {
+            assert_eq!(quad.pattern, [0.0; 2]);
+            assert!(quad.color[3] >= 0.95);
+            let (cos, sin) = (quad.rotation.cos(), quad.rotation.sin());
+            let reach = 0.5 * quad.size[0].hypot(quad.size[1]);
+            let column = |x: f32| ((x + aspect) / PIXEL).clamp(0.0, columns as f32) as usize;
+            let row = |y: f32| (-y / PIXEL).clamp(0.0, rows as f32) as usize;
+            let (left, right) = (
+                column(quad.center[0] - reach),
+                column(quad.center[0] + reach),
+            );
+            let (top, bottom) = (row(quad.center[1] + reach), row(quad.center[1] - reach));
+            for y_index in top..(bottom + 1).min(rows) {
+                for x_index in left..(right + 1).min(columns) {
+                    let x = (x_index as f32 + 0.5) * PIXEL - aspect - quad.center[0];
+                    let y = -(y_index as f32 + 0.5) * PIXEL - quad.center[1];
+                    let (along, across) = (x * cos + y * sin, y * cos - x * sin);
+                    if along.abs() <= 0.5 * quad.size[0] && across.abs() <= 0.5 * quad.size[1] {
+                        covered[y_index * columns + x_index] = true;
+                    }
+                }
+            }
+        }
+        covered.iter().filter(|&&pixel| pixel).count() as f32 * PIXEL * PIXEL
+    }
+
+    /// Steps `layers` through 1 s of `audio` (48 kHz, 60 fps) via a real
+    /// scope tap and returns the ribbon's drawn area per frame.
+    fn drawn_areas(audio: impl Fn(usize) -> f32) -> Vec<f32> {
+        use crate::audio::scope::ScopeTap;
+        let (rate, aspect) = (48_000.0, 16.0 / 9.0);
+        let mut tap = ScopeTap::new(rate);
+        let mut layers = MicLayers::new(Mode::Scope);
+        let per_frame = (rate / FPS) as usize;
+        (0..FPS as usize)
+            .map(|frame| {
+                let start = frame * per_frame;
+                let samples: Vec<f32> = (start..start + per_frame).map(&audio).collect();
+                tap.push(&samples);
+                layers.step(quiet(), Some(&tap.snapshot(0)), frame as f32 / FPS, true);
+                let mut instances = Vec::new();
+                layers.build(quiet(), aspect, &mut instances);
+                ribbon_area(&instances, aspect)
+            })
+            .collect()
+    }
+
+    /// The ribbon's flash exemption rests on it being thin: loud high
+    /// frequencies (a tone or noise) gated on and off at 3 to 10 Hz must
+    /// draw no more area, and change it by no more, than a loud slow tone's
+    /// ribbon (the thin-line budget), never a filled band.
+    #[test]
+    fn gated_high_frequencies_keep_the_ribbon_thin() {
+        let rate = 48_000.0;
+        let sine =
+            |hz: f32| move |n: usize| 0.9 * (std::f32::consts::TAU * hz * n as f32 / rate).sin();
+        // A steady, full-scale 440 Hz ribbon sets the budget: about nine
+        // full-height cycles of thin line.
+        let budget = max_area(&drawn_areas(sine(440.0))[30..]);
+        let flat = drawn_areas(|_| 0.0)[30];
+        assert!(flat > 0.0 && budget > 5.0 * flat, "{flat} {budget}");
+        let noise = |n: usize| {
+            let hashed = (n as u32).wrapping_mul(0x9e37_79b9).rotate_left(13) ^ 0x5bd1_e995;
+            0.9 * (hash(hashed) * 2.0 - 1.0)
+        };
+        for gate_hz in [3.0, 5.0, 10.0] {
+            let gate =
+                move |n: usize| ((n as f32 / rate * gate_hz * 2.0) as usize).is_multiple_of(2);
+            for (name, signal) in [
+                ("4 kHz", &sine(4_000.0) as &dyn Fn(usize) -> f32),
+                ("noise", &noise),
+            ] {
+                let areas = drawn_areas(|n| if gate(n) { signal(n) } else { 0.0 });
+                let low = areas.iter().copied().fold(f32::INFINITY, f32::min);
+                let high = max_area(&areas);
+                assert!(
+                    high <= budget,
+                    "{name} gated at {gate_hz} Hz draws {high}, budget {budget}"
+                );
+                assert!(
+                    high - low <= budget,
+                    "{name} at {gate_hz} Hz: {low}..{high}"
+                );
+                // The gate is seen: the lines do move.
+                assert!(high > 1.5 * low, "{name} at {gate_hz} Hz: {low}..{high}");
+            }
+        }
+        // A filled band (one line zigzagging between the extremes, as a
+        // per-point alternating envelope drew) is well over budget.
+        let mut layers = MicLayers::new(Mode::Scope);
+        let zigzag = std::array::from_fn(|index| if index % 2 == 0 { 0.9 } else { -0.9 });
+        let band = ScopeSnapshot {
+            upper: zigzag,
+            lower: zigzag,
+            onsets: 0,
+        };
+        layers.step(quiet(), Some(&band), 0.0, true);
+        let mut instances = Vec::new();
+        layers.build(quiet(), 16.0 / 9.0, &mut instances);
+        let filled = ribbon_area(&instances, 16.0 / 9.0);
+        assert!(filled > 2.0 * budget, "{filled} vs budget {budget}");
+    }
+
+    fn max_area(areas: &[f32]) -> f32 {
+        areas.iter().copied().fold(0.0, f32::max)
     }
 }

@@ -877,7 +877,7 @@ mod tests {
         }
         let drain = Drain::plan(0, consumer.slots(), 0, 48_000);
         assert!(feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer));
-        assert!(tap.snapshot(0).points.iter().any(|point| point.abs() > 0.5));
+        assert!(tap.snapshot(0).upper.iter().any(|&point| point > 0.5));
 
         // The ring overflows: its whole contents and the drops are skipped.
         for sample in tone(rate as usize) {
@@ -888,7 +888,9 @@ mod tests {
         assert_eq!((drain.discard, drain.analyse), (rate as usize, 0));
         assert!(!feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer));
         assert_eq!(consumer.slots(), 0);
-        assert_eq!(tap.snapshot(0).points, [0.0; super::super::scope::POINTS]);
+        let gap = tap.snapshot(0);
+        assert_eq!(gap.upper, [0.0; super::super::scope::POINTS]);
+        assert_eq!(gap.lower, gap.upper);
 
         // Quiet post-gap audio is not stretched by the pre-gap peak's gain:
         // the peak released across the skipped interval.
@@ -899,7 +901,7 @@ mod tests {
         feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer);
         let peak = tap
             .snapshot(0)
-            .points
+            .upper
             .iter()
             .fold(0.0_f32, |peak, point| peak.max(point.abs()));
         // Unreleased, the pre-gap peak would hold this near 0.05.

@@ -533,10 +533,11 @@ mod tests {
         assert!((8..=14).contains(&onsets), "{onsets} onsets");
         let (loud, loud_scope) = &frames[200];
         assert!(loud.energy > 40, "{loud:?}");
-        assert!(loud_scope.points.iter().any(|point| point.abs() > 0.3));
+        assert!(loud_scope.upper.iter().any(|&point| point > 0.3));
         // From 6 s (frame 360) the input is silent: flat waveform, no onsets.
         let (quiet, quiet_scope) = &frames[420];
-        assert_eq!(quiet_scope.points, [0.0; crate::audio::scope::POINTS]);
+        assert_eq!(quiet_scope.upper, [0.0; crate::audio::scope::POINTS]);
+        assert_eq!(quiet_scope.lower, quiet_scope.upper);
         assert_eq!(quiet_scope.onsets, frames[380].1.onsets);
         assert!(quiet.energy < loud.energy);
     }

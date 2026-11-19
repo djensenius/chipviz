@@ -3,7 +3,7 @@
 //! The control frame carries no waveform, so the analysis thread also feeds
 //! its mono samples to a [`ScopeTap`]. After each poll it publishes a
 //! [`ScopeSnapshot`] (a trigger-aligned, decimated, gain-normalised
-//! waveform plus the analyzer's onset count) to [`SharedScope`]. Both sides
+//! waveform envelope plus the analyzer's onset count) to [`SharedScope`]. Both sides
 //! are wait-free: the writer stores one atomic per point and the reader loads
 //! them, so the render thread never waits on audio and memory stays bounded.
 //! A read that races a publish can mix points from two consecutive snapshots;
@@ -27,18 +27,22 @@ const MAX_SEARCH: usize = 12_800;
 pub const PEAK_FLOOR: f32 = 0.02;
 const PEAK_RELEASE_S: f32 = 1.5;
 
-/// One published waveform: `points` are in -1..=1 (normalised by the recent
-/// peak) and `onsets` counts the analyzer's onsets (wrapping).
+/// One published waveform as two outlines, the maximum (`upper`) and
+/// minimum (`lower`) of each point's samples (see [`decimate`]), in -1..=1
+/// (normalised by the recent peak); `onsets` counts the analyzer's onsets
+/// (wrapping).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScopeSnapshot {
-    pub points: [f32; POINTS],
+    pub upper: [f32; POINTS],
+    pub lower: [f32; POINTS],
     pub onsets: u32,
 }
 
 impl Default for ScopeSnapshot {
     fn default() -> Self {
         Self {
-            points: [0.0; POINTS],
+            upper: [0.0; POINTS],
+            lower: [0.0; POINTS],
             onsets: 0,
         }
     }
@@ -98,13 +102,17 @@ impl ScopeTap {
         self.scratch[..oldest.len()].copy_from_slice(oldest);
         self.scratch[oldest.len()..].copy_from_slice(newest);
         let start = trigger(&self.scratch);
-        let mut points = [0.0; POINTS];
-        decimate(&self.scratch[start..start + SPAN], &mut points);
+        let (mut upper, mut lower) = ([0.0; POINTS], [0.0; POINTS]);
+        decimate(&self.scratch[start..start + SPAN], &mut upper, &mut lower);
         let gain = 1.0 / self.peak.max(PEAK_FLOOR);
-        for point in &mut points {
+        for point in upper.iter_mut().chain(&mut lower) {
             *point = (*point * gain).clamp(-1.0, 1.0);
         }
-        ScopeSnapshot { points, onsets }
+        ScopeSnapshot {
+            upper,
+            lower,
+            onsets,
+        }
     }
 }
 
@@ -130,101 +138,49 @@ pub fn trigger(history: &[f32]) -> usize {
         .unwrap_or(last)
 }
 
-/// Click-preserving decimation: each output point is `max + min - mean` of
-/// its share of `samples`, i.e. the mean plus both extremes' deviations from
-/// it. A ramp deviates evenly both ways and keeps its mean, so steep tones do
-/// not flicker with sub-sample shifts, while a short one-sided click keeps
-/// most of its height. Where the signal oscillates faster than the points can
-/// follow (at least three large swings, see [`swings`], around the share), a
-/// full cycle would cancel to its mean and a loud tone would look silent, so
-/// the points instead alternate between each share's maximum and minimum,
-/// drawing the tone's envelope. Empty shares (more points than samples)
-/// repeat the nearest sample.
-pub fn decimate(samples: &[f32], out: &mut [f32]) {
-    let points = out.len();
-    for (index, point) in out.iter_mut().enumerate() {
+/// Peak-detect decimation into two outlines: each point's `upper` and
+/// `lower` are the maximum and minimum of its share of `samples`. The same
+/// rule applies to every point, so nothing switches style between
+/// neighbours. Where the signal is slow, a share is a short monotone piece
+/// and the outlines are the same curve offset by at most one point, so they
+/// draw as one thin line; a one-sided click keeps its full height in one
+/// outline. A tone too fast for the points (a cycle or more per share)
+/// keeps its loudness as two separate thin lines at its envelope instead of
+/// cancelling to a flat line or filling a band. Empty shares (more points
+/// than samples) repeat the nearest sample.
+pub fn decimate(samples: &[f32], upper: &mut [f32], lower: &mut [f32]) {
+    let points = upper.len().min(lower.len());
+    for index in 0..points {
         let start = index * samples.len() / points;
         let end = ((index + 1) * samples.len() / points).max(start + 1);
         let share = samples
             .get(start..end.min(samples.len()))
             .unwrap_or_default();
+        let (low, high) = share
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &v| {
+                (low.min(v), high.max(v))
+            });
         if share.is_empty() {
-            *point = 0.0;
-            continue;
-        }
-        let (low, high, sum) = share.iter().fold(
-            (f32::INFINITY, f32::NEG_INFINITY, 0.0),
-            |(low, high, sum), &sample| (low.min(sample), high.max(sample), sum + sample),
-        );
-        // The share plus one and a half shares either side, so tones of up to
-        // about two points per cycle show their swings whatever the phase.
-        let margin = share.len() * 3 / 2;
-        let around = &samples[start.saturating_sub(margin)..(end + margin).min(samples.len())];
-        *point = if swings(around) >= 3 {
-            if index % 2 == 0 { high } else { low }
+            (upper[index], lower[index]) = (0.0, 0.0);
         } else {
-            high + low - sum / share.len() as f32
-        };
-    }
-}
-
-/// Monotone runs in `window` that each travel at least half its range, up to
-/// 3. A ramp has 1 and a click or a half cycle 2, while noise smaller than
-/// half the range never starts a run, so slow tones with hiss keep their
-/// shape; 3 means at least one full oscillation.
-fn swings(window: &[f32]) -> usize {
-    let Some(&first) = window.first() else {
-        return 0;
-    };
-    let (low, high) = window
-        .iter()
-        .fold((first, first), |(low, high), &v| (low.min(v), high.max(v)));
-    let step = 0.5 * (high - low);
-    if step <= 0.0 {
-        return 0;
-    }
-    // Before the first run, `low..high` is the range seen so far; after it,
-    // `extreme` is the furthest point of the current run.
-    let (mut low, mut high) = (first, first);
-    let mut rising: Option<bool> = None;
-    let mut extreme = first;
-    let mut runs = 0;
-    for &value in window {
-        match rising {
-            None => {
-                low = low.min(value);
-                high = high.max(value);
-                if value - low >= step || high - value >= step {
-                    rising = Some(value - low >= step);
-                    (extreme, runs) = (value, 1);
-                }
-            }
-            Some(up) => {
-                if (value - extreme) * if up { 1.0 } else { -1.0 } > 0.0 {
-                    extreme = value;
-                } else if (extreme - value).abs() >= step {
-                    rising = Some(!up);
-                    (extreme, runs) = (value, runs + 1);
-                    if runs == 3 {
-                        break;
-                    }
-                }
-            }
+            (upper[index], lower[index]) = (high, low);
         }
     }
-    runs
 }
 
 /// Wait-free single-writer publication of the latest [`ScopeSnapshot`].
 pub struct SharedScope {
-    points: [AtomicU32; POINTS],
+    upper: [AtomicU32; POINTS],
+    lower: [AtomicU32; POINTS],
     onsets: AtomicU32,
 }
 
 impl Default for SharedScope {
     fn default() -> Self {
         Self {
-            points: std::array::from_fn(|_| AtomicU32::new(0)),
+            upper: std::array::from_fn(|_| AtomicU32::new(0)),
+            lower: std::array::from_fn(|_| AtomicU32::new(0)),
             onsets: AtomicU32::new(0),
         }
     }
@@ -232,7 +188,8 @@ impl Default for SharedScope {
 
 impl SharedScope {
     pub fn store(&self, snapshot: &ScopeSnapshot) {
-        for (slot, point) in self.points.iter().zip(snapshot.points) {
+        let slots = self.upper.iter().chain(&self.lower);
+        for (slot, point) in slots.zip(snapshot.upper.iter().chain(&snapshot.lower)) {
             slot.store(point.to_bits(), Ordering::Relaxed);
         }
         self.onsets.store(snapshot.onsets, Ordering::Release);
@@ -241,8 +198,11 @@ impl SharedScope {
     pub fn load(&self) -> ScopeSnapshot {
         let onsets = self.onsets.load(Ordering::Acquire);
         ScopeSnapshot {
-            points: std::array::from_fn(|index| {
-                f32::from_bits(self.points[index].load(Ordering::Relaxed))
+            upper: std::array::from_fn(|index| {
+                f32::from_bits(self.upper[index].load(Ordering::Relaxed))
+            }),
+            lower: std::array::from_fn(|index| {
+                f32::from_bits(self.lower[index].load(Ordering::Relaxed))
             }),
             onsets,
         }
@@ -261,89 +221,108 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn decimation_keeps_shape_and_short_clicks() {
-        let mut out = [0.0; 8];
-        let mut samples = vec![0.1; 64];
-        samples[37] = -0.9;
-        decimate(&samples, &mut out);
-        for (index, point) in out.into_iter().enumerate() {
-            let expected = if index == 4 { -0.775 } else { 0.1 };
-            assert!((point - expected).abs() < 1e-6, "{index}: {point}");
-        }
-        // A steep ramp keeps its mean instead of jumping to an end.
-        let ramp: Vec<f32> = (0..8).map(|n| n as f32 - 3.5).collect();
-        decimate(&ramp, &mut out[..1]);
-        assert!(out[0].abs() < 1e-6, "{}", out[0]);
-
-        // Uneven and short inputs still fill every point.
-        let mut out = [9.0; 5];
-        decimate(&[1.0, -2.0, 3.0], &mut out);
-        assert_eq!(out, [1.0, 1.0, -2.0, -2.0, 3.0]);
-        let mut out = [9.0; 4];
-        decimate(&[], &mut out);
-        assert_eq!(out, [0.0; 4]);
+    /// Both outlines, upper then lower, for drift comparisons.
+    fn outlines(snapshot: &ScopeSnapshot) -> Vec<f32> {
+        snapshot
+            .upper
+            .iter()
+            .chain(&snapshot.lower)
+            .copied()
+            .collect()
     }
 
-    /// The weakest, over start phases within one sample of a rising zero
-    /// crossing, of the largest absolute point of a full-scale `hz` tone at
-    /// `rate`.
-    fn weakest_view(rate: f32, hz: f32) -> f32 {
+    #[test]
+    fn decimation_keeps_shape_and_short_clicks() {
+        let (mut upper, mut lower) = ([0.0; 8], [0.0; 8]);
+        let mut samples = vec![0.1; 64];
+        samples[37] = -0.9;
+        decimate(&samples, &mut upper, &mut lower);
+        assert_eq!(upper, [0.1; 8]);
+        for (index, point) in lower.into_iter().enumerate() {
+            // The click keeps its full height in the lower outline.
+            let expected = if index == 4 { -0.9 } else { 0.1 };
+            assert_eq!(point, expected, "{index}");
+        }
+        // A steep ramp spans its share: its ends, one point apart.
+        let ramp: Vec<f32> = (0..8).map(|n| n as f32 - 3.5).collect();
+        decimate(&ramp, &mut upper[..1], &mut lower[..1]);
+        assert_eq!((upper[0], lower[0]), (3.5, -3.5));
+
+        // Uneven and short inputs still fill every point.
+        let (mut upper, mut lower) = ([9.0; 5], [9.0; 5]);
+        decimate(&[1.0, -2.0, 3.0], &mut upper, &mut lower);
+        assert_eq!(upper, [1.0, 1.0, -2.0, -2.0, 3.0]);
+        assert_eq!(lower, upper);
+        let (mut upper, mut lower) = ([9.0; 4], [9.0; 4]);
+        decimate(&[], &mut upper, &mut lower);
+        assert_eq!((upper, lower), ([0.0; 4], [0.0; 4]));
+    }
+
+    /// Decimated outlines of a full-scale `hz` tone at `rate` for each start
+    /// phase within one sample of a rising zero crossing, as the trigger
+    /// leaves it.
+    fn tone_outlines(rate: f32, hz: f32) -> Vec<([f32; POINTS], [f32; POINTS])> {
         let step = std::f32::consts::TAU * hz / rate;
         (0..8)
             .map(|offset| {
                 let phase = step * offset as f32 / 8.0;
                 let tone: Vec<f32> = (0..SPAN).map(|n| (step * n as f32 + phase).sin()).collect();
-                let mut points = [0.0; POINTS];
-                decimate(&tone, &mut points);
-                points
-                    .iter()
-                    .fold(0.0_f32, |peak, point| peak.max(point.abs()))
+                let (mut upper, mut lower) = ([0.0; POINTS], [0.0; POINTS]);
+                decimate(&tone, &mut upper, &mut lower);
+                (upper, lower)
             })
-            .fold(f32::INFINITY, f32::min)
+            .collect()
     }
 
     #[test]
     fn decimation_keeps_tones_tied_to_the_point_spacing_visible() {
-        // Eight samples per point at 48 kHz: 6 kHz puts exactly one cycle in
-        // each share, 12 kHz two, and 6.01 kHz drifts slowly across them.
-        // 2 to 4 kHz are a few points per cycle. The span starts anywhere
-        // within the sample after a rising crossing, as the trigger leaves it.
-        for hz in [
-            2_000.0, 3_000.0, 4_000.0, 6_000.0, 6_010.0, 12_000.0, 18_000.0,
+        // Eight samples per point at 48 kHz (and at 96 kHz, where 12 kHz is
+        // one cycle a share): 6 kHz puts exactly one cycle in each share,
+        // 12 kHz two, and 6.01 kHz drifts slowly across them. A cycle-mean
+        // decimation draws these flat; the outlines hold their envelope, so
+        // every upper point is at least about 0.5 and every lower point at
+        // most about -0.5 (4 kHz samples its trough at exactly -0.5).
+        for (rate, hz) in [
+            (48_000.0, 4_000.0),
+            (48_000.0, 6_000.0),
+            (48_000.0, 6_010.0),
+            (48_000.0, 12_000.0),
+            (48_000.0, 18_000.0),
+            (96_000.0, 12_000.0),
         ] {
-            let seen = weakest_view(48_000.0, hz);
-            assert!(seen >= 0.5, "{hz} Hz at full scale shows only {seen}");
+            for (upper, lower) in tone_outlines(rate, hz) {
+                let top = upper.iter().copied().fold(f32::INFINITY, f32::min);
+                let bottom = lower.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                assert!(
+                    top >= 0.49 && bottom <= -0.49,
+                    "{hz} Hz at {rate}: {top} {bottom}"
+                );
+            }
         }
-        // At 96 kHz the share is 8 samples too, so 12 kHz is one cycle each.
-        let seen = weakest_view(96_000.0, 12_000.0);
-        assert!(seen >= 0.5, "12 kHz at 96 kHz shows only {seen}");
-        // Slow tones keep their shape rather than turning into an envelope.
-        let mut points = [0.0; POINTS];
-        let slow: Vec<f32> = (0..SPAN)
-            .map(|n| (std::f32::consts::TAU * 440.0 * n as f32 / 48_000.0).sin())
-            .collect();
-        decimate(&slow, &mut points);
-        let jump = points
-            .windows(2)
-            .map(|pair| (pair[1] - pair[0]).abs())
-            .fold(0.0, f32::max);
-        // One point is 8 samples: 2 pi 440 * 8 / 48000 = 0.46 at most.
-        assert!(jump < 0.5, "a 440 Hz tone zigzags by {jump}");
-    }
-
-    #[test]
-    fn swings_count_oscillations_not_clicks_or_hiss() {
-        assert_eq!(swings(&[]), 0);
-        assert_eq!(swings(&[0.3; 8]), 0);
-        assert_eq!(swings(&[0.0, 0.1, 0.2, 0.3]), 1);
-        assert_eq!(swings(&[0.1, 0.1, -0.9, 0.1, 0.1]), 2);
-        assert_eq!(swings(&[0.0, 1.0, 0.0, -1.0, 0.0, 1.0]), 3);
-        // A ramp with small hiss on it is still one run.
-        let hissy: Vec<f32> = (0..32)
-            .map(|n| n as f32 * 0.1 + if n % 2 == 0 { 0.05 } else { -0.05 })
-            .collect();
-        assert_eq!(swings(&hissy), 1);
+        // A few points per cycle: the outlines follow the wave and reach
+        // its peaks.
+        for hz in [2_000.0, 3_000.0] {
+            for (upper, lower) in tone_outlines(48_000.0, hz) {
+                let top = upper.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let bottom = lower.iter().copied().fold(f32::INFINITY, f32::min);
+                assert!(top >= 0.9 && bottom <= -0.9, "{hz} Hz: {top} {bottom}");
+            }
+        }
+        // A slow tone's outlines are one curve: apart by at most one point's
+        // travel (2 pi 440 * 8 / 48000 = 0.46), and smooth.
+        for (upper, lower) in tone_outlines(48_000.0, 440.0) {
+            let apart = upper
+                .iter()
+                .zip(lower)
+                .map(|(high, low)| high - low)
+                .fold(0.0, f32::max);
+            assert!(apart < 0.5, "a 440 Hz tone splits by {apart}");
+            let jump = upper
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).abs())
+                .fold(0.0, f32::max);
+            assert!(jump < 0.5, "a 440 Hz tone zigzags by {jump}");
+        }
     }
 
     #[test]
@@ -355,11 +334,11 @@ mod tests {
             tap.push(chunk);
             shots.push(tap.snapshot(0));
         }
-        let first = shots[5].points;
+        let first = outlines(&shots[5]);
         for shot in &shots[6..] {
             let drift = first
                 .iter()
-                .zip(shot.points)
+                .zip(outlines(shot))
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0, f32::max);
             // At most one sample of trigger jitter: 2 pi 440 / 48000 per sample.
@@ -389,9 +368,9 @@ mod tests {
             // different phase.
             for chunk in signal.chunks(733).take(80) {
                 tap.push(chunk);
-                shots.push(tap.snapshot(0).points);
+                shots.push(outlines(&tap.snapshot(0)));
             }
-            let first = shots[10];
+            let first = &shots[10];
             for (index, shot) in shots[11..].iter().enumerate() {
                 let drift = first
                     .iter()
@@ -435,15 +414,15 @@ mod tests {
         let history = tap.ring.len();
         tap.push(&sine(4800, 220.0, 0.8, 0.0));
         tap.push_silence(history);
-        assert_eq!(tap.snapshot(3).points, [0.0; POINTS]);
+        assert_eq!(outlines(&tap.snapshot(3)), [0.0; 2 * POINTS]);
         // Long silence lets the peak fall to the floor; quiet hiss stays small.
         tap.push_silence(10 * RATE as usize);
         tap.push(&sine(history, 3000.0, 0.002, 0.0));
-        let hiss = tap.snapshot(0).points;
+        let hiss = outlines(&tap.snapshot(0));
         assert!(hiss.iter().all(|point| point.abs() <= 0.11), "{hiss:?}");
         // Non-finite samples are treated as silence.
         tap.push(&vec![f32::NAN; history]);
-        assert_eq!(tap.snapshot(0).points, [0.0; POINTS]);
+        assert_eq!(outlines(&tap.snapshot(0)), [0.0; 2 * POINTS]);
     }
 
     #[test]
@@ -454,8 +433,9 @@ mod tests {
             onsets: 42,
             ..ScopeSnapshot::default()
         };
-        for (index, point) in snapshot.points.iter_mut().enumerate() {
+        for (index, point) in snapshot.upper.iter_mut().enumerate() {
             *point = index as f32 / POINTS as f32 - 0.5;
+            snapshot.lower[index] = -*point;
         }
         shared.store(&snapshot);
         assert_eq!(shared.load(), snapshot);
@@ -481,7 +461,8 @@ mod tests {
                     onsets += 1;
                     shared.store(&ScopeSnapshot {
                         // Exact in f32 far beyond any count reached here.
-                        points: [onsets as f32; POINTS],
+                        upper: [onsets as f32; POINTS],
+                        lower: [onsets as f32; POINTS],
                         onsets,
                     });
                 }
@@ -493,7 +474,7 @@ mod tests {
             let snapshot = shared.load();
             // Points are never older than the onset count they are read with.
             let floor = snapshot.onsets as f32;
-            assert!(snapshot.points.iter().all(|&point| point >= floor));
+            assert!(outlines(&snapshot).iter().all(|&point| point >= floor));
             assert!(snapshot.onsets >= last);
             last = snapshot.onsets;
             reads.fetch_add(1, Ordering::Release);

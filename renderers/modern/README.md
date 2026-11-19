@@ -152,10 +152,12 @@ change the control-frame wire format.
   so steady tones hold still; the crossing is searched for in the newest
   period of a 30 Hz tone (at least 1,024 samples; 1,600 at 48 kHz), so the
   window can end up to about 33 ms (at 44.1 kHz and above) before the newest
-  sample. Its 256 points each cover 8 samples; tones too fast for them to
-  follow (a few kHz and up) are drawn as a zigzag between each point's
-  extremes, so they keep their loudness. It is peak-normalised with a floor
-  so room hiss stays flat, and silence flattens it smoothly. It is drawn in
+  sample. Its 256 points each cover 8 samples, and it is drawn as two thin
+  lines through each point's highest and lowest sample. For slow sound the
+  two lines coincide; tones too fast for the points (a few kHz and up) and
+  noise separate them into a thin upper and lower outline, so they keep their
+  loudness without filling a band. It is peak-normalised with a floor so room
+  hiss stays flat, and silence flattens it smoothly. Each line is drawn in
   three near-opaque layers: a dimmed palette-tinted halo, a black backing
   inside it, and a near-white tinted core, which keep it readable over scenes
   of the same colour.
@@ -175,15 +177,17 @@ Bursts are not gated by the `unmeasured-flash` feature. This rests on their
 design, not on a photometric measurement: each one is a single smooth, partly
 transparent rise and fall (glow at most 30% and sparks at most 50% opacity),
 with its colour and peak fixed when it starts, over a small part of the screen
-rather than a full-screen change, and new
-bursts start at most once every 0.5 s (two per second, with margin under the
-three-per-second limit for dark rooms and projection), with at most four alive
-at once. A unit test composites a CPU model of the bursts over black at the
+rather than a full-screen change, and new bursts start at most once every
+0.5 s (two per second, with margin under the three-per-second limit for dark
+rooms and projection), with at most four alive at once. A unit test composites a CPU model of the bursts over black at the
 maximum onset rate, including input whose palette and energy change every
 frame at 60, 120 and 240 fps, and finds at most two flashes (opposing changes
-of 0.1 relative luminance) in any 1 s at any sampled point; the scope ribbon is a thin
-line and is not modelled. Measure the actual display before relying on this
-for a photosensitive audience.
+of 0.1 relative luminance) in any 1 s at any sampled point. The scope ribbon
+is outside that model; its exemption rests on staying thin lines, and another
+test gates a loud 4 kHz tone and white noise at 3, 5 and 10 Hz and checks that
+the ribbon never draws, or changes by, more area than a steady full-scale
+440 Hz ribbon. Measure the
+actual display before relying on this for a photosensitive audience.
 
 ```sh
 just modern-m1 -- --mic --mic-layers both
