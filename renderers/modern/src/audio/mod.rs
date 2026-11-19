@@ -15,8 +15,8 @@ pub use capture::{InputDevices, MicSource};
 
 use crate::control_frame::{ControlFrame, MAX_NOTES, Note};
 
-const BEAT_FLAG: u8 = 0x01;
-const BAR_FLAG: u8 = 0x02;
+pub const BEAT_FLAG: u8 = 0x01;
+pub const BAR_FLAG: u8 = 0x02;
 const BEATS_PER_BAR: u16 = 4;
 
 /// Latest analysed features, published without locks. Only the transport

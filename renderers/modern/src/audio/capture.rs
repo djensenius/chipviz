@@ -7,7 +7,10 @@
 //! [`SharedFeatures`]. Samples dropped on either side are reported to the
 //! analyzer with [`Analyzer::skip`] so its beat clock keeps real time. If the
 //! device stops delivering, the thread feeds silence so the published levels
-//! decay instead of freezing.
+//! decay instead of freezing. [`SampleClock`] counts each stretch of time
+//! once: the stall threshold adapts to devices that deliver in large batches,
+//! and real samples that arrive late for time already filled with silence are
+//! discarded rather than analysed a second time.
 //!
 //! The stream is not reopened: if the device is unplugged or fails, cpal
 //! reports an error (printed, rate-limited) and the levels decay to silence
@@ -28,6 +31,7 @@ const RING_S: f32 = 1.0;
 const MAX_BACKLOG_S: f32 = 0.1;
 const POLL: Duration = Duration::from_millis(5);
 const STALL: Duration = Duration::from_millis(100);
+const MAX_STALL: Duration = Duration::from_millis(500);
 const SILENCE_WARNING: Duration = Duration::from_secs(3);
 const ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const PERMISSION_HINT: &str = if cfg!(target_os = "macos") {
@@ -281,6 +285,89 @@ impl ErrorLimiter {
     }
 }
 
+/// How one poll's samples are spent. Every sample here is time the analyzer
+/// accounts for exactly once.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Accounting {
+    /// Late real samples covering time already filled with silence. They are
+    /// consumed (oldest first) without reaching the analyzer.
+    overlap: usize,
+    /// Silence to synthesize because the device has stalled.
+    silence: usize,
+}
+
+/// Single time base for the analysis thread: real samples (analysed or
+/// skipped) plus synthesized silence advance the analyzer, and no wall-clock
+/// interval is counted twice.
+///
+/// A delivery of `n` samples seen at `now` is taken to cover the
+/// `n / rate` seconds ending at `now`. Silence is synthesized only after a
+/// stall, from the end of the covered time up to `now`. When real samples
+/// later turn up for time that silence already covered, that overlap is
+/// discarded, so it is never counted twice.
+#[derive(Debug)]
+struct SampleClock {
+    rate: f32,
+    /// No audio for this long counts as a stall. It grows (up to `MAX_STALL`)
+    /// to cover the longest gap seen between deliveries, so batched devices do
+    /// not trigger silence between their batches.
+    stall: Duration,
+    last_audio: Instant,
+    /// Wall-clock time up to which the analyzer has been fed.
+    covered_until: Instant,
+    silence_debt: f64,
+    /// Synthesized silence that late real samples may still overlap.
+    unmatched_silence: usize,
+}
+
+impl SampleClock {
+    fn new(rate: f32, now: Instant) -> Self {
+        Self {
+            rate,
+            stall: STALL,
+            last_audio: now,
+            covered_until: now,
+            silence_debt: 0.0,
+            unmatched_silence: 0,
+        }
+    }
+
+    /// `real` is every real sample that became known this poll: dropped by
+    /// the callback plus waiting in the ring.
+    fn poll(&mut self, now: Instant, real: usize) -> Accounting {
+        let mut accounting = Accounting::default();
+        let rate = f64::from(self.rate);
+        if real > 0 {
+            let gap = now.duration_since(self.last_audio);
+            self.stall = self.stall.max((gap + gap / 2).min(MAX_STALL));
+            let span = Duration::from_secs_f64(real as f64 / rate);
+            let overlap = (self.covered_until + span).saturating_duration_since(now);
+            let overlap = (overlap.as_secs_f64() * rate).round() as usize;
+            if overlap == 0 {
+                self.unmatched_silence = 0;
+            } else {
+                accounting.overlap = overlap.min(self.unmatched_silence).min(real);
+                self.unmatched_silence -= accounting.overlap;
+            }
+            self.last_audio = now;
+            self.covered_until = self.covered_until.max(now);
+            self.silence_debt = 0.0;
+        } else if now.duration_since(self.last_audio) > self.stall {
+            // Keep the fractional remainder so the clock does not drift.
+            self.silence_debt += now
+                .saturating_duration_since(self.covered_until)
+                .as_secs_f64()
+                * rate;
+            let whole = self.silence_debt.floor();
+            self.silence_debt -= whole;
+            accounting.silence = whole as usize;
+            self.unmatched_silence += accounting.silence;
+            self.covered_until = self.covered_until.max(now);
+        }
+        accounting
+    }
+}
+
 fn analysis_loop(
     analyzer: &mut Analyzer,
     mut consumer: rtrb::Consumer<f32>,
@@ -291,44 +378,44 @@ fn analysis_loop(
     let rate = analyzer.sample_rate();
     let max_backlog = (rate * MAX_BACKLOG_S) as usize;
     let started = Instant::now();
-    let mut last_audio = started;
-    let mut last_poll = started;
-    let mut silence_debt = 0.0f32;
+    let mut clock = SampleClock::new(rate, started);
     let mut heard_signal = false;
     let mut warned = false;
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         let mut skipped = dropped.swap(0, Ordering::Relaxed);
+        let accounting = clock.poll(now, skipped + consumer.slots());
+
+        // Late samples for time already filled with silence: drop the
+        // callback-dropped ones first, then the oldest samples in the ring.
+        let overlap_dropped = accounting.overlap.min(skipped);
+        skipped -= overlap_dropped;
+        let mut discard = accounting.overlap - overlap_dropped;
         let available = consumer.slots();
-        if available > max_backlog
-            && let Ok(stale) = consumer.read_chunk(available - max_backlog)
+        if available > discard + max_backlog {
+            skipped += available - discard - max_backlog;
+            discard = available - max_backlog;
+        }
+        if discard > 0
+            && let Ok(stale) = consumer.read_chunk(discard)
         {
-            skipped += available - max_backlog;
             stale.commit_all();
         }
         if skipped > 0 {
             analyzer.skip(skipped);
         }
         let available = consumer.slots();
-        if available > 0 {
-            if let Ok(chunk) = consumer.read_chunk(available) {
-                let (first, second) = chunk.as_slices();
-                heard_signal |= first.iter().chain(second).any(|&s| s != 0.0);
-                analyzer.push(first);
-                analyzer.push(second);
-                chunk.commit_all();
-            }
-            last_audio = now;
-            silence_debt = 0.0;
-        } else if now.duration_since(last_audio) > STALL {
-            // Keep the fractional remainder so the clock does not drift.
-            silence_debt += now.duration_since(last_poll).as_secs_f32() * rate;
-            let whole = silence_debt.floor();
-            silence_debt -= whole;
-            analyzer.push_silence(whole as usize);
+        if available > 0
+            && let Ok(chunk) = consumer.read_chunk(available)
+        {
+            let (first, second) = chunk.as_slices();
+            heard_signal |= first.iter().chain(second).any(|&s| s != 0.0);
+            analyzer.push(first);
+            analyzer.push(second);
+            chunk.commit_all();
         }
-        last_poll = now;
+        analyzer.push_silence(accounting.silence);
         shared.store(analyzer.features());
 
         if !warned && !heard_signal && now.duration_since(started) > SILENCE_WARNING {
@@ -355,5 +442,94 @@ mod tests {
         assert_eq!(limiter.report(start + Duration::from_secs(2)), None);
         assert_eq!(limiter.report(start + ERROR_REPORT_INTERVAL), Some(2));
         assert_eq!(limiter.report(start + ERROR_REPORT_INTERVAL), None);
+    }
+
+    const RATE: f32 = 48_000.0;
+
+    fn samples(duration: Duration) -> usize {
+        (duration.as_secs_f64() * RATE as f64).round() as usize
+    }
+
+    /// Replays callbacks (delivery time, samples) against 5 ms polls and
+    /// returns the samples the analyzer accounted for and the silence fed.
+    fn replay(callbacks: &[(Duration, usize)], end: Duration) -> (usize, usize) {
+        let start = Instant::now();
+        let mut clock = SampleClock::new(RATE, start);
+        let (mut pending, mut accounted, mut silence) = (0, 0, 0);
+        let mut next = callbacks.iter().peekable();
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= end {
+            while let Some((_, count)) = next.next_if(|(at, _)| *at <= elapsed) {
+                pending += count;
+            }
+            let accounting = clock.poll(start + elapsed, pending);
+            accounted += pending - accounting.overlap + accounting.silence;
+            silence += accounting.silence;
+            pending = 0;
+            elapsed += POLL;
+        }
+        (accounted, silence)
+    }
+
+    fn assert_close(accounted: usize, expected: Duration) {
+        let error = accounted.abs_diff(samples(expected));
+        assert!(
+            error <= samples(Duration::from_millis(15)),
+            "accounted {accounted} samples, expected {}",
+            samples(expected)
+        );
+    }
+
+    #[test]
+    fn steady_small_callbacks_need_no_silence() {
+        let callbacks: Vec<_> = (1..=200)
+            .map(|i| {
+                (
+                    Duration::from_millis(10 * i),
+                    samples(Duration::from_millis(10)),
+                )
+            })
+            .collect();
+        let (accounted, silence) = replay(&callbacks, Duration::from_secs(2));
+        assert_close(accounted, Duration::from_secs(2));
+        assert_eq!(silence, 0);
+    }
+
+    #[test]
+    fn batched_callbacks_count_each_interval_once() {
+        // 2 s of audio arriving as 200 ms batches, each 200 ms late.
+        let batch = Duration::from_millis(200);
+        let callbacks: Vec<_> = (1..=10).map(|i| (batch * i, samples(batch))).collect();
+        let (accounted, _) = replay(&callbacks, Duration::from_secs(2));
+        assert_close(accounted, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn batches_split_across_polls_count_each_interval_once() {
+        // Each 250 ms batch arrives as two callbacks 7 ms apart.
+        let mut callbacks = Vec::new();
+        for i in 1..=8u32 {
+            let at = Duration::from_millis(250) * i;
+            callbacks.push((at, samples(Duration::from_millis(125))));
+            callbacks.push((
+                at + Duration::from_millis(7),
+                samples(Duration::from_millis(125)),
+            ));
+        }
+        let (accounted, _) = replay(&callbacks, Duration::from_millis(2010));
+        assert_close(accounted, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_outage_is_filled_with_silence_and_live_audio_is_kept_afterwards() {
+        // 0.5 s of audio, 1 s with nothing, then live audio again.
+        let chunk = samples(Duration::from_millis(10));
+        let callbacks: Vec<_> = (1..=50)
+            .chain(151..=200)
+            .map(|i| (Duration::from_millis(10 * i), chunk))
+            .collect();
+        let (accounted, silence) = replay(&callbacks, Duration::from_secs(2));
+        assert_close(accounted, Duration::from_secs(2));
+        assert!(silence >= samples(Duration::from_millis(950)), "{silence}");
     }
 }
