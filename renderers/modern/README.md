@@ -150,15 +150,17 @@ change the control-frame wire format.
 - `scope`: an oscilloscope ribbon across the lower part of the screen. With
   `--mic`, it shows a 2,048-sample window aligned on a rising zero crossing,
   so steady tones hold still; the crossing is searched for in the newest
-  1,024 samples, so the window can end up to that much (about 21 ms at
-  48 kHz) before the newest sample. It is peak-normalised with a floor so room
-  hiss stays flat, and silence flattens it smoothly. A dark edge under a
-  whitened core keeps it readable over scenes of the same colour.
+  period of a 30 Hz tone (at least 1,024 samples; 1,600 at 48 kHz), so the
+  window can end up to about 33 ms (at 44.1 kHz and above) before the newest
+  sample. It is peak-normalised with a floor so room hiss stays flat, and
+  silence flattens it smoothly. It is drawn in three opaque layers: a dimmed palette-tinted halo,
+  a black backing inside it, and a near-white tinted core, which keep it
+  readable over scenes of the same colour.
 - `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
   rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
   one arriving less than 0.5 s after the last burst started is skipped, and
   onsets while bursts are hidden (layers `off` or `scope`, or scene 7) start
-  nothing.
+  nothing. Hiding bursts drops any still fading, so none reappear mid-fade.
 
 With `--mic`, the analysis thread publishes the samples and onset count
 through a lock-free side channel (atomics only), which the render thread reads
@@ -168,13 +170,15 @@ fire when `beat_count` changes.
 
 Bursts are not gated by the `unmeasured-flash` feature. This rests on their
 design, not on a photometric measurement: each one is a single smooth, partly
-transparent rise and fall (glow at most 30% and sparks at most 50% opacity)
-over a small part of the screen rather than a full-screen change, and new
+transparent rise and fall (glow at most 30% and sparks at most 50% opacity),
+with its colour and peak fixed when it starts, over a small part of the screen
+rather than a full-screen change, and new
 bursts start at most once every 0.5 s (two per second, with margin under the
 three-per-second limit for dark rooms and projection), with at most four alive
 at once. A unit test composites a CPU model of the bursts over black at the
-maximum onset rate and finds at most two flashes (opposing changes of 0.1
-relative luminance) in any 1 s at any sampled point; the scope ribbon is a thin
+maximum onset rate, including input whose palette and energy change every
+frame at 60, 120 and 240 fps, and finds at most two flashes (opposing changes
+of 0.1 relative luminance) in any 1 s at any sampled point; the scope ribbon is a thin
 line and is not modelled. Measure the actual display before relying on this
 for a photosensitive audience.
 

@@ -16,9 +16,12 @@ pub const POINTS: usize = 256;
 /// Samples shown per snapshot (about 43 ms at 48 kHz).
 pub const SPAN: usize = 2048;
 /// Samples searched before the shown span for a rising zero crossing, so a
-/// steady tone stands still instead of scrolling.
-const SEARCH: usize = 1024;
-const HISTORY: usize = SPAN + SEARCH;
+/// steady tone stands still instead of scrolling: at least one period of
+/// `LOWEST_HZ` at the input rate, within `MIN_SEARCH..=MAX_SEARCH`.
+const LOWEST_HZ: f32 = 30.0;
+const MIN_SEARCH: usize = 1024;
+/// One `LOWEST_HZ` period at 384 kHz, which bounds memory for any rate.
+const MAX_SEARCH: usize = 12_800;
 /// The gain normaliser's peak never drops below this (about -34 dBFS), so
 /// room hiss stays small instead of being amplified to full height.
 pub const PEAK_FLOOR: f32 = 0.02;
@@ -53,12 +56,13 @@ pub struct ScopeTap {
 
 impl ScopeTap {
     pub fn new(sample_rate: f32) -> Self {
+        let history = SPAN + search(sample_rate);
         Self {
-            ring: vec![0.0; HISTORY],
+            ring: vec![0.0; history],
             head: 0,
             peak: PEAK_FLOOR,
             release: (-1.0 / (sample_rate.max(1.0) * PEAK_RELEASE_S)).exp(),
-            scratch: vec![0.0; HISTORY],
+            scratch: vec![0.0; history],
         }
     }
 
@@ -67,21 +71,22 @@ impl ScopeTap {
             let sample = if sample.is_finite() { sample } else { 0.0 };
             self.peak = sample.abs().max(self.peak * self.release);
             self.ring[self.head] = sample;
-            self.head = (self.head + 1) % HISTORY;
+            self.head = (self.head + 1) % self.ring.len();
         }
     }
 
     pub fn push_silence(&mut self, count: usize) {
         const CHUNK: [f32; 256] = [0.0; 256];
-        let mut remaining = count.min(HISTORY);
+        let history = self.ring.len();
+        let mut remaining = count.min(history);
         while remaining > 0 {
             let take = remaining.min(CHUNK.len());
             self.push(&CHUNK[..take]);
             remaining -= take;
         }
         // Long silences still decay the peak by their full length.
-        if count > HISTORY {
-            self.peak *= self.release.powf((count - HISTORY) as f32);
+        if count > history {
+            self.peak *= self.release.powf((count - history) as f32);
         }
     }
 
@@ -103,7 +108,18 @@ impl ScopeTap {
     }
 }
 
-/// Start of the shown span in `history` (`HISTORY` samples, oldest first):
+/// Trigger search length for `sample_rate`; see `MIN_SEARCH`.
+fn search(sample_rate: f32) -> usize {
+    let period = (sample_rate / LOWEST_HZ).ceil();
+    if period.is_nan() {
+        return MIN_SEARCH;
+    }
+    // Saturating float-to-int conversion, then bounded.
+    (period as usize).clamp(MIN_SEARCH, MAX_SEARCH)
+}
+
+/// Start of the shown span in `history` (oldest first, `SPAN` plus the
+/// search length):
 /// the latest rising zero crossing that leaves a full span after it, or the
 /// newest span when there is none.
 pub fn trigger(history: &[f32]) -> usize {
@@ -235,11 +251,60 @@ mod tests {
         assert!(peak > 0.95 && peak <= 1.0, "{peak}");
     }
 
+    fn tone(rate: f32, count: usize, hz: f32) -> Vec<f32> {
+        (0..count)
+            .map(|n| 0.5 * (std::f32::consts::TAU * hz * n as f32 / rate + 0.3).sin())
+            .collect()
+    }
+
+    #[test]
+    fn low_tones_stay_aligned_at_any_rate() {
+        // One period of each is 1,200 samples, longer than a fixed 1,024
+        // sample search would cover.
+        for (rate, hz) in [(48_000.0, 40.0), (96_000.0, 80.0)] {
+            let mut tap = ScopeTap::new(rate);
+            let signal = tone(rate, 4 * rate as usize, hz);
+            let mut shots = Vec::new();
+            // Chunks that do not divide the period, so each snapshot ends at a
+            // different phase.
+            for chunk in signal.chunks(733).take(80) {
+                tap.push(chunk);
+                shots.push(tap.snapshot(0).points);
+            }
+            let first = shots[10];
+            for (index, shot) in shots[11..].iter().enumerate() {
+                let drift = first
+                    .iter()
+                    .zip(shot)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(
+                    drift < 0.03,
+                    "{rate} Hz rate, {hz} Hz tone, shot {index}: {drift}"
+                );
+            }
+            assert!(first[0] >= 0.0 && first[1] > first[0], "{:?}", &first[..4]);
+        }
+    }
+
+    #[test]
+    fn history_covers_the_lowest_tone_period() {
+        for rate in [8_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0] {
+            let tap = ScopeTap::new(rate);
+            let search = tap.ring.len() - SPAN;
+            assert!(search as f32 >= rate / LOWEST_HZ, "{rate}: {search}");
+            assert!(search >= MIN_SEARCH);
+        }
+        // Absurd rates stay bounded.
+        assert!(ScopeTap::new(f32::INFINITY).ring.len() <= SPAN + MAX_SEARCH);
+        assert_eq!(ScopeTap::new(f32::NAN).ring.len(), SPAN + MIN_SEARCH);
+    }
+
     #[test]
     fn trigger_falls_back_to_the_newest_span() {
-        let flat = vec![0.25; HISTORY];
-        assert_eq!(trigger(&flat), SEARCH);
-        let mut edge = vec![-1.0; HISTORY];
+        let flat = vec![0.25; SPAN + MIN_SEARCH];
+        assert_eq!(trigger(&flat), MIN_SEARCH);
+        let mut edge = vec![-1.0; SPAN + MIN_SEARCH];
         edge[100..].fill(1.0);
         assert_eq!(trigger(&edge), 100);
     }
@@ -247,16 +312,17 @@ mod tests {
     #[test]
     fn silence_flattens_and_hiss_is_not_amplified() {
         let mut tap = ScopeTap::new(RATE);
+        let history = tap.ring.len();
         tap.push(&sine(4800, 220.0, 0.8, 0.0));
-        tap.push_silence(HISTORY);
+        tap.push_silence(history);
         assert_eq!(tap.snapshot(3).points, [0.0; POINTS]);
         // Long silence lets the peak fall to the floor; quiet hiss stays small.
         tap.push_silence(10 * RATE as usize);
-        tap.push(&sine(HISTORY, 3000.0, 0.002, 0.0));
+        tap.push(&sine(history, 3000.0, 0.002, 0.0));
         let hiss = tap.snapshot(0).points;
         assert!(hiss.iter().all(|point| point.abs() <= 0.11), "{hiss:?}");
         // Non-finite samples are treated as silence.
-        tap.push(&[f32::NAN; HISTORY]);
+        tap.push(&vec![f32::NAN; history]);
         assert_eq!(tap.snapshot(0).points, [0.0; POINTS]);
     }
 

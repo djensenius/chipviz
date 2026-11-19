@@ -19,7 +19,9 @@
 //! silence decays it smoothly to a flat line instead of cutting.
 //!
 //! Flash design (not a measured compliance claim): a burst is one smooth rise
-//! (`ATTACK_S`) and exponential fall, so each is at most one flash. Bursts
+//! (`ATTACK_S`) and exponential fall, so each is at most one flash. Its
+//! colour and peak strength are fixed when it starts, so later palette or
+//! energy changes cannot make a live burst flicker. Bursts
 //! start at most once every `MIN_BURST_GAP_S` (2 per second, below the
 //! 3-per-second WCAG 2.3.1 general flash limit that
 //! `shared/specs/colour-field-v0.md` also follows) however fast onsets
@@ -184,7 +186,10 @@ pub fn synthesise(frame: ControlFrame, elapsed: f32) -> [f32; POINTS] {
 struct Burst {
     born: f32,
     serial: u32,
+    /// Peak intensity, from the energy at onset.
     strength: f32,
+    /// RGB from the palette and energy at onset.
+    color: [f32; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -239,7 +244,9 @@ impl MicLayers {
     /// (live) or beat (fallback). The ribbon eases whatever the mode, so
     /// toggling it on shows its current state, but bursts only start while
     /// they are drawn (`shown`, see [`shown`], and the mode includes
-    /// bursts), so none pop in mid-fade. Time never runs backwards here.
+    /// bursts), so none pop in mid-fade. Live bursts are dropped while hidden
+    /// (the start-rate cap is kept), so none reappear mid-fade either. Time
+    /// never runs backwards here.
     pub fn step(
         &mut self,
         frame: ControlFrame,
@@ -277,20 +284,23 @@ impl MicLayers {
         );
         self.last_trigger = Some(trigger);
 
+        let hidden = !shown || !self.mode.bursts();
         for slot in &mut self.bursts {
-            if slot.is_some_and(|burst| now - burst.born >= LIFETIME_S) {
+            if hidden || slot.is_some_and(|burst| now - burst.born >= LIFETIME_S) {
                 *slot = None;
             }
         }
         let rested = self
             .last_burst
             .is_none_or(|last| now - last >= MIN_BURST_GAP_S);
-        if onset && rested && shown && self.mode.bursts() {
+        if onset && rested && !hidden {
             let energy = f32::from(frame.energy) / 255.0;
+            let [red, green, blue, _] = palette(frame.palette.wrapping_add(2), 1.0, energy);
             let burst = Burst {
                 born: now,
                 serial: self.serial,
                 strength: 0.55 + 0.45 * energy,
+                color: [red, green, blue],
             };
             self.serial = self.serial.wrapping_add(1);
             self.last_burst = Some(now);
@@ -311,7 +321,7 @@ impl MicLayers {
     pub fn build(&self, frame: ControlFrame, aspect: f32, instances: &mut Vec<Instance>) {
         let aspect = aspect.max(0.01);
         if self.mode.bursts() {
-            self.build_bursts(frame, aspect, instances);
+            self.build_bursts(aspect, instances);
         }
         if self.mode.scope() {
             self.build_ribbon(frame, aspect, instances);
@@ -360,11 +370,10 @@ impl MicLayers {
         }
     }
 
-    fn build_bursts(&self, frame: ControlFrame, aspect: f32, instances: &mut Vec<Instance>) {
+    fn build_bursts(&self, aspect: f32, instances: &mut Vec<Instance>) {
         let Some(now) = self.last_elapsed else {
             return;
         };
-        let energy = f32::from(frame.energy) / 255.0;
         let mut bursts: Vec<Burst> = self.bursts.iter().flatten().copied().collect();
         bursts.sort_by(|a, b| a.born.total_cmp(&b.born));
         for burst in bursts {
@@ -381,8 +390,8 @@ impl MicLayers {
             #[cfg(test)]
             let center = self.pinned.unwrap_or(center);
             let radius = 0.06 + 0.42 * (1.0 - (-age / 0.3).exp());
-            let mut color = palette(frame.palette.wrapping_add(2), 1.0, energy);
-            color[3] = envelope * GLOW_ALPHA;
+            let [red, green, blue] = burst.color;
+            let mut color = [red, green, blue, envelope * GLOW_ALPHA];
             instances.push(Instance {
                 center: [center[0], center[1], 0.0],
                 size: [radius * 1.6, radius * 1.6],
@@ -772,21 +781,17 @@ mod tests {
         assert!(transitions(&[0.0, 0.05, 0.0, 0.09], 0.1).is_empty());
     }
 
-    /// A CPU model of the bursts, not a photometric measurement: onsets every
-    /// frame at full energy, the brightest burst palette, over black. With
-    /// hashed positions few bursts land on any one point, so the second case
-    /// pins every burst to one spot: there each burst is a flash, and only
-    /// the start-rate cap keeps it to 2 flashes (pairs of opposing changes of
-    /// at least 0.1 relative luminance) in any 1 s, under the limit of 3.
-    #[test]
-    fn flash_model_stays_under_three_flashes_per_second_at_max_onset_rate() {
+    /// The most flashes (pairs of opposing changes of at least 0.1 relative
+    /// luminance, see [`transitions`]) in any 1 s at any probe, and the
+    /// brightest value seen, over 6 s at `fps`. `input` gives each frame and
+    /// whether the onset arrives live (a new onset count every frame) or by
+    /// fallback (a new `beat_count` every frame).
+    fn worst_flashes(
+        fps: f32,
+        pinned: Option<[f32; 2]>,
+        input: impl Fn(usize) -> (ControlFrame, bool),
+    ) -> (usize, usize, f32) {
         let aspect = 16.0 / 9.0;
-        // Burst colours use `frame.palette + 2`; palette 0 is white.
-        let frame = ControlFrame {
-            energy: 255,
-            palette: 2,
-            ..quiet()
-        };
         let (columns, rows) = (48, 27);
         let mut probes: Vec<[f32; 2]> = (0..columns * rows)
             .map(|probe| {
@@ -798,44 +803,59 @@ mod tests {
             .collect();
         // The pinned spot itself and points across its glow.
         probes.extend((0..=8).map(|step| [step as f32 * 0.03, 0.0]));
-        for pinned in [None, Some([0.0, 0.0])] {
-            let mut layers = MicLayers::new(Mode::Bursts);
-            layers.pinned = pinned;
-            let frames = 6 * FPS as usize;
-            let mut series = vec![Vec::with_capacity(frames); probes.len()];
-            let mut brightest = 0.0_f32;
-            for step in 0..frames {
-                layers.step(
-                    frame,
-                    Some(&snapshot(0.0, step as u32)),
-                    step as f32 / FPS,
-                    true,
-                );
-                let mut instances = Vec::new();
-                layers.build(frame, aspect, &mut instances);
-                for (point, values) in probes.iter().zip(&mut series) {
-                    let value = luminance(&instances, *point);
-                    brightest = brightest.max(value);
-                    values.push(value);
-                }
+        let mut layers = MicLayers::new(Mode::Bursts);
+        layers.pinned = pinned;
+        let frames = 6 * fps as usize;
+        let mut series = vec![Vec::with_capacity(frames); probes.len()];
+        let mut brightest = 0.0_f32;
+        for step in 0..frames {
+            let (mut frame, live) = input(step);
+            frame.beat_count = step as u16;
+            let scope = snapshot(0.0, step as u32);
+            layers.step(frame, live.then_some(&scope), step as f32 / fps, true);
+            let mut instances = Vec::new();
+            layers.build(frame, aspect, &mut instances);
+            for (point, values) in probes.iter().zip(&mut series) {
+                let value = luminance(&instances, *point);
+                brightest = brightest.max(value);
+                values.push(value);
             }
+        }
+        let window = fps as usize;
+        let mut worst = 0;
+        for values in &series {
+            let found = transitions(values, 0.1);
+            for (index, &start) in found.iter().enumerate() {
+                let within = found[index..]
+                    .iter()
+                    .take_while(|&&later| later < start + window)
+                    .count();
+                worst = worst.max(within);
+            }
+        }
+        (worst / 2, worst, brightest)
+    }
+
+    /// A CPU model of the bursts, not a photometric measurement: onsets every
+    /// frame at full energy, the brightest burst palette, over black. With
+    /// hashed positions few bursts land on any one point, so the second case
+    /// pins every burst to one spot: there each burst is a flash, and only
+    /// the start-rate cap keeps it to 2 flashes (pairs of opposing changes of
+    /// at least 0.1 relative luminance) in any 1 s, under the limit of 3.
+    #[test]
+    fn flash_model_stays_under_three_flashes_per_second_at_max_onset_rate() {
+        // Burst colours use `frame.palette + 2`; palette 0 is white.
+        let frame = ControlFrame {
+            energy: 255,
+            palette: 2,
+            ..quiet()
+        };
+        for pinned in [None, Some([0.0, 0.0])] {
+            let (flashes, worst, brightest) = worst_flashes(FPS, pinned, |_| (frame, true));
             assert!(
                 brightest > 0.1,
                 "the model must see the bursts: {brightest}"
             );
-            let window = FPS as usize;
-            let mut worst = 0;
-            for values in &series {
-                let found = transitions(values, 0.1);
-                for (index, &start) in found.iter().enumerate() {
-                    let within = found[index..]
-                        .iter()
-                        .take_while(|&&later| later < start + window)
-                        .count();
-                    worst = worst.max(within);
-                }
-            }
-            let flashes = worst / 2;
             assert!(
                 flashes <= 2,
                 "{pinned:?}: {flashes} flashes ({worst} opposing changes) in 1 s"
@@ -845,6 +865,67 @@ mod tests {
                 // the count: it must reach the capped rate.
                 assert_eq!(flashes, 2, "pinned bursts must each flash: {worst}");
             }
+        }
+    }
+
+    /// Input that changes every frame (palettes 0 and 2, full and zero
+    /// energy, as from UDP) must not re-colour live bursts into extra
+    /// flashes: each burst keeps its onset colour and strength, so the cap
+    /// still bounds the rate below the limit of 3 at any frame rate.
+    #[test]
+    fn flash_model_holds_while_palette_and_energy_change_every_frame() {
+        let changing = |step: usize| ControlFrame {
+            palette: if step.is_multiple_of(2) { 0 } else { 2 },
+            energy: if step % 4 < 2 { 255 } else { 0 },
+            ..quiet()
+        };
+        for fps in [60.0, 120.0, 240.0] {
+            for live in [true, false] {
+                for pinned in [None, Some([0.0, 0.0])] {
+                    let (flashes, worst, brightest) =
+                        worst_flashes(fps, pinned, |step| (changing(step), live));
+                    let case = format!("{fps} Hz, live {live}, pinned {pinned:?}");
+                    assert!(brightest > 0.1, "{case}: unseen bursts: {brightest}");
+                    assert!(
+                        flashes <= 2,
+                        "{case}: {flashes} flashes ({worst} opposing changes) in 1 s"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hiding_drops_live_bursts_but_keeps_the_start_cap() {
+        for hide in [
+            |layers: &mut MicLayers| (false, layers.mode()),
+            |_: &mut MicLayers| (true, Mode::Off),
+            |_: &mut MicLayers| (true, Mode::Scope),
+        ] {
+            let mut layers = MicLayers::new(Mode::Both);
+            layers.step(quiet(), Some(&snapshot(0.0, 0)), 0.0, true);
+            layers.step(quiet(), Some(&snapshot(0.0, 1)), 0.1, true);
+            assert_eq!(live_bursts(&layers), 1);
+            // Hidden by the colour field (not shown) or by cycling the mode.
+            let (shown, mode) = hide(&mut layers);
+            layers.set_mode(mode);
+            layers.step(quiet(), Some(&snapshot(0.0, 1)), 0.2, shown);
+            assert_eq!(live_bursts(&layers), 0, "{mode:?} shown={shown}");
+            // Shown again mid-fade: nothing reappears, and an onset inside
+            // the start gap of the dropped burst still waits.
+            layers.set_mode(Mode::Both);
+            layers.step(quiet(), Some(&snapshot(0.0, 2)), 0.3, true);
+            let mut instances = Vec::new();
+            layers.build(quiet(), 1.0, &mut instances);
+            assert_eq!(live_bursts(&layers), 0, "{mode:?}: start cap kept");
+            assert_eq!(instances.len(), RIBBON_PASSES.len() * (POINTS - 1));
+            layers.step(
+                quiet(),
+                Some(&snapshot(0.0, 3)),
+                0.1 + MIN_BURST_GAP_S,
+                true,
+            );
+            assert_eq!(live_bursts(&layers), 1, "{mode:?}: fires after the gap");
         }
     }
 }

@@ -682,6 +682,34 @@ fn snapshot(
     }
 }
 
+/// Advances the analyzer and scope tap through one poll: synthesized
+/// `silence`, then the skipped interval, then the retained ring samples.
+/// The tap has no beat clock, so it records skipped time as silence: audio
+/// from before the gap ages out and the peak normaliser releases across it.
+/// Returns whether any analysed sample was non-zero.
+fn feed(
+    analyzer: &mut Analyzer,
+    tap: &mut ScopeTap,
+    silence: usize,
+    drain: &Drain,
+    consumer: &mut rtrb::Consumer<f32>,
+) -> bool {
+    // Silence covers time before this poll's real samples.
+    analyzer.push_silence(silence);
+    tap.push_silence(silence);
+    if drain.skip > 0 {
+        analyzer.skip(drain.skip);
+        tap.push_silence(drain.skip);
+    }
+    let mut heard = false;
+    drain.apply(consumer, |samples| {
+        heard |= samples.iter().any(|&s| s != 0.0);
+        analyzer.push(samples);
+        tap.push(samples);
+    });
+    heard
+}
+
 /// Where the analysis thread publishes each poll's results.
 struct Outputs<'a> {
     features: &'a SharedFeatures,
@@ -707,17 +735,13 @@ fn analysis_loop(
         let (now, dropped, available) = snapshot(dropped, &consumer, Instant::now);
         let accounting = clock.poll(now, dropped + available);
         let drain = Drain::plan(dropped, available, accounting.overlap, max_backlog);
-        // Silence covers time before this poll's real samples.
-        analyzer.push_silence(accounting.silence);
-        tap.push_silence(accounting.silence);
-        if drain.skip > 0 {
-            analyzer.skip(drain.skip);
-        }
-        drain.apply(&mut consumer, |samples| {
-            heard_signal |= samples.iter().any(|&s| s != 0.0);
-            analyzer.push(samples);
-            tap.push(samples);
-        });
+        heard_signal |= feed(
+            analyzer,
+            &mut tap,
+            accounting.silence,
+            &drain,
+            &mut consumer,
+        );
         outputs.features.store(analyzer.features());
         // The onset count wraps; the mic layers only look for changes.
         outputs.scope.store(&tap.snapshot(analyzer.onsets() as u32));
@@ -837,6 +861,52 @@ mod tests {
         assert_eq!(analysed, (4..10).map(|i| i as f32).collect::<Vec<_>>());
         assert_eq!(consumer.slots(), 5);
         assert_eq!(consumer.pop(), Ok(10.0));
+    }
+
+    #[test]
+    fn a_discarded_ring_ages_the_pre_gap_waveform_out_of_the_scope() {
+        let rate = 48_000;
+        let mut analyzer = Analyzer::new(rate).unwrap();
+        let mut tap = ScopeTap::new(rate as f32);
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(rate as usize);
+        let tone = |count: usize| {
+            (0..count).map(|n| 0.8 * (std::f32::consts::TAU * 220.0 * n as f32 / 48_000.0).sin())
+        };
+        for sample in tone(9_600) {
+            producer.push(sample).unwrap();
+        }
+        let drain = Drain::plan(0, consumer.slots(), 0, 48_000);
+        assert!(feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer));
+        assert!(tap.snapshot(0).points.iter().any(|point| point.abs() > 0.5));
+
+        // The ring overflows: its whole contents and the drops are skipped.
+        for sample in tone(rate as usize) {
+            producer.push(sample).unwrap();
+        }
+        // Drops for 2 s: 3 s of skipped time in all.
+        let drain = Drain::plan(2 * rate as usize, consumer.slots(), 0, 4_800);
+        assert_eq!((drain.discard, drain.analyse), (rate as usize, 0));
+        assert!(!feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer));
+        assert_eq!(consumer.slots(), 0);
+        assert_eq!(tap.snapshot(0).points, [0.0; super::super::scope::POINTS]);
+
+        // Quiet post-gap audio is not stretched by the pre-gap peak's gain:
+        // the peak released across the skipped interval.
+        for sample in tone(4_800).map(|sample| sample * 0.05) {
+            producer.push(sample).unwrap();
+        }
+        let drain = Drain::plan(0, consumer.slots(), 0, 4_800);
+        feed(&mut analyzer, &mut tap, 0, &drain, &mut consumer);
+        let peak = tap
+            .snapshot(0)
+            .points
+            .iter()
+            .fold(0.0_f32, |peak, point| peak.max(point.abs()));
+        // Unreleased, the pre-gap peak would hold this near 0.05.
+        assert!(
+            peak > 0.2,
+            "the peak did not release across the gap: {peak}"
+        );
     }
 
     const RATE: f32 = 48_000.0;
