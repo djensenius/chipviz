@@ -52,19 +52,28 @@ static void meter_bounds(void) {
 
 static void reference_geometry(void) {
   int preserved = 1;
+  /* Original formula; frames 0..127 cover every (frame >> 3) & 9 phase. */
   for (int scene = 0; scene <= 5; scene++) {
-    for (int channel = 0; channel < 8; channel++) {
-      meter_rect_t r[4];
-      channel_meter_rects(72, (uint8_t)scene, channel, 255, r);
-      int x = 22 + channel * 35 + (scene - 3) * channel;
-      int y = 210 - 97 - channel * 5 - 9;
-      preserved &= r[0].x0 == x + 8 && r[0].y0 == y - 6 && r[0].x1 == x + 34 && r[0].y1 == y;
-      preserved &= r[1].x0 == x && r[1].y0 == y && r[1].x1 == x + 26 && r[1].y1 == y + 97;
-      preserved &= r[2].x0 == x + 26 && r[2].y0 == y + 6 && r[2].x1 == x + 34 && r[2].y1 == y + 105;
-      preserved &= r[3].x0 == x + 3 && r[3].y0 == y + 93 && r[3].x1 == x + 23 && r[3].y1 == y + 96;
+    for (int frame = 0; frame < 128; frame++) {
+      for (int energy = 0; energy <= 255; energy++) {
+        for (int channel = 0; channel < 8; channel++) {
+          meter_rect_t r[4];
+          channel_meter_rects(frame, (uint8_t)scene, channel, (uint8_t)energy, r);
+          int height = 12 + energy / 3;
+          int depth = channel * 5 + ((frame >> 3) & 9);
+          int x = 22 + channel * 35 + (scene - 3) * channel;
+          int y = 210 - height - depth;
+          preserved &= r[0].x0 == x + 8 && r[0].y0 == y - 6 && r[0].x1 == x + 34 && r[0].y1 == y;
+          preserved &= r[1].x0 == x && r[1].y0 == y && r[1].x1 == x + 26 && r[1].y1 == y + height;
+          preserved &= r[2].x0 == x + 26 && r[2].y0 == y + 6 && r[2].x1 == x + 34 &&
+                       r[2].y1 == y + height + 8;
+          preserved &= r[3].x0 == x + 3 && r[3].y0 == y + height - 4 && r[3].x1 == x + 23 &&
+                       r[3].y1 == y + height - 1;
+        }
+      }
     }
   }
-  require(preserved, "scenes 0..5 preserve all four faces of every meter");
+  require(preserved, "scenes 0..5 preserve all four faces of every meter for every frame phase and energy");
   static const uint8_t scenes[] = {6, 13, 15, 255};
   int repaired = 1;
   for (unsigned s = 0; s < sizeof(scenes) / sizeof(scenes[0]); s++) {

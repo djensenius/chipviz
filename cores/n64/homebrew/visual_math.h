@@ -11,21 +11,23 @@ typedef struct {
  * Preserve the existing color ramps, deliberately saturating instead of
  * wrapping or relying on the final RGBA conversion to clip them.
  */
-static int scene_sky_blue(uint8_t scene) {
+static inline int scene_sky_blue(uint8_t scene) {
   int blue = 58 + scene * 18;
   return blue > 255 ? 255 : blue;
 }
 
-static int scene_floor_green(uint8_t scene) {
+static inline int scene_floor_green(uint8_t scene) {
   int green = 5 + scene * 8;
   return green > 255 ? 255 : green;
 }
 
-/* channel is 0..7; energy is a byte. Rectangles have exclusive lower-right
- * bounds, in draw order: cap, front, side, highlight.
+/* channel is 0..7; energy is a byte. Callers holding int scene/energy values
+ * (decoded from packet bytes, so already 0..255) cast explicitly to uint8_t.
+ * Rectangles have exclusive lower-right bounds, in draw order: cap, front,
+ * side, highlight.
  */
-static void channel_meter_rects(int frame, uint8_t scene, int channel,
-                                uint8_t energy, meter_rect_t rects[4]) {
+static inline void channel_meter_rects(int frame, uint8_t scene, int channel,
+                                       uint8_t energy, meter_rect_t rects[4]) {
   int height = 12 + energy / 3;
   int depth = channel * 5 + ((frame >> 3) & 9);
   int pitch = 32 + scene;

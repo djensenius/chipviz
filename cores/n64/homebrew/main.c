@@ -140,8 +140,8 @@ static void draw_perspective_grid(int frame, const visual_state_t *state) {
   int center = 160 + ((state->midi - 128) / 9);
   int flash = state->beat ? 36 : 0;
 
-  fill_rect(0.0f, 0.0f, 320.0f, (float)horizon, rgba(8 + state->palette * 8, 18 + flash, scene_sky_blue(state->scene)));
-  fill_rect(0.0f, (float)horizon, 320.0f, 240.0f, rgba(3, scene_floor_green(state->scene), 24 + state->palette * 6));
+  fill_rect(0.0f, 0.0f, 320.0f, (float)horizon, rgba(8 + state->palette * 8, 18 + flash, scene_sky_blue((uint8_t)state->scene)));
+  fill_rect(0.0f, (float)horizon, 320.0f, 240.0f, rgba(3, scene_floor_green((uint8_t)state->scene), 24 + state->palette * 6));
 
   for (int row = 0; row < 12; row++) {
     int y = horizon + row * row + ((frame >> 2) & 7);
@@ -174,7 +174,7 @@ static void draw_channel_meters(int frame, const visual_state_t *state) {
       rgba(36 + energy / 3, 70 + state->palette * 11, 150 + i * 8),
       rgba(255, 255, 255),
     };
-    channel_meter_rects(frame, state->scene, i, energy, rects);
+    channel_meter_rects(frame, (uint8_t)state->scene, i, (uint8_t)energy, rects);
     for (int face = 0; face < 4; face++) {
       meter_rect_t rect = rects[face];
       fill_rect((float)rect.x0, (float)rect.y0, (float)rect.x1, (float)rect.y1, colors[face]);
