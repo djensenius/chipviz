@@ -35,12 +35,13 @@ The renderer starts windowed by default.
 | Option | Effect |
 | --- | --- |
 | `--fullscreen` | Start in borderless fullscreen (primary display unless `--monitor` is given). |
-| `--monitor INDEX\|NAME` | Choose the display by index or case-insensitive name substring. Without `--fullscreen`, the window opens on that display. |
+| `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 
 ```sh
 just modern-m1 -- --list-monitors
 just modern-m1 -- --fullscreen --monitor "Studio Display"
+just modern-m1 -- --fullscreen --monitor 1
 ```
 
 | Key | Action |

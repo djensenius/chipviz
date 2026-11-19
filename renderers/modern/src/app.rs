@@ -231,8 +231,10 @@ impl MonitorSelector {
 }
 
 /// Resolves a selector against monitor names (in enumeration order).
-/// Name matching is a case-insensitive substring match; an exact
-/// (case-insensitive) name wins when several monitors match.
+/// All-digit selectors are indices (as printed by `--list-monitors`). Names
+/// match as a case-insensitive substring; a *unique* exact (case-insensitive)
+/// name wins when several monitors match. Duplicate names (e.g. two identical
+/// displays) are ambiguous and must be selected by index.
 fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Result<usize, String> {
     match selector {
         MonitorSelector::Index(index) if *index < names.len() => Ok(*index),
@@ -246,11 +248,14 @@ fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Resul
                 .iter()
                 .map(|name| name.as_ref().map(|name| name.to_lowercase()))
                 .collect();
-            if let Some(index) = lowered
+            let exact: Vec<usize> = lowered
                 .iter()
-                .position(|name| name.as_deref() == Some(&*needle))
-            {
-                return Ok(index);
+                .enumerate()
+                .filter(|(_, name)| name.as_deref() == Some(&*needle))
+                .map(|(index, _)| index)
+                .collect();
+            if let [index] = exact.as_slice() {
+                return Ok(*index);
             }
             let matches: Vec<usize> = lowered
                 .iter()
@@ -264,7 +269,7 @@ fn select_monitor(names: &[Option<String>], selector: &MonitorSelector) -> Resul
                     "no monitor name contains \"{query}\" (see --list-monitors)"
                 )),
                 _ => Err(format!(
-                    "monitor name \"{query}\" is ambiguous: matches indices {matches:?} (see --list-monitors)"
+                    "monitor name \"{query}\" is ambiguous: matches indices {matches:?}; select one with --monitor INDEX (see --list-monitors)"
                 )),
             }
         }
@@ -549,6 +554,25 @@ mod tests {
         assert!(select("dell").unwrap_err().contains("ambiguous"));
         assert_eq!(select("dell u2720q"), Ok(0));
         assert_eq!(select("(2)"), Ok(1));
+    }
+
+    #[test]
+    fn duplicate_exact_names_are_ambiguous_and_need_an_index() {
+        let monitors = names(&[
+            Some("Built-in Retina Display"),
+            Some("DELL U2720Q"),
+            Some("dell u2720q"),
+        ]);
+        let by_name = |query: &str| select_monitor(&monitors, &MonitorSelector::Name(query.into()));
+        let error = by_name("DELL U2720Q").unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("[1, 2]"), "{error}");
+        assert!(error.contains("--monitor INDEX"), "{error}");
+        assert_eq!(by_name("retina"), Ok(0));
+        let by_index = |index: usize| select_monitor(&monitors, &MonitorSelector::Index(index));
+        assert_eq!(by_index(2), Ok(2));
+        assert!(by_index(3).unwrap_err().contains("out of range"));
+        assert_eq!(MonitorSelector::parse("2"), MonitorSelector::Index(2));
     }
 
     #[test]
