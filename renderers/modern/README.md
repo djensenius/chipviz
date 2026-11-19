@@ -61,7 +61,7 @@ needed. Capture is off by default.
 | --- | --- |
 | `--mic` | Drive frames from the microphone (the system default input unless `--audio-device` is given). |
 | `--audio-device INDEX\|NAME` | Choose the input by the index from `--list-audio-devices` (all-digit values are indices) or by name, matched like `--monitor`: a unique exact name, else a unique case-insensitive substring; ambiguous names are rejected. Requires `--mic`. |
-| `--list-audio-devices` | Print each input device's index and name (marking the default), then exit. |
+| `--list-audio-devices` | Print each input device's index and name (marking the default), then exit. Combined with `--list-monitors`, both lists are printed under headings. |
 
 ```sh
 just modern-m1 -- --list-audio-devices
@@ -83,10 +83,24 @@ as in the host bridge), `bpm` (`0` until a tempo is detected), `beat_phase`,
 `beat_count`, and the beat and bar flags. `frame`, `scene`, and `palette`
 follow the same timeline as procedural frames, so scenes still cycle.
 
+The beat clock only moves forward: `beat_count` increments exactly when
+`beat_phase` wraps, and `beat_count * 256 + beat_phase` never decreases. Onsets
+near the expected beat nudge the clock (jumping forward, or briefly slowing
+down) instead of rewinding it; off-beat onsets are ignored. Tempo comes from
+onset gaps folded into 60-200 BPM, so steady eighths read as the quarter-note
+tempo. Known limits: tempos outside 60-200 BPM are folded into that range, 3/4
+and swung feels are not distinguished from straight time, and music with only
+off-beat accents is tracked on those accents.
+
 Analysis runs on its own thread; the render thread reads the latest result
 without waiting. Levels use automatic gain with a noise floor, so quiet and
 loud rooms both move the scenes, room hiss stays dark, and silence (or a
-device that stops sending audio) fades smoothly to zero.
+device that stops sending audio) fades smoothly to zero. Audio dropped while
+analysis catches up still advances the beat clock, so it keeps real time.
+
+The stream is not reopened if the device is unplugged or fails: the renderer
+prints a stream error (at most once every five seconds) and the levels fade to
+silence. Restart the renderer to pick up a reconnected device.
 
 If no input device exists, the name or index matches nothing, or the stream
 cannot be opened, the renderer prints an error and exits with a non-zero
@@ -107,8 +121,15 @@ tccutil reset Microphone
 tccutil reset Microphone com.apple.Terminal
 ```
 
-On Linux, building the renderer needs the ALSA headers (`libasound2-dev` on
-Debian and Raspberry Pi OS).
+On other platforms the silence warning instead suggests checking that the
+input is not muted and is the expected device.
+
+### Linux (including Raspberry Pi 5)
+
+All renderer binaries, including `chipviz-pi5` and `chipviz-capture`, link
+against ALSA even when `--mic` is not used. Building needs the headers
+(`libasound2-dev` on Debian and Raspberry Pi OS) and running needs the runtime
+library (`libasound2`, installed by default on Raspberry Pi OS desktop images).
 
 ## Scene plan
 

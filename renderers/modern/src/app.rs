@@ -9,7 +9,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
-use crate::audio::{self, InputDevices, MicSource};
+use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
@@ -75,15 +75,26 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         ArgsCommand::Run(args) => args,
     };
 
+    // Both list flags may be given together; each list gets a heading then.
+    let both_lists = args.list_audio_devices && args.list_monitors;
     if args.list_audio_devices {
-        InputDevices::enumerate().map_err(AppError::Audio)?.print();
-        return Ok(());
+        let devices = InputDevices::enumerate().map_err(AppError::Audio)?;
+        if both_lists {
+            println!("Audio input devices:");
+        }
+        devices.print();
+        if !args.list_monitors {
+            return Ok(());
+        }
     }
 
     let event_loop = EventLoop::new()?;
 
     if args.list_monitors {
         let monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
+        if both_lists {
+            println!("\nMonitors:");
+        }
         print_monitors(&monitors);
         return Ok(());
     }
@@ -499,6 +510,17 @@ impl UdpFrameSource {
     }
 }
 
+/// Anything that can hand the render thread the latest analysed audio.
+trait LatestFeatures {
+    fn latest(&self) -> AudioFeatures;
+}
+
+impl LatestFeatures for MicSource {
+    fn latest(&self) -> AudioFeatures {
+        MicSource::latest(self)
+    }
+}
+
 fn start_mic(selector: Option<&DeviceSelector>) -> Result<MicSource, String> {
     let devices = InputDevices::enumerate()?;
     let index = selector
@@ -539,7 +561,7 @@ fn idle_source(mic: bool, udp: bool, since_udp: Option<Duration>) -> IdleSource 
 
 struct FrameSource {
     udp: UdpFrameSource,
-    mic: Option<MicSource>,
+    mic: Option<Box<dyn LatestFeatures>>,
     fallback_index: u64,
     latest: ControlFrame,
     last_udp: Option<Instant>,
@@ -548,6 +570,10 @@ struct FrameSource {
 
 impl FrameSource {
     fn new(udp: UdpFrameSource, mic: Option<MicSource>) -> Self {
+        Self::with_feed(udp, mic.map(|mic| Box::new(mic) as Box<dyn LatestFeatures>))
+    }
+
+    fn with_feed(udp: UdpFrameSource, mic: Option<Box<dyn LatestFeatures>>) -> Self {
         Self {
             udp,
             mic,
@@ -559,7 +585,10 @@ impl FrameSource {
     }
 
     fn next_frame(&mut self) -> ControlFrame {
-        let now = Instant::now();
+        self.next_frame_at(Instant::now())
+    }
+
+    fn next_frame_at(&mut self, now: Instant) -> ControlFrame {
         if let Some(frame) = self.udp.receive_latest() {
             self.latest = frame;
             self.last_udp = Some(now);
@@ -874,6 +903,71 @@ mod tests {
         assert!(error.contains("--list-audio-devices"), "{error}");
         let error = select(DeviceSelector::parse("webcam")).unwrap_err();
         assert!(error.contains("no audio input device name"), "{error}");
+    }
+
+    struct FakeMic(std::rc::Rc<std::cell::Cell<AudioFeatures>>);
+
+    impl LatestFeatures for FakeMic {
+        fn latest(&self) -> AudioFeatures {
+            self.0.get()
+        }
+    }
+
+    fn wire_packet(energy: u8) -> [u8; WIRE_SIZE] {
+        let mut packet = [0; WIRE_SIZE];
+        packet[0] = crate::control_frame::MAGIC;
+        packet[8] = energy;
+        packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+        packet
+    }
+
+    #[test]
+    fn mic_beat_flag_resets_after_a_udp_packet() {
+        let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+        let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures {
+            beat_count: 5,
+            ..AudioFeatures::default()
+        }));
+        let mut source = FrameSource::with_feed(udp, Some(Box::new(FakeMic(feed.clone()))));
+        let set_count = |count: u16| {
+            feed.set(AudioFeatures {
+                beat_count: count,
+                ..feed.get()
+            })
+        };
+        let start = Instant::now();
+
+        // Mic frames: no beat on the first frame, a beat when the count moves.
+        assert!(!source.next_frame_at(start).beat_onset());
+        set_count(6);
+        let frame = source.next_frame_at(start);
+        assert!(frame.beat_onset());
+        assert_eq!(frame.beat_count, 6);
+
+        // A UDP packet wins and is held while recent, even as the mic moves on.
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(&wire_packet(77), address).unwrap();
+        let mut udp_frame = None;
+        for _ in 0..200 {
+            let frame = source.next_frame_at(start);
+            if frame.energy == 77 {
+                udp_frame = Some(frame);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(udp_frame.is_some(), "UDP packet never arrived");
+        set_count(9);
+        assert_eq!(source.next_frame_at(start + UDP_HOLD / 2).energy, 77);
+
+        // Back on the mic: the count jumped while UDP held, but that is not a beat.
+        let later = start + UDP_HOLD * 2;
+        let frame = source.next_frame_at(later);
+        assert_eq!(frame.beat_count, 9);
+        assert!(!frame.beat_onset(), "{frame:?}");
+        set_count(10);
+        assert!(source.next_frame_at(later).beat_onset());
     }
 
     #[test]

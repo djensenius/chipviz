@@ -19,8 +19,11 @@ const BEAT_FLAG: u8 = 0x01;
 const BAR_FLAG: u8 = 0x02;
 const BEATS_PER_BAR: u16 = 4;
 
-/// Latest analysed features, published without locks. `bpm`, `beat_phase`,
-/// and `beat_count` share one word so readers always see a consistent beat.
+/// Latest analysed features, published without locks. Only the transport
+/// fields are guaranteed consistent with each other: `bpm`, `beat_phase`, and
+/// `beat_count` share one word (with `energy`, `bass`, `mid`, and `treble`).
+/// `spectrum` is a separate word, so a reader may see it one analysis step
+/// apart from the levels; that is harmless for rendering.
 #[derive(Default)]
 pub struct SharedFeatures {
     transport: AtomicU64,

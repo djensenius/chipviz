@@ -11,9 +11,22 @@
 //! - attack/release smoothing of every level;
 //! - onsets from spectral flux over the gain-normalised bands with an adaptive
 //!   (moving mean) threshold and a refractory period;
-//! - a beat clock: `beat_phase` advances at the estimated tempo and onsets pull
-//!   it into line. `beat_count` increments exactly when the phase wraps, so the
-//!   two are always consistent.
+//! - tempo: gaps between each onset and the few before it are octave-folded
+//!   into 0.3-1.0 s (60-200 BPM) and accumulated in a decaying histogram,
+//!   weighted towards the nearest onsets; the strongest bin is the beat period. Folding makes steady eighths read as the
+//!   quarter-note tempo and keeps off-beats from doubling it;
+//! - a forward-only beat clock ([`BeatTracker`]): `beat_phase` advances at the
+//!   estimated tempo and `beat_count` increments exactly when the phase wraps,
+//!   so `beat_count * 256 + beat_phase` never decreases. Onsets within a
+//!   quarter beat of the expected beat correct the clock: an early onset jumps
+//!   forward to the next beat, a late one slows the clock (to at most half
+//!   speed) until it is back in line. Off-beat onsets are ignored unless
+//!   several arrive in a row or the clock has lost lock (no on-beat onset for
+//!   two beats), in which case the next onset re-anchors the beat.
+//!
+//! Known limits: tempos outside 60-200 BPM are folded into that range, the
+//! tracker cannot tell a 3/4 or swung feel from straight time, and a pattern
+//! of only off-beats ends up treated as the beat.
 //!
 //! Everything is plain arithmetic on the input, so identical input produces
 //! identical output.
@@ -44,15 +57,172 @@ const ONSET_RATIO: f32 = 1.5;
 const ONSET_DELTA: f32 = 0.08;
 const ONSET_REFRACTORY_S: f32 = 0.12;
 const DEFAULT_BEAT_PERIOD_S: f32 = 0.5;
-const MIN_BEAT_PERIOD_S: f32 = 60.0 / 200.0;
-const MAX_BEAT_PERIOD_S: f32 = 60.0 / 50.0;
-const TEMPO_HISTORY: usize = 8;
+/// Folded beat periods span 0.3-1.0 s (200-60 BPM).
+const MIN_BEAT_PERIOD_S: f32 = 0.3;
+const MAX_BEAT_PERIOD_S: f32 = 1.0;
+const MIN_ONSET_GAP_S: f64 = 0.075;
+const MAX_ONSET_GAP_S: f64 = 2.0;
+const TEMPO_BIN_S: f32 = 0.01;
+const TEMPO_BINS: usize = 70;
+const TEMPO_DECAY: f32 = 0.9;
+const TEMPO_MIN_WEIGHT: f32 = 1.5;
+const RECENT_ONSETS: usize = 4;
+/// Onsets within this fraction of a beat of the expected beat steer the clock.
+const LOCK_WINDOW: f32 = 0.25;
+/// Consecutive off-beat onsets that re-anchor the beat.
+const OFF_BEAT_RELOCK: u32 = 4;
+/// Lock is lost after this many beats without an on-beat onset.
+const LOCK_TIMEOUT_BEATS: f32 = 2.0;
+/// The clock never runs slower than this fraction of the tempo while catching up.
+const MAX_SLOWDOWN: f32 = 0.5;
 const SILENT_DB: f32 = -200.0;
+
+/// Forward-only beat clock with a folded inter-onset tempo histogram.
+#[derive(Clone, Debug)]
+pub struct BeatTracker {
+    time_s: f64,
+    recent_onsets: VecDeque<f64>,
+    tempo_weight: [f32; TEMPO_BINS],
+    tempo_sum: [f32; TEMPO_BINS],
+    period_s: f32,
+    tempo_known: bool,
+    phase: f32,
+    beat_count: u16,
+    /// Phase still to be absorbed by running the clock slow.
+    lag: f32,
+    last_on_beat_s: Option<f64>,
+    off_beat_streak: u32,
+}
+
+impl Default for BeatTracker {
+    fn default() -> Self {
+        Self {
+            time_s: 0.0,
+            recent_onsets: VecDeque::with_capacity(RECENT_ONSETS),
+            tempo_weight: [0.0; TEMPO_BINS],
+            tempo_sum: [0.0; TEMPO_BINS],
+            period_s: DEFAULT_BEAT_PERIOD_S,
+            tempo_known: false,
+            phase: 0.0,
+            beat_count: 0,
+            lag: 0.0,
+            last_on_beat_s: None,
+            off_beat_streak: 0,
+        }
+    }
+}
+
+impl BeatTracker {
+    /// Advances the clock by `dt` seconds; `onset` marks an onset at the end.
+    pub fn advance(&mut self, dt: f32, onset: bool) {
+        self.time_s += f64::from(dt);
+        let step = dt / self.period_s;
+        let absorbed = self.lag.min(step * MAX_SLOWDOWN);
+        self.lag -= absorbed;
+        self.phase += step - absorbed;
+        if self.phase >= 1.0 {
+            self.phase = (self.phase - 1.0).min(0.999);
+            self.beat_count = self.beat_count.wrapping_add(1);
+        }
+        if onset {
+            self.update_tempo();
+            self.align_to_onset();
+        }
+    }
+
+    /// `None` until enough onset gaps agree on a tempo.
+    pub fn bpm(&self) -> Option<f32> {
+        self.tempo_known.then(|| 60.0 / self.period_s)
+    }
+
+    pub fn beat_phase(&self) -> u8 {
+        (self.phase * 256.0).floor().clamp(0.0, 255.0) as u8
+    }
+
+    pub fn beat_count(&self) -> u16 {
+        self.beat_count
+    }
+
+    fn update_tempo(&mut self) {
+        for (weight, sum) in self.tempo_weight.iter_mut().zip(&mut self.tempo_sum) {
+            *weight *= TEMPO_DECAY;
+            *sum *= TEMPO_DECAY;
+        }
+        // Gaps to nearer onsets weigh more, so a multiple of the beat period
+        // (two or three beats back) never outvotes the period itself.
+        for (lag, &previous) in self.recent_onsets.iter().rev().enumerate() {
+            let gap = self.time_s - previous;
+            if !(MIN_ONSET_GAP_S..=MAX_ONSET_GAP_S).contains(&gap) {
+                continue;
+            }
+            let period = fold_period(gap as f32);
+            let bin = (((period - MIN_BEAT_PERIOD_S) / TEMPO_BIN_S) as usize).min(TEMPO_BINS - 1);
+            let weight = 1.0 / (lag + 1) as f32;
+            self.tempo_weight[bin] += weight;
+            self.tempo_sum[bin] += period * weight;
+        }
+        if self.recent_onsets.len() == RECENT_ONSETS {
+            self.recent_onsets.pop_front();
+        }
+        self.recent_onsets.push_back(self.time_s);
+
+        // First strongest bin wins ties, so the result is deterministic.
+        let peak = (0..TEMPO_BINS).fold(0, |best, bin| {
+            if self.tempo_weight[bin] > self.tempo_weight[best] {
+                bin
+            } else {
+                best
+            }
+        });
+        let neighbours = peak.saturating_sub(1)..(peak + 2).min(TEMPO_BINS);
+        let weight: f32 = self.tempo_weight[neighbours.clone()].iter().sum();
+        let sum: f32 = self.tempo_sum[neighbours].iter().sum();
+        if weight >= TEMPO_MIN_WEIGHT {
+            self.period_s = (sum / weight).clamp(MIN_BEAT_PERIOD_S, MAX_BEAT_PERIOD_S);
+            self.tempo_known = true;
+        }
+    }
+
+    fn align_to_onset(&mut self) {
+        let locked = self.last_on_beat_s.is_some_and(|last| {
+            self.time_s - last <= f64::from(LOCK_TIMEOUT_BEATS * self.period_s)
+        });
+        let early = self.phase >= 1.0 - LOCK_WINDOW;
+        let late = self.phase <= LOCK_WINDOW;
+        if locked && !early && !late && self.off_beat_streak + 1 < OFF_BEAT_RELOCK {
+            self.off_beat_streak += 1;
+            return;
+        }
+        if late {
+            // The clock is ahead of the music: slow down, never rewind.
+            self.lag = self.phase;
+        } else {
+            // Early, or (re-)anchoring: jump forward to the next beat.
+            self.phase = 0.0;
+            self.lag = 0.0;
+            self.beat_count = self.beat_count.wrapping_add(1);
+        }
+        self.off_beat_streak = 0;
+        self.last_on_beat_s = Some(self.time_s);
+    }
+}
+
+/// Octave-folds an onset gap into the beat-period range.
+fn fold_period(gap: f32) -> f32 {
+    let mut period = gap;
+    while period < MIN_BEAT_PERIOD_S {
+        period *= 2.0;
+    }
+    while period >= MAX_BEAT_PERIOD_S {
+        period /= 2.0;
+    }
+    period
+}
 
 /// Analysed audio fields in control-frame units.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AudioFeatures {
-    /// Estimated tempo, `0` until two plausible inter-onset intervals are seen.
+    /// Estimated tempo, `0` until enough onset gaps agree.
     pub bpm: u8,
     pub beat_phase: u8,
     pub beat_count: u16,
@@ -85,11 +255,7 @@ pub struct Analyzer {
     time_s: f64,
     last_onset_s: Option<f64>,
     onsets: u64,
-    intervals: VecDeque<f32>,
-    period_s: f32,
-    tempo_known: bool,
-    phase: f32,
-    beat_count: u16,
+    beat: BeatTracker,
     features: AudioFeatures,
 }
 
@@ -144,11 +310,7 @@ impl Analyzer {
             time_s: 0.0,
             last_onset_s: None,
             onsets: 0,
-            intervals: VecDeque::with_capacity(TEMPO_HISTORY),
-            period_s: DEFAULT_BEAT_PERIOD_S,
-            tempo_known: false,
-            phase: 0.0,
-            beat_count: 0,
+            beat: BeatTracker::default(),
             features: AudioFeatures::default(),
         })
     }
@@ -185,6 +347,19 @@ impl Analyzer {
                 self.step();
             }
         }
+    }
+
+    /// Accounts for `count` samples that were captured but dropped before
+    /// analysis: the beat clock advances by their duration so it stays in
+    /// step with real time; levels are left as they are.
+    pub fn skip(&mut self, count: usize) {
+        self.pending += count;
+        while self.pending >= self.hop {
+            self.pending -= self.hop;
+            self.time_s += f64::from(self.dt);
+            self.beat.advance(self.dt, false);
+        }
+        self.publish();
     }
 
     /// Feeds `count` zero samples (used when the device stops delivering).
@@ -272,44 +447,12 @@ impl Analyzer {
             *level += (target - *level) * coefficient;
         }
 
-        self.advance_beat_clock(dt, onset);
+        if onset {
+            self.onsets += 1;
+            self.last_onset_s = Some(self.time_s);
+        }
+        self.beat.advance(dt, onset);
         self.publish();
-    }
-
-    fn advance_beat_clock(&mut self, dt: f32, onset: bool) {
-        self.phase += dt / self.period_s;
-        if self.phase >= 1.0 {
-            self.phase = (self.phase - 1.0).min(0.999);
-            self.beat_count = self.beat_count.wrapping_add(1);
-        }
-        if !onset {
-            return;
-        }
-        self.onsets += 1;
-        if let Some(last) = self.last_onset_s {
-            let interval = (self.time_s - last) as f32;
-            if (MIN_BEAT_PERIOD_S..=MAX_BEAT_PERIOD_S).contains(&interval) {
-                if self.intervals.len() == TEMPO_HISTORY {
-                    self.intervals.pop_front();
-                }
-                self.intervals.push_back(interval);
-                if self.intervals.len() >= 2 {
-                    let mut sorted: Vec<f32> = self.intervals.iter().copied().collect();
-                    sorted.sort_by(f32::total_cmp);
-                    self.period_s = sorted[sorted.len() / 2];
-                    self.tempo_known = true;
-                }
-            }
-        }
-        self.last_onset_s = Some(self.time_s);
-        // Late in the beat: the onset is the next beat, so wrap now.
-        // Early in the beat: the clock already wrapped; pull the phase back.
-        if self.phase >= 0.5 {
-            self.phase = 0.0;
-            self.beat_count = self.beat_count.wrapping_add(1);
-        } else {
-            self.phase *= 0.5;
-        }
     }
 
     fn publish(&mut self) {
@@ -320,13 +463,12 @@ impl Analyzer {
             *byte = level(value);
         }
         self.features = AudioFeatures {
-            bpm: if self.tempo_known {
-                (60.0 / self.period_s).round().clamp(1.0, 255.0) as u8
-            } else {
-                0
-            },
-            beat_phase: (self.phase * 256.0).floor().clamp(0.0, 255.0) as u8,
-            beat_count: self.beat_count,
+            bpm: self
+                .beat
+                .bpm()
+                .map_or(0, |bpm| bpm.round().clamp(1.0, 255.0) as u8),
+            beat_phase: self.beat.beat_phase(),
+            beat_count: self.beat.beat_count(),
             energy: level(bands.iter().sum::<f32>() / BANDS as f32),
             bass: level(bands[0].max(bands[1])),
             mid: level(bands[3].max(bands[4])),
@@ -584,33 +726,133 @@ mod tests {
         );
     }
 
-    #[test]
-    fn beat_phase_wraps_exactly_when_count_increments() {
+    /// 10 ms clicks at the given times, with per-click amplitude.
+    fn clicks(events: &[(f32, f32)], seconds: f32) -> Vec<f32> {
+        let click = noise(1.0, 0.01, 7);
+        let mut samples = vec![0.0; (seconds * RATE as f32) as usize];
+        for &(time, amplitude) in events {
+            let start = (time * RATE as f32) as usize;
+            for (offset, value) in click.iter().enumerate() {
+                if let Some(slot) = samples.get_mut(start + offset) {
+                    let decay = 1.0 - offset as f32 / click.len() as f32;
+                    *slot = amplitude * value * decay;
+                }
+            }
+        }
+        samples
+    }
+
+    /// Quarter notes at `bpm` from `start` for `beats` beats, with optional
+    /// softer off-beat eighths.
+    fn pattern(bpm: f32, start: f32, beats: usize, off_beats: Option<f32>) -> Vec<(f32, f32)> {
+        let period = 60.0 / bpm;
+        let mut events = Vec::new();
+        for beat in 0..beats {
+            let time = start + beat as f32 * period;
+            events.push((time, 0.5));
+            if let Some(amplitude) = off_beats {
+                events.push((time + period / 2.0, amplitude));
+            }
+        }
+        events
+    }
+
+    fn position(features: AudioFeatures) -> u32 {
+        u32::from(features.beat_count) * 256 + u32::from(features.beat_phase)
+    }
+
+    /// Replays `samples` hop by hop, asserting the beat position never
+    /// decreases, and returns the final features.
+    fn replay_monotonic(samples: &[f32]) -> AudioFeatures {
         let mut analyzer = Analyzer::new(RATE).unwrap();
-        let mut samples = click_train(100.0, 0.5, 6.0);
-        samples.extend(vec![0.0; 2 * RATE as usize]);
-        samples.extend(click_train(140.0, 0.5, 6.0));
         let hop = (analyzer.hop_seconds() * RATE as f32).round() as usize;
         let mut previous = analyzer.features();
         for chunk in samples.chunks(hop) {
             analyzer.push(chunk);
             let next = analyzer.features();
-            let delta = next.beat_count.wrapping_sub(previous.beat_count);
-            assert!(delta <= 1, "{previous:?} -> {next:?}");
-            if delta == 1 {
-                assert!(
-                    next.beat_phase < previous.beat_phase,
-                    "count rose without a wrap: {previous:?} -> {next:?}"
-                );
-            } else {
-                assert!(
-                    next.beat_phase >= previous.beat_phase / 2,
-                    "phase wrapped without a count: {previous:?} -> {next:?}"
-                );
-            }
+            assert!(
+                position(next) >= position(previous),
+                "beat went backwards: {previous:?} -> {next:?}"
+            );
+            assert!(
+                next.beat_count.wrapping_sub(previous.beat_count) <= 1,
+                "{previous:?} -> {next:?}"
+            );
             previous = next;
         }
-        assert!((138..=142).contains(&previous.bpm), "{previous:?}");
+        previous
+    }
+
+    #[test]
+    fn beat_position_never_decreases_for_steady_quarters() {
+        let features = replay_monotonic(&click_train(120.0, 0.5, 8.0));
+        assert!((118..=122).contains(&features.bpm), "{features:?}");
+        assert!((15..=17).contains(&features.beat_count), "{features:?}");
+    }
+
+    #[test]
+    fn off_beat_eighths_neither_rewind_nor_double_count() {
+        let events = pattern(120.0, 0.0, 16, Some(0.3));
+        let features = replay_monotonic(&clicks(&events, 8.0));
+        assert!((118..=122).contains(&features.bpm), "{features:?}");
+        assert!((15..=17).contains(&features.beat_count), "{features:?}");
+    }
+
+    #[test]
+    fn steady_eighths_report_the_quarter_note_tempo() {
+        let features = replay_monotonic(&click_train(240.0, 0.5, 8.0));
+        assert!((118..=122).contains(&features.bpm), "{features:?}");
+        assert!((14..=18).contains(&features.beat_count), "{features:?}");
+    }
+
+    #[test]
+    fn tempo_change_keeps_the_beat_moving_forward() {
+        let mut events = pattern(100.0, 0.0, 10, None);
+        events.extend(pattern(140.0, 6.0, 14, None));
+        let features = replay_monotonic(&clicks(&events, 12.0));
+        assert!((138..=142).contains(&features.bpm), "{features:?}");
+
+        // Same change after a gap of silence.
+        let mut samples = click_train(100.0, 0.5, 6.0);
+        samples.extend(vec![0.0; 2 * RATE as usize]);
+        samples.extend(click_train(140.0, 0.5, 6.0));
+        let features = replay_monotonic(&samples);
+        assert!((138..=142).contains(&features.bpm), "{features:?}");
+    }
+
+    #[test]
+    fn beat_tracker_is_monotonic_for_arbitrary_onsets() {
+        let mut tracker = BeatTracker::default();
+        let mut state = 12_345u32;
+        let mut previous = 0u32;
+        for _ in 0..20_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let onset = state >> 28 == 0;
+            tracker.advance(0.0107, onset);
+            let now = u32::from(tracker.beat_count()) * 256 + u32::from(tracker.beat_phase());
+            assert!(now >= previous, "{previous} -> {now}");
+            previous = now;
+        }
+    }
+
+    #[test]
+    fn fold_period_maps_gaps_into_the_beat_range() {
+        assert!((fold_period(0.25) - 0.5).abs() < 1e-6);
+        assert!((fold_period(0.125) - 0.5).abs() < 1e-6);
+        assert!((fold_period(1.2) - 0.6).abs() < 1e-6);
+        assert!((fold_period(0.75) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn skipped_samples_advance_the_beat_clock_only() {
+        let mut skipped = analyze(&click_train(120.0, 0.5, 4.0));
+        let mut silent = analyze(&click_train(120.0, 0.5, 4.0));
+        let levels = skipped.features().energy;
+        skipped.skip(RATE as usize);
+        silent.push_silence(RATE as usize);
+        let (a, b) = (skipped.features(), silent.features());
+        assert_eq!((a.beat_count, a.beat_phase), (b.beat_count, b.beat_phase));
+        assert_eq!(a.energy, levels);
     }
 
     #[test]
