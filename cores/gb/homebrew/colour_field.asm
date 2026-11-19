@@ -576,6 +576,8 @@ ENDC
   ld [wEntryPending], a
   ret
 .exit
+  ld a, [wPinReq]        ; a pin still pending under the budget is kept:
+  ld [wPin], a           ; nothing is shown, so the latest request applies
   xor a                  ; native from the next step; the latch clears
   ld [wShowMode], a
   ld [wLatch], a
@@ -1519,12 +1521,27 @@ IF DEF(CHIPVIZ_FIXTURE)
   and CTL_WIRE | CTL_PAD
   jr z, ReqClearEqual    ; local p: the frame's palette is ignored
 ENDC
-  ; Wire gate with the scene-7 window.
+  ; Wire gate with the scene-7 window. Palette changes are tracked on every
+  ; field step, so a new value starts a fresh run even outside the window;
+  ; an unchanged consumed value stays consumed across window resets.
+  ld a, [wPalIn]
+  ld b, a
+  ld a, [wWireVal]
+  cp b
+  jr z, .window
+  ld a, b
+  ld [wWireVal], a
+  xor a
+  ld [wWireN], a
+  ld [wWireUsed], a
+  ld a, [wInAbs]         ; a run keeps the source it began with
+  ld [wWireAbs], a
+.window
   ld a, [wSceneIn]
   cp 7
   jr z, .count
-  xor a                  ; outside the window: restart, drop a wire request
-  ld [wWireN], a
+  xor a                  ; outside the window: restart the count only, and
+  ld [wWireN], a         ; drop a pending wire request
   ld a, [wReqWire]
   or a
   jr z, ReqClearEqual
@@ -1533,19 +1550,6 @@ ENDC
   ld [wReqWire], a
   jr ReqClearEqual
 .count
-  ld a, [wPalIn]
-  ld b, a
-  ld a, [wWireVal]
-  cp b
-  jr z, .same
-  ld a, b
-  ld [wWireVal], a
-  xor a
-  ld [wWireN], a
-  ld [wWireUsed], a
-  ld a, [wInAbs]         ; a run keeps the source it began with
-  ld [wWireAbs], a
-.same
   INCSAT wWireN
   ld a, [wWireN]
   cp P_STABLE

@@ -166,7 +166,16 @@ def pulses(trace):
 
 
 def max_in_window(steps, width=60):
-  return max((sum(1 for s in steps if t <= s < t + width) for t in range(600)), default=0)
+  """Most events in any width consecutive steps; the busiest window can be
+  taken to start at an event, so only event steps are tried."""
+  return max((sum(1 for s in steps if t <= s < t + width) for t in steps), default=0)
+
+
+class GbColourFieldHelpers(unittest.TestCase):
+  def test_max_in_window_late_events(self):
+    self.assertEqual(max_in_window([800, 801, 802, 803]), 4)
+    self.assertEqual(max_in_window([10, 69, 70, 128, 129]), 3)
+    self.assertEqual(max_in_window([]), 0)
 
 
 @unittest.skipUnless(TOOLS and CORE.exists(), "needs RGBDS and the SameBoy libretro core")
@@ -471,6 +480,31 @@ class GbColourFieldFixtures(unittest.TestCase):
     self.assertEqual(next(t for t, s in enumerate(trace) if s and s[0] == 3), 71)
     self.assertTrue(all(s[0] == 3 for s in trace[71:]))
 
+  def wire_discard_run(self, return_pal):
+    """Cuts (p 2) on the wire, starved by a cut every 20 steps, so the stable
+    palette 1 at step 69 stays a pending request. Scene 6 at 80..94 (a deferred
+    exit) discards it; return_pal(t) gives the palette from 80. Beats stop at
+    95, so from then on a stable new request can apply."""
+    def inputs(t):
+      pal = 2 if t < 40 else 1 if t < 80 else return_pal(t)
+      flags = BEAT if t < 95 and t % 2 else 0
+      return {"in": flat(100, flags=flags), "scene": 6 if 80 <= t <= 94 else 7, "pal": pal}
+    trace = self.rom.run(inputs, steps=200, wire=True)
+    self.assertNotIn(None, trace)
+    self.assertTrue(all(s[0] == 2 for s in trace[:95]))
+    return trace
+
+  def test_wire_change_during_deferred_exit(self):
+    # 1 -> 2 -> 1 outside the window is a real change: the fresh run of 1
+    # (in the window from 95) requests on its 30th step, 124.
+    trace = self.wire_discard_run(lambda t: 2 if t < 88 else 1)
+    self.assertEqual(next((t for t, s in enumerate(trace) if s[0] == 1), None), 125)
+
+  def test_wire_consumed_value_stays_consumed(self):
+    # An unchanged consumed 1 is not requested again after the window resets.
+    trace = self.wire_discard_run(lambda t: 1)
+    self.assertTrue(all(s[0] == 2 for s in trace))
+
   def test_f24_relative_palette(self):
     def inputs(t):
       buttons = ("right",) if t in (10, 20, 30) else ("left",) if t == 130 else ()
@@ -715,6 +749,19 @@ class GbColourFieldCaptures(unittest.TestCase):
     entry = next(t for t, s in enumerate(rom.trace) if s[0] == 1)
     self.assertNotIn(2, {s[0] for s in rom.trace})
     self.assertEqual({s[1] for s in rom.trace[entry:]}, {2})
+
+  def test_operator_pin_kept_on_exit(self):
+    # Select pins V2 in the native scene. Shortly after entry, Select asks for
+    # H2, which the budget still holds back (since_cut < CUT_MIN) when Down
+    # leaves scene 7. The re-entry uses H2.
+    rom = self.start("operator")
+    rom.run(80, held({10: "select", 20: "up", 26: "select", 32: "down", 50: "up"}))
+    shown = [s[0] == 1 for s in rom.trace]
+    entries = [t for t in range(1, 80) if shown[t] and not shown[t - 1]]
+    self.assertEqual(len(entries), 2)
+    self.assertTrue(all(s[3] == V2 for s in rom.trace[entries[0]:40] if s[0] == 1))
+    self.assertEqual(rom.trace[entries[1]][3], H2)
+    self.assertEqual(rom.gb.read(rom.symbols["wPin"])[0], H2)
 
   def test_fixture_black_rests(self):
     # Silence (F0) on the fixture build: spectral black, and the flash/gate
