@@ -127,16 +127,21 @@ extern uint8_t cf_irq_n[2];
 uint8_t cf_irq_init(uint16_t irq_line, uint16_t frame_lines);
 uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011);
 
-/* Step-rate limit (spec: Step rate, at most 60 steps in any 1-second
- * window). A frame of frame_cycles at clock_hz puts at most
- * w = clock_hz / frame_cycles + 1 IRQs in a 1-second window. When w > 60,
- * dropping every p-th IRQ, p = w / (w - 60), leaves at most 60 steps in any
- * w consecutive IRQs. cf_irq_rate stores p (0: no rate drops) and restarts
- * the count; it returns p. Only the early NTSC VIC-II (6567R56A: 262 lines
- * of 64 cycles at 1022727 Hz, 60.99 frames a second) needs it: p = 61, so
- * one IRQ in 61 drops its step (59.99 steps a second). The 6567R8 (263 x 65,
- * 59.83 frames a second) and PAL (312 x 63 at 985248 Hz, 50.12) never drop. */
-uint8_t cf_irq_rate(uint32_t frame_cycles, uint32_t clock_hz);
+/* Step-rate limit (spec: Step rate, at most 60 steps in any closed 1-second
+ * window). Frames are lines * cycles_per_line cycles at clock_hz, and an
+ * accepted IRQ steps up to j = CF_IRQ_WINDOW * cycles_per_line cycles after
+ * its line, so two steps k IRQs apart are at least k * frame - j cycles
+ * apart. A 1-second window therefore holds steps from at most
+ * w = (clock_hz + j) / frame + 1 consecutive IRQs. When w > 60, dropping
+ * every p-th IRQ, p = w / (w - 60), puts at least w - 60 drops in any w
+ * consecutive IRQs, so at most 60 steps. cf_irq_rate stores p (0: no rate
+ * drops) and restarts the count; it returns p. Only the early NTSC VIC-II
+ * (6567R56A: 262 lines of 64 cycles at 1022727 Hz, 60.99 frames a second)
+ * needs it: w = 62 (62 IRQs span only 121 cycles more than a second, so
+ * lateness can squeeze them into one), p = 31, one IRQ in 31 drops its step
+ * (59.02 steps a second). The 6567R8 (263 x 65, 59.83 frames a second), PAL
+ * (312 x 63 at 985248 Hz, 50.12) and Drean never drop. */
+uint8_t cf_irq_rate(uint16_t lines, uint8_t cycles_per_line, uint32_t clock_hz);
 
 /* The step half of one raster IRQ, after the target has checked
  * cf_irq_on_time and, only when on time, presented the staged step (so the

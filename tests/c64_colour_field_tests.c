@@ -889,7 +889,7 @@ static void irq_steps(void) {
   uint32_t f;
   int unchanged = 1;
 
-  require(cf_irq_rate(263u * 65u, second) == 0u, "irq steps", "the 6567R8 has no rate drops");
+  require(cf_irq_rate(263u, 65u, second) == 0u, "irq steps", "the 6567R8 has no rate drops");
   cf_init();
   keys_none();
   for (f = 0; f < 1200u; f++) {
@@ -931,66 +931,124 @@ static void irq_steps(void) {
           "irq steps", "Space edge and 8+Q held over a late IRQ are sampled next step");
 }
 
-/* The step-rate limit on each VIC-II timing over 100000 frames (about half
- * an hour), with every IRQ on time and with every 7th one late: no 1-second
- * window (closed, so 61 steps exactly a second apart also fail) holds more
- * than 60 steps. The 6567R56A (262 x 64 cycles at 1022727 Hz, 60.99 frames
- * a second) drops one IRQ's step in 61, so it still makes 59.99 steps a
- * second; stepping every on-time IRQ (a6906f87) gives 61. The other timings
- * never drop an on-time step. */
+/* The step-rate limit on each VIC-II timing, using exact cycle times (the
+ * IRQ's line times cycles per line). A closed 1-second window (so steps
+ * exactly a second apart count together) never holds more than 60 steps:
+ * - over 100000 frames (about half an hour) with every IRQ on time, and
+ *   with every 7th one late (dropped);
+ * - with one IRQ accepted 0-15 lines late (anywhere in CF_IRQ_WINDOW), at
+ *   every phase of the drop period;
+ * - with every IRQ accepted at a pseudo-random lateness of 0-15 lines.
+ * On the 6567R56A (262 x 64 cycles at 1022727 Hz, 60.99 frames a second)
+ * 62 IRQs span only 121 cycles more than a second, so one IRQ 8 or more
+ * lines late gave 61 steps with one drop in 61 (af2b9ca1), and stepping
+ * every IRQ (a6906f87) gave 61 even on time. It now drops one in 31 (59.02
+ * steps a second). The other timings never drop an on-time step. */
+typedef struct {
+  const char *name;
+  uint16_t lines;
+  uint8_t cycles;
+  uint32_t clock;
+  uint16_t irq_line;
+  uint8_t period;
+} irq_model_t;
+
+enum { LATE_NONE, LATE_7TH, LATE_ONE, LATE_RANDOM };
+
+/* Lines after the IRQ line at which frame f's IRQ is read. */
+static uint16_t irq_lateness(uint8_t kind, uint32_t f, uint32_t at, uint16_t lines, uint32_t *seed) {
+  switch (kind) {
+    case LATE_7TH:
+      return f % 7u == 6u ? 66u : 0u; /* past the window: dropped */
+    case LATE_ONE:
+      return f == at ? lines : 0u;
+    case LATE_RANDOM:
+      *seed = *seed * 1103515245u + 12345u;
+      return (uint16_t)((*seed >> 16) % CF_IRQ_WINDOW);
+    default:
+      return 0u;
+  }
+}
+
+/* Runs frames IRQs; returns 1 when no closed 1-second window holds more
+ * than 60 steps. Counts the steps and late (dropped) IRQs. */
+static int irq_rate_run(const irq_model_t *model, uint32_t frames, uint8_t kind, uint32_t at, uint16_t lines,
+                        uint32_t *steps, uint32_t *late) {
+  uint32_t last[60];
+  uint32_t seed = at * 2654435761u + lines;
+  uint32_t f;
+  int capped = 1;
+
+  *steps = 0;
+  *late = 0;
+  (void)cf_irq_rate(model->lines, model->cycles, model->clock);
+  cf_init();
+  keys_none();
+  for (f = 0; f < frames; f++) {
+    uint16_t lateness = irq_lateness(kind, f, at, lines, &seed);
+    uint32_t line = f * model->lines + model->irq_line + lateness;
+    *late += lateness >= CF_IRQ_WINDOW;
+    if (irq_at(line, model->irq_line, model->lines, 2u) != CF_IRQ_LATE) {
+      uint32_t time = line * model->cycles;
+      /* This step and the 60 before it must span more than a second. */
+      if (*steps >= 60u && time - last[*steps % 60u] <= model->clock) {
+        capped = 0;
+      }
+      last[*steps % 60u] = time;
+      ++*steps;
+    }
+  }
+  return capped;
+}
+
 static void irq_rate(void) {
-  static const struct {
-    const char *name;
-    uint16_t lines;
-    uint16_t cycles;
-    uint32_t clock;
-    uint16_t irq_line;
-    uint8_t period;
-  } models[4] = {
+  static const irq_model_t models[4] = {
       {"irq rate PAL", 312u, 63u, 985248u, 300u, 0u},
       {"irq rate 6567R8", 263u, 65u, 1022727u, 16u, 0u},
-      {"irq rate 6567R56A", 262u, 64u, 1022727u, 16u, 61u},
+      {"irq rate 6567R56A", 262u, 64u, 1022727u, 16u, 31u},
       {"irq rate Drean", 312u, 65u, 1023440u, 300u, 0u},
   };
   const uint32_t frames = 100000u;
   uint8_t m;
-  uint8_t pass;
 
   for (m = 0; m < 4u; m++) {
-    for (pass = 0; pass < 2u; pass++) {
-      uint32_t last[60];
-      uint32_t steps = 0;
-      uint32_t late = 0;
-      uint32_t f;
-      int capped = 1;
+    const irq_model_t *model = &models[m];
+    uint32_t steps;
+    uint32_t late;
+    uint32_t at;
+    uint16_t lines;
+    int capped;
 
-      require(cf_irq_rate((uint32_t)models[m].lines * models[m].cycles, models[m].clock) == models[m].period,
-              models[m].name, "rate-drop period");
-      cf_init();
-      keys_none();
-      for (f = 0; f < frames; f++) {
-        uint8_t is_late = pass && f % 7u == 6u;
-        uint32_t line = f * models[m].lines + models[m].irq_line + 6u + (is_late ? 60u : 0u);
-        late += is_late;
-        if (irq_at(line, models[m].irq_line, models[m].lines, 2u) != CF_IRQ_LATE) {
-          uint32_t at = line * models[m].cycles;
-          /* This step and the 60 before it must span more than a second. */
-          if (steps >= 60u && at - last[steps % 60u] <= models[m].clock) {
-            capped = 0;
-          }
-          last[steps % 60u] = at;
-          steps++;
-        }
-      }
-      require(capped, models[m].name, "at most 60 steps in any 1-second window");
-      if (models[m].period == 0u) {
-        require(steps == frames - late, models[m].name, "every on-time IRQ steps");
-      } else if (!pass) {
-        require(steps == frames - frames / models[m].period, models[m].name, "one step in 61 dropped, 59.99 a second");
+    require(cf_irq_rate(model->lines, model->cycles, model->clock) == model->period, model->name,
+            "rate-drop period");
+    capped = irq_rate_run(model, frames, LATE_NONE, 0u, 0u, &steps, &late);
+    require(capped, model->name, "on time: at most 60 steps in any closed 1-second window");
+    require(steps == frames - (model->period ? frames / model->period : 0u), model->name,
+            model->period ? "on time: one step in 31 dropped, 59.02 a second" : "on time: every IRQ steps");
+    capped = irq_rate_run(model, frames, LATE_7TH, 0u, 0u, &steps, &late);
+    require(capped, model->name, "every 7th IRQ late: at most 60 steps in any closed 1-second window");
+    if (!model->period) {
+      require(steps == frames - late, model->name, "every 7th IRQ late: every on-time IRQ steps");
+    }
+    /* One IRQ accepted 0-15 lines late, at every phase of two drop periods
+     * (or of 62 IRQs without drops). */
+    capped = 1;
+    for (lines = 0; lines < CF_IRQ_WINDOW; lines++) {
+      for (at = 70u; at < 70u + 2u * (model->period ? model->period : 31u); at++) {
+        capped &= irq_rate_run(model, 260u, LATE_ONE, at, lines, &steps, &late);
+        capped &= late == 0u;
       }
     }
+    require(capped, model->name, "one IRQ 0-15 lines late: at most 60 steps in any closed 1-second window");
+    /* Every IRQ accepted at a pseudo-random lateness of 0-15 lines. */
+    capped = 1;
+    for (at = 0; at < 8u; at++) {
+      capped &= irq_rate_run(model, 20000u, LATE_RANDOM, at, 0u, &steps, &late);
+      capped &= late == 0u;
+    }
+    require(capped, model->name, "every IRQ 0-15 lines late: at most 60 steps in any closed 1-second window");
   }
-  (void)cf_irq_rate(263u * 65u, 1022727u);
+  (void)cf_irq_rate(263u, 65u, 1022727u);
 }
 
 int main(void) {

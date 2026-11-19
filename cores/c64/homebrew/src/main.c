@@ -210,7 +210,7 @@ static uint8_t raster_irq(void) {
    * after a step overran a frame) drops this frame's step entirely: no
    * register writes (so they never change mid-screen), no input sampling and
    * no tick, so steps never come closer than a frame. On the 6567R56A
-   * (60.99 frames a second) cf_irq_frame also drops one IRQ's step in 61, so
+   * (60.99 frames a second) cf_irq_frame also drops one IRQ's step in 31, so
    * there are never more than 60 steps in a second. Nothing new is staged on
    * a dropped step, so the next on-time IRQ writes the same registers again. */
   raster_low = CHIPVIZ_RASTER_LINE; /* D012 first, as cf_irq_on_time expects */
@@ -330,10 +330,10 @@ int main(void) {
     /* 262 lines is the 6567R56A (64 cycles a line, about 60.99 frames a
      * second); anything but the 6567R8's 263 is treated the same way, which
      * only ever drops more steps. */
-    (void)cf_irq_rate((uint32_t)lines * (lines == 263u ? 65u : 64u), CHIPVIZ_CLOCK_NTSC);
+    (void)cf_irq_rate(lines, lines == 263u ? 65u : 64u, CHIPVIZ_CLOCK_NTSC);
   } else {
     irq_line = CHIPVIZ_IRQ_LINE_PAL;
-    (void)cf_irq_rate((uint32_t)lines * 63u, CHIPVIZ_CLOCK_PAL);
+    (void)cf_irq_rate(lines, 63u, CHIPVIZ_CLOCK_PAL);
   }
   (void)cf_irq_init(irq_line, lines);
   set_irq(raster_irq, irq_stack, sizeof(irq_stack));

@@ -631,8 +631,8 @@ uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011) {
 static uint8_t cf_irq_period;
 static uint8_t cf_irq_count;
 
-uint8_t cf_irq_rate(uint32_t frame_cycles, uint32_t clock_hz) {
-  uint32_t window = clock_hz / frame_cycles + 1u;
+uint8_t cf_irq_rate(uint16_t lines, uint8_t cycles_per_line, uint32_t clock_hz) {
+  uint32_t window = (clock_hz + (uint32_t)CF_IRQ_WINDOW * cycles_per_line) / ((uint32_t)lines * cycles_per_line) + 1u;
 
   cf_irq_period = window > 60u ? (uint8_t)(window / (window - 60u)) : 0u;
   cf_irq_count = 0u;

@@ -18,9 +18,10 @@ hard cuts (mode 2) with a steady picture and the flash latch clear.
 `--model ntsc-old` on an early NTSC C64 (6567R56A, about 60.99 frames a
 second), one model per process because the VICE core is a singleton. Each
 model also counts the steps in 610 frames of scene 7: one per frame, except
-that the 6567R56A drops one in 61 to stay at 60 steps a second or fewer. The script also reads the core's RAM (the `_cf`
-address from the linker map) to measure the scene-7 entry and exit timing in
-frames.
+that the 6567R56A drops one in 31 (19 or 20 of the 610, depending on the
+phase) to stay at 60 steps a second or fewer. The script also reads the
+core's RAM (the `_cf` address from the linker map) to measure the scene-7
+entry and exit timing in frames.
 """
 
 from __future__ import annotations
@@ -78,7 +79,7 @@ KERNAL_PALNTSC = 0x02A6
 PALNTSC_FLAG = {"pal": 1, "ntsc": 0, "ntsc-old": 0}
 # Steps counted over RATE_FRAMES frames of scene 7 (cf.since_sw).
 RATE_FRAMES = 610
-RATE_STEPS = {"pal": 610, "ntsc": 610, "ntsc-old": 600}
+RATE_STEPS = {"pal": {610}, "ntsc": {610}, "ntsc-old": {590, 591}}
 NATIVE_FRAMES = 60  # frames sampled to check the native demo animates
 
 # Pepto PAL palette (VICE pepto-pal.vpl), indexed by C64 colour number.
@@ -500,8 +501,9 @@ def main(argv: list[str] | None = None) -> int:
               "default_8r": default_8r, "rate": {"frames": RATE_FRAMES, "steps": rate_steps},
               "captures": results}
     print(json.dumps(report, indent=2))
-    if rate_steps != RATE_STEPS[args.model]:
-      print(f"{rate_steps} steps in {RATE_FRAMES} frames, expected {RATE_STEPS[args.model]}", file=sys.stderr)
+    if rate_steps not in RATE_STEPS[args.model]:
+      print(f"{rate_steps} steps in {RATE_FRAMES} frames, expected {sorted(RATE_STEPS[args.model])}",
+            file=sys.stderr)
       return 1
     if len(native_frames) < NATIVE_FRAMES // 2:
       print("native demo is not animating", file=sys.stderr)

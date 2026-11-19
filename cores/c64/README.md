@@ -47,10 +47,14 @@ the late IRQ drops that step entirely (no register writes, input sampling or
 tick) rather than change registers mid-screen or catch up; keys still held
 are sampled on the next step. The early NTSC VIC-II (6567R56A: 262 lines of 64
 cycles, about 60.99 frames a second) would otherwise make 61 steps in some
-seconds, so the program counts the raster lines at boot and, on 262 lines,
-drops one IRQ's step in every 61 the same way (59.99 steps a second). The
-6567R8 (263 lines, 59.83 frames a second) and PAL (50.12) never drop a step,
-so there are never more than 60 steps in any second (spec: Step rate).
+seconds. Even one drop in 61 is not enough there: 62 frames last only 121
+cycles more than a second, so an IRQ accepted 8 or more lines late could
+squeeze 61 steps into one. The program counts the raster lines at boot and,
+on 262 lines, drops one IRQ's step in every 31 the same way (59.02 steps a
+second), which holds for any lateness the IRQ accepts. The 6567R8 (263
+lines, 59.83 frames a second), PAL (50.12) and Drean never drop a step, so
+there are never more than 60 steps in any closed 1-second window (spec: Step
+rate).
 The native PETSCII demo keeps drawing in the main loop and pauses while scene 7
 is shown. Its frame counter keeps running during scene 7, so after a visit its
 animation phase jumps ahead instead of resuming where it stopped.
@@ -112,7 +116,7 @@ animation phase jumps ahead instead of resuming where it stopped.
 - **Not implemented.** The operator role (`L` pin and the RETURN warning screen)
   and joystick relative palette pulses.
 - **Timing.** Every frame is a step, in or out of scene 7 (on the 6567R56A,
-  60 frames in every 61). Holding `8` shows
+  30 frames in every 31). Holding `8` shows
   the field from the 31st sampled step (the debounce decides at the end of the
   30th). Measured in VICE (PAL and NTSC alike): 31–32 frames from the key press until the step that
   shows scene 7, and 33–34 frames until it is on screen (registers land at the
@@ -132,7 +136,7 @@ checks every region's exact colour, the boundary positions and the black
 border. It also measures the entry and exit timing from the core's RAM, and
 checks that `R` held without `8`, and `8`+`R` in the default ROM, stay in
 steady hard cuts with the flash latch clear, that 610 frames of scene 7 make
-610 steps (600 on the 6567R56A), and that the native
+610 steps (590 or 591 on the 6567R56A), and that the native
 demo animates. It needs a local RetroArch core, so it is not part of
 `just check`.
 
