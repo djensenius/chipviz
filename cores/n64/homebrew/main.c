@@ -2,6 +2,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "visual_math.h"
+
 typedef struct {
   int bands[8];
   int beat;
@@ -138,8 +140,8 @@ static void draw_perspective_grid(int frame, const visual_state_t *state) {
   int center = 160 + ((state->midi - 128) / 9);
   int flash = state->beat ? 36 : 0;
 
-  fill_rect(0.0f, 0.0f, 320.0f, (float)horizon, rgba(8 + state->palette * 8, 18 + flash, 58 + state->scene * 18));
-  fill_rect(0.0f, (float)horizon, 320.0f, 240.0f, rgba(3, 5 + state->scene * 8, 24 + state->palette * 6));
+  fill_rect(0.0f, 0.0f, 320.0f, (float)horizon, rgba(8 + state->palette * 8, 18 + flash, scene_sky_blue(state->scene)));
+  fill_rect(0.0f, (float)horizon, 320.0f, 240.0f, rgba(3, scene_floor_green(state->scene), 24 + state->palette * 6));
 
   for (int row = 0; row < 12; row++) {
     int y = horizon + row * row + ((frame >> 2) & 7);
@@ -165,18 +167,18 @@ static void draw_perspective_grid(int frame, const visual_state_t *state) {
 static void draw_channel_meters(int frame, const visual_state_t *state) {
   for (int i = 0; i < 8; i++) {
     int energy = state->bands[i];
-    int height = 12 + energy / 3;
-    int depth = i * 5 + ((frame >> 3) & 9);
-    int x = 22 + i * 35 + (state->scene - 3) * i;
-    int y = 210 - height - depth;
-    color_t front = rgba(energy, 255 - energy / 2, 72 + state->palette * 16);
-    color_t side = rgba(36 + energy / 3, 70 + state->palette * 11, 150 + i * 8);
-    color_t cap = rgba(235, 200 + state->beat * 18, 255);
-
-    fill_rect((float)(x + 8), (float)(y - 6), (float)(x + 34), (float)y, cap);
-    fill_rect((float)x, (float)y, (float)(x + 26), (float)(y + height), front);
-    fill_rect((float)(x + 26), (float)(y + 6), (float)(x + 34), (float)(y + height + 8), side);
-    fill_rect((float)(x + 3), (float)(y + height - 4), (float)(x + 23), (float)(y + height - 1), rgba(255, 255, 255));
+    meter_rect_t rects[4];
+    color_t colors[4] = {
+      rgba(235, 200 + state->beat * 18, 255),
+      rgba(energy, 255 - energy / 2, 72 + state->palette * 16),
+      rgba(36 + energy / 3, 70 + state->palette * 11, 150 + i * 8),
+      rgba(255, 255, 255),
+    };
+    channel_meter_rects(frame, state->scene, i, energy, rects);
+    for (int face = 0; face < 4; face++) {
+      meter_rect_t rect = rects[face];
+      fill_rect((float)rect.x0, (float)rect.y0, (float)rect.x1, (float)rect.y1, colors[face]);
+    }
   }
 }
 
