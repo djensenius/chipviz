@@ -207,13 +207,14 @@ impl BeatTracker {
     }
 }
 
-/// Octave-folds an onset gap into the beat-period range.
+/// Octave-folds a positive, finite onset gap into the inclusive beat-period
+/// range, so both 60 and 200 BPM map to themselves.
 fn fold_period(gap: f32) -> f32 {
     let mut period = gap;
     while period < MIN_BEAT_PERIOD_S {
         period *= 2.0;
     }
-    while period >= MAX_BEAT_PERIOD_S {
+    while period > MAX_BEAT_PERIOD_S {
         period /= 2.0;
     }
     period
@@ -841,6 +842,16 @@ mod tests {
         assert!((fold_period(0.125) - 0.5).abs() < 1e-6);
         assert!((fold_period(1.2) - 0.6).abs() < 1e-6);
         assert!((fold_period(0.75) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fold_period_keeps_both_range_endpoints() {
+        // 60 BPM: one-second gaps stay put; two-second gaps fold onto them.
+        assert_eq!(fold_period(MAX_BEAT_PERIOD_S), MAX_BEAT_PERIOD_S);
+        assert_eq!(fold_period(2.0 * MAX_BEAT_PERIOD_S), MAX_BEAT_PERIOD_S);
+        // 200 BPM is neither doubled nor halved out of range.
+        assert_eq!(fold_period(MIN_BEAT_PERIOD_S), MIN_BEAT_PERIOD_S);
+        assert_eq!(fold_period(MIN_BEAT_PERIOD_S / 2.0), MIN_BEAT_PERIOD_S);
     }
 
     #[test]
