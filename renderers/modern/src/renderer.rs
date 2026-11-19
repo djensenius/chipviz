@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -8,15 +9,20 @@ use crate::profile::RenderProfile;
 use crate::scene::{
     Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
 };
-use crate::scenes;
+use crate::scenes::{self, CameraMode, colour_field};
 
 /// Offscreen capture format; sRGB like the window's preferred surface format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// Pipeline, buffers and camera shared by the window and offscreen targets.
+/// Pipeline, buffers, camera and colour-field state shared by the window and
+/// offscreen targets.
 pub struct ScenePipeline {
     profile: RenderProfile,
     camera: Camera,
+    colour_field: colour_field::ColourField,
+    colour_controls: colour_field::Controls,
+    /// Wall-clock step cap for live rendering; `None` steps every new frame.
+    step_clock: Option<(colour_field::StepClock, Instant)>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     render_pipeline: wgpu::RenderPipeline,
@@ -230,6 +236,9 @@ impl ScenePipeline {
         Self {
             profile,
             camera: Camera::default(),
+            colour_field: colour_field::ColourField::new(colour_field::Config::default()),
+            colour_controls: colour_field::Controls::default(),
+            step_clock: None,
             device,
             queue,
             render_pipeline,
@@ -241,15 +250,61 @@ impl ScenePipeline {
         }
     }
 
-    /// Restarts camera smoothing, as at renderer start-up.
-    pub fn reset_camera(&mut self) {
+    /// Restarts camera smoothing and the colour field, as at renderer
+    /// start-up.
+    pub fn reset_state(&mut self) {
         self.camera = Camera::default();
+        self.colour_field = colour_field::ColourField::new(self.colour_field.config());
     }
 
-    /// Steps camera smoothing for a frame that is not drawn.
-    pub fn advance_camera(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
+    /// Steps camera smoothing and the colour field for a frame that is not
+    /// drawn.
+    pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
+        let (frame, _) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed, aspect);
+    }
+
+    /// Replaces the colour-field configuration and restarts it from power-on.
+    pub fn configure_colour_field(&mut self, config: colour_field::Config) {
+        self.colour_field = colour_field::ColourField::new(config);
+    }
+
+    /// Caps colour-field steps at 60 in any wall-clock second (live window).
+    pub fn limit_colour_field_steps(&mut self) {
+        self.step_clock = Some((colour_field::StepClock::default(), Instant::now()));
+    }
+
+    /// Operator pin control (`L`): cycles the layout pin on the next step.
+    pub fn cycle_layout_pin(&mut self) {
+        self.colour_controls.pin_cycle = true;
+    }
+
+    /// Feeds a received frame to the colour field's onset detection without
+    /// drawing it (frames that arrive between redraws).
+    pub fn observe(&mut self, frame: &ControlFrame) {
+        self.colour_field.observe(frame);
+    }
+
+    /// Scene dispatch: the colour field sees every frame and owns scene 7;
+    /// otherwise the native scene goes through the registry unchanged.
+    fn dispatch(&mut self, frame: ControlFrame) -> (ControlFrame, colour_field::Display) {
+        self.colour_field.observe(&frame);
+        let allowed = match &mut self.step_clock {
+            None => true,
+            Some((clock, start)) => {
+                !self.colour_field.has_new_frame() || clock.try_step(start.elapsed())
+            }
+        };
+        if self.colour_field.has_new_frame() && allowed {
+            self.colour_field
+                .step(std::mem::take(&mut self.colour_controls));
+        }
+        let display = self.colour_field.display();
+        match display {
+            colour_field::Display::Native(scene) => (ControlFrame { scene, ..frame }, display),
+            colour_field::Display::ColourField(_) => (frame, display),
+        }
     }
 
     /// Uploads this frame's instances and uniforms, then records its render pass.
@@ -259,11 +314,24 @@ impl ScenePipeline {
         view: &wgpu::TextureView,
         frame: ControlFrame,
         elapsed: f32,
-        aspect: f32,
+        size: (u32, u32),
     ) {
-        let instances = build_instances(&self.profile, frame, elapsed, aspect);
+        let (width, height) = size;
+        let aspect = width as f32 / height.max(1) as f32;
+        let (frame, display) = self.dispatch(frame);
+        let (instances, camera) = match display {
+            colour_field::Display::ColourField(trace) => {
+                let mut instances = Vec::new();
+                colour_field::build(&trace, width, height, &mut instances);
+                (instances, CameraMode::ScreenSpace)
+            }
+            colour_field::Display::Native(_) => (
+                build_instances(&self.profile, frame, elapsed, aspect),
+                scenes::select(frame.scene).camera,
+            ),
+        };
         let uniforms = scene_uniforms(
-            scenes::select(frame.scene).camera,
+            camera,
             &mut self.camera,
             &self.profile,
             frame,
@@ -271,6 +339,11 @@ impl ScenePipeline {
             aspect,
         );
         self.encode_instances(encoder, view, &instances, &uniforms);
+    }
+
+    /// What the latest colour-field step shows.
+    pub fn colour_field_display(&self) -> colour_field::Display {
+        self.colour_field.display()
     }
 
     /// Uploads explicit instances and uniforms, then records the render pass.
@@ -364,6 +437,10 @@ impl Renderer {
         self.surface.configure(&self.pipeline.device, &self.config);
     }
 
+    pub fn pipeline_mut(&mut self) -> &mut ScenePipeline {
+        &mut self.pipeline
+    }
+
     pub fn resize_to_current_window(&mut self) {
         let size = self.window.inner_size();
         self.resize(size.width, size.height);
@@ -374,10 +451,10 @@ impl Renderer {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let size = (self.config.width, self.config.height);
         let mut encoder = self.pipeline.command_encoder();
         self.pipeline
-            .encode(&mut encoder, &view, frame, elapsed, aspect);
+            .encode(&mut encoder, &view, frame, elapsed, size);
         self.pipeline
             .queue
             .submit(std::iter::once(encoder.finish()));
@@ -442,9 +519,9 @@ impl OffscreenRenderer {
 
     /// Draws one frame and returns tightly packed RGB8 rows, top row first.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<Vec<u8>, RendererError> {
-        let aspect = self.aspect();
+        let size = (self.width, self.height);
         self.render_with(|pipeline, encoder, view| {
-            pipeline.encode(encoder, view, frame, elapsed, aspect);
+            pipeline.encode(encoder, view, frame, elapsed, size);
         })
     }
 

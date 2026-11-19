@@ -12,6 +12,7 @@ use winit::window::{Fullscreen, Window, WindowBuilder};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
+use crate::scenes::colour_field;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -91,6 +92,10 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         None => None,
     };
 
+    if args.allow_flash {
+        eprintln!("{}", colour_field::FLASH_WARNING);
+    }
+
     let udp = UdpFrameSource::bind(args.udp_endpoint.as_deref())?;
 
     let mut builder = WindowBuilder::new()
@@ -113,6 +118,10 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     window.set_cursor_visible(cursor_visible(args.fullscreen));
 
     let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
+    renderer
+        .pipeline_mut()
+        .configure_colour_field(colour_field_config(&args));
+    renderer.pipeline_mut().limit_colour_field_steps();
     let mut frame_source = FrameSource::new(udp);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
@@ -140,12 +149,16 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                 match key_action(input, mods, fullscreen) {
                     Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
                     Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
+                    Some(KeyAction::CycleLayoutPin) => renderer.pipeline_mut().cycle_layout_pin(),
                     None => {}
                 }
             }
             WindowEvent::RedrawRequested => {
                 let elapsed = start.elapsed().as_secs_f32();
-                let frame = frame_source.next_frame();
+                let (earlier, frame) = frame_source.next_frames();
+                for frame in &earlier {
+                    renderer.pipeline_mut().observe(frame);
+                }
                 match renderer.render(frame, elapsed) {
                     Ok(()) => {}
                     Err(RendererError::Surface(
@@ -195,16 +208,20 @@ fn print_monitors(monitors: &[MonitorHandle]) {
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--fullscreen] [--monitor INDEX|NAME] [--list-monitors]
+       [--layout auto|v2|h2|v3|h3] [--allow-flash]
 
 Options:
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
   --fullscreen            start in borderless fullscreen (default: windowed)
   --monitor INDEX|NAME    display to use, by index or case-insensitive name substring
   --list-monitors         print available monitors and exit
+  --layout LAYOUT         colour-field (scene 7) layout pin (default: auto)
+  --allow-flash           let scene 7 palettes 3 and 7 run flash/gate (prints a warning)
   -h, --help              print this help
 
 Keys:
   F, Cmd+F, Ctrl+Cmd+F    toggle fullscreen
+  L                       cycle the colour-field layout pin (auto, V2, H2, V3, H3)
   Esc                     exit fullscreen
   Cmd+Q                   quit (macOS application menu)"
     )
@@ -302,6 +319,7 @@ impl KeyInput {
         }
         match physical {
             PhysicalKey::Code(KeyCode::KeyF) => Self::Character('f'),
+            PhysicalKey::Code(KeyCode::KeyL) => Self::Character('l'),
             PhysicalKey::Code(KeyCode::Escape) => Self::Escape,
             _ => Self::Other,
         }
@@ -320,6 +338,7 @@ struct KeyModifiers {
 enum KeyAction {
     ToggleFullscreen,
     ExitFullscreen,
+    CycleLayoutPin,
 }
 
 fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
@@ -332,6 +351,7 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
             Some(KeyAction::ToggleFullscreen)
         }
         (KeyInput::Escape, false, false) if fullscreen => Some(KeyAction::ExitFullscreen),
+        (KeyInput::Character('l'), false, false) => Some(KeyAction::CycleLayoutPin),
         _ => None,
     }
 }
@@ -348,6 +368,36 @@ struct AppArgs {
     fullscreen: bool,
     monitor: Option<MonitorSelector>,
     list_monitors: bool,
+    /// Colour-field layout pin; `None` is `auto`.
+    layout: Option<u8>,
+    allow_flash: bool,
+}
+
+/// Wire palettes go through the stability gate; procedural frames use a
+/// local palette 0, which never arms.
+fn colour_field_config(args: &AppArgs) -> colour_field::Config {
+    colour_field::Config {
+        allow_flash: args.allow_flash,
+        palette: if args.udp_endpoint.is_some() {
+            colour_field::PaletteSource::Wire
+        } else {
+            colour_field::PaletteSource::Local { p: 0, armed: false }
+        },
+        pin: args.layout,
+    }
+}
+
+fn parse_layout(value: &str) -> Result<Option<u8>, AppError> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Ok(None),
+        "v2" => Ok(Some(0)),
+        "h2" => Ok(Some(1)),
+        "v3" => Ok(Some(2)),
+        "h3" => Ok(Some(3)),
+        _ => Err(invalid_input(format!(
+            "--layout expects auto|v2|h2|v3|h3, got {value}"
+        ))),
+    }
 }
 
 impl AppArgs {
@@ -369,6 +419,11 @@ impl AppArgs {
                     parsed.monitor = Some(MonitorSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
+                "--layout" => {
+                    let value = required_value(&mut args, "--layout", "auto|v2|h2|v3|h3")?;
+                    parsed.layout = parse_layout(&value)?;
+                }
+                "--allow-flash" => parsed.allow_flash = true,
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
@@ -410,15 +465,18 @@ impl UdpFrameSource {
         })
     }
 
-    fn receive_latest(&self) -> Option<ControlFrame> {
-        let socket = self.socket.as_ref()?;
-        let mut latest = None;
+    /// Every valid frame received since the last call, oldest first.
+    fn receive_all(&self) -> Vec<ControlFrame> {
+        let mut frames = Vec::new();
+        let Some(socket) = self.socket.as_ref() else {
+            return frames;
+        };
         let mut packet = [0; WIRE_SIZE];
 
         loop {
             match socket.recv(&mut packet) {
                 Ok(WIRE_SIZE) => match ControlFrame::parse_wire(&packet) {
-                    Ok(frame) => latest = Some(frame),
+                    Ok(frame) => frames.push(frame),
                     Err(error) => eprintln!("ignored invalid control frame: {error}"),
                 },
                 Ok(size) => eprintln!("ignored short UDP packet: {size} bytes"),
@@ -430,7 +488,7 @@ impl UdpFrameSource {
             }
         }
 
-        latest
+        frames
     }
 }
 
@@ -449,10 +507,13 @@ impl FrameSource {
         }
     }
 
-    fn next_frame(&mut self) -> ControlFrame {
-        if let Some(frame) = self.udp.receive_latest() {
+    /// The frame to draw, plus any earlier frames received since the last
+    /// redraw (the colour field's onset detection sees every frame).
+    fn next_frames(&mut self) -> (Vec<ControlFrame>, ControlFrame) {
+        let mut frames = self.udp.receive_all();
+        if let Some(frame) = frames.pop() {
             self.latest = frame;
-            return frame;
+            return (frames, frame);
         }
 
         if self.udp.socket.is_none() {
@@ -460,7 +521,7 @@ impl FrameSource {
             self.latest = ControlFrame::procedural(self.fallback_index);
         }
 
-        self.latest
+        (frames, self.latest)
     }
 }
 
@@ -711,6 +772,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_colour_field_options() {
+        let args = parse_run(&["--layout", "H3", "--allow-flash"]);
+        assert_eq!(args.layout, Some(3));
+        assert!(args.allow_flash);
+        assert_eq!(parse_run(&["--layout", "auto"]).layout, None);
+        assert_eq!(parse_run(&["--layout", "v2"]).layout, Some(0));
+        assert!(!AppArgs::default().allow_flash);
+        assert!(parse(&["--layout", "v4"]).is_err());
+        assert!(parse(&["--layout"]).is_err());
+    }
+
+    #[test]
+    fn colour_field_config_never_arms_by_default() {
+        let config = colour_field_config(&AppArgs::default());
+        assert!(!config.allow_flash);
+        assert_eq!(
+            config.palette,
+            colour_field::PaletteSource::Local { p: 0, armed: false }
+        );
+        let udp = colour_field_config(&parse_run(&["--udp", "127.0.0.1:6464"]));
+        assert_eq!(udp.palette, colour_field::PaletteSource::Wire);
+        assert!(!udp.allow_flash);
+    }
+
+    #[test]
+    fn l_cycles_the_layout_pin() {
+        let plain = KeyModifiers::default();
+        let cmd = KeyModifiers {
+            command: true,
+            ..plain
+        };
+        let l = KeyInput::Character('l');
+        assert_eq!(key_action(l, plain, false), Some(KeyAction::CycleLayoutPin));
+        assert_eq!(key_action(l, cmd, true), None);
+        assert_eq!(
+            KeyInput::from_winit(
+                &Key::Character("д".into()),
+                PhysicalKey::Code(KeyCode::KeyL)
+            ),
+            l
+        );
+    }
+
+    #[test]
     fn cursor_hidden_only_in_fullscreen() {
         assert!(!cursor_visible(true));
         assert!(cursor_visible(false));
@@ -723,6 +828,9 @@ mod tests {
             "--fullscreen",
             "--monitor",
             "--list-monitors",
+            "--layout auto|v2|h2|v3|h3",
+            "--allow-flash",
+            "cycle the colour-field layout pin",
             "Esc",
             "Cmd+Q",
         ] {

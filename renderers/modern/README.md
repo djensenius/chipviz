@@ -37,6 +37,8 @@ The renderer starts windowed by default.
 | `--fullscreen` | Start in borderless fullscreen (primary display unless `--monitor` is given). |
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
+| `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
+| `--allow-flash` | Let scene 7 run flash/gate (palettes 3 and 7). Prints the photosensitivity warning to stderr at start-up. Without it, 3 and 7 always run as hard cuts (2 and 6). |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -48,6 +50,7 @@ just modern-m1 -- --fullscreen --monitor 1
 | --- | --- |
 | `F`, `Cmd+F`, `Ctrl+Cmd+F` | Toggle fullscreen on the window's current display. |
 | `Esc` | Exit fullscreen (does nothing when windowed). |
+| `L` | Cycle the colour-field layout pin: auto, V2, H2, V3, H3. A pin that changes the layout waits for the change budget. |
 | `Cmd+Q` | Quit (macOS application menu). |
 
 The cursor is hidden while fullscreen and restored when windowed.
@@ -55,18 +58,35 @@ The cursor is hidden while fullscreen and restored when windowed.
 ## Scene plan
 
 Scenes live in `src/scenes/`, one module per scene, behind the `REGISTRY`
-table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
+table in `src/scenes/mod.rs`. Scene byte 7 is checked first and always selects
+the colour field, whatever the registry length; every other byte selects
 `REGISTRY[scene % REGISTRY.len()]`:
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
+| 7 | `ColourField` | `ScreenSpace` |
 | 0, 6, 12, ... | `SignalField` | `Orbit3D` |
-| 1, 7, 13, ... | `SpectrumVolume` | `Orbit3D` |
+| 1, 13, 19, ... | `SpectrumVolume` | `Orbit3D` |
 | 2, 8, 14, ... | `PulseTunnel` | `Orbit3D` |
 | 3, 9, 15, ... | `Lines` | `ScreenSpace` |
 | 4, 10, 16, ... | `Static` | `ScreenSpace` |
 | 5, 11, 17, ... | `Object` | `ScreenSpace` |
 
+- `ColourField` (scene 7, `src/scenes/colour_field/`): two or three large
+  regions of flat colour, meant to be projected onto performers in the dark.
+  It follows [`shared/specs/colour-field-v0.md`](../../shared/specs/colour-field-v0.md),
+  which is shared with the console ports. A pure, deterministic step function
+  (`state.rs`) runs once per new control frame, at most 60 times per
+  second. Its fixtures F0 to F22 and F24 are unit tests (F23 is host-only).
+  Rendering only draws the step's trace. In scene 7, `palette & 3` picks the
+  mode (0 held, 1 spectral levels, 2 hard cuts, 3 flash/gate) and
+  `palette & 4` the family (red/yellow/blue or RGB/CMY). Beats, bars, drops and
+  note onsets change the layout (V2, H2, V3, H3), the colour combination and
+  the rotation, within the spec's limit of 3 flashes per second. Wire palette
+  and scene values must hold for 30 steps before they apply, and changes share
+  a budget of one per 20 steps. Without `--udp` the palette is local 0 (held).
+  Flash/gate runs only with `--allow-flash` and a stable absolute wire 3 or 7;
+  without the flag, 3 and 7 run as hard cuts.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
@@ -181,7 +201,9 @@ Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
 frame 0, so very large frame indices take longer to capture.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
-scene byte is used. `--input` is `procedural` (default) or a `.cvz` file of
+scene byte is used. `--scene 7` captures the colour field, which is replayed
+from frame 0 like the camera and never arms flash/gate. Recorded inputs use
+their wire palettes; procedural input uses palette 0. `--input` is `procedural` (default) or a `.cvz` file of
 concatenated control-frame packets, such as the bridge's `--output`.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`
 for every option. The GPU smoke test is ignored by default; run it with

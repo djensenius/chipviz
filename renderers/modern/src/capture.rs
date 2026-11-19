@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::OffscreenRenderer;
-use crate::scenes::{self, CameraMode};
+use crate::scenes::{self, CameraMode, colour_field};
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
@@ -17,7 +17,8 @@ const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scen
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
-  --scene    force the control-frame scene byte; registry index = N % scene count
+  --scene    force the control-frame scene byte: 7 is the colour field,
+             otherwise registry index = N % scene count
   --frames   comma-separated frame indices (default 0); elapsed = index / 60 s
   --input    procedural frames (default) or a raw .cvz control-frame file
   --size     output size in pixels (default: the profile's target size)";
@@ -183,22 +184,39 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     let mut renderer =
         pollster::block_on(OffscreenRenderer::new(args.profile.clone(), width, height))
             .map_err(|error| error.to_string())?;
+    // Recorded frames carry wire palettes; procedural frames use a local
+    // palette 0. Capture never arms flash/gate.
+    renderer
+        .pipeline_mut()
+        .configure_colour_field(colour_field::Config {
+            palette: match args.input {
+                Input::Procedural => colour_field::PaletteSource::Local { p: 0, armed: false },
+                Input::File(_) => colour_field::PaletteSource::Wire,
+            },
+            ..colour_field::Config::default()
+        });
     let mut captures = Vec::new();
 
     for &index in &args.frames {
-        // Replay camera smoothing from frame 0 so stills match a live run.
+        // Replay camera smoothing and the colour field from frame 0 so stills
+        // match a live run.
         let aspect = renderer.aspect();
         let pipeline = renderer.pipeline_mut();
-        pipeline.reset_camera();
+        pipeline.reset_state();
         for previous in 0..index {
-            pipeline.advance_camera(source.frame(previous)?, elapsed(previous), aspect);
+            pipeline.advance_state(source.frame(previous)?, elapsed(previous), aspect);
         }
         let frame = source.frame(index)?;
         let rgb = renderer
             .render(frame, elapsed(index))
             .map_err(|error| error.to_string())?;
-        let entry = scenes::select(frame.scene);
-        let file = format!("frame{index:06}-{}.png", entry.name);
+        // Named by what is shown: scene 7 enters the colour field after its
+        // debounce, and leaving it is debounced too.
+        let entry = scenes::dispatch(match renderer.pipeline_mut().colour_field_display() {
+            colour_field::Display::ColourField(_) => colour_field::SCENE,
+            colour_field::Display::Native(scene) => scene,
+        });
+        let file = format!("frame{index:06}-{}.png", entry.name());
         write_png(&args.out.join(&file), width, height, &rgb)?;
         println!("wrote {}", args.out.join(&file).display());
         captures.push(format!(
@@ -206,8 +224,8 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
             json_string(&file),
             elapsed(index),
             frame.scene,
-            json_string(entry.name),
-            json_string(match entry.camera {
+            json_string(entry.name()),
+            json_string(match entry.camera() {
                 CameraMode::Orbit3D => "orbit3d",
                 CameraMode::ScreenSpace => "screen_space",
             }),
@@ -340,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn scene_override_selects_registry_entry() {
+    fn scene_override_dispatches_seven_to_the_colour_field() {
         let source = FrameSource {
             fixture: None,
             scene: Some(7),
@@ -348,7 +366,8 @@ mod tests {
         let frame = source.frame(120).unwrap();
         assert_eq!(frame.scene, 7);
         assert_eq!(frame.energy, ControlFrame::procedural(120).energy);
-        assert_eq!(scenes::select(frame.scene).name, "SpectrumVolume");
+        assert_eq!(scenes::dispatch(frame.scene).name(), colour_field::NAME);
+        assert_eq!(scenes::dispatch(13).name(), "SpectrumVolume");
         let unforced = FrameSource {
             fixture: None,
             scene: None,
@@ -396,6 +415,60 @@ mod tests {
                 rgb.iter().any(|&value| value > 16),
                 "scene {scene} is blank"
             );
+        }
+    }
+
+    /// Scene 7 enters the colour field at power-on and draws flat regions
+    /// whose sRGB pixels and boundaries match the CPU model exactly.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn colour_field_renders_exact_flat_regions() {
+        let (width, height) = (161, 91);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        for layout in 0..4 {
+            renderer
+                .pipeline_mut()
+                .configure_colour_field(colour_field::Config {
+                    palette: colour_field::PaletteSource::Local { p: 1, armed: false },
+                    pin: Some(layout),
+                    ..colour_field::Config::default()
+                });
+            let frame = ControlFrame {
+                scene: colour_field::SCENE,
+                ..ControlFrame::procedural(120)
+            };
+            let rgb = renderer.render(frame, 2.0).unwrap();
+            let colour_field::Display::ColourField(trace) =
+                renderer.pipeline_mut().colour_field_display()
+            else {
+                panic!("scene 7 did not enter the colour field");
+            };
+            assert_eq!(trace.layout, layout);
+            let colours = colour_field::region_colours(&trace);
+            let vertical = layout % 2 == 0;
+            let n = colour_field::regions(layout);
+            let edges = colour_field::boundaries(if vertical { width } else { height }, n);
+            for (row, line) in rgb.chunks_exact(width as usize * 3).enumerate() {
+                for (column, pixel) in line.chunks_exact(3).enumerate() {
+                    // Rows run from the bottom; readback rows from the top.
+                    let position = if vertical {
+                        column as u32
+                    } else {
+                        height - 1 - row as u32
+                    };
+                    let region = edges
+                        .iter()
+                        .skip(1)
+                        .position(|&edge| position < edge)
+                        .unwrap();
+                    assert_eq!(
+                        pixel, colours[region],
+                        "layout {layout} pixel ({column}, {row})"
+                    );
+                }
+            }
         }
     }
 
