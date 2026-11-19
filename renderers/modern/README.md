@@ -37,6 +37,8 @@ The renderer starts windowed by default.
 | `--fullscreen` | Start in borderless fullscreen (primary display unless `--monitor` is given). |
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
+| `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
+| `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -48,6 +50,7 @@ just modern-m1 -- --fullscreen --monitor 1
 | --- | --- |
 | `F`, `Cmd+F`, `Ctrl+Cmd+F` | Toggle fullscreen on the window's current display. |
 | `Esc` | Exit fullscreen (does nothing when windowed). |
+| `L` | Cycle the colour-field layout pin: auto, V2, H2, V3, H3. A pin that changes the layout waits for the change budget. |
 | `Cmd+Q` | Quit (macOS application menu). |
 
 The cursor is hidden while fullscreen and restored when windowed.
@@ -137,18 +140,44 @@ library `libasound2` (e.g. `sudo apt install libasound2`).
 ## Scene plan
 
 Scenes live in `src/scenes/`, one module per scene, behind the `REGISTRY`
-table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
+table in `src/scenes/mod.rs`. Scene byte 7 is checked first and always selects
+the colour field, whatever the registry length; every other byte selects
 `REGISTRY[scene % REGISTRY.len()]`:
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
+| 7 | `ColourField` | `ScreenSpace` |
 | 0, 6, 12, ... | `SignalField` | `Orbit3D` |
-| 1, 7, 13, ... | `SpectrumVolume` | `Orbit3D` |
+| 1, 13, 19, ... | `SpectrumVolume` | `Orbit3D` |
 | 2, 8, 14, ... | `PulseTunnel` | `Orbit3D` |
 | 3, 9, 15, ... | `Lines` | `ScreenSpace` |
 | 4, 10, 16, ... | `Static` | `ScreenSpace` |
 | 5, 11, 17, ... | `Object` | `ScreenSpace` |
 
+- `ColourField` (scene 7, `src/scenes/colour_field/`): two or three large
+  regions of flat colour, meant to be projected onto performers in the dark.
+  It follows [`shared/specs/colour-field-v0.md`](../../shared/specs/colour-field-v0.md),
+  which is shared with the console ports. A pure, deterministic step function
+  (`state.rs`) runs once per new control frame, at most 60 times per
+  second. Its fixtures F0 to F22 and F24 are unit tests (F23 is host-only).
+  Rendering only draws the step's trace. In scene 7, `palette & 3` picks the
+  mode (0 held, 1 spectral levels, 2 hard cuts, 3 flash/gate) and
+  `palette & 4` the family (red/yellow/blue or RGB/CMY). Beats, bars, drops and
+  note onsets change the layout (V2, H2, V3, H3), the colour combination and
+  the rotation, within the spec's limit of 3 flashes per second. Wire palette
+  and scene values must hold for 30 steps before they apply, and changes share
+  a budget of one per 20 steps. Without `--udp` the palette is local 0 (held).
+  Scene 7 arrives over UDP (procedural and mic frames use scenes 0 to 2). The
+  field steps once per new UDP, mic or procedural frame. A held UDP frame
+  repeats the last step and its cleared one-off flags never count as edges, so
+  when mic frames take over, the debounce returns to the native scene after
+  about 30 steps.
+  Flash/gate runs only when armed, and default builds never latch it (see
+  [Flash/gate is off by default](#flashgate-is-off-by-default)).
+  With the `unmeasured-flash` feature, a stable absolute wire 3 or 7 (held 30
+  steps with incoming scene 7 throughout) arms it, since hosts send those
+  only when started with `--allow-flash`. Relative palette inputs, procedural
+  and mic frames never arm, and unarmed 3 and 7 run as hard cuts (2 and 6).
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
@@ -247,6 +276,28 @@ sparkle, 3 scanlines (see `src/scenes/object/mod.rs`).
 The Pi 5 profile favors crisp geometry and predictable frame pacing. The M1
 profile favors density, deeper Z spacing, and more aggressive camera motion.
 
+## Flash/gate is off by default
+
+Colour-field modes 3 and 7 (flash/gate) flash the whole field at up to 7.5
+flashes per second, above the WCAG 2.3.1 and Harding limit of 3. Issue #68
+requires an independent photosensitivity analyser (PEAT, or a Harding-style
+general and red flash check) to measure them before any build ships them.
+Until then they sit behind the `unmeasured-flash` Cargo feature, which is off
+by default and must not be enabled for releases:
+
+- **Default builds** (including release packages) never latch flash, whatever
+  arms it: wire selection, operator requests or a local pre-arm. Palettes 3
+  and 7 run as the spec's unarmed requests, hard cuts 2 and 6, and
+  `--allow-flash` only prints a notice.
+- **`--features unmeasured-flash`** runs flash/gate as the spec describes, for
+  measurement and development only.
+
+`just rust-lint` and `just rust-test` run clippy and the tests for both
+builds. The default build's tests check that every armed fixture equals hard
+cuts, and count WCAG 2.3.1 general and red flashes in its rendered sequences
+(at most 3 per second). That count is supporting evidence, not a substitute
+for the analyser.
+
 ## Capture
 
 `chipviz-capture` renders frames through the same pipeline and shader into an
@@ -263,7 +314,12 @@ Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
 frame 0, so very large frame indices take longer to capture.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
-scene byte is used. `--input` is `procedural` (default) or a `.cvz` file of
+scene byte is used. `--scene 7` captures the colour field, which is replayed
+from frame 0 like the camera. Procedural input never arms flash/gate; with
+the `unmeasured-flash` feature, a recording arms it only as a target would,
+from a stable absolute wire 3 or 7 held in scene 7, and default builds never
+flash. Recorded inputs use
+their wire palettes; procedural input uses palette 0. `--input` is `procedural` (default) or a `.cvz` file of
 concatenated control-frame packets, such as the bridge's `--output`.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`
 for every option. The GPU smoke test is ignored by default; run it with

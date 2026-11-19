@@ -1,5 +1,10 @@
 //! Scene registry for the modern renderer.
 //!
+//! Scene byte 7 is the colour field ([`colour_field`]), checked before the
+//! registry mapping on every frame (see [`dispatch`]); the colour field is
+//! stateful, so it is not a registry entry. Every other byte keeps its
+//! registry scene.
+//!
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
 //! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
 //! with the current six entries scene 0/6/12... is SignalField, 1/7/13... is
@@ -14,6 +19,7 @@
 //! SignalField, SpectrumVolume, PulseTunnel, Lines and Static) to Object,
 //! SignalField, SpectrumVolume, PulseTunnel and Lines.
 
+pub mod colour_field;
 mod lines;
 mod object;
 mod pulse_tunnel;
@@ -59,8 +65,42 @@ pub const REGISTRY: &[SceneEntry] = &[
     object::ENTRY,
 ];
 
+/// The registry mapping for native scenes. Callers check
+/// [`colour_field::SCENE`] first (see [`dispatch`]).
 pub fn select(scene: u8) -> &'static SceneEntry {
     &REGISTRY[usize::from(scene) % REGISTRY.len()]
+}
+
+/// What a scene byte selects: 7 is the colour field on every target,
+/// whatever the registry length; anything else is `REGISTRY[scene % len]`.
+#[derive(Clone, Copy)]
+pub enum Selected {
+    ColourField,
+    Registry(&'static SceneEntry),
+}
+
+impl Selected {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ColourField => colour_field::NAME,
+            Self::Registry(entry) => entry.name,
+        }
+    }
+
+    pub fn camera(self) -> CameraMode {
+        match self {
+            Self::ColourField => CameraMode::ScreenSpace,
+            Self::Registry(entry) => entry.camera,
+        }
+    }
+}
+
+pub fn dispatch(scene: u8) -> Selected {
+    if scene == colour_field::SCENE {
+        Selected::ColourField
+    } else {
+        Selected::Registry(select(scene))
+    }
 }
 
 pub(crate) fn palette(index: u8, brightness: f32, energy: f32) -> [f32; 4] {
@@ -165,6 +205,19 @@ mod tests {
         let orbit = CameraMode::Orbit3D;
         let flat = CameraMode::ScreenSpace;
         assert_eq!(cameras, [orbit, orbit, orbit, flat, flat, flat]);
+    }
+
+    #[test]
+    fn scene_seven_dispatches_to_colour_field_before_the_registry() {
+        let names: Vec<_> = (0..=13).map(|scene| dispatch(scene).name()).collect();
+        let mut expected: Vec<_> = (0..=13).map(|scene| select(scene).name).collect();
+        expected[7] = "ColourField";
+        assert_eq!(names, expected);
+        for scene in [15, 23, 71, 255] {
+            assert_eq!(dispatch(scene).name(), select(scene).name);
+        }
+        assert_eq!(dispatch(7).camera(), CameraMode::ScreenSpace);
+        assert!(REGISTRY.iter().all(|entry| entry.name != "ColourField"));
     }
 
     #[test]
