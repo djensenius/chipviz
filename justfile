@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/gb_libretro_capture.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_nes_colour_field.py scripts/c64_colour_field_capture.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py scripts/gb_libretro_capture.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_homebrew.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_nes_colour_field.py tests/test_rust_notices.py scripts/c64_colour_field_capture.py"
 
 default:
     just --list
@@ -15,7 +15,7 @@ default:
 check: lint test
     @echo "chipviz check OK"
 
-lint: scaffold-check c-lint python-lint docs-lint rust-lint
+lint: scaffold-check c-lint python-lint docs-lint rust-lint third-party-notices-check
     @echo "chipviz lint OK"
 
 test: c-test python-test rust-test build-sim simulate host-sample target-arrays homebrew-artifacts
@@ -89,6 +89,8 @@ scaffold-check:
     @test -f cores/snes/src/main.c
     @test -f renderers/modern/Cargo.toml
     @test -f renderers/modern/src/lib.rs
+    @test -f THIRD_PARTY_NOTICES/rust.md
+    @test -f THIRD_PARTY_NOTICES/roms.md
     @echo "chipviz scaffold OK"
 
 build: build-sim
@@ -140,6 +142,14 @@ docs-lint:
     @${PYTHON:-python3} -m json.tool shared/specs/control-frame-v0.json >/dev/null
     @${PYTHON:-python3} shared/tools/lint_docs.py
     @echo "chipviz docs lint OK"
+
+# Regenerate THIRD_PARTY_NOTICES/rust.md from renderers/modern/Cargo.lock.
+third-party-notices:
+    @${PYTHON:-python3} shared/tools/rust_notices.py
+
+# Fails if the Rust notices are stale; skips when crate sources are unavailable.
+third-party-notices-check:
+    @${PYTHON:-python3} shared/tools/rust_notices.py --check
 
 host-sample:
     @mkdir -p build
