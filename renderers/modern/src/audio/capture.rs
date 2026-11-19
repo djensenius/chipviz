@@ -23,6 +23,7 @@
 //! reports an error (printed, rate-limited) and the levels decay to silence
 //! until the renderer is restarted.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -50,6 +51,20 @@ const LOSS_CONFIRM: Duration = Duration::from_millis(50);
 const SNAPSHOT_RETRIES: usize = 3;
 /// Deliveries this long with only normal gaps reset the stall threshold.
 const STALL_RESET: Duration = Duration::from_secs(1);
+/// The smallest lag in each window this long feeds the device clock drift
+/// estimate.
+const DRIFT_WINDOW: Duration = Duration::from_secs(1);
+/// Window minima the drift is fitted to: a minute, so one loss left unfilled
+/// barely moves the fit.
+const DRIFT_HISTORY: usize = 60;
+/// Window minima needed before the drift is estimated.
+const DRIFT_MIN_WINDOWS: usize = 3;
+/// The latency line rises by the smallest excess of this many windows, so a
+/// window whose minimum lands a little lower than the last does not look like
+/// fill to take back.
+const DRIFT_RAISE_WINDOWS: usize = 10;
+/// Largest drift accepted, in seconds of lag gained per second.
+const MAX_DRIFT: f64 = 0.01;
 const SILENCE_WARNING: Duration = Duration::from_secs(3);
 const ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const PERMISSION_HINT: &str = if cfg!(target_os = "macos") {
@@ -484,9 +499,32 @@ impl SampleClock {
 /// a run that ends up within the margin after a partial fill keeps its
 /// residual. A large burst (for example after the analysis thread was
 /// starved) hides nothing: the lag counts every sample it delivers.
+///
+/// A device clock slower or faster than the wall clock makes the lag drift
+/// steadily. That trend is the device's time, not lost audio or jitter, so
+/// the latency is a line rather than a constant: its slope is a least-squares
+/// fit (clamped to `MAX_DRIFT`) to the smallest lag in each `DRIFT_WINDOW` of
+/// the last `DRIFT_HISTORY`, and the excess lag and jitter are measured from
+/// it. When every window in a block of `DRIFT_RAISE_WINDOWS` has its minimum
+/// above the line (within the margin), the line rises by the smallest of
+/// them, so the fit's error does not build up. The fit uses the lag after
+/// each adjustment, leaves out windows with stall silence, and a filled loss
+/// leaves the minimum unchanged, so only losses within the margin reach it.
+/// Until the drift is fitted, a fast clock's falling lag still takes back
+/// outstanding fill, as without drift tracking.
 #[derive(Debug)]
 struct LossDetector {
+    /// Smallest lag less the drift since `origin`.
     latency: Option<f64>,
+    origin: Instant,
+    /// Lag the device clock gains per second on the wall clock.
+    drift: f64,
+    /// The current drift window.
+    window: DriftWindow,
+    /// Recent windows' time and lag, oldest first.
+    minima: VecDeque<(f64, f64)>,
+    /// Windows in the current raise block and their smallest excess.
+    raise: (usize, f64),
     /// Start, smallest and largest excess lag of the run above the margin.
     excess: Option<(Instant, f64, f64)>,
     /// Largest jitter seen in the current and the previous `STALL_RESET`.
@@ -504,6 +542,11 @@ impl LossDetector {
     fn new(now: Instant) -> Self {
         Self {
             latency: None,
+            origin: now,
+            drift: 0.0,
+            window: DriftWindow::new(now),
+            minima: VecDeque::with_capacity(DRIFT_HISTORY + 1),
+            raise: (0, f64::INFINITY),
             excess: None,
             jitter: 0.0,
             previous_jitter: 0.0,
@@ -516,6 +559,7 @@ impl LossDetector {
     /// Stall silence fills up to now, as if deliveries had no latency; any
     /// of it that proves too much is taken back like a loss fill.
     fn stalled(&mut self, silence: f64) {
+        self.window.clean = false;
         self.excess = None;
         self.filled += silence;
         self.reversed = None;
@@ -523,6 +567,9 @@ impl LossDetector {
 
     /// Late real samples already cancelled this much stall silence.
     fn overlapped(&mut self, overlap: f64) {
+        if overlap > 0.0 {
+            self.window.clean = false;
+        }
         self.filled = (self.filled - overlap).max(0.0);
     }
 
@@ -539,21 +586,73 @@ impl LossDetector {
         self.jitter = self.jitter.max(excess);
     }
 
+    /// Ends the drift window if it is over: a clean window's minimum within
+    /// the margin of the latency line joins the raise block and refits the
+    /// drift, keeping the line where it was at that minimum.
+    fn close_window(&mut self, now: Instant) {
+        if now.duration_since(self.window.start) < DRIFT_WINDOW {
+            return;
+        }
+        let window = std::mem::replace(&mut self.window, DriftWindow::new(now));
+        let (Some(steady), Some((at, lag)), Some(latency), true) =
+            (window.steady, window.fit, self.latency, window.clean)
+        else {
+            return;
+        };
+        let above = steady - latency;
+        if above > self.margin() {
+            return;
+        }
+        let mut latency = latency;
+        self.raise.0 += 1;
+        self.raise.1 = self.raise.1.min(above);
+        if self.raise.0 >= DRIFT_RAISE_WINDOWS {
+            latency += self.raise.1.max(0.0);
+            self.raise = (0, f64::INFINITY);
+        }
+        self.minima.push_back((at, lag));
+        if self.minima.len() > DRIFT_HISTORY {
+            self.minima.pop_front();
+        }
+        if self.minima.len() >= DRIFT_MIN_WINDOWS {
+            let n = self.minima.len() as f64;
+            let mean_at = self.minima.iter().map(|m| m.0).sum::<f64>() / n;
+            let mean_lag = self.minima.iter().map(|m| m.1).sum::<f64>() / n;
+            let (mut covariance, mut variance) = (0.0, 0.0);
+            for (at, lag) in &self.minima {
+                covariance += (at - mean_at) * (lag - mean_lag);
+                variance += (at - mean_at).powi(2);
+            }
+            if variance > 0.0 {
+                let drift = (covariance / variance).clamp(-MAX_DRIFT, MAX_DRIFT);
+                latency += (self.drift - drift) * at;
+                self.drift = drift;
+            }
+        }
+        self.latency = Some(latency);
+    }
+
     /// Seconds to adjust the timeline by, given the lag (in seconds) after a
     /// delivery: positive is lost audio to fill with silence, negative is
     /// earlier fill to take back, at most `spare` seconds of this delivery.
     fn check(&mut self, now: Instant, lag: f64, spare: f64) -> f64 {
-        let latency = *self.latency.get_or_insert(lag);
-        if lag < latency && self.filled > 0.0 {
-            let back = (latency - lag).min(self.filled).min(spare);
+        self.close_window(now);
+        let at = now.duration_since(self.origin).as_secs_f64();
+        let steady = lag - self.drift * at;
+        let window = &mut self.window;
+        window.steady = Some(window.steady.map_or(steady, |s| s.min(steady)));
+        let latency = *self.latency.get_or_insert(steady);
+        if steady < latency && self.filled > 0.0 {
+            let back = (latency - steady).min(self.filled).min(spare);
             self.filled -= back;
             // Fill taken back was a delay, not a loss: learn the whole
             // reversal as jitter so the same delay is not filled again. It
             // accumulates over an episode, so a delay that recovers in steps
             // (or a take-back that `spare` splits) counts in full. Episodes
             // last at most `STALL_RESET`: a device clock running fast keeps
-            // taking back stall silence for hours, and that slow trend must
-            // not pile up into a margin that hides real losses.
+            // taking back stall silence until its drift is fitted, and that
+            // slow trend must not pile up into a margin that hides real
+            // losses.
             let (since, total) = self.reversed.get_or_insert((now, 0.0));
             if now.duration_since(*since) >= STALL_RESET {
                 *since = now;
@@ -563,11 +662,13 @@ impl LossDetector {
             let total = *total;
             self.note_jitter(now, total);
             self.excess = None;
+            self.window.fit(at, lag + back, self.drift);
             return -back;
         }
-        let latency = latency.min(lag);
+        self.window.fit(at, lag, self.drift);
+        let latency = latency.min(steady);
         self.latency = Some(latency);
-        let excess = lag - latency;
+        let excess = steady - latency;
         if excess <= self.margin() {
             if let Some((_, _, largest)) = self.excess.take() {
                 self.note_jitter(now, largest);
@@ -586,6 +687,39 @@ impl LossDetector {
         self.filled += lost;
         self.reversed = None;
         lost
+    }
+}
+
+/// Smallest lags over one `DRIFT_WINDOW` of [`LossDetector`] deliveries.
+#[derive(Debug)]
+struct DriftWindow {
+    start: Instant,
+    /// Smallest lag less the drift.
+    steady: Option<f64>,
+    /// Time since the detector's origin and lag after any take-back, at the
+    /// smallest such lag less the drift.
+    fit: Option<(f64, f64)>,
+    /// No stall silence or overlap in the window.
+    clean: bool,
+}
+
+impl DriftWindow {
+    fn new(start: Instant) -> Self {
+        Self {
+            start,
+            steady: None,
+            fit: None,
+            clean: true,
+        }
+    }
+
+    fn fit(&mut self, at: f64, lag: f64, drift: f64) {
+        if self
+            .fit
+            .is_none_or(|(t, l)| lag - drift * at < l - drift * t)
+        {
+            self.fit = Some((at, lag));
+        }
     }
 }
 
@@ -1291,6 +1425,106 @@ mod tests {
         assert!(loss.check(at(150), -0.01, 1.0) < 0.0);
         assert_eq!(loss.check(at(160), 0.09, 1.0), 0.0);
         assert_eq!(loss.check(at(210), 0.09, 1.0), 0.09);
+    }
+
+    /// `count` callbacks of `ms` milliseconds of device time from a device
+    /// clock running at `ratio` times the wall clock, the `k`th captured by
+    /// `k * ms` device time and delivered `late(k)` after that, in delivery
+    /// order. Callbacks for which `lose(k)` holds are never delivered.
+    fn drifting(
+        ms: u64,
+        count: u64,
+        ratio: f64,
+        mut late: impl FnMut(usize) -> Duration,
+        lose: impl Fn(u64) -> bool,
+    ) -> Vec<(Duration, usize)> {
+        let chunk = samples(Duration::from_millis(ms));
+        let mut callbacks: Vec<_> = (1..=count)
+            .map(|k| {
+                let captured = Duration::from_secs_f64((k * ms) as f64 / 1000.0 / ratio);
+                (k, captured + late(k as usize))
+            })
+            .filter(|&(k, _)| !lose(k))
+            .map(|(_, at)| (at, chunk))
+            .collect();
+        callbacks.sort_by_key(|&(at, _)| at);
+        callbacks
+    }
+
+    /// Replays `callbacks` like [`replay`] and returns the silence fed and the
+    /// furthest the analysed timeline got from the real samples delivered
+    /// (net silence: fill minus discarded overlap) and where it ended, in
+    /// samples.
+    fn replay_deviation(callbacks: &[(Duration, usize)]) -> (usize, usize, i64) {
+        let start = Instant::now();
+        let end = callbacks.last().unwrap().0 + POLL;
+        let mut clock = SampleClock::new(RATE, start);
+        let (mut pending, mut silence, mut net, mut furthest) = (0, 0, 0i64, 0);
+        let mut next = callbacks.iter().peekable();
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= end {
+            while let Some((_, count)) = next.next_if(|(at, _)| *at <= elapsed) {
+                pending += count;
+            }
+            let accounting = clock.poll(start + elapsed, pending);
+            silence += accounting.silence;
+            net += accounting.silence as i64 - accounting.overlap as i64;
+            furthest = furthest.max(net.unsigned_abs() as usize);
+            pending = 0;
+            elapsed += POLL;
+        }
+        (silence, furthest, net)
+    }
+
+    #[test]
+    fn device_clock_drift_is_followed_without_fills() {
+        // Ten minutes of 10 ms and 20 ms callbacks from a device clock 0.1%
+        // and 0.5% slow or fast: the timeline follows the device clock.
+        for ms in [10, 20] {
+            for ratio in [0.999, 0.995, 1.001, 1.005] {
+                let callbacks = drifting(ms, 600_000 / ms, ratio, |_| Duration::ZERO, |_| false);
+                let (silence, furthest, _) = replay_deviation(&callbacks);
+                assert!(
+                    furthest <= samples(Duration::from_millis(20)),
+                    "{ms} ms at {ratio}: {furthest} samples off, {silence} silence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fill_survives_a_fast_device_clock() {
+        // An 80 ms loss early on stays filled for ten minutes of a device
+        // clock 0.5% fast: the clock's gain is not mistaken for overfill.
+        for ms in [10, 20] {
+            let lost = |k: u64| (5000..5080).contains(&(k * ms));
+            let callbacks = drifting(ms, 600_000 / ms, 1.005, |_| Duration::ZERO, lost);
+            let (silence, furthest, net) = replay_deviation(&callbacks);
+            let lost = samples(Duration::from_millis(80));
+            let error = net.abs_diff(lost as i64) as usize;
+            assert!(
+                error <= samples(Duration::from_millis(15)) && furthest <= 2 * lost,
+                "{ms} ms: {net} samples net, at most {furthest}, {silence} silence"
+            );
+            let (accounted, _) = replay(&callbacks, callbacks.last().unwrap().0 + POLL);
+            assert_close(accounted, Duration::from_millis(600_000));
+        }
+    }
+
+    #[test]
+    fn a_short_loss_amid_jitter_and_drift_is_filled() {
+        // 20 ms callbacks up to 30 ms late from a device clock 0.1% slow or
+        // fast for six minutes, with 80 ms lost at five minutes.
+        for ratio in [0.999, 1.001] {
+            let lost = |k: u64| (300_000..300_080).contains(&(k * 20));
+            let late = random_lateness(0x5EED_D1F7, 30);
+            let callbacks = drifting(20, 18_000, ratio, late, lost);
+            assert_eq!(callbacks.len(), 18_000 - 4);
+            let end = callbacks.last().unwrap().0 + POLL;
+            let (accounted, silence) = replay(&callbacks, end);
+            assert_close(silence, Duration::from_millis(80));
+            assert_close(accounted, Duration::from_secs(360));
+        }
     }
 
     /// Polls every 10 ms over `from..to`, delivering 10 ms of audio per poll

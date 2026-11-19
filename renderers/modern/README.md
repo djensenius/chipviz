@@ -107,6 +107,8 @@ loud rooms both move the scenes, room hiss stays dark, and silence (or a
 device that stops sending audio) fades smoothly to zero. Audio dropped while
 analysis catches up still advances the beat clock, so it keeps real time, and
 so do short gaps where the device itself loses audio (they count as silence).
+A device clock running slightly slow or fast is followed as a steady drift,
+not mistaken for lost audio or delivery jitter.
 
 The stream is not reopened if the device is unplugged or fails: the renderer
 prints a stream error (at most once every five seconds) and the levels fade to
