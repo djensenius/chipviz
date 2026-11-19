@@ -90,20 +90,21 @@ The effective palette `p_eff` comes from one of three sources:
   procedural `(frame/32)%8` and the GBA demo cycling never drive the mode.
   Demo and attract never use flash/gate: a local 3 or 7 runs as 2 or 6.
 - **Operator:** only in an `operator` input role (see
-  [Input roles](#input-roles)). Pulses take effect on the next step.
+  [Input roles](#input-roles)). A pulse sets the requested palette `p_req`,
+  which is applied under the [change budget](#change-budget).
 - **Wire:** control frames, file playback, Joybus and HID palette bits.
   - On scene entry, `p_eff` is the wire value. If that value is 3 or 7, it runs
     as 2 or 6.
   - The stability counter starts at scene entry. The entry value counts as
     step 1.
-  - A wire value, including one present at entry, becomes `p_eff` from the step
-    after it has been received unchanged for `P_STABLE = 30` consecutive steps.
-    A wire 3 or 7 held for 30 steps from entry therefore arms on its 30th step
-    and runs from the 31st.
+  - A wire value, including one present at entry, becomes `p_req` once it has
+    been received unchanged for `P_STABLE = 30` consecutive steps. A wire 3 or
+    7 held for 30 steps from entry therefore arms on its 30th step and, when
+    the change budget allows (as in F10), runs from the 31st.
   - A stable 3 or 7 arms flash (see [arming](#arming-and-operator-inputs)).
 - **Precedence:** a later event overrides an earlier one, whatever its source.
-  - An operator pulse sets `p_eff` directly and consumes the current wire
-    value: that value never becomes `p_eff` again, however long it stays.
+  - An operator pulse sets `p_req` and consumes the current wire value: that
+    value never becomes `p_req` again, however long it stays.
   - The stability counter restarts only when a new wire value (different from
     the consumed one) arrives. That new value overrides the operator choice
     once it has stayed unchanged for 30 steps.
@@ -148,14 +149,19 @@ uses the rising edges of `beat`, `bar` and `drop`, and ignores `fill` and
 ### Layout pinning (local, no wire change)
 
 `pin` is `auto` or a fixed layout id, and it starts as `auto` at power-on. The
-pin control cycles `auto → V2 → H2 → V3 → H3 → auto` and takes effect on the
-next step.
+pin control cycles the requested pin `pin_req` through `auto → V2 → H2 → V3 →
+H3 → auto`. Only the latest request is kept. A request that would change the
+displayed layout is applied under the [change budget](#change-budget); setting
+`auto`, or pinning the layout already shown, applies at the end of the step
+without using the budget.
 
 When the pin is set, layout equals the pinned layout:
 
 - Event-driven `next_layout` does nothing, except that hard-cut action 3 rotates
   instead (see [Modes](#modes)).
-- In spectral mode, a pin change counts as a layout change.
+- Applying a pin that changes the layout counts as a layout change: it sets
+  `since_layout = 0`, and in spectral mode it re-initialises `lvl` as
+  `next_layout` does.
 
 Setting the pin back to `auto` resumes event-driven changes from the current
 layout.
@@ -311,8 +317,21 @@ poll. Unavailable fields are 0.
 On reduced transports, the oracle is the reference implementation fed the
 mapped frames, stepped once per poll.
 
-Steps are nominally 60 Hz. At 50 Hz the step counts are the same, which only
-lowers the rates. Counters are saturating `u16`. A counter that is reset during
+**Step rate (normative):** every rate limit in this spec assumes at most 60
+steps per second.
+
+- Renderers and ROMs must advance colour-field logic (detector, counters and
+  mode rules) at most 60 times per second of wall-clock time. Extra display
+  frames repeat the previous step's output and do not advance any counter.
+- Hosts must not send more than 60 colour-field frames per second, for example
+  `live_bridge --rate 120` must drop to 60 while scene is 7. A target that
+  receives frames faster must resample to at most 60 steps per second, using
+  the newest frame and OR-ing flag rising edges and note onsets since the last
+  step, rather than stepping once per frame.
+- At 50 Hz the step counts are the same, which only lowers the rates. The flash
+  limits therefore hold whatever the transport rate.
+
+Counters are saturating `u16`. A counter that is reset during
 a step reads 1 on the next step, so "at least N steps" means the next action can
 happen at `t + N`. Arithmetic is signed 16-bit.
 
@@ -348,13 +367,15 @@ no events. This happens at power-on and every time scene 7 is entered again.
 - **Mode state:** apply mode entry (below).
 - `since_layout = 0`.
 
-**Mode entry** runs on scene entry and whenever the mode or family of `p_eff`
-changes. `layout`, `combo` and `rot` are kept, except that held mode sets
+**Mode entry** runs on scene entry and whenever the effective mode (after the
+unarmed 3→2 rule) or the family of `p_eff` changes. `layout`, `combo` and `rot` are kept, except that held mode sets
 `combo = dom`.
 
-- **Counters:** `act = 0` and `since_cut = CUT_MIN`.
-- **Spectral levels:** each region gets `lvl[i] = count(UP[k] <= v_i)`, and
-  `lg = LEVEL_OPP`. `lvl[2] = 0` in 2-region layouts.
+- **Counters:** `act = 0`. On scene entry, `since_cut = CUT_MIN` and `lg =
+  LEVEL_OPP`. On a mode or family change, `since_cut = 0` and `lg = 0`: the
+  change is itself a visible full-field change and uses the budget.
+- **Spectral levels:** each region gets `lvl[i] = count(UP[k] <= v_i)`.
+  `lvl[2] = 0` in 2-region layouts.
 - **Gate:** `pulse = 0`, `gate_off = GATE_OFF_MIN`, and `dim = avg_e >=
   REST_DIM_ON`, where `avg_e` is the current average.
 - **Silence:** in spectral or flash/gate mode, if `silent`, all regions are
@@ -398,8 +419,34 @@ changes. `layout`, `combo` and `rot` are kept, except that held mode sets
    SECTION_MIN)`. Any `next_layout` sets `since_layout = 0`. In spectral mode,
    it also re-initialises `lvl` from the current values for the new region
    count, as in mode entry, and sets `lg = 0`.
-7. Increment `since_cut`, `since_layout`, `gate_off` and `lg`. Then apply the
-   wire stability gate and the pin, so they take effect from the next step.
+7. Increment `since_cut`, `since_layout`, `gate_off` and `lg`. Then update
+   `p_req` (wire stability gate, operator pulses) and `pin_req`, and apply at
+   most one pending request under the change budget, so it takes effect from
+   the next step.
+
+### Change budget
+
+`lg` is a field-wide count of steps since the last visible change, kept in every
+mode. Outside armed flash/gate, every visible change sets `lg = 0`: a spectral
+level change, any `next_layout`, `next_combo` or `rotate`, a held-mode combo
+change on `D`, an applied pin, and a mode or family change. Flash/gate pulses do
+not touch `lg`, so a request to leave mode 3 is never starved.
+
+At the end of step 7, a pending request is applied only when `lg >= LEVEL_OPP`
+and `since_cut >= CUT_MIN`:
+
+- A `p_req` whose effective mode or family differs from the current one runs
+  mode entry, which sets `lg = 0` and `since_cut = 0`. A `p_req` with the same
+  effective mode and family just replaces `p_eff`.
+- Otherwise, a `pin_req` that changes the layout applies the pin and sets `lg =
+  0` and `since_cut = 0`.
+- Otherwise, the request stays pending. Only the latest `p_req` and `pin_req`
+  are kept; a newer request replaces an older one, and a request equal to the
+  current value is cleared.
+
+Operator- and host-driven mode, family and pin changes are therefore at most 3
+per second, the same as hard cuts. Arming or clearing the flash latch changes
+the effective mode and goes through the same rule.
 
 ## Modes
 
@@ -426,9 +473,9 @@ changes. `layout`, `combo` and `rot` are kept, except that held mode sets
     across the whole field, which keeps it at or below 3 flashes per second.
     There are no per-region timers.
 - **Hard cuts (2):** level 3. On `E` with `since_cut >= CUT_MIN`, set
-  `since_cut = 0`, then:
+  `since_cut = 0` and `lg = 0`, then:
   - If `X`: `next_layout` and `next_combo`.
-  - Otherwise, apply action `act & 3` and then increment `act`:
+  - Otherwise, apply action `act` and then set `act = (act + 1) & 3`:
     - 0: rotate
     - 1: `next_combo`
     - 2: rotate
@@ -553,3 +600,4 @@ OTHER = CANCEL
 | F9 beat/bar | `e`, bands and spectrum 100. `beat` at `20 + 40k` (`k = 0..14`) and `bar` at `40 + 120k` (`k = 0..4`). | 20 cuts and 20 pulses, one at every beat and bar step. Held never changes. |
 | F10 wire gate | F1 input without `drop`. Wire `p` is 0 for steps 0–99, 2 for 100–109, 0 for 110–199, and 3 from 200 on. | `p_eff` is 0 through step 229 and 3 from step 230, when mode 3 enters resting dim (armed by host selection). Steps 100–109 have no effect. |
 | F11 pinned | F5 input, pinned to H3. | Layout is always H3. 19 cuts, and every fourth cut rotates instead of changing layout. |
+| F12 mode toggle | F0 input, starting at `p = 0`. Operator pulses request `p = 1` at steps `60 + 12k` and `p = 0` at `66 + 12k`, through step 594. | Requests apply at the end of steps 60, 80, 100, 126, 146, 166, 192, … (20 or 26 steps apart; a request equal to the current `p_eff` is cleared). The field alternates held level 3 and spectral black, visible from the next step. Never more than 3 changes in any 60 steps. |
