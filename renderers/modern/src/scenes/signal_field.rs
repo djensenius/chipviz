@@ -1,6 +1,6 @@
 //! SignalField: thousands of thin high-contrast data planes in a rotating 3D field.
 
-use super::{CameraMode, SceneEntry, hash, note_emphasis, palette};
+use super::{CameraMode, SceneBuild, SceneEntry, hash, note_emphasis, palette};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -8,7 +8,7 @@ use crate::scene::Instance;
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "SignalField",
     camera: CameraMode::Orbit3D,
-    build,
+    build: SceneBuild::Stateless(build),
 };
 
 fn build(

@@ -6,23 +6,34 @@
 //! shader can only draw quads facing the z axis, and the hallway walls face x.
 //!
 //! The plane is two mirrored halves (`x >= 0` and its reflection) running the
-//! same line animation. Every 512 control frames (about 8.5 s at 60 fps) a
-//! section starts: odd sections are a hallway (each half folds up about its
-//! outer edge into a wall, so the walls mirror each other) and even sections
-//! are the flat plane. A section change morphs smoothly over its first 96
-//! frames (1.6 s), except that every fourth section (`section % 4 == 3`) cuts
-//! straight to the hallway.
+//! same line animation. Odd sections are a hallway (each half folds up about
+//! its outer edge into a wall, so the walls mirror each other) and even
+//! sections are the flat plane. [`LinesState`] keeps the section between
+//! frames:
 //!
-//! The fold is timed by the monotonic `frame` counter, not `beat_count` and
-//! `beat_phase`: the scene is stateless, and sources whose phase wraps before
-//! the count ticks (procedural input, `live_bridge`) would make a beat-timed
-//! fold step backwards. Timings in seconds assume 60 control frames per
-//! second; the fold's real speed follows the sender's frame rate. Beat-synced folds are follow-up
-//! <https://github.com/djensenius/chipviz/issues/80>. The drop flag is not used: it is a one-frame trigger,
-//! and without state it could only flash for that frame. Everything derives
-//! from the control frame and elapsed time, so captures are reproducible.
+//! - A section starts when `beat_count` crosses a multiple of 16 (a 16-beat
+//!   phrase, four bars of 4/4). Only small forward steps of the counter
+//!   count; a backward or large jump (a restart, a loop or a source handover)
+//!   resyncs without a section change. `beat_phase` is not used: procedural
+//!   input and `live_bridge` wrap it before the count ticks.
+//! - The fold eases from wherever the shape was to the section's shape over
+//!   one bar (four beats at the section's `bpm`, 60 to 240 control frames),
+//!   counted in observed frames, so it never moves backwards within a
+//!   section. Every fourth section (`section % 4 == 3`) cuts straight to the
+//!   hallway.
+//! - Sources whose beat counter stalls for 4 s fall back to a new section
+//!   every 512 frames (about 8.5 s).
+//! - With [`SceneConfig::lines_drop_cuts`](super::SceneConfig) (`--lines-drop-cuts`),
+//!   a rising drop flag (0x04) cuts straight to the next section. The cut
+//!   refolds the same lines rather than flashing the screen, and any section
+//!   change, cut or not, waits for one bar after the last one.
+//!
+//! Timings in seconds assume 60 control frames per second; the fold's real
+//! speed follows the sender's frame rate. Everything else derives from the
+//! control frame and elapsed time, and the state steps only on observed
+//! frames, so captures replayed from frame 0 are reproducible.
 
-use super::{CameraMode, SceneEntry, hash, note_emphasis, palette};
+use super::{CameraMode, SceneBuild, SceneEntry, SceneState, hash, note_emphasis, palette};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -31,15 +42,30 @@ use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "Lines",
     camera: CameraMode::ScreenSpace,
-    build,
+    build: SceneBuild::Stateful(build),
 };
 
-/// Divides the u16 frame counter's wrap, so section parity survives it.
-const SECTION_FRAMES: u16 = 512;
-const MORPH_FRAMES: f32 = 96.0;
+/// A section starts when `beat_count` crosses a multiple of this.
+const SECTION_BEATS: u16 = 16;
+/// A forward `beat_count` step larger than this is a resync, not beats.
+const MAX_BEAT_STEP: u16 = 4;
+/// A forward `frame` step larger than this counts as one frame.
+const MAX_FRAME_STEP: u16 = 8;
+/// Frames without a beat before sections free-run.
+const BEAT_STALL_FRAMES: u32 = 240;
+/// Free-running section length.
+const FREE_SECTION_FRAMES: u32 = 512;
+/// Control frames per second assumed when converting `bpm` to frames.
+const FRAME_RATE: f32 = 60.0;
+const BAR_BEATS: f32 = 4.0;
+/// Used when `bpm` is 0 (unknown).
+const DEFAULT_BPM: f32 = 120.0;
+const MIN_MORPH_FRAMES: f32 = 60.0;
+const MAX_MORPH_FRAMES: f32 = 240.0;
+const DROP_FLAG: u8 = 0x04;
 /// Largest per-frame morph change: the smoothstep's peak slope.
 #[cfg(test)]
-const MAX_MORPH_STEP: f32 = 1.5 / MORPH_FRAMES;
+const MAX_MORPH_STEP: f32 = 1.5 / MIN_MORPH_FRAMES;
 /// The orbit swings up to this far (radians) either side of the hallway
 /// entrance, so easing it to the entrance never wraps around the target.
 const SWING: f32 = 2.6;
@@ -78,16 +104,127 @@ pub(crate) fn line_fade(profile: &RenderProfile, active: f32, index: usize) -> f
     ((active - index as f32) / ramp).clamp(0.0, 1.0)
 }
 
-/// 0 = flat plane, 1 = full hallway.
-pub(crate) fn hallway_morph(frame: ControlFrame) -> f32 {
-    let section = frame.frame / SECTION_FRAMES;
-    let target = if section % 2 == 1 { 1.0 } else { 0.0 };
-    if section % 4 == 3 {
-        return target;
+/// One bar in control frames at `bpm`: how long a fold takes, and the
+/// shortest gap between section changes.
+fn bar_frames(bpm: u8) -> f32 {
+    let bpm = if bpm == 0 {
+        DEFAULT_BPM
+    } else {
+        f32::from(bpm)
+    };
+    (BAR_BEATS * 60.0 * FRAME_RATE / bpm).clamp(MIN_MORPH_FRAMES, MAX_MORPH_FRAMES)
+}
+
+/// The fields [`LinesState::observe`] compares between frames.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    frame: u16,
+    beat_count: u16,
+    flags: u8,
+}
+
+/// Lines' section and fold, kept between frames (see the module docs).
+#[derive(Clone, Debug)]
+pub struct LinesState {
+    drop_cuts: bool,
+    last: Option<Seen>,
+    /// Odd sections are the hallway.
+    section: u32,
+    /// The section started with a cut: it shows its shape at once.
+    cut: bool,
+    /// Morph when the section started; the fold eases from it.
+    from: f32,
+    /// Frames observed since the section started.
+    frames: u32,
+    /// Fold length and minimum section length, from `bpm` at its start.
+    bar: f32,
+    /// Frames since `beat_count` last advanced.
+    stalled: u32,
+}
+
+impl Default for LinesState {
+    fn default() -> Self {
+        Self::new(false)
     }
-    let t = (f32::from(frame.frame % SECTION_FRAMES) / MORPH_FRAMES).clamp(0.0, 1.0);
-    let eased = t * t * (3.0 - 2.0 * t);
-    (1.0 - target) + (2.0 * target - 1.0) * eased
+}
+
+impl LinesState {
+    /// Starts flat, as if the plane had been showing for a while.
+    pub fn new(drop_cuts: bool) -> Self {
+        Self {
+            drop_cuts,
+            last: None,
+            section: 0,
+            cut: false,
+            from: 0.0,
+            frames: 0,
+            bar: bar_frames(0),
+            stalled: 0,
+        }
+    }
+
+    /// Steps on one new frame. A frame whose counter repeats the last one is
+    /// ignored, like the colour field's step.
+    pub fn observe(&mut self, frame: &ControlFrame) {
+        let seen = Seen {
+            frame: frame.frame,
+            beat_count: frame.beat_count,
+            flags: frame.flags,
+        };
+        let Some(last) = self.last else {
+            self.last = Some(seen);
+            return;
+        };
+        let step = frame.frame.wrapping_sub(last.frame);
+        if step == 0 {
+            return;
+        }
+        self.last = Some(seen);
+        let frames = u32::from(if step <= MAX_FRAME_STEP { step } else { 1 });
+        self.frames = self.frames.saturating_add(frames);
+        let beats = frame.beat_count.wrapping_sub(last.beat_count);
+        let advanced = (1..=MAX_BEAT_STEP).contains(&beats);
+        self.stalled = if advanced {
+            0
+        } else {
+            self.stalled.saturating_add(frames)
+        };
+        if (self.frames as f32) < self.bar {
+            return;
+        }
+        let phrase = advanced && frame.beat_count % SECTION_BEATS < beats;
+        let free_run = self.stalled >= BEAT_STALL_FRAMES && self.frames >= FREE_SECTION_FRAMES;
+        let drop = self.drop_cuts && frame.flags & !last.flags & DROP_FLAG != 0;
+        if phrase || free_run || drop {
+            self.start_section(frame.bpm, drop);
+        }
+    }
+
+    fn start_section(&mut self, bpm: u8, cut: bool) {
+        self.from = self.morph();
+        self.section = self.section.wrapping_add(1);
+        self.cut = cut || self.section % 4 == 3;
+        self.frames = 0;
+        self.bar = bar_frames(bpm);
+    }
+
+    /// The current section; odd sections are the hallway.
+    #[cfg(test)]
+    pub fn section(&self) -> u32 {
+        self.section
+    }
+
+    /// 0 = flat plane, 1 = full hallway. Within a section it only moves
+    /// toward the section's shape.
+    pub fn morph(&self) -> f32 {
+        let target = if self.section % 2 == 1 { 1.0 } else { 0.0 };
+        if self.cut {
+            return target;
+        }
+        let t = (self.frames as f32 / self.bar).clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        self.from + (target - self.from) * eased
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -265,6 +402,7 @@ fn build(
     frame: ControlFrame,
     elapsed: f32,
     aspect: f32,
+    state: &SceneState,
     instances: &mut Vec<Instance>,
 ) {
     build_with_morph(
@@ -272,7 +410,7 @@ fn build(
         frame,
         elapsed,
         aspect,
-        hallway_morph(frame),
+        state.lines.morph(),
         instances,
     );
 }
@@ -382,63 +520,243 @@ fn normalize(value: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::parse_cvz;
 
-    fn at(frame: u16) -> ControlFrame {
+    const FIXTURES: [&[u8]; 3] = [
+        include_bytes!("../../../../host/fixtures/musical/groove.cvz"),
+        include_bytes!("../../../../host/fixtures/musical/scale.cvz"),
+        include_bytes!("../../../../host/fixtures/chipsynth/groove.cvz"),
+    ];
+
+    /// `host/bridge/live_bridge.py`'s `frame_from_bands` timing: phase 4 per
+    /// frame (wrapping every 64 frames), a beat every 30 frames, 120 bpm.
+    fn live(index: u64) -> ControlFrame {
         ControlFrame {
-            frame,
-            ..ControlFrame::procedural(0)
-        }
-    }
-
-    #[test]
-    fn hallway_alternates_by_section_with_smooth_and_cut_transitions() {
-        assert_eq!(hallway_morph(at(120)), 0.0);
-        assert_eq!(hallway_morph(at(512)), 0.0);
-        let mid = hallway_morph(at(512 + 48));
-        assert!((mid - 0.5).abs() < 1e-6, "{mid}");
-        assert_eq!(hallway_morph(at(512 + 96)), 1.0);
-        assert_eq!(hallway_morph(at(1024)), 1.0);
-        assert_eq!(hallway_morph(at(1024 + 96)), 0.0);
-        // Every fourth section cuts straight to the hallway.
-        assert_eq!(hallway_morph(at(1536)), 1.0);
-        // Section parity survives the frame counter wrap.
-        assert_eq!(hallway_morph(at(u16::MAX)), 1.0);
-        assert_eq!(hallway_morph(at(0)), 1.0);
-        // The drop flag and beat fields are ignored.
-        let drop = ControlFrame {
-            flags: 0x04,
-            beat_count: 999,
-            beat_phase: 77,
-            ..at(600)
-        };
-        assert_eq!(hallway_morph(drop), hallway_morph(at(600)));
-    }
-
-    #[test]
-    fn morph_never_steps_backwards_on_real_frame_sources() {
-        // Procedural input and a live_bridge-style source (phase 4/frame,
-        // count every 30 frames) both wrap phase before the count ticks.
-        let live = |index: u64| ControlFrame {
+            bpm: 120,
             beat_phase: ((index * 4) & 0xFF) as u8,
             beat_count: (index / 30) as u16,
             ..ControlFrame::procedural(index)
-        };
-        for source in [ControlFrame::procedural, live] {
-            for index in 1..4096u64 {
-                let (before, after) = (source(index - 1), source(index));
-                let section = after.frame / SECTION_FRAMES;
-                if section != before.frame / SECTION_FRAMES {
+        }
+    }
+
+    /// Each fixture played start to end `loops` times by a player that keeps
+    /// counting frames and beats across loops.
+    fn fixture_playback(bytes: &[u8], loops: u16) -> Vec<ControlFrame> {
+        let frames = parse_cvz(bytes).unwrap();
+        let beats = frames.last().unwrap().beat_count + 1;
+        let length = frames.len() as u16;
+        (0..loops)
+            .flat_map(|round| {
+                frames.iter().map(move |frame| ControlFrame {
+                    frame: frame.frame.wrapping_add(round * length),
+                    beat_count: frame.beat_count.wrapping_add(round * beats),
+                    ..*frame
+                })
+            })
+            .collect()
+    }
+
+    /// Steps a state through `frames`, checking that the fold only moves
+    /// toward the section's shape, by at most the eased step, and that every
+    /// section starts on a 16-beat boundary at least a bar after the last.
+    /// Returns the number of sections started.
+    fn assert_monotonic(state: &mut LinesState, frames: &[ControlFrame], source: &str) -> u32 {
+        let start = state.section();
+        let mut since_change = u32::MAX;
+        for (index, frame) in frames.iter().enumerate() {
+            let (section, before, bar) = (state.section(), state.morph(), state.bar);
+            state.observe(frame);
+            let after = state.morph();
+            since_change = since_change.saturating_add(1);
+            if state.section() != section {
+                assert_eq!(state.section(), section.wrapping_add(1), "{source} {index}");
+                assert_eq!(frame.beat_count % SECTION_BEATS, 0, "{source} {index}");
+                assert!(since_change as f32 >= bar, "{source} {index}");
+                since_change = 0;
+                if state.cut {
                     continue;
                 }
-                let step = hallway_morph(after) - hallway_morph(before);
-                let toward = if section % 2 == 1 { step } else { -step };
-                assert!(toward >= -1e-6, "frame {index}: step {step}");
-                assert!(
-                    step.abs() <= MAX_MORPH_STEP + 1e-6,
-                    "frame {index}: step {step}"
-                );
+                // A new section starts from where the fold was.
+                assert!((after - before).abs() <= MAX_MORPH_STEP + 1e-6);
+                continue;
+            }
+            let step = after - before;
+            let toward = if section % 2 == 1 { step } else { -step };
+            assert!(toward >= -1e-6, "{source} frame {index}: step {step}");
+            assert!(
+                step.abs() <= MAX_MORPH_STEP + 1e-6,
+                "{source} frame {index}: step {step}"
+            );
+        }
+        state.section().wrapping_sub(start)
+    }
+
+    #[test]
+    fn fold_is_monotonic_and_phrase_aligned_under_procedural_input() {
+        // Includes the u16 frame-counter wrap at index 65536.
+        for range in [0..8192u64, 60_000..70_000] {
+            let frames: Vec<_> = range.map(ControlFrame::procedural).collect();
+            let sections = assert_monotonic(&mut LinesState::default(), &frames, "procedural");
+            assert!(sections >= 15, "{sections} sections");
+        }
+    }
+
+    #[test]
+    fn fold_is_monotonic_and_phrase_aligned_under_live_bridge_input() {
+        let frames: Vec<_> = (0..8192).map(live).collect();
+        let sections = assert_monotonic(&mut LinesState::default(), &frames, "live_bridge");
+        // A phrase is 16 beats of 30 frames.
+        assert_eq!(sections, 8192 / (16 * 30));
+    }
+
+    #[test]
+    fn fold_is_monotonic_and_phrase_aligned_under_cvz_playback() {
+        for bytes in FIXTURES {
+            // Played once, and looped with continuing counters.
+            let once = parse_cvz(bytes).unwrap();
+            assert_monotonic(&mut LinesState::default(), &once, "cvz once");
+            let looped = fixture_playback(bytes, 40);
+            let sections = assert_monotonic(&mut LinesState::default(), &looped, "cvz looped");
+            assert!(sections >= 4, "{sections} sections");
+            // Restarting the file (counters jump back) is a resync, not a
+            // section change, and never reverses a fold in progress.
+            let mut state = LinesState::default();
+            let restarted: Vec<_> = (0..3).flat_map(|_| looped.iter().copied()).collect();
+            assert_monotonic(&mut state, &restarted, "cvz restarted");
+        }
+    }
+
+    #[test]
+    fn source_handover_mid_fold_keeps_folding_forward() {
+        let mut state = LinesState::default();
+        let procedural: Vec<_> = (0..300).map(ControlFrame::procedural).collect();
+        assert_monotonic(&mut state, &procedural, "procedural");
+        assert_eq!(state.section(), 1);
+        let mid = state.morph();
+        assert!(0.0 < mid && mid < 1.0, "{mid}");
+        let fixture = fixture_playback(FIXTURES[0], 2);
+        assert_monotonic(&mut state, &fixture, "handover to cvz");
+        let live: Vec<_> = (1000..1400).map(live).collect();
+        assert_monotonic(&mut state, &live, "handover to live_bridge");
+    }
+
+    #[test]
+    fn sections_alternate_with_one_bar_folds_and_every_fourth_cuts() {
+        let mut state = LinesState::default();
+        let mut morph = Vec::new();
+        for index in 0..1200 {
+            state.observe(&ControlFrame::procedural(index));
+            morph.push(state.morph());
+        }
+        // Procedural input: 120 bpm (one bar = 120 frames), a beat every 16
+        // frames, so a 16-beat phrase starts every 256 frames.
+        assert_eq!(morph[255], 0.0);
+        assert!((morph[256 + 60] - 0.5).abs() < 1e-6, "{}", morph[316]);
+        assert_eq!(morph[256 + 120], 1.0);
+        assert_eq!(morph[511], 1.0);
+        assert_eq!(morph[512 + 120], 0.0);
+        // Section 3 cuts straight to the hallway.
+        assert_eq!((morph[767], morph[768]), (0.0, 1.0));
+        assert_eq!(morph[1024 + 120], 0.0);
+        // The beat phase and drop flag (cuts off) do not move the fold.
+        let mut plain = LinesState::default();
+        let mut noisy = LinesState::default();
+        for index in 0..600 {
+            let frame = ControlFrame::procedural(index);
+            plain.observe(&frame);
+            noisy.observe(&ControlFrame {
+                beat_phase: (index * 77) as u8,
+                flags: frame.flags | if index % 7 == 0 { DROP_FLAG } else { 0 },
+                ..frame
+            });
+            assert_eq!(plain.morph(), noisy.morph());
+        }
+    }
+
+    #[test]
+    fn fold_length_follows_bpm() {
+        assert_eq!(bar_frames(120), 120.0);
+        assert_eq!(bar_frames(0), 120.0);
+        assert_eq!(bar_frames(240), MIN_MORPH_FRAMES);
+        assert_eq!(bar_frames(30), 240.0);
+        assert_eq!(bar_frames(10), MAX_MORPH_FRAMES);
+    }
+
+    #[test]
+    fn stalled_beats_free_run_sections() {
+        let mut state = LinesState::default();
+        for index in 0..2048 {
+            state.observe(&ControlFrame {
+                beat_count: 7,
+                ..ControlFrame::procedural(index)
+            });
+        }
+        assert_eq!(state.section(), 3);
+    }
+
+    /// Procedural frames with the drop flag on `drops`.
+    fn with_drops(drops: &[u64], range: std::ops::Range<u64>) -> Vec<ControlFrame> {
+        range
+            .map(|index| {
+                let frame = ControlFrame::procedural(index);
+                let drop = if drops.contains(&index) { DROP_FLAG } else { 0 };
+                ControlFrame {
+                    flags: frame.flags | drop,
+                    ..frame
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drop_cuts_are_opt_in_and_at_most_one_per_bar() {
+        let frames = with_drops(&[150, 160, 200, 290, 415, 416], 0..800);
+        let mut off = LinesState::new(false);
+        let mut on = LinesState::new(true);
+        let mut sections = Vec::new();
+        for frame in &frames {
+            off.observe(frame);
+            on.observe(frame);
+            sections.push((on.section(), on.morph()));
+        }
+        assert_eq!(off.section(), 3);
+        // Frame 150 cuts to the hallway at once; 160 and 200 fall within
+        // its bar, and so does the phrase at 256. The drop at 290 cuts back
+        // to the plane and 415 cuts again (416 is not a rising edge); the
+        // phrase at 512 is again within a bar, and 768 folds as usual.
+        assert_eq!(sections[149], (0, 0.0));
+        assert_eq!(sections[150], (1, 1.0));
+        assert_eq!(sections[289].0, 1);
+        assert_eq!(sections[290], (2, 0.0));
+        assert_eq!(sections[415], (3, 1.0));
+        assert_eq!(sections[512].0, 3);
+        assert_eq!(sections[768], (4, 1.0));
+        assert!(sections[769].1 < 1.0);
+        let mut last_change = None;
+        for index in 1..sections.len() {
+            if sections[index].0 != sections[index - 1].0 {
+                assert!(last_change.is_none_or(|last| index - last >= 120));
+                last_change = Some(index);
             }
         }
+        // A held drop flag does not repeat the cut.
+        let held = with_drops(&(150..600).collect::<Vec<_>>(), 0..600);
+        let mut state = LinesState::new(true);
+        held.iter().for_each(|frame| state.observe(frame));
+        assert_eq!(state.section(), 2);
+    }
+
+    #[test]
+    fn repeated_frame_counters_do_not_step() {
+        let mut state = LinesState::default();
+        for index in 0..300 {
+            state.observe(&ControlFrame::procedural(index));
+        }
+        let morph = state.morph();
+        for _ in 0..50 {
+            state.observe(&ControlFrame::procedural(299));
+        }
+        assert_eq!(state.morph(), morph);
     }
 
     #[test]
@@ -622,13 +940,19 @@ mod tests {
     #[test]
     fn instances_respect_profile_budget_and_are_deterministic() {
         for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let mut state = SceneState::default();
+            let mut observed = 0;
             for index in [0, 120, 288, 400, 800] {
                 let frame = ControlFrame::procedural(index);
+                while observed <= index {
+                    state.observe(&ControlFrame::procedural(observed));
+                    observed += 1;
+                }
                 let elapsed = index as f32 / 60.0;
                 let mut first = Vec::new();
-                build(&profile, frame, elapsed, 16.0 / 9.0, &mut first);
+                build(&profile, frame, elapsed, 16.0 / 9.0, &state, &mut first);
                 let mut second = Vec::new();
-                build(&profile, frame, elapsed, 16.0 / 9.0, &mut second);
+                build(&profile, frame, elapsed, 16.0 / 9.0, &state, &mut second);
                 assert!(!first.is_empty() && first.len() <= 2 * line_slots(&profile));
                 assert!(first.len() <= profile.instance_count);
                 assert_eq!(

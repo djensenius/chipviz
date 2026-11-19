@@ -46,7 +46,7 @@ mod models;
 #[cfg(test)]
 mod tests;
 
-use super::{CameraMode, SceneEntry, hash};
+use super::{CameraMode, SceneBuild, SceneEntry, hash};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -58,7 +58,7 @@ use std::sync::Mutex;
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "Object",
     camera: CameraMode::ScreenSpace,
-    build,
+    build: SceneBuild::Stateless(build),
 };
 
 /// Divides the u16 frame counter's wrap.

@@ -9,7 +9,7 @@ use crate::profile::RenderProfile;
 use crate::scene::{
     Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
 };
-use crate::scenes::{self, CameraMode, colour_field};
+use crate::scenes::{self, CameraMode, SceneConfig, SceneState, colour_field};
 
 /// Offscreen capture format; sRGB like the window's preferred surface format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -23,6 +23,8 @@ pub struct ScenePipeline {
     colour_controls: colour_field::Controls,
     /// Wall-clock step cap for live rendering; `None` steps every new frame.
     step_clock: Option<(colour_field::StepClock, Instant)>,
+    /// State registry scenes keep between observed frames.
+    scene_state: SceneState,
     /// The colour attachment encodes sRGB on write, so flat colours are
     /// given in linear light; otherwise they are written as sRGB bytes.
     srgb_target: bool,
@@ -242,6 +244,7 @@ impl ScenePipeline {
             colour_field: colour_field::ColourField::new(colour_field::Config::default()),
             colour_controls: colour_field::Controls::default(),
             step_clock: None,
+            scene_state: SceneState::default(),
             srgb_target: format.is_srgb(),
             device,
             queue,
@@ -254,11 +257,12 @@ impl ScenePipeline {
         }
     }
 
-    /// Restarts camera smoothing and the colour field, as at renderer
-    /// start-up.
+    /// Restarts camera smoothing, the colour field and scene state, as at
+    /// renderer start-up.
     pub fn reset_state(&mut self) {
         self.camera = Camera::default();
         self.colour_field = colour_field::ColourField::new(self.colour_field.config());
+        self.scene_state = SceneState::new(self.scene_state.config());
     }
 
     /// Steps camera smoothing and the colour field for a frame that is not
@@ -275,6 +279,11 @@ impl ScenePipeline {
         self.colour_field = colour_field::ColourField::new(config);
     }
 
+    /// Replaces the registry scenes' options and restarts their state.
+    pub fn configure_scenes(&mut self, config: SceneConfig) {
+        self.scene_state = SceneState::new(config);
+    }
+
     /// Caps colour-field steps at 60 in any wall-clock second (live window).
     pub fn limit_colour_field_steps(&mut self) {
         self.step_clock = Some((colour_field::StepClock::default(), Instant::now()));
@@ -286,11 +295,13 @@ impl ScenePipeline {
     }
 
     /// Feeds one received or generated frame to the colour field (onset
-    /// detection, and the newest frame for its next step). Call once per new
+    /// detection, and the newest frame for its next step) and the stateful
+    /// registry scenes (see `SceneState`). Call once per new
     /// frame, never for a held display repeat; `encode` steps on what was
     /// observed.
     pub fn observe(&mut self, frame: &ControlFrame) {
         self.colour_field.observe(frame);
+        self.scene_state.observe(frame);
     }
 
     /// Scene dispatch: the colour field steps once per new observed frame
@@ -332,7 +343,7 @@ impl ScenePipeline {
                 (instances, CameraMode::ScreenSpace)
             }
             colour_field::Display::Native(_) => (
-                build_instances(&self.profile, frame, elapsed, aspect),
+                build_instances(&self.profile, frame, elapsed, aspect, &self.scene_state),
                 scenes::select(frame.scene).camera,
             ),
         };

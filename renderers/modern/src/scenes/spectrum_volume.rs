@@ -1,6 +1,6 @@
 //! SpectrumVolume: layered spectrum slices forming an audio volume.
 
-use super::{CameraMode, SceneEntry, note_emphasis, palette};
+use super::{CameraMode, SceneBuild, SceneEntry, note_emphasis, palette};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -8,7 +8,7 @@ use crate::scene::Instance;
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "SpectrumVolume",
     camera: CameraMode::Orbit3D,
-    build,
+    build: SceneBuild::Stateless(build),
 };
 
 fn build(
