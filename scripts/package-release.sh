@@ -14,8 +14,11 @@ mise exec -- just check
 # Every release (individual assets and the combined zip) ships the licence terms
 # and the third-party notices (THIRD_PARTY_NOTICES/, flattened into asset names).
 cp LICENSE COMMERCIAL.md "$assets/"
+# Only top-level files ship; THIRD_PARTY_NOTICES/licenses/ is already embedded in rust.md.
 for notice in THIRD_PARTY_NOTICES/*; do
-  cp "$notice" "$assets/THIRD_PARTY_NOTICES-$(basename "$notice")"
+  if [ -f "$notice" ]; then
+    cp "$notice" "$assets/THIRD_PARTY_NOTICES-$(basename "$notice")"
+  fi
 done
 
 mkdir -p build/release

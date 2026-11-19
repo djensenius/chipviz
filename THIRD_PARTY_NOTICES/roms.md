@@ -4,9 +4,11 @@ This file lists the SDK runtime code that the release build
 (`.github/workflows/release-assets.yml`) links into each shipped ROM.
 Build-only tools such as compilers, assemblers, linkers and header fixers
 are not listed because they are not copied into the ROMs. The linked code was
-taken from the linker maps of local builds with the pinned toolchains. Each
-licence is cited from the upstream source at the pinned revision where there is
-one. Items marked **to verify** could not be confirmed and need follow-up.
+taken from linker maps of local builds on 2026-11-19, not from release CI:
+C64 with Homebrew cc65 2.19, and GBA and N64 in the same Docker images as CI.
+SNES was not built locally. Each licence is cited from the upstream source,
+pinned to a commit where one is known. Items marked **to verify** could not be
+confirmed and need follow-up.
 
 ## ROMs with no third-party runtime
 
@@ -79,12 +81,12 @@ Built by `scripts/n64-docker-build.sh` from libdragon commit
 
   - **libcart** (`cart.o`), which libdragon marks "Adapted for use with
     libdragon" from <https://github.com/devwizard64/libcart>. GitHub reports
-    the upstream repository licence as MIT-0. **To verify:** that this applies
-    to the adapted revision.
+    the upstream repository licence as MIT-0 (default branch, checked on
+    2026-11-19). **To verify:** that this applies to the adapted revision.
   - **UNFLoader USB library** (`usb.o`), from
     <https://github.com/buu342/N64-UNFLoader>. GitHub reports the upstream
-    repository licence as WTFPL. **To verify:** that this applies to the
-    adapted revision.
+    repository licence as WTFPL (default branch, checked on 2026-11-19).
+    **To verify:** that this applies to the adapted revision.
   - The Shrinkler, LZ4 and aPLib decompressors are libdragon's own code.
     libdragon's `tools/common/shrinkler/LICENSE-shrinkler.txt` says that
     "Runtime code shipped in ROMs is written from scratch and thus distributed
@@ -101,20 +103,28 @@ Built by `scripts/n64-docker-build.sh` from libdragon commit
   It contains every section of the 4.4.0 file and adds sections (57) and (58).
   The only other change is that one target name in section (44) is reworded.
   **To verify:** the per-file notices of the linked newlib members.
+- **libgcc** (MIPS, GCC 16.2.0 from the libdragon toolchain). The GCC startup
+  files `crti.o`, `crtbegin.o`, `crtend.o` and `crtn.o` are linked. `libgcc.a`
+  is searched, but the map shows no members pulled in. These are under the GPL
+  v3 with the GCC Runtime Library Exception 3.1, which allows compiled output to
+  be distributed under terms of the distributor's choice. No notice is needed.
 
 ## Game Boy Advance (`chipviz-gba.gba`): devkitARM startup and libraries
 
-Built in `devkitpro/devkitarm:latest` with `-specs=gba.specs` (devkitARM GCC
-16.1.0, devkitarm-crtls 1.2.6, devkitarm-newlib 4.6.0.20260123). The linker
-map pulls in:
+Built with `-specs=gba.specs` in the floating `devkitpro/devkitarm:latest`
+image, which is not pinned. On 2026-11-19 that image (local ID `116afba8df84`)
+contained devkitARM GCC 16.1.0, devkitarm-crtls 1.2.6 and devkitarm-newlib
+4.6.0.20260123. A later image can link different code. The linker map pulls in:
 
 - **`gba_crt0.o`** from devkitarm-crtls
-  (<https://github.com/devkitPro/devkitarm-crtls/blob/v1.2.6/gba_crt0.s>).
+  (<https://github.com/devkitPro/devkitarm-crtls/blob/9788af74f0f3cfd903cffdc903d514fc073a0f95/gba_crt0.s>,
+  tag v1.2.6).
   It is under the Mozilla Public License 2.0, as stated in the file header. The
   source code form of that file is available at that URL. The MPL 2.0 text is
   at <https://mozilla.org/MPL/2.0/>.
 - **newlib `init.c`** (`__libc_init_array`), from devkitPro's newlib fork
-  (<https://github.com/devkitPro/newlib/blob/devkitPro/newlib/libc/misc/init.c>):
+  (<https://github.com/devkitPro/newlib/blob/57bd8e1ade3cf46d2e61a72516ac8bfaf8fdfd62/newlib/libc/misc/init.c>,
+  the `devkitPro` branch head on 2026-11-19):
 
   ```text
   Copyright (C) 2004 CodeSourcery, LLC
@@ -130,7 +140,7 @@ map pulls in:
 
 - **libsysbase `malloc_vars.o`** (`fake_heap_start` and `fake_heap_end`), from
   devkitPro's newlib fork
-  (<https://github.com/devkitPro/newlib/blob/devkitPro/libgloss/libsysbase/malloc_vars.c>).
+  (<https://github.com/devkitPro/newlib/blob/57bd8e1ade3cf46d2e61a72516ac8bfaf8fdfd62/libgloss/libsysbase/malloc_vars.c>).
   The file has no licence header. **To verify:** its licence.
 - **libgcc** (integer division helpers and `crti`, `crtbegin`, `crtend` and
   `crtn`). These are under the GPL v3 with the GCC Runtime Library Exception

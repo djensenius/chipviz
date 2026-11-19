@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -21,10 +22,40 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "renderers" / "modern" / "Cargo.toml"
 OUTPUT = ROOT / "THIRD_PARTY_NOTICES" / "rust.md"
-# Release platforms: CI (x86_64 Linux), Raspberry Pi 5 and Apple silicon.
+# Release binaries are built on x86_64 Linux. The Raspberry Pi 5 and Apple
+# silicon targets are extra coverage for local builds of the same binaries.
 PLATFORMS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin")
 NOTICE_FILE = re.compile(r"^(licen[cs]e|copying|notice|unlicense|copyright)([-._].*)?$", re.IGNORECASE)
 NOTICE_DIR = re.compile(r"^licen[cs]es$", re.IGNORECASE)
+# Canonical SPDX texts (license-list-data v3.29.0) for crates whose package
+# ships no licence file.
+FALLBACK_DIR = ROOT / "THIRD_PARTY_NOTICES" / "licenses"
+# Licences whose canonical text needs no per-project copyright line.
+NO_HOLDER_NEEDED = {"Apache-2.0", "CC0-1.0"}
+MIT_TEMPLATE_LINE = "Copyright (c) <year> <copyright holders>"
+# Copyright lines for MIT crates without a licence file, from the upstream
+# LICENSE at the commit recorded in the crate's .cargo_vcs_info.json.
+MIT_COPYRIGHT = {
+  ("block-sys", "0.2.1"): ("Copyright (c) Steven Sheldon", "https://github.com/madsmtm/objc2/blob/01c7406f13e3f4abf75ec5e3d074893990c5eab5/LICENSE.txt"),
+  ("block2", "0.3.0"): ("Copyright (c) Steven Sheldon", "https://github.com/madsmtm/objc2/blob/3d9b6864af05592fc18b1ab27b3da9ed3896bc53/LICENSE.txt"),
+  ("icrate", "0.0.4"): ("Copyright (c) Steven Sheldon", "https://github.com/madsmtm/objc2/blob/3d9b6864af05592fc18b1ab27b3da9ed3896bc53/LICENSE.txt"),
+  ("objc-sys", "0.3.5"): ("Copyright (c) Steven Sheldon", "https://github.com/madsmtm/objc2/blob/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt"),
+  ("objc2", "0.4.1"): ("Copyright (c) Steven Sheldon", "https://github.com/madsmtm/objc2/blob/3d9b6864af05592fc18b1ab27b3da9ed3896bc53/LICENSE.txt"),
+  ("objc2-encode", "3.0.0"): ("Copyright (c) Steven Sheldon", "https://github.com/madsmtm/objc2/blob/3d9b6864af05592fc18b1ab27b3da9ed3896bc53/LICENSE.txt"),
+  ("wayland-protocols-plasma", "0.2.0"): ("Copyright (c) 2015 Elinor Berger", "https://github.com/smithay/wayland-rs/blob/ea4c856cca609bf658cc7945ffa7e4b4aa268171/LICENSE.txt"),
+  ("wayland-protocols-wlr", "0.2.0"): ("Copyright (c) 2015 Elinor Berger", "https://github.com/smithay/wayland-rs/blob/8050a7bd668154f99ebfed805705cd10a1435b5a/LICENSE.txt"),
+}
+# Why the remaining MIT crates have no verified copyright line.
+OBJC2_MIT_NOTE = "upstream LICENSE.md at the crate's commit states MIT but names no copyright holder"
+KNOWN_GAPS = {
+  ("block", "0.1.6"): "upstream SSheldon/rust-block has no licence file at tag 0.1.6",
+  ("dispatch", "0.2.0"): "upstream SSheldon/rust-dispatch has no licence file at the crate's commit",
+  ("malloc_buf", "0.0.6"): "upstream SSheldon/malloc_buf has no licence file at tag 0.0.6",
+  ("block2", "0.6.2"): OBJC2_MIT_NOTE,
+  ("objc2", "0.6.5"): OBJC2_MIT_NOTE,
+  ("objc2-encode", "4.1.0"): OBJC2_MIT_NOTE,
+  ("objc2-foundation", "0.3.2"): OBJC2_MIT_NOTE,
+}
 
 
 class SourcesUnavailable(Exception):
@@ -76,7 +107,56 @@ def notice_files(package: dict) -> list[Path]:
     licence_file = directory / package["license_file"]
     if licence_file.is_file():
       files.add(licence_file)
-  return sorted(files, key=lambda path: path.relative_to(directory).as_posix())
+  return sorted(files, key=lambda path: display_path(path, directory))
+
+
+def display_path(path: Path, directory: Path) -> str:
+  try:
+    return path.relative_to(directory).as_posix()
+  except ValueError:
+    return path.name
+
+
+def licence_alternatives(expression: str) -> list[list[str]]:
+  """Split an SPDX expression (or legacy "A/B") into OR alternatives of AND-ed ids."""
+  alternatives = []
+  for alternative in re.split(r"\s+OR\s+|/", expression):
+    ids = [token for token in re.split(r"\s+AND\s+|[()\s]+", alternative) if token and token != "WITH"]
+    if ids:
+      alternatives.append(ids)
+  return alternatives
+
+
+def fallback_texts(package: dict, fallback_dir: Path) -> tuple[list[tuple[str, str]], str | None]:
+  """Return (label, text) fallbacks for a crate without licence files, and a gap reason if incomplete."""
+  key = (package["name"], package["version"])
+  expression = package.get("license") or ""
+  alternatives = licence_alternatives(expression)
+  found: list[tuple[str, str]] = []
+  satisfied = False
+  for alternative in alternatives:
+    complete = True
+    for spdx_id in alternative:
+      path = fallback_dir / f"{spdx_id}.txt"
+      if not path.is_file():
+        complete = False
+        continue
+      text = normalise(path.read_text(encoding="utf-8"))
+      label = f"fallback SPDX {spdx_id} text"
+      if spdx_id == "MIT" and key in MIT_COPYRIGHT:
+        line, source = MIT_COPYRIGHT[key]
+        text = text.replace(MIT_TEMPLATE_LINE, line)
+        label += f", copyright line from {source}"
+      elif spdx_id not in NO_HOLDER_NEEDED:
+        complete = False
+      if (label, text) not in found:
+        found.append((label, text))
+    satisfied = satisfied or complete
+  if not alternatives:
+    return found, "no licence declared"
+  if satisfied:
+    return found, None
+  return found, KNOWN_GAPS.get(key, "no licence file in package and no verified copyright holder for its licence")
 
 
 def normalise(text: str) -> str:
@@ -89,23 +169,34 @@ def fence_for(text: str) -> str:
   return "`" * max(3, longest + 1)
 
 
-def render(metadata: dict) -> str:
+def render(metadata: dict, fallback_dir: Path | None = None) -> str:
+  fallback_dir = FALLBACK_DIR if fallback_dir is None else fallback_dir
   packages = shipped_packages(metadata)
   texts: dict[str, dict] = {}
-  rows: list[str] = []
+  rows: list[tuple[str, str, str, list[str], bool]] = []
+  gaps: list[tuple[str, str]] = []
+
+  def add(text: str, user: str) -> str:
+    key = hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
+    entry = texts.setdefault(key, {"text": text, "users": []})
+    entry["users"].append(user)
+    return key
+
   for package in packages:
     label = f"{package['name']} {package['version']}"
     directory = Path(package["manifest_path"]).parent
     refs: list[str] = []
     for path in notice_files(package):
       text = normalise(path.read_text(encoding="utf-8", errors="replace"))
-      if not text:
-        continue
-      key = hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
-      entry = texts.setdefault(key, {"text": text, "users": []})
-      entry["users"].append(f"{label} ({path.relative_to(directory).as_posix()})")
-      refs.append(key)
-    rows.append((label, package.get("license") or "not declared", package.get("repository") or "", refs))
+      if text:
+        refs.append(add(text, f"{label} ({display_path(path, directory)})"))
+    fallback = not refs
+    if fallback:
+      found, gap = fallback_texts(package, fallback_dir)
+      refs = [add(text, f"{label} ({fallback_label})") for fallback_label, text in found]
+      if gap:
+        gaps.append((label, gap))
+    rows.append((label, package.get("license") or "not declared", package.get("repository") or "", refs, fallback))
 
   ordered = sorted(texts.items(), key=lambda item: item[1]["users"][0])
   numbers = {key: index for index, (key, _) in enumerate(ordered, start=1)}
@@ -120,18 +211,32 @@ def render(metadata: dict) -> str:
     f"for {', '.join(f'`{platform}`' for platform in PLATFORMS)}.",
     "Each crate is distributed under its own licence. Where a crate offers a",
     "choice of licences, every licence file shipped in its package is reproduced.",
-    "\"none in package\" means the published crate ships no licence file; its",
-    "declared licence applies and the full text is in its repository.",
+    "Notice numbers marked \"(fallback)\" are canonical SPDX licence texts used",
+    "because the published crate ships no licence file. For MIT crates, the",
+    "copyright line comes from the upstream repository at the crate's commit.",
     "",
     "## Crates",
     "",
     "| Crate | Version | Licence | Repository | Notice texts |",
     "| --- | --- | --- | --- | --- |",
   ]
-  for label, licence, repository, refs in rows:
+  for label, licence, repository, refs, fallback in rows:
     name, version = label.split(" ", 1)
-    notices = ", ".join(f"[{numbers[key]}](#notice-{numbers[key]})" for key in refs) or "none in package"
+    notices = ", ".join(f"[{numbers[key]}](#notice-{numbers[key]})" for key in refs) or "none"
+    if fallback:
+      notices += " (fallback)"
     lines.append(f"| {name} | {version} | {licence.replace('|', '/')} | {repository} | {notices} |")
+  lines += ["", "## Known gaps", ""]
+  if gaps:
+    lines += [
+      "These crates ship no licence file, and no copyright holder could be",
+      "verified upstream for the licence they declare. The canonical licence",
+      "text is listed for each, with the copyright line left as the SPDX template.",
+      "",
+    ]
+    lines += [f"- {label}: {reason}." for label, reason in gaps]
+  else:
+    lines.append("None.")
   lines += ["", "## Licence and notice texts", ""]
   for key, entry in ordered:
     number = numbers[key]
@@ -159,10 +264,11 @@ def main(argv: list[str] | None = None) -> int:
   try:
     content = render(cargo_metadata())
   except SourcesUnavailable as error:
-    if args.check:
+    if args.check and not os.environ.get("CI"):
       print(f"chipviz Rust notices check skipped: {error}")
       return 0
-    print(f"cannot generate Rust notices: {error}", file=sys.stderr)
+    reason = " (crate sources are required when CI is set)" if args.check else ""
+    print(f"cannot generate Rust notices{reason}: {error}", file=sys.stderr)
     return 1
   if args.check:
     current = args.output.read_text(encoding="utf-8") if args.output.exists() else ""
