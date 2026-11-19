@@ -274,9 +274,10 @@ c64-debug: c64-rom
     @ra="${RETROARCH_BIN:-/Applications/RetroArch.app/Contents/MacOS/RetroArch}"; cores="${RETROARCH_CORES:-$HOME/Library/Application Support/RetroArch/cores}"; rom="$(pwd)/cores/c64/homebrew/chipviz-c64.prg"; \
       "$ra" -L "$cores/vice_x64sc_libretro.dylib" "$rom" --verbose 2>&1 | tee build/retroarch-smoke/c64.log
 
-# Headless VICE libretro captures of the C64 colour field (needs the local core).
+# Headless VICE libretro captures of the C64 colour field, PAL then NTSC (needs the local core).
 c64-colour-field-capture: c64-rom
     @${PYTHON:-python3} scripts/c64_colour_field_capture.py
+    @${PYTHON:-python3} scripts/c64_colour_field_capture.py --model ntsc
 
 snes-debug: snes-rom
     @mkdir -p build/retroarch-smoke

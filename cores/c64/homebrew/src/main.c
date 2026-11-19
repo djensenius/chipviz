@@ -1,4 +1,5 @@
 #include <6502.h>
+#include <cbm.h>
 #include <conio.h>
 #include <stdint.h>
 #include <string.h>
@@ -19,8 +20,15 @@
 #define CHIPVIZ_VIC_IRQ_STATUS (*(volatile uint8_t *)0xD019)
 #define CHIPVIZ_VIC_IRQ_ENABLE (*(volatile uint8_t *)0xD01A)
 #define CHIPVIZ_IRQ_VECTOR (*(volatile uint16_t *)0x0314)
-/* Raster compare line; bit 8 is D011 bit 7. */
-#define CHIPVIZ_IRQ_LINE 300u
+/* Raster IRQ line, chosen at boot from the KERNAL's PAL/NTSC flag: both are
+ * in the vertical blank, below the visible bottom border on PAL (312 lines,
+ * also Drean) and above the visible top border on NTSC (263 lines, where
+ * line 300 does not exist). Bit 8 of the line is D011 bit 7. */
+#define CHIPVIZ_IRQ_LINE_PAL 300u
+#define CHIPVIZ_IRQ_LINE_NTSC 16u
+/* An IRQ that starts more than this many lines late (after a step overran a
+ * frame) does not write the registers, so they never change mid-screen. */
+#define CHIPVIZ_IRQ_WINDOW 8u
 /* D011: display on, 25 rows, scroll 3; bit 6 adds extended colour mode. */
 #define CHIPVIZ_D011_NATIVE 0x1Bu
 #define CHIPVIZ_ECM 0x40u
@@ -50,6 +58,8 @@ static volatile uint8_t native_scene;
 static volatile uint8_t field_shown;
 static volatile uint8_t irq_frames;
 static uint8_t irq_stack[128];
+static uint8_t irq_line_low;
+static uint8_t irq_line_bit8;
 
 typedef struct {
   uint8_t spectrum[8];
@@ -150,10 +160,10 @@ static void prepare_field_screens(void) {
 }
 
 /* The border goes first so it changes inside the vertical blank. Bit 7 of
- * D011 keeps raster compare bit 8 set for line 300. */
+ * D011 keeps raster compare bit 8 of the IRQ line. */
 static void present(void) {
   CHIPVIZ_BORDER_COLOR = pending.border;
-  CHIPVIZ_VIC_CONTROL1 = (uint8_t)(pending.control1 | 0x80u);
+  CHIPVIZ_VIC_CONTROL1 = (uint8_t)(pending.control1 | irq_line_bit8);
   CHIPVIZ_MEMORY_POINTERS = pending.memory;
   CHIPVIZ_VIC_BACKGROUND[0] = pending.background[0];
   CHIPVIZ_VIC_BACKGROUND[1] = pending.background[1];
@@ -176,7 +186,7 @@ static void stage_native(void) {
   pending.background[0] = native_background;
 }
 
-/* Raster IRQ at line 300, below the visible border on PAL: one colour-field
+/* Raster IRQ in the vertical blank (line 300 PAL, 16 NTSC): one colour-field
  * step per VBlank. The previous step's registers land first, then the
  * keyboard is sampled and the next step is staged. Only this handler calls
  * these functions, so cc65's static locals are never shared with the main
@@ -187,7 +197,12 @@ static uint8_t raster_irq(void) {
   }
   /* Acknowledge first: an overrun step is then delayed, not lost. */
   CHIPVIZ_VIC_IRQ_STATUS = 1u;
-  present();
+  /* A late IRQ skips this frame's writes; the next step's registers land on
+   * time at the next IRQ (the field's display then lags by one step). */
+  if ((CHIPVIZ_VIC_CONTROL1 & 0x80u) == irq_line_bit8 &&
+      (uint8_t)(CHIPVIZ_RASTER_LINE - irq_line_low) < CHIPVIZ_IRQ_WINDOW) {
+    present();
+  }
   scan_keyboard();
   cf_read_keys(native_scene);
   if (cf_tick()) {
@@ -270,11 +285,18 @@ int main(void) {
   native_border = pending.border;
   native_background = pending.background[0];
   native_scene = demo_scene(frame);
+  if (get_tv() == TV_NTSC) {
+    irq_line_low = (uint8_t)CHIPVIZ_IRQ_LINE_NTSC;
+    irq_line_bit8 = 0u;
+  } else {
+    irq_line_low = (uint8_t)(CHIPVIZ_IRQ_LINE_PAL & 0xFFu);
+    irq_line_bit8 = 0x80u;
+  }
   __asm__("sei");
   set_irq(raster_irq, irq_stack, sizeof(irq_stack));
   CHIPVIZ_IRQ_VECTOR = (uint16_t)irq_entry;
-  CHIPVIZ_RASTER_LINE = (uint8_t)(CHIPVIZ_IRQ_LINE & 0xFFu);
-  CHIPVIZ_VIC_CONTROL1 = (uint8_t)(CHIPVIZ_D011_NATIVE | 0x80u);
+  CHIPVIZ_RASTER_LINE = irq_line_low;
+  CHIPVIZ_VIC_CONTROL1 = (uint8_t)(CHIPVIZ_D011_NATIVE | irq_line_bit8);
   CHIPVIZ_VIC_IRQ_STATUS = 0x0Fu;
   CHIPVIZ_VIC_IRQ_ENABLE = 1u;
   __asm__("cli");

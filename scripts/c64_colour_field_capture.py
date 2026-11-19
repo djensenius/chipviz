@@ -12,7 +12,8 @@ is not part of `just check`.
 Only the held and hard-cut modes are captured (keys Q/E/T/U). Flash/gate is
 never armed: palette keys R and I are refused, except for one negative check
 that holds R without the scene key 8, which must run as hard cuts (mode 2) with
-a steady picture. The script also reads the core's RAM (the `_cf` address from
+a steady picture. `--model ntsc` runs the same sequence on an NTSC C64 (one
+model per process: the VICE core is a singleton). The script also reads the core's RAM (the `_cf` address from
 the linker map) to measure the scene-7 entry and exit timing in frames.
 """
 
@@ -63,6 +64,9 @@ CORE_OPTIONS = {
   "vice_aspect_ratio": "pal",
   "vice_retropad_options": "disabled",
 }
+
+MODELS = {"pal": "C64 PAL auto", "ntsc": "C64 NTSC auto"}
+NATIVE_FRAMES = 60  # frames sampled to check the native demo animates
 
 # Pepto PAL palette (VICE pepto-pal.vpl), indexed by C64 colour number.
 PEPTO = {
@@ -328,12 +332,15 @@ def main(argv: list[str] | None = None) -> int:
                       f"vice_x64sc_libretro{CORE_EXT}")
   parser.add_argument("--prg", type=pathlib.Path, default=ROOT / "cores/c64/homebrew/chipviz-c64.prg")
   parser.add_argument("--map", type=pathlib.Path, default=ROOT / "cores/c64/homebrew/build/chipviz-c64.map")
+  parser.add_argument("--model", choices=sorted(MODELS), default="pal")
   parser.add_argument("--output", type=pathlib.Path, default=ROOT / "build/c64-colour-field")
   args = parser.parse_args(argv)
   if not args.core.exists() or not args.prg.exists() or not args.map.exists():
     print(f"missing core, prg or map: {args.core} {args.prg} {args.map}", file=sys.stderr)
     return 2
   cf = symbol(args.map, "_cf")
+  CORE_OPTIONS["vice_c64_model"] = MODELS[args.model]
+  prefix = "c64-" if args.model == "pal" else f"c64-{args.model}-"
   args.output.mkdir(parents=True, exist_ok=True)
 
   with tempfile.TemporaryDirectory() as workdir:
@@ -344,6 +351,12 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     assert emu.frame is not None
     origin = find_window(*emu.frame)
+    native_frames = set()
+    for _ in range(NATIVE_FRAMES):
+      emu.run(1)
+      assert emu.frame is not None
+      native_frames.add(hashlib.sha256(emu.frame[2]).hexdigest())
+    frame += NATIVE_FRAMES
 
     def hold(*keys: str, unarmed: bool = False) -> None:
       if FORBIDDEN & set(keys) and (unarmed is False or "8" in keys):
@@ -365,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     def capture(name: str, family: int, layout: int, combo: int, rot: int) -> None:
       assert emu.frame is not None
       width, height, rgb = emu.frame
-      png = args.output / f"c64-{name}.png"
+      png = args.output / f"{prefix}{name}.png"
       write_png(png, width, height, rgb)
       result = check(name, png, family, layout, combo, rot, origin)
       result["frame"] = frame
@@ -442,13 +455,17 @@ def main(argv: list[str] | None = None) -> int:
     advance(2 * GAP)
     native = emu.frame
     assert native is not None
-    write_png(args.output / "c64-native-after-exit.png", *native)
+    write_png(args.output / f"{prefix}native-after-exit.png", *native)
     failed = [r for r in results if r["failures"]]
     report = {"core": str(args.core), "prg_sha256": hashlib.sha256(args.prg.read_bytes()).hexdigest(),
-              "core_options": CORE_OPTIONS, "boot_frames": BOOT, "window_origin": origin,
+              "model": args.model, "core_options": CORE_OPTIONS, "boot_frames": BOOT,
+              "window_origin": origin, "native_distinct_frames": len(native_frames),
               "native_after_exit_colours": colour_count(native), "timing": timing, "unarmed_r": unarmed,
               "captures": results}
     print(json.dumps(report, indent=2))
+    if len(native_frames) < NATIVE_FRAMES // 2:
+      print("native demo is not animating", file=sys.stderr)
+      return 1
     if report["native_after_exit_colours"] < 3:
       print("native scene did not return after scene-7 exit", file=sys.stderr)
       return 1

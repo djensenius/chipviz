@@ -32,12 +32,17 @@ SDK-free tokenized BASIC fallback when cc65 is not installed.
 ## Colour field (scene 7)
 
 `src/colour_field.c` implements the [colour-field-v0](../../shared/specs/colour-field-v0.md)
-target role in the `data` input role. A raster IRQ at line 300 (below the
-visible border on PAL) runs one step per VBlank poll: it writes the previous
-step's VIC-II registers (border first), samples the keyboard, and stages the
-next step. All changes land in the vertical blank, so the screen never tears.
+target role in the `data` input role. PAL (and Drean) and NTSC machines are
+supported: at boot the program reads the KERNAL's PAL/NTSC flag (`get_tv()`,
+`$02A6`) and puts a raster IRQ in the vertical blank, at line 300 on PAL
+(below the visible border) or line 16 on NTSC (above it). The IRQ runs one step
+per VBlank poll: it writes the previous step's VIC-II registers (border first),
+samples the keyboard, and stages the next step. All changes land in the
+vertical blank, so the screen never tears. If a step ever overruns a frame,
+the late IRQ skips its register writes rather than change them mid-screen.
 The native PETSCII demo keeps drawing in the main loop and pauses while scene 7
-is shown.
+is shown. Its frame counter keeps running during scene 7, so after a visit its
+animation phase jumps ahead instead of resuming where it stopped.
 
 - **Display.** ECM text mode with the blank glyph (screen code 32). Screen code
   bits 6–7 select `$D021`–`$D023` for regions 0–2. One screen is prepared per
@@ -88,7 +93,7 @@ is shown.
   and joystick relative palette pulses.
 - **Timing.** Every frame is a step, in or out of scene 7. Holding `8` shows
   the field from the 31st sampled step (the debounce decides at the end of the
-  30th). Measured in VICE: 31–32 frames from the key press until the step that
+  30th). Measured in VICE (PAL and NTSC alike): 31–32 frames from the key press until the step that
   shows scene 7, and 33–34 frames until it is on screen (registers land at the
   next VBlank). Exit with `1` takes 31–32 frames, and 32–33 until the last
   native frame is back on screen. The per-frame step costs the native demo
@@ -96,10 +101,13 @@ is shown.
 
 Tests: `tests/c64_colour_field_tests.c` runs the spec fixtures on the host as
 part of `just c-test`. `just c64-colour-field-capture` drives the VICE x64sc
-libretro core headlessly. It holds keys, saves PNGs to `build/c64-colour-field/`,
-and checks every region's exact colour, the boundary positions and the black
+libretro core headlessly, once as a PAL and once as an NTSC C64. It holds keys,
+saves PNGs to `build/c64-colour-field/` (NTSC files are `c64-ntsc-*`), and
+checks every region's exact colour, the boundary positions and the black
 border. It also measures the entry and exit timing from the core's RAM, and
-checks that `R` held without `8` stays in steady hard cuts. It needs a local RetroArch core, so it is not part of `just check`.
+checks that `R` held without `8` stays in steady hard cuts and that the native
+demo animates. It needs a local RetroArch core, so it is not part of
+`just check`.
 
 ## Connection path
 
