@@ -26,11 +26,29 @@ const MAX_SEARCH: usize = 12_800;
 /// room hiss stays small instead of being amplified to full height.
 pub const PEAK_FLOOR: f32 = 0.02;
 const PEAK_RELEASE_S: f32 = 1.5;
+/// Most vertical coverage (see [`coverage`], in full-scale units) the
+/// published outlines may have: about a loud 440 Hz tone's at 44.1 kHz,
+/// some 20 cycles of one line rising and falling by 2. See
+/// [`limit_coverage`].
+pub const MAX_COVERAGE: f32 = 84.0;
+/// Points either side held by the envelope: a 9-point (72-sample) window,
+/// over a period of any tone whose outlines alternate point to point.
+const HOLD: usize = 4;
+/// Direction reversals per point at which outlines start (and finish)
+/// blending to the envelope: an outline reverses twice a period, so
+/// periods of 10 points or more (600 Hz and below at 48 kHz) draw as a
+/// waveform and periods under about 6.7 points (900 Hz and up) as an
+/// envelope.
+const ALTERNATION: (f32, f32) = (0.2, 0.3);
+/// Steps smaller than this (full scale) are not counted as reversals, so
+/// faint hiss on a slow wave does not make it an envelope.
+const REVERSAL_STEP: f32 = 0.05;
 
 /// One published waveform as two outlines, the maximum (`upper`) and
-/// minimum (`lower`) of each point's samples (see [`decimate`]), in -1..=1
-/// (normalised by the recent peak); `onsets` counts the analyzer's onsets
-/// (wrapping).
+/// minimum (`lower`) of each point's samples (see [`decimate`]), turned
+/// into an envelope where they would fill a band (see [`limit_coverage`]),
+/// in -1..=1 (normalised by the recent peak); `onsets` counts the
+/// analyzer's onsets (wrapping).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScopeSnapshot {
     pub upper: [f32; POINTS],
@@ -108,6 +126,7 @@ impl ScopeTap {
         for point in upper.iter_mut().chain(&mut lower) {
             *point = (*point * gain).clamp(-1.0, 1.0);
         }
+        limit_coverage(&mut upper, &mut lower);
         ScopeSnapshot {
             upper,
             lower,
@@ -146,8 +165,10 @@ pub fn trigger(history: &[f32]) -> usize {
 /// draw as one thin line; a one-sided click keeps its full height in one
 /// outline. A tone too fast for the points (a cycle or more per share)
 /// keeps its loudness as two separate thin lines at its envelope instead of
-/// cancelling to a flat line or filling a band. Empty shares (more points
-/// than samples) repeat the nearest sample.
+/// cancelling to a flat line. Tones of a few points a period make the
+/// outlines alternate point to point; [`limit_coverage`] turns those into
+/// an envelope before publishing. Empty shares (more points than samples)
+/// repeat the nearest sample.
 pub fn decimate(samples: &[f32], upper: &mut [f32], lower: &mut [f32]) {
     let points = upper.len().min(lower.len());
     for index in 0..points {
@@ -167,6 +188,103 @@ pub fn decimate(samples: &[f32], upper: &mut [f32], lower: &mut [f32]) {
             (upper[index], lower[index]) = (high, low);
         }
     }
+}
+
+/// Vertical extent the two outlines cover: one outline's travel (the sum
+/// of its point-to-point steps) plus the rises and falls of the other that
+/// it does not cover within two points either side, taking the larger
+/// either way round. A slow wave's outlines are one curve offset by up to a
+/// point and draw as one line, covering about its travel; two separate
+/// lines cover both travels; flat lines cover nothing. The drawn area grows
+/// with it, beyond a flat line's.
+pub fn coverage(upper: &[f32], lower: &[f32]) -> f32 {
+    let points = upper.len().min(lower.len());
+    let hull = |outline: &[f32], from: usize, to: usize| {
+        outline[from..to.min(points)]
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &point| {
+                (low.min(point), high.max(point))
+            })
+    };
+    let beyond = |own: &[f32], other: &[f32]| -> f32 {
+        (0..points.saturating_sub(1))
+            .map(|index| {
+                let step = hull(other, index, index + 2);
+                let near = hull(own, index.saturating_sub(2), index + 4);
+                let shared = (step.1.min(near.1) - step.0.max(near.0)).max(0.0);
+                (step.1 - step.0) - shared
+            })
+            .sum::<f32>()
+            + own[..points]
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).abs())
+                .sum::<f32>()
+    };
+    beyond(upper, lower).max(beyond(lower, upper))
+}
+
+/// Direction reversals per point in `points`, ignoring small steps.
+fn alternation(points: &[f32]) -> f32 {
+    let mut direction = 0.0_f32;
+    let mut reversals = 0;
+    for pair in points.windows(2) {
+        let step = pair[1] - pair[0];
+        if step.abs() >= REVERSAL_STEP {
+            if direction * step < 0.0 {
+                reversals += 1;
+            }
+            direction = step;
+        }
+    }
+    reversals as f32 / points.len().max(1) as f32
+}
+
+/// Keeps the outlines thin lines: no tone (or noise) fills a band.
+///
+/// A tone with a period of a few points (about 1 to 4 kHz at 48 kHz)
+/// makes each raw outline alternate from point to point (exact 3 kHz is
+/// half a cycle a share: upper 1, 0, 1, 0), which draws near-vertical
+/// strokes filling the band. Such outlines blend towards an envelope: a
+/// running maximum of `upper` (and minimum of `lower`) over `HOLD` points
+/// either side, which spans their period and so draws them as two
+/// near-flat lines. The blend is one weight for the whole snapshot, so
+/// nothing switches style between neighbours. It is the larger of:
+/// - a ramp on how often the outlines reverse (`ALTERNATION`), so
+///   mid-high tones and noise are all envelope, with no residual zigzag;
+/// - the least weight (in eighths) that brings [`coverage`] within
+///   [`MAX_COVERAGE`], so faster waves that do not alternate per point
+///   cannot draw more than a loud 440 Hz ribbon either.
+///
+/// Slower sound (a loud 440 Hz tone reverses about 0.15 times per point and
+/// covers about 75 at 48 kHz) is left exactly as it is.
+pub fn limit_coverage(upper: &mut [f32; POINTS], lower: &mut [f32; POINTS]) {
+    let reversing = alternation(upper).max(alternation(lower));
+    let least = ((reversing - ALTERNATION.0) / (ALTERNATION.1 - ALTERNATION.0)).clamp(0.0, 1.0);
+    if least == 0.0 && coverage(upper, lower) <= MAX_COVERAGE {
+        return;
+    }
+    let hold = |points: &[f32; POINTS], pick: fn(f32, f32) -> f32| -> [f32; POINTS] {
+        std::array::from_fn(|index| {
+            points[index.saturating_sub(HOLD)..(index + HOLD + 1).min(POINTS)]
+                .iter()
+                .copied()
+                .fold(points[index], pick)
+        })
+    };
+    let (high, low) = (hold(upper, f32::max), hold(lower, f32::min));
+    let blend = |weight: f32| -> ([f32; POINTS], [f32; POINTS]) {
+        let mix = |raw: &[f32; POINTS], envelope: &[f32; POINTS]| {
+            std::array::from_fn(|index| raw[index] + (envelope[index] - raw[index]) * weight)
+        };
+        (mix(upper, &high), mix(lower, &low))
+    };
+    // `least`, then each eighth above it, falling back to all envelope.
+    let weights = std::iter::once(least).chain((1..8).map(|eighth| eighth as f32 / 8.0));
+    (*upper, *lower) = weights
+        .filter(|&weight| weight >= least && weight < 1.0)
+        .map(blend)
+        .find(|(upper, lower)| coverage(upper, lower) <= MAX_COVERAGE)
+        .unwrap_or((high, low));
 }
 
 /// Wait-free single-writer publication of the latest [`ScopeSnapshot`].
@@ -323,6 +441,63 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!(jump < 0.5, "a 440 Hz tone zigzags by {jump}");
         }
+    }
+
+    #[test]
+    fn limited_outlines_never_fill_a_band() {
+        let travel = |points: &[f32]| -> f32 {
+            points
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).abs())
+                .sum()
+        };
+        for rate in [44_100.0_f32, 48_000.0, 96_000.0] {
+            // 0.5 to 8 kHz every 100 Hz, plus periods of whole half-points.
+            let divisors = (2..=16).map(|half_points| rate / (4.0 * half_points as f32));
+            let tones = (5..=80).map(|step| step as f32 * 100.0).chain(divisors);
+            for hz in tones.filter(|hz| (500.0..=8_000.0).contains(hz)) {
+                for (raw_upper, raw_lower) in tone_outlines(rate, hz).into_iter().step_by(3) {
+                    let (mut upper, mut lower) = (raw_upper, raw_lower);
+                    limit_coverage(&mut upper, &mut lower);
+                    let covered = coverage(&upper, &lower);
+                    assert!(covered <= MAX_COVERAGE, "{hz} Hz at {rate}: {covered}");
+                    let most = travel(&upper).max(travel(&lower));
+                    assert!(most <= MAX_COVERAGE, "{hz} Hz at {rate}: travel {most}");
+                    // The envelope only widens: loudness is kept.
+                    for index in 0..POINTS {
+                        assert!(upper[index] >= raw_upper[index] - 1e-6);
+                        assert!(lower[index] <= raw_lower[index] + 1e-6);
+                    }
+                }
+            }
+        }
+        // Exact 3 kHz at 48 kHz alternates 1, 0, 1, 0 raw; limited, each
+        // outline is a flat line near the peak.
+        for (upper, lower) in tone_outlines(48_000.0, 3_000.0) {
+            let (mut upper, mut lower) = (upper, lower);
+            limit_coverage(&mut upper, &mut lower);
+            assert!(upper.iter().all(|&point| point > 0.98), "{upper:?}");
+            assert!(lower.iter().all(|&point| point < -0.98), "{lower:?}");
+        }
+        // A slow tone is a waveform, left exactly as decimated.
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            for (upper, lower) in tone_outlines(rate, 440.0) {
+                let (mut limited_upper, mut limited_lower) = (upper, lower);
+                limit_coverage(&mut limited_upper, &mut limited_lower);
+                assert_eq!((limited_upper, limited_lower), (upper, lower), "{rate}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_loud_tone_tied_to_the_point_spacing_stays_loud_when_published() {
+        // Through the whole tap (trigger, normalisation and limiting): a
+        // full-scale 6 kHz tone at 48 kHz is two lines near full scale.
+        let mut tap = ScopeTap::new(RATE);
+        tap.push(&sine(8192, 6_000.0, 1.0, 0.0));
+        let snapshot = tap.snapshot(0);
+        assert!(snapshot.upper.iter().all(|&point| point >= 0.49));
+        assert!(snapshot.lower.iter().all(|&point| point <= -0.49));
     }
 
     #[test]

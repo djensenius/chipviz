@@ -1031,14 +1031,17 @@ mod tests {
             assert_eq!(quad.pattern, [0.0; 2]);
             assert!(quad.color[3] >= 0.95);
             let (cos, sin) = (quad.rotation.cos(), quad.rotation.sin());
-            let reach = 0.5 * quad.size[0].hypot(quad.size[1]);
+            // The rotated rectangle's bounding box.
+            let (half_width, half_height) = (0.5 * quad.size[0], 0.5 * quad.size[1]);
+            let reach_x = cos.abs() * half_width + sin.abs() * half_height + PIXEL;
+            let reach_y = sin.abs() * half_width + cos.abs() * half_height + PIXEL;
             let column = |x: f32| ((x + aspect) / PIXEL).clamp(0.0, columns as f32) as usize;
             let row = |y: f32| (-y / PIXEL).clamp(0.0, rows as f32) as usize;
             let (left, right) = (
-                column(quad.center[0] - reach),
-                column(quad.center[0] + reach),
+                column(quad.center[0] - reach_x),
+                column(quad.center[0] + reach_x),
             );
-            let (top, bottom) = (row(quad.center[1] + reach), row(quad.center[1] - reach));
+            let (top, bottom) = (row(quad.center[1] + reach_y), row(quad.center[1] - reach_y));
             for y_index in top..(bottom + 1).min(rows) {
                 for x_index in left..(right + 1).min(columns) {
                     let x = (x_index as f32 + 0.5) * PIXEL - aspect - quad.center[0];
@@ -1053,25 +1056,89 @@ mod tests {
         covered.iter().filter(|&&pixel| pixel).count() as f32 * PIXEL * PIXEL
     }
 
-    /// Steps `layers` through 1 s of `audio` (48 kHz, 60 fps) via a real
-    /// scope tap and returns the ribbon's drawn area per frame.
-    fn drawn_areas(audio: impl Fn(usize) -> f32) -> Vec<f32> {
-        use crate::audio::scope::ScopeTap;
-        let (rate, aspect) = (48_000.0, 16.0 / 9.0);
+    const ASPECT: f32 = 16.0 / 9.0;
+    /// Absolute cap on the ribbon's drawn area: 13% of the 16:9 screen
+    /// (2 * aspect by 2 units), which pins the thin-line budget so it cannot
+    /// quietly grow with the reference ribbon.
+    const AREA_CAP: f32 = 0.13 * 4.0 * ASPECT;
+
+    /// Which frames [`drawn`] rasterises.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Areas {
+        Every,
+        /// Only the frame whose drawn outlines cover the most height,
+        /// appended as an extra last element.
+        Worst,
+    }
+
+    /// Steps `layers` through `seconds` of `audio` at `rate` (60 fps) via a
+    /// real scope tap; returns each frame's published-snapshot coverage
+    /// (see `scope::coverage`) and drawn area (0 where `areas` skips it).
+    fn drawn(
+        rate: f32,
+        seconds: f32,
+        areas: Areas,
+        audio: impl Fn(usize) -> f32,
+    ) -> Vec<(f32, f32)> {
+        use crate::audio::scope::{ScopeTap, coverage};
         let mut tap = ScopeTap::new(rate);
         let mut layers = MicLayers::new(Mode::Scope);
         let per_frame = (rate / FPS) as usize;
-        (0..FPS as usize)
+        let area = |layers: &MicLayers| {
+            let mut instances = Vec::new();
+            layers.build(quiet(), ASPECT, &mut instances);
+            ribbon_area(&instances, ASPECT)
+        };
+        let mut most = (-1.0, layers.clone());
+        let mut frames: Vec<(f32, f32)> = (0..(seconds * FPS) as usize)
             .map(|frame| {
                 let start = frame * per_frame;
                 let samples: Vec<f32> = (start..start + per_frame).map(&audio).collect();
                 tap.push(&samples);
-                layers.step(quiet(), Some(&tap.snapshot(0)), frame as f32 / FPS, true);
-                let mut instances = Vec::new();
-                layers.build(quiet(), aspect, &mut instances);
-                ribbon_area(&instances, aspect)
+                let snapshot = tap.snapshot(0);
+                layers.step(quiet(), Some(&snapshot), frame as f32 / FPS, true);
+                let published = coverage(&snapshot.upper, &snapshot.lower);
+                match areas {
+                    Areas::Every => (published, area(&layers)),
+                    Areas::Worst => {
+                        let shown = coverage(&layers.wave[0], &layers.wave[1]);
+                        if shown > most.0 {
+                            most = (shown, layers.clone());
+                        }
+                        (published, 0.0)
+                    }
+                }
             })
+            .collect();
+        if areas == Areas::Worst {
+            frames.push((0.0, area(&most.1)));
+        }
+        frames
+    }
+
+    /// Drawn areas over 1 s of `audio` at 48 kHz, one per frame.
+    fn drawn_areas(audio: impl Fn(usize) -> f32) -> Vec<f32> {
+        drawn(48_000.0, 1.0, Areas::Every, audio)
+            .into_iter()
+            .map(|(_, area)| area)
             .collect()
+    }
+
+    fn sine(rate: f32, hz: f32) -> impl Fn(usize) -> f32 {
+        move |n: usize| 0.9 * (std::f32::consts::TAU * hz * n as f32 / rate).sin()
+    }
+
+    /// A steady, full-scale 440 Hz ribbon sets the thin-line budget: about
+    /// 19 full-height cycles of thin line at 48 kHz, 20 at 44.1 kHz (the
+    /// larger of the rates is taken).
+    fn budget() -> f32 {
+        [44_100.0, 48_000.0, 96_000.0]
+            .into_iter()
+            .map(|rate| {
+                let settled = &drawn(rate, 0.3, Areas::Every, sine(rate, 440.0))[10..];
+                max_area(&settled.iter().map(|&(_, area)| area).collect::<Vec<_>>())
+            })
+            .fold(0.0, f32::max)
     }
 
     /// The ribbon's flash exemption rests on it being thin: loud high
@@ -1081,13 +1148,10 @@ mod tests {
     #[test]
     fn gated_high_frequencies_keep_the_ribbon_thin() {
         let rate = 48_000.0;
-        let sine =
-            |hz: f32| move |n: usize| 0.9 * (std::f32::consts::TAU * hz * n as f32 / rate).sin();
-        // A steady, full-scale 440 Hz ribbon sets the budget: about nine
-        // full-height cycles of thin line.
-        let budget = max_area(&drawn_areas(sine(440.0))[30..]);
+        let budget = budget();
         let flat = drawn_areas(|_| 0.0)[30];
         assert!(flat > 0.0 && budget > 5.0 * flat, "{flat} {budget}");
+        assert!(budget <= AREA_CAP, "budget {budget} over cap {AREA_CAP}");
         let noise = |n: usize| {
             let hashed = (n as u32).wrapping_mul(0x9e37_79b9).rotate_left(13) ^ 0x5bd1_e995;
             0.9 * (hash(hashed) * 2.0 - 1.0)
@@ -1096,7 +1160,7 @@ mod tests {
             let gate =
                 move |n: usize| ((n as f32 / rate * gate_hz * 2.0) as usize).is_multiple_of(2);
             for (name, signal) in [
-                ("4 kHz", &sine(4_000.0) as &dyn Fn(usize) -> f32),
+                ("4 kHz", &sine(rate, 4_000.0) as &dyn Fn(usize) -> f32),
                 ("noise", &noise),
             ] {
                 let areas = drawn_areas(|n| if gate(n) { signal(n) } else { 0.0 });
@@ -1110,8 +1174,9 @@ mod tests {
                     high - low <= budget,
                     "{name} at {gate_hz} Hz: {low}..{high}"
                 );
-                // The gate is seen: the lines do move.
-                assert!(high > 1.5 * low, "{name} at {gate_hz} Hz: {low}..{high}");
+                // The gate is seen: one flat line opens into two (a loud
+                // tone's envelope) or a ragged pair (noise).
+                assert!(high > 1.25 * low, "{name} at {gate_hz} Hz: {low}..{high}");
             }
         }
         // A filled band (one line zigzagging between the extremes, as a
@@ -1125,9 +1190,64 @@ mod tests {
         };
         layers.step(quiet(), Some(&band), 0.0, true);
         let mut instances = Vec::new();
-        layers.build(quiet(), 16.0 / 9.0, &mut instances);
-        let filled = ribbon_area(&instances, 16.0 / 9.0);
+        layers.build(quiet(), ASPECT, &mut instances);
+        let filled = ribbon_area(&instances, ASPECT);
         assert!(filled > 2.0 * budget, "{filled} vs budget {budget}");
+    }
+
+    /// Every loud tone from 0.5 to 8 kHz (every 100 Hz, plus those whose
+    /// period is a whole number of half-points, where raw outlines
+    /// alternate between extremes) at 44.1, 48 and 96 kHz, steady and gated
+    /// at 3, 5 and 10 Hz, publishes outlines within the scope's coverage
+    /// bound in every frame, and draws within the thin-line budget and the
+    /// absolute cap. Each run rasterises its frame whose drawn outlines
+    /// cover the most height. Gated runs are for every third tone, to keep
+    /// the test quick.
+    #[test]
+    fn mid_and_high_tones_never_fill_a_band() {
+        use crate::audio::scope::MAX_COVERAGE;
+        let budget = budget();
+        let limit = budget.min(AREA_CAP);
+        for rate in [44_100.0_f32, 48_000.0, 96_000.0] {
+            let divisors = (2..=16)
+                .map(|half_points| rate / (4.0 * half_points as f32))
+                .filter(|hz| (500.0..=8_000.0).contains(hz));
+            let tones: Vec<f32> = (5..=80)
+                .map(|step| step as f32 * 100.0)
+                .chain(divisors)
+                .collect();
+            for (index, &hz) in tones.iter().enumerate() {
+                let tone = sine(rate, hz);
+                // Steady, then gated for every third tone; the gated runs
+                // cover a full 3 Hz cycle (20 frames).
+                let gates: &[Option<f32>] = if index % 3 == 0 {
+                    &[None, Some(3.0), Some(5.0), Some(10.0)]
+                } else {
+                    &[None]
+                };
+                for &gate_hz in gates {
+                    let gate = move |n: usize| {
+                        gate_hz.is_none_or(|gate_hz| {
+                            ((n as f32 / rate * gate_hz * 2.0) as usize).is_multiple_of(2)
+                        })
+                    };
+                    let seconds = if gate_hz.is_none() { 0.1 } else { 0.35 };
+                    let frames = drawn(rate, seconds, Areas::Worst, |n| {
+                        if gate(n) { tone(n) } else { 0.0 }
+                    });
+                    for &(published, area) in &frames {
+                        assert!(
+                            published <= MAX_COVERAGE,
+                            "{hz} Hz at {rate} gated at {gate_hz:?} Hz: coverage {published}"
+                        );
+                        assert!(
+                            area <= limit,
+                            "{hz} Hz at {rate} gated at {gate_hz:?} Hz: area {area}, limit {limit}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn max_area(areas: &[f32]) -> f32 {

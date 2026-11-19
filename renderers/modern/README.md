@@ -153,11 +153,16 @@ change the control-frame wire format.
   period of a 30 Hz tone (at least 1,024 samples; 1,600 at 48 kHz), so the
   window can end up to about 33 ms (at 44.1 kHz and above) before the newest
   sample. Its 256 points each cover 8 samples, and it is drawn as two thin
-  lines through each point's highest and lowest sample. For slow sound the
-  two lines coincide; tones too fast for the points (a few kHz and up) and
-  noise separate them into a thin upper and lower outline, so they keep their
-  loudness without filling a band. It is peak-normalised with a floor so room
-  hiss stays flat, and silence flattens it smoothly. Each line is drawn in
+  lines through each point's highest and lowest sample. For slow sound (a
+  440 Hz tone, say) the two lines coincide and draw the waveform. Faster
+  tones (from about 1 kHz at 48 kHz; 2 kHz at 96 kHz) and noise would make
+  each line jump between extremes from point to point and fill a band, so
+  the lines blend, by one weight for the whole window, into an envelope (the
+  highest and lowest values within 4 points either side): a loud tone of a
+  few kHz draws as two near-flat lines at its peaks. Tones in between keep
+  their waveform until the lines would cover more height than a loud 440 Hz
+  tone, then blend just enough to stay within that. It is peak-normalised
+  with a floor so room hiss stays flat, and silence flattens it smoothly. Each line is drawn in
   three near-opaque layers: a dimmed palette-tinted halo, a black backing
   inside it, and a near-white tinted core, which keep it readable over scenes
   of the same colour.
@@ -183,11 +188,13 @@ rooms and projection), with at most four alive at once. A unit test composites a
 maximum onset rate, including input whose palette and energy change every
 frame at 60, 120 and 240 fps, and finds at most two flashes (opposing changes
 of 0.1 relative luminance) in any 1 s at any sampled point. The scope ribbon
-is outside that model; its exemption rests on staying thin lines, and another
-test gates a loud 4 kHz tone and white noise at 3, 5 and 10 Hz and checks that
-the ribbon never draws, or changes by, more area than a steady full-scale
-440 Hz ribbon. Measure the
-actual display before relying on this for a photosensitive audience.
+is outside that model; its exemption rests on staying thin lines. Unit tests
+rasterise the ribbon for a loud 4 kHz tone and white noise gated at 3, 5 and
+10 Hz, and for loud tones every 100 Hz from 0.5 to 8 kHz (plus those that
+divide the point spacing) at 44.1, 48 and 96 kHz, steady and gated. They check
+that it never draws more area than a steady full-scale 440 Hz ribbon, nor more
+than 13% of the screen. Measure the actual display before relying on this for
+a photosensitive audience.
 
 ```sh
 just modern-m1 -- --mic --mic-layers both
