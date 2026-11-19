@@ -817,6 +817,14 @@ OTHER = CANCEL
   all 8 bands.
 - **LCG:** `x = (x * 25173 + 13849) & 0xFFFF`, with `x0 = 1`. It advances once
   per field per step, in wire order. Jitter is `j = ((x >> 8) % 25) - 12`.
+  - `x0` is the seed and is never used itself: each field first advances `x`,
+    then uses the new value. The first value is `x1 = 39022` (`x >> 8 = 152`).
+  - Wire order is `e`, bass, mid, treble, then spectrum 0–7: 12 values per
+    step, and no other field consumes the LCG.
+  - Each fixture starts its own sequence at `x0 = 1` on its first noisy step
+    and advances only on noisy steps. F2 starts at step 0 (first `e` is
+    `150 - 10 = 140`). F6 starts at step 60 and advances only on steps
+    60–419 (first floor `e` is `152 % 13 = 9`).
 
 **Verification:**
 

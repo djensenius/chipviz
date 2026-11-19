@@ -13,6 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
+use crate::scenes::colour_field;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -110,6 +111,10 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         None => None,
     };
 
+    if args.allow_flash {
+        eprintln!("{}", colour_field::allow_flash_notice());
+    }
+
     let udp = UdpFrameSource::bind(args.udp_endpoint.as_deref())?;
     let mic = if args.mic {
         Some(start_mic(args.audio_device.as_ref()).map_err(AppError::Audio)?)
@@ -137,6 +142,10 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     window.set_cursor_visible(cursor_visible(args.fullscreen));
 
     let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
+    renderer
+        .pipeline_mut()
+        .configure_colour_field(colour_field_config(&args));
+    renderer.pipeline_mut().limit_colour_field_steps();
     let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
@@ -164,12 +173,18 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                 match key_action(input, mods, fullscreen) {
                     Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
                     Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
+                    Some(KeyAction::CycleLayoutPin) => renderer.pipeline_mut().cycle_layout_pin(),
                     None => {}
                 }
             }
             WindowEvent::RedrawRequested => {
                 let elapsed = start.elapsed().as_secs_f32();
                 let frame = frame_source.next_frame();
+                // The colour field sees each received or generated frame once;
+                // held redraws only repeat its last step.
+                for fresh in frame_source.fresh() {
+                    renderer.pipeline_mut().observe(fresh);
+                }
                 match renderer.render(frame, elapsed) {
                     Ok(()) => {}
                     Err(RendererError::Surface(
@@ -219,6 +234,7 @@ fn print_monitors(monitors: &[MonitorHandle]) {
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
+       [--layout auto|v2|h2|v3|h3] [--allow-flash]
        {program} --list-monitors | --list-audio-devices
 
 Options:
@@ -232,10 +248,17 @@ Options:
   --fullscreen            start in borderless fullscreen (default: windowed)
   --monitor INDEX|NAME    display to use, by index or case-insensitive name substring
   --list-monitors         print available monitors and exit
+  --layout LAYOUT         colour-field (scene 7) layout pin (default: auto)
+  --allow-flash           print the flash/gate warning and arm operator flash requests;
+                          scene 7 wire palettes 3 and 7 from a host started with
+                          --allow-flash arm flash/gate without it. Only builds with
+                          the unmeasured-flash feature can flash; default builds run
+                          3 and 7 as hard cuts and print a notice instead
   -h, --help              print this help
 
 Keys:
   F, Cmd+F, Ctrl+Cmd+F    toggle fullscreen
+  L                       cycle the colour-field layout pin (auto, V2, H2, V3, H3)
   Esc                     exit fullscreen
   Cmd+Q                   quit (macOS application menu)"
     )
@@ -365,6 +388,7 @@ impl KeyInput {
         }
         match physical {
             PhysicalKey::Code(KeyCode::KeyF) => Self::Character('f'),
+            PhysicalKey::Code(KeyCode::KeyL) => Self::Character('l'),
             PhysicalKey::Code(KeyCode::Escape) => Self::Escape,
             _ => Self::Other,
         }
@@ -383,6 +407,7 @@ struct KeyModifiers {
 enum KeyAction {
     ToggleFullscreen,
     ExitFullscreen,
+    CycleLayoutPin,
 }
 
 fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
@@ -395,6 +420,7 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
             Some(KeyAction::ToggleFullscreen)
         }
         (KeyInput::Escape, false, false) if fullscreen => Some(KeyAction::ExitFullscreen),
+        (KeyInput::Character('l'), false, false) => Some(KeyAction::CycleLayoutPin),
         _ => None,
     }
 }
@@ -414,6 +440,37 @@ struct AppArgs {
     mic: bool,
     audio_device: Option<DeviceSelector>,
     list_audio_devices: bool,
+    /// Colour-field layout pin; `None` is `auto`.
+    layout: Option<u8>,
+    allow_flash: bool,
+}
+
+/// Wire palettes go through the stability gate, and a stable absolute 3 or 7
+/// arms whatever `--allow-flash` says (the host's flag is the opt-in).
+/// Procedural and mic-only frames use a local palette 0, which never arms.
+fn colour_field_config(args: &AppArgs) -> colour_field::Config {
+    colour_field::Config {
+        allow_flash: args.allow_flash,
+        palette: if args.udp_endpoint.is_some() {
+            colour_field::PaletteSource::Wire
+        } else {
+            colour_field::PaletteSource::Local { p: 0, armed: false }
+        },
+        pin: args.layout,
+    }
+}
+
+fn parse_layout(value: &str) -> Result<Option<u8>, AppError> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Ok(None),
+        "v2" => Ok(Some(0)),
+        "h2" => Ok(Some(1)),
+        "v3" => Ok(Some(2)),
+        "h3" => Ok(Some(3)),
+        _ => Err(invalid_input(format!(
+            "--layout expects auto|v2|h2|v3|h3, got {value}"
+        ))),
+    }
 }
 
 impl AppArgs {
@@ -441,6 +498,11 @@ impl AppArgs {
                     parsed.audio_device = Some(DeviceSelector::parse(&value));
                 }
                 "--list-audio-devices" => parsed.list_audio_devices = true,
+                "--layout" => {
+                    let value = required_value(&mut args, "--layout", "auto|v2|h2|v3|h3")?;
+                    parsed.layout = parse_layout(&value)?;
+                }
+                "--allow-flash" => parsed.allow_flash = true,
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
@@ -486,15 +548,18 @@ impl UdpFrameSource {
         })
     }
 
-    fn receive_latest(&self) -> Option<ControlFrame> {
-        let socket = self.socket.as_ref()?;
-        let mut latest = None;
+    /// Every valid frame received since the last call, oldest first.
+    fn receive_all(&self) -> Vec<ControlFrame> {
+        let mut frames = Vec::new();
+        let Some(socket) = self.socket.as_ref() else {
+            return frames;
+        };
         let mut packet = [0; WIRE_SIZE];
 
         loop {
             match socket.recv(&mut packet) {
                 Ok(WIRE_SIZE) => match ControlFrame::parse_wire(&packet) {
-                    Ok(frame) => latest = Some(frame),
+                    Ok(frame) => frames.push(frame),
                     Err(error) => eprintln!("ignored invalid control frame: {error}"),
                 },
                 Ok(size) => eprintln!("ignored short UDP packet: {size} bytes"),
@@ -506,7 +571,7 @@ impl UdpFrameSource {
             }
         }
 
-        latest
+        frames
     }
 }
 
@@ -566,6 +631,7 @@ struct FrameSource {
     latest: ControlFrame,
     last_udp: Option<Instant>,
     mic_beat_count: Option<u16>,
+    fresh: Vec<ControlFrame>,
 }
 
 impl FrameSource {
@@ -581,6 +647,7 @@ impl FrameSource {
             latest: ControlFrame::procedural(0),
             last_udp: None,
             mic_beat_count: None,
+            fresh: Vec::new(),
         }
     }
 
@@ -588,8 +655,17 @@ impl FrameSource {
         self.next_frame_at(Instant::now())
     }
 
+    /// Frames received or generated by the last `next_frame_at`, oldest
+    /// first. Empty on a held redraw: a held frame is a display repeat, not
+    /// a new frame, so the colour field neither steps on it nor sees its
+    /// cleared one-off flags as falling edges.
+    fn fresh(&self) -> &[ControlFrame] {
+        &self.fresh
+    }
+
     fn next_frame_at(&mut self, now: Instant) -> ControlFrame {
-        if let Some(frame) = self.udp.receive_latest() {
+        self.fresh = self.udp.receive_all();
+        if let Some(&frame) = self.fresh.last() {
             self.latest = frame;
             self.last_udp = Some(now);
             self.mic_beat_count = None;
@@ -607,9 +683,14 @@ impl FrameSource {
                     self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
                 }
             }
+            // Generated frames number from `fallback_index`, independent of
+            // UDP counters. On a handover the first one can equal the last
+            // stepped counter; the colour field then skips that one frame
+            // (see `ColourField::has_new_frame`).
             IdleSource::Procedural => {
                 self.fallback_index = self.fallback_index.wrapping_add(1);
                 self.latest = ControlFrame::procedural(self.fallback_index);
+                self.fresh.push(self.latest);
             }
             IdleSource::Mic => {
                 if let Some(mic) = &self.mic {
@@ -618,6 +699,7 @@ impl FrameSource {
                     let base = ControlFrame::procedural(self.fallback_index);
                     self.latest = audio::mic_frame(base, features, self.mic_beat_count);
                     self.mic_beat_count = Some(features.beat_count);
+                    self.fresh.push(self.latest);
                 }
             }
         }
@@ -1009,6 +1091,89 @@ mod tests {
         assert!(source.next_frame_at(later).beat_onset());
     }
 
+    /// Held redraws in mic mode clear one-off flags. The colour field must
+    /// not see that as a falling edge (which would turn a sustained beat flag
+    /// in the next packet into a second onset), and a held redraw is a
+    /// display repeat, so it must not step.
+    #[test]
+    fn held_udp_redraws_neither_step_nor_retrigger_the_colour_field() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+        let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures::default()));
+        let mut source = FrameSource::with_feed(udp, Some(Box::new(FakeMic(feed))));
+        let mut field = ColourField::new(Config::default());
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let start = Instant::now();
+        // One window redraw, as in `run`: returns (new frames, beat edge
+        // pending, stepped).
+        fn redraw(
+            source: &mut FrameSource,
+            field: &mut ColourField,
+            now: Instant,
+        ) -> (usize, bool, bool) {
+            source.next_frame_at(now);
+            for fresh in source.fresh() {
+                field.observe(fresh);
+            }
+            let beat = field.pending_beat_bar();
+            let stepped = field.has_new_frame();
+            if stepped {
+                field.step(Controls::default());
+            }
+            (source.fresh().len(), beat, stepped)
+        }
+        // Packet counters stay clear of the mic frames' small counters.
+        let send = |source: &mut FrameSource, field: &mut ColourField, counter: u16, flags: u8| {
+            let mut packet = wire_packet(90, flags, Some((60, 100)));
+            packet[2..4].copy_from_slice(&counter.to_le_bytes());
+            packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+            sender.send_to(&packet, address).unwrap();
+            // Until the first packet lands, redraws in mic mode generate mic
+            // frames; wait for this packet itself.
+            // About 2 s, for loaded CI hosts.
+            for _ in 0..1000 {
+                let result = redraw(source, field, start);
+                if source.fresh().iter().any(|frame| frame.frame == counter) {
+                    return result;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("UDP packet {counter} never arrived");
+        };
+
+        // Mic frames before any packet are new frames too.
+        for _ in 0..3 {
+            assert_eq!(redraw(&mut source, &mut field, start), (1, false, true));
+        }
+        assert_eq!(send(&mut source, &mut field, 1001, 0), (1, false, true));
+        assert_eq!(
+            send(&mut source, &mut field, 1002, audio::BEAT_FLAG),
+            (1, true, true)
+        );
+        // Held redraws (flags cleared for display) add no frames and no steps.
+        for _ in 0..5 {
+            let held = source.next_frame_at(start);
+            assert_eq!(held.flags, 0);
+            assert!(source.fresh().is_empty());
+            assert_eq!(redraw(&mut source, &mut field, start), (0, false, false));
+        }
+        // The beat flag is still high in the next packet: no second onset.
+        assert_eq!(
+            send(&mut source, &mut field, 1003, audio::BEAT_FLAG),
+            (1, false, true)
+        );
+        assert_eq!(send(&mut source, &mut field, 1004, 0), (1, false, true));
+        assert_eq!(
+            send(&mut source, &mut field, 1005, audio::BEAT_FLAG),
+            (1, true, true)
+        );
+        // After the hold, mic frames are new frames and step again.
+        let (fresh, _, stepped) = redraw(&mut source, &mut field, start + UDP_HOLD * 2);
+        assert_eq!((fresh, stepped), (1, true));
+    }
+
     #[test]
     fn udp_packets_win_over_mic_and_procedural_is_unchanged() {
         let recent = Some(Duration::from_millis(100));
@@ -1022,6 +1187,51 @@ mod tests {
         assert_eq!(idle_source(true, true, None), IdleSource::Mic);
         assert_eq!(idle_source(true, true, recent), IdleSource::Hold);
         assert_eq!(idle_source(true, true, stale), IdleSource::Mic);
+    }
+
+    #[test]
+    fn parses_colour_field_options() {
+        let args = parse_run(&["--layout", "H3", "--allow-flash"]);
+        assert_eq!(args.layout, Some(3));
+        assert!(args.allow_flash);
+        assert_eq!(parse_run(&["--layout", "auto"]).layout, None);
+        assert_eq!(parse_run(&["--layout", "v2"]).layout, Some(0));
+        assert!(!AppArgs::default().allow_flash);
+        assert!(parse(&["--layout", "v4"]).is_err());
+        assert!(parse(&["--layout"]).is_err());
+    }
+
+    #[test]
+    fn colour_field_config_arms_locally_only_with_the_flag() {
+        let config = colour_field_config(&AppArgs::default());
+        assert!(!config.allow_flash);
+        assert_eq!(
+            config.palette,
+            colour_field::PaletteSource::Local { p: 0, armed: false }
+        );
+        let udp = colour_field_config(&parse_run(&["--udp", "127.0.0.1:6464"]));
+        assert_eq!(udp.palette, colour_field::PaletteSource::Wire);
+        assert!(!udp.allow_flash);
+        assert!(colour_field_config(&parse_run(&["--allow-flash"])).allow_flash);
+    }
+
+    #[test]
+    fn l_cycles_the_layout_pin() {
+        let plain = KeyModifiers::default();
+        let cmd = KeyModifiers {
+            command: true,
+            ..plain
+        };
+        let l = KeyInput::Character('l');
+        assert_eq!(key_action(l, plain, false), Some(KeyAction::CycleLayoutPin));
+        assert_eq!(key_action(l, cmd, true), None);
+        assert_eq!(
+            KeyInput::from_winit(
+                &Key::Character("д".into()),
+                PhysicalKey::Code(KeyCode::KeyL)
+            ),
+            l
+        );
     }
 
     #[test]
@@ -1040,6 +1250,9 @@ mod tests {
             "--mic",
             "--audio-device",
             "--list-audio-devices",
+            "--layout auto|v2|h2|v3|h3",
+            "--allow-flash",
+            "cycle the colour-field layout pin",
             "Esc",
             "Cmd+Q",
         ] {
