@@ -186,9 +186,10 @@ How the release binaries meet these licences' terms is tracked in
 
 ## Known gaps
 
-These crates ship no licence file, and no copyright holder could be
-verified upstream for the licence they declare. The canonical licence
-text is listed for each, with the copyright line left as the SPDX template.
+These crates ship no licence file, and the committed fallback texts do
+not fully cover the licence they declare: either no copyright holder could
+be verified upstream (the copyright line is left as the SPDX template) or
+no canonical text is committed for a required licence or exception.
 
 - block 0.1.6: upstream SSheldon/rust-block has no licence file at tag 0.1.6.
 - block2 0.6.2: upstream LICENSE.md at the crate's commit states MIT but names no copyright holder.

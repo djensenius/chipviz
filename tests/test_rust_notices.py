@@ -139,6 +139,46 @@ class RustNoticesTests(unittest.TestCase):
     self.assertIn(rust_notices.LGPL_DECISION, content)
     self.assertNotIn("fn copy()", content)
 
+  def test_licence_expression_parser(self) -> None:
+    parse = rust_notices.licence_alternatives
+    self.assertEqual(parse("(Apache-2.0 OR MIT) AND Unicode-3.0"), [["Apache-2.0", "Unicode-3.0"], ["MIT", "Unicode-3.0"]])
+    self.assertEqual(parse("MIT OR Apache-2.0 WITH LLVM-exception"), [["MIT"], ["Apache-2.0", "LLVM-exception"]])
+    self.assertEqual(parse("MIT AND Zlib OR Apache-2.0"), [["MIT", "Zlib"], ["Apache-2.0"]])
+    self.assertEqual(parse("MIT/Apache-2.0"), [["MIT"], ["Apache-2.0"]])
+    self.assertEqual(parse("(MIT OR Zlib) AND (Apache-2.0 OR MIT)"), [["MIT", "Apache-2.0"], ["MIT"], ["Zlib", "Apache-2.0"], ["Zlib", "MIT"]])
+    self.assertEqual(parse(""), [])
+    for broken in ("(MIT OR Apache-2.0", "MIT OR", "MIT Apache-2.0", "AND MIT"):
+      with self.assertRaises(ValueError, msg=broken):
+        parse(broken)
+
+  def test_grouped_and_term_without_text_is_a_gap(self) -> None:
+    package = {"name": "ident", "version": "1.0.0", "license": "(Apache-2.0 OR MIT) AND Unicode-3.0"}
+    texts, gap = rust_notices.fallback_texts(package, self.fallback)
+    self.assertEqual([label for label, _ in texts], ["fallback SPDX Apache-2.0 text"])
+    self.assertEqual(gap, "no licence file in package; no canonical text for Unicode-3.0")
+    write(self.fallback / "Unicode-3.0.txt", "Unicode licence\n")
+    texts, gap = rust_notices.fallback_texts(package, self.fallback)
+    self.assertEqual([label for label, _ in texts], ["fallback SPDX Apache-2.0 text", "fallback SPDX Unicode-3.0 text"])
+    self.assertIsNone(gap)
+
+  def test_with_exception_needs_its_text_and_fewest_missing_wins(self) -> None:
+    package = {"name": "llvm", "version": "1.0.0", "license": "MIT OR Apache-2.0 WITH LLVM-exception"}
+    texts, gap = rust_notices.fallback_texts(package, self.fallback)
+    self.assertEqual([label for label, _ in texts], ["fallback SPDX MIT text"])
+    self.assertEqual(gap, "no licence file in package; no verified copyright holder for MIT")
+    write(self.fallback / "LLVM-exception.txt", "LLVM exception\n")
+    texts, gap = rust_notices.fallback_texts(package, self.fallback)
+    self.assertEqual([label for label, _ in texts], ["fallback SPDX Apache-2.0 text", "fallback SPDX LLVM-exception text"])
+    self.assertIsNone(gap)
+
+  def test_declared_copyleft_is_listed_and_alternatives_are_optional(self) -> None:
+    self.add_shipped("mpl", "MPL-2.0", {"LICENSE": "MPL text\n"})
+    self.add_shipped("either", "MIT OR LGPL-2.1-or-later", {"LICENSE": "either text\n"})
+    content = rust_notices.render(self.metadata, self.fallback)
+    self.assertIn("## Copyleft components", content)
+    self.assertIn("- mpl 1.0.0: MPL-2.0.", content)
+    self.assertIn("- either 1.0.0: LGPL-2.1-or-later (optional: the crate may be used under an alternative licence).", content)
+
   def test_fence_for_is_longer_than_any_backtick_run(self) -> None:
     self.assertEqual(rust_notices.fence_for("plain text"), "```")
     self.assertEqual(rust_notices.fence_for("```rust\ncode\n```"), "````")

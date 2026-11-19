@@ -39,7 +39,7 @@ LGPL_DECISION = "https://github.com/djensenius/chipviz/issues/110"
 # ships no licence file.
 FALLBACK_DIR = ROOT / "THIRD_PARTY_NOTICES" / "licenses"
 # Licences whose canonical text needs no per-project copyright line.
-NO_HOLDER_NEEDED = {"Apache-2.0", "CC0-1.0"}
+NO_HOLDER_NEEDED = {"Apache-2.0", "CC0-1.0", "LLVM-exception", "Unicode-3.0"}
 MIT_TEMPLATE_LINE = "Copyright (c) <year> <copyright holders>"
 # Copyright lines for MIT crates without a licence file, from the upstream
 # LICENSE at the commit recorded in the crate's .cargo_vcs_info.json.
@@ -157,52 +157,116 @@ def display_path(path: Path, directory: Path) -> str:
     return path.name
 
 
+SPDX_TOKEN = re.compile(r"\(|\)|/|[^\s()/]+")
+
+
 def licence_alternatives(expression: str) -> list[list[str]]:
-  """Split an SPDX expression (or legacy "A/B") into OR alternatives of AND-ed ids."""
-  alternatives = []
-  for alternative in re.split(r"\s+OR\s+|/", expression):
-    ids = [token for token in re.split(r"\s+AND\s+|[()\s]+", alternative) if token and token != "WITH"]
-    if ids:
-      alternatives.append(ids)
-  return alternatives
+  """Expand an SPDX expression into OR alternatives, each a list of required ids.
+
+  Handles parentheses, AND binding tighter than OR, the legacy "A/B" form of OR,
+  and "X WITH exception" (both X and the exception are required).
+  """
+  tokens = SPDX_TOKEN.findall(expression)
+  position = 0
+
+  def peek() -> str | None:
+    return tokens[position] if position < len(tokens) else None
+
+  def take() -> str:
+    nonlocal position
+    if position >= len(tokens):
+      raise ValueError(f"unexpected end of licence expression {expression!r}")
+    position += 1
+    return tokens[position - 1]
+
+  def parse_or() -> list[list[str]]:
+    alternatives = parse_and()
+    while peek() in ("OR", "/"):
+      take()
+      alternatives = alternatives + parse_and()
+    return alternatives
+
+  def parse_and() -> list[list[str]]:
+    alternatives = parse_with()
+    while peek() == "AND":
+      take()
+      right = parse_with()
+      alternatives = [left + [spdx_id for spdx_id in other if spdx_id not in left] for left in alternatives for other in right]
+    return alternatives
+
+  def parse_with() -> list[list[str]]:
+    token = take()
+    if token == "(":
+      alternatives = parse_or()
+      if take() != ")":
+        raise ValueError(f"unbalanced parentheses in licence expression {expression!r}")
+    elif token in ("AND", "OR", "WITH", "/", ")"):
+      raise ValueError(f"unexpected {token!r} in licence expression {expression!r}")
+    else:
+      alternatives = [[token]]
+    if peek() == "WITH":
+      take()
+      exception = take()
+      alternatives = [alternative + [exception] for alternative in alternatives]
+    return alternatives
+
+  if not tokens:
+    return []
+  alternatives = parse_or()
+  if peek() is not None:
+    raise ValueError(f"unexpected {peek()!r} in licence expression {expression!r}")
+  unique: list[list[str]] = []
+  for alternative in alternatives:
+    if alternative not in unique:
+      unique.append(alternative)
+  return unique
+
+
+def fallback_text(spdx_id: str, key: tuple[str, str], fallback_dir: Path) -> tuple[tuple[str, str] | None, str | None]:
+  """Return the (label, text) fallback for one id and why it is incomplete, if it is."""
+  path = fallback_dir / f"{spdx_id}.txt"
+  if not path.is_file():
+    return None, f"no canonical text for {spdx_id}"
+  text = normalise(path.read_text(encoding="utf-8"))
+  label = f"fallback SPDX {spdx_id} text"
+  if spdx_id == "MIT" and key in MIT_COPYRIGHT:
+    line, source = MIT_COPYRIGHT[key]
+    return (label + f", copyright line from {source}", text.replace(MIT_TEMPLATE_LINE, line)), None
+  if spdx_id in NO_HOLDER_NEEDED:
+    return (label, text), None
+  return (label, text), f"no verified copyright holder for {spdx_id}"
 
 
 def fallback_texts(package: dict, fallback_dir: Path) -> tuple[list[tuple[str, str]], str | None]:
-  """Return (label, text) fallbacks for a crate without licence files, and a gap reason if incomplete."""
+  """Return (label, text) fallbacks for a crate without licence files, and a gap reason if incomplete.
+
+  Every alternative needing no missing text is reproduced. Otherwise the
+  alternative with the fewest missing texts is used and reported as a gap.
+  """
   key = (package["name"], package["version"])
-  expression = package.get("license") or ""
-  alternatives = licence_alternatives(expression)
-  found: list[tuple[str, str]] = []
-  complete_found: list[tuple[str, str]] = []
-  satisfied = False
-  for alternative in alternatives:
-    complete = True
-    alternative_found: list[tuple[str, str]] = []
-    for spdx_id in alternative:
-      path = fallback_dir / f"{spdx_id}.txt"
-      if not path.is_file():
-        complete = False
-        continue
-      text = normalise(path.read_text(encoding="utf-8"))
-      label = f"fallback SPDX {spdx_id} text"
-      if spdx_id == "MIT" and key in MIT_COPYRIGHT:
-        line, source = MIT_COPYRIGHT[key]
-        text = text.replace(MIT_TEMPLATE_LINE, line)
-        label += f", copyright line from {source}"
-      elif spdx_id not in NO_HOLDER_NEEDED:
-        complete = False
-      if (label, text) not in alternative_found:
-        alternative_found.append((label, text))
-    found += [item for item in alternative_found if item not in found]
-    if complete:
-      satisfied = True
-      complete_found += [item for item in alternative_found if item not in complete_found]
+  alternatives = licence_alternatives(package.get("license") or "")
   if not alternatives:
-    return found, "no licence declared"
-  if satisfied:
+    return [], "no licence declared"
+  evaluated = []
+  for alternative in alternatives:
+    found: list[tuple[str, str]] = []
+    problems: list[str] = []
+    for spdx_id in alternative:
+      item, problem = fallback_text(spdx_id, key, fallback_dir)
+      if item and item not in found:
+        found.append(item)
+      if problem:
+        problems.append(problem)
+    evaluated.append((found, problems))
+  complete = [found for found, problems in evaluated if not problems]
+  if complete:
     # Only link texts of complete alternatives, never an unfilled template.
-    return complete_found, None
-  return found, KNOWN_GAPS.get(key, "no licence file in package and no verified copyright holder for its licence")
+    texts: list[tuple[str, str]] = []
+    for found in complete:
+      texts += [item for item in found if item not in texts]
+    return texts, None
+  found, problems = min(evaluated, key=lambda entry: len(entry[1]))
+  return found, KNOWN_GAPS.get(key, "no licence file in package; " + "; ".join(problems))
 
 
 def normalise(text: str) -> str:
@@ -258,7 +322,8 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
       if gap:
         gaps.append((label, gap))
     licence = package.get("license") or "not declared"
-    declared = {token for alternative in licence_alternatives(licence) for token in alternative}
+    declared_alternatives = licence_alternatives(package.get("license") or "")
+    declared = {token for alternative in declared_alternatives for token in alternative}
     extra = sorted(embedded - declared)
     notes = []
     if extra:
@@ -268,6 +333,13 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
     if notes:
       licence += " (" + "; ".join(notes) + ")"
     copyleft_ids = [spdx_id for spdx_id in extra if COPYLEFT.match(spdx_id)]
+    for spdx_id in sorted(declared):
+      if not COPYLEFT.match(spdx_id) or spdx_id in extra:
+        continue
+      if all(spdx_id in alternative for alternative in declared_alternatives):
+        copyleft_ids.append(spdx_id)
+      else:
+        copyleft_ids.append(f"{spdx_id} (optional: the crate may be used under an alternative licence)")
     if copyleft_ids:
       copyleft.append((label, copyleft_ids))
     rows.append((label, licence, package.get("repository") or "", refs, fallback))
@@ -314,9 +386,10 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
   lines += ["", "## Known gaps", ""]
   if gaps:
     lines += [
-      "These crates ship no licence file, and no copyright holder could be",
-      "verified upstream for the licence they declare. The canonical licence",
-      "text is listed for each, with the copyright line left as the SPDX template.",
+      "These crates ship no licence file, and the committed fallback texts do",
+      "not fully cover the licence they declare: either no copyright holder could",
+      "be verified upstream (the copyright line is left as the SPDX template) or",
+      "no canonical text is committed for a required licence or exception.",
       "",
     ]
     lines += [f"- {label}: {reason}." for label, reason in gaps]
