@@ -8,8 +8,7 @@ use crate::audio::scope::ScopeSnapshot;
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::{
-    Camera, Instance, QUAD_VERTICES, SCREEN_SPACE_TRANSFORM, Uniforms, Vertex, build_instances,
-    scene_uniforms,
+    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
 };
 use crate::scenes::{self, CameraMode, colour_field, mic_layers};
 
@@ -294,11 +293,12 @@ impl ScenePipeline {
     /// frame that is not drawn.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
         self.observe(&frame);
-        let (frame, _) = self.dispatch(frame);
+        let (frame, display) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed, aspect);
+        let shown = mic_layers::shown(self.mic_layers.mode(), display);
         self.mic_layers
-            .step(frame, self.live_scope.as_ref(), elapsed);
+            .step(frame, self.live_scope.as_ref(), elapsed, shown);
     }
 
     pub fn set_mic_layers(&mut self, mode: mic_layers::Mode) {
@@ -392,14 +392,14 @@ impl ScenePipeline {
             elapsed,
             aspect,
         );
+        let shown = mic_layers::shown(self.mic_layers.mode(), display);
         self.mic_layers
-            .step(frame, self.live_scope.as_ref(), elapsed);
+            .step(frame, self.live_scope.as_ref(), elapsed, shown);
         let mut overlay = Vec::new();
-        // The colour field's colours follow its trace alone: never overlaid.
-        if let colour_field::Display::Native(_) = display {
+        if shown {
             self.mic_layers.build(frame, aspect, &mut overlay);
         }
-        self.encode_layers(encoder, view, &instances, &uniforms, &overlay);
+        self.encode_layers(encoder, view, &instances, &uniforms, &overlay, aspect);
     }
 
     /// What the latest colour-field step shows.
@@ -416,11 +416,11 @@ impl ScenePipeline {
         instances: &[Instance],
         uniforms: &Uniforms,
     ) {
-        self.encode_layers(encoder, view, instances, uniforms, &[]);
+        self.encode_layers(encoder, view, instances, uniforms, &[], 1.0);
     }
 
-    /// Records the scene's instances, then `overlay` (`ScreenSpace`
-    /// instances drawn flat on top, with their own uniforms) in one pass.
+    /// Records the scene's instances, then `overlay` (aspect-space instances
+    /// drawn flat on top, with their own uniforms) in one pass.
     fn encode_layers(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -428,6 +428,7 @@ impl ScenePipeline {
         instances: &[Instance],
         uniforms: &Uniforms,
         overlay: &[Instance],
+        aspect: f32,
     ) {
         let instance_count = instances.len().min(self.instance_capacity);
         self.queue.write_buffer(
@@ -446,7 +447,7 @@ impl ScenePipeline {
                 bytemuck::cast_slice(&overlay[..overlay_count]),
             );
             let flat = Uniforms {
-                view_projection: SCREEN_SPACE_TRANSFORM,
+                view_projection: mic_layers::transform(aspect),
                 beat: 0.0,
                 screen_space: 1.0,
                 ..*uniforms

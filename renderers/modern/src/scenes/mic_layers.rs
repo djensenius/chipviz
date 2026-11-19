@@ -18,37 +18,79 @@
 //! The ribbon eases towards each new waveform (time constant `SMOOTH_S`), so
 //! silence decays it smoothly to a flat line instead of cutting.
 //!
-//! Flash safety: a burst is one smooth rise (`ATTACK_S`) and exponential
-//! fall, so each is at most one flash. Bursts start at most once every
-//! `MIN_BURST_GAP_S` (3 per second, the WCAG 2.3.1 general flash limit that
+//! Flash design (not a measured compliance claim): a burst is one smooth rise
+//! (`ATTACK_S`) and exponential fall, so each is at most one flash. Bursts
+//! start at most once every `MIN_BURST_GAP_S` (2 per second, below the
+//! 3-per-second WCAG 2.3.1 general flash limit that
 //! `shared/specs/colour-field-v0.md` also follows) however fast onsets
 //! arrive, and they are soft, partly transparent glows over a small part of
 //! the screen. Nothing here inverts or flips the whole screen, so the layers
-//! need no `unmeasured-flash` gate.
+//! have no `unmeasured-flash` gate. The `flash_model` test checks a CPU model
+//! of the burst shapes over black at the maximum onset rate; it is not a
+//! photometric measurement of a display or projector.
+//!
+//! Geometry is built in aspect space (x spans `-aspect..aspect`, y `-1..1`)
+//! and flattened by [`transform`], so rotated ribbon segments and round
+//! bursts keep their shape at any aspect ratio.
 
-use super::{hash, palette};
+use super::{colour_field, hash, palette};
 use crate::audio::scope::{POINTS, ScopeSnapshot};
 use crate::control_frame::ControlFrame;
-use crate::scene::Instance;
+use crate::scene::{Instance, SCREEN_SPACE_TRANSFORM};
 
 const SMOOTH_S: f32 = 0.05;
 const LEVEL_S: f32 = 0.12;
 pub const ATTACK_S: f32 = 0.08;
 pub const DECAY_S: f32 = 0.35;
 pub const LIFETIME_S: f32 = 1.6;
-/// Just over a third of a second, so even four starts span more than 1 s.
-pub const MIN_BURST_GAP_S: f32 = 0.34;
+/// Half a second: at most two starts in any 1 s, with margin under the
+/// 3-per-second limit for dark rooms and projection.
+pub const MIN_BURST_GAP_S: f32 = 0.5;
 /// Enough slots for every burst alive at once under the start-rate cap.
-const MAX_BURSTS: usize = 6;
+const MAX_BURSTS: usize = 4;
+const GLOW_ALPHA: f32 = 0.3;
+const SPARK_ALPHA: f32 = 0.5;
 const SPARKS: usize = 12;
 const RIBBON_Y: f32 = -0.55;
 const RIBBON_AMPLITUDE: f32 = 0.3;
 const RIBBON_HALF_WIDTH: f32 = 0.92;
 /// Shapes from `scenes::object` (see `shape_alpha` in `shader.wgsl`).
 const GLOW: [f32; 2] = [0.0, -2.0];
-/// Upper bound on overlay instances: two quads per ribbon segment, plus each
-/// burst's glow and sparks.
-pub const MAX_INSTANCES: usize = 2 * (POINTS - 1) + MAX_BURSTS * (1 + SPARKS);
+/// Ribbon passes, drawn in order: (thickness, alpha, kind). The halo is
+/// translucent, so its segments meet end to end instead of overlapping
+/// (overlaps would stack into visible dashes). The dark backing is opaque and
+/// the core nearly so; they overlap to hide joint gaps, which opaque quads
+/// can do without stacking.
+const RIBBON_PASSES: [(f32, f32, Pass); 3] = [
+    (0.03, 0.16, Pass::Halo),
+    (0.017, 1.0, Pass::Backing),
+    (0.008, 0.95, Pass::Core),
+];
+/// Upper bound on overlay instances: a quad per ribbon segment per pass,
+/// plus each burst's glow and sparks.
+pub const MAX_INSTANCES: usize = RIBBON_PASSES.len() * (POINTS - 1) + MAX_BURSTS * (1 + SPARKS);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    Halo,
+    Backing,
+    Core,
+}
+
+/// The overlay's view-projection: flattens like `SCREEN_SPACE_TRANSFORM`,
+/// and maps aspect-space x (`-aspect..aspect`) onto the viewport.
+pub fn transform(aspect: f32) -> [[f32; 4]; 4] {
+    let mut transform = SCREEN_SPACE_TRANSFORM;
+    transform[0][0] = 1.0 / aspect.max(0.01);
+    transform
+}
+
+/// Whether the overlay is drawn (and may start bursts) over `display`:
+/// never when off, and never over the colour field, whose colours must follow
+/// its trace alone.
+pub fn shown(mode: Mode, display: colour_field::Display) -> bool {
+    mode != Mode::Off && matches!(display, colour_field::Display::Native(_))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -189,9 +231,17 @@ impl MicLayers {
 
     /// Advances to `elapsed`: eases the ribbon towards this frame's waveform
     /// (`live`, or synthesised from `frame`) and starts a burst on a new onset
-    /// (live) or beat (fallback). Runs whatever the mode, so toggling a layer
-    /// on shows its current state. Time never runs backwards here.
-    pub fn step(&mut self, frame: ControlFrame, live: Option<&ScopeSnapshot>, elapsed: f32) {
+    /// (live) or beat (fallback). The ribbon eases whatever the mode, so
+    /// toggling it on shows its current state, but bursts only start while
+    /// they are drawn (`shown`, see [`shown`], and the mode includes
+    /// bursts), so none pop in mid-fade. Time never runs backwards here.
+    pub fn step(
+        &mut self,
+        frame: ControlFrame,
+        live: Option<&ScopeSnapshot>,
+        elapsed: f32,
+        shown: bool,
+    ) {
         let previous = self.last_elapsed.unwrap_or(elapsed);
         let now = previous.max(elapsed);
         let delta = now - previous;
@@ -230,7 +280,7 @@ impl MicLayers {
         let rested = self
             .last_burst
             .is_none_or(|last| now - last >= MIN_BURST_GAP_S);
-        if onset && rested {
+        if onset && rested && shown && self.mode.bursts() {
             let energy = f32::from(frame.energy) / 255.0;
             let burst = Burst {
                 born: now,
@@ -259,27 +309,40 @@ impl MicLayers {
             self.build_bursts(frame, aspect, instances);
         }
         if self.mode.scope() {
-            self.build_ribbon(frame, instances);
+            self.build_ribbon(frame, aspect, instances);
         }
     }
 
-    fn build_ribbon(&self, frame: ControlFrame, instances: &mut Vec<Instance>) {
+    fn build_ribbon(&self, frame: ControlFrame, aspect: f32, instances: &mut Vec<Instance>) {
         let energy = f32::from(frame.energy) / 255.0;
         let brightness = 0.55 + 0.45 * self.level.min(1.0);
         let point = |index: usize| {
-            let x = (index as f32 / (POINTS - 1) as f32 * 2.0 - 1.0) * RIBBON_HALF_WIDTH;
+            let x = (index as f32 / (POINTS - 1) as f32 * 2.0 - 1.0) * RIBBON_HALF_WIDTH * aspect;
             [x, RIBBON_Y + self.wave[index] * RIBBON_AMPLITUDE]
         };
-        for (thickness, alpha) in [(0.028, 0.16), (0.006, 0.9)] {
-            let mut color = palette(frame.palette, brightness, energy);
-            color[3] = alpha;
+        let tint = palette(frame.palette, brightness, energy);
+        for (thickness, alpha, pass) in RIBBON_PASSES {
+            let (color, overlap) = match pass {
+                Pass::Halo => ([tint[0], tint[1], tint[2], alpha], 0.0),
+                // A dark edge keeps the core readable over same-hued scenes.
+                Pass::Backing => ([0.0, 0.0, 0.0, alpha], thickness * 0.5),
+                // The core leans towards white for contrast with the palette.
+                Pass::Core => (
+                    [
+                        0.4 * tint[0] + 0.6 * brightness,
+                        0.4 * tint[1] + 0.6 * brightness,
+                        0.4 * tint[2] + 0.6 * brightness,
+                        alpha,
+                    ],
+                    thickness * 0.5,
+                ),
+            };
             for index in 0..POINTS - 1 {
                 let (a, b) = (point(index), point(index + 1));
                 let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
                 instances.push(Instance {
                     center: [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, 0.0],
-                    // Overlap neighbours slightly so joints have no gaps.
-                    size: [dx.hypot(dy) + thickness * 0.5, thickness],
+                    size: [dx.hypot(dy) + overlap, thickness],
                     color,
                     rotation: dy.atan2(dx),
                     scene_mix: 0.0,
@@ -303,30 +366,33 @@ impl MicLayers {
                 continue;
             }
             let seed = burst.serial.wrapping_mul(7);
-            let center = [hash(seed) * 1.3 - 0.65, hash(seed + 1) * 0.7 - 0.05];
+            let center = [
+                (hash(seed) * 1.3 - 0.65) * aspect,
+                hash(seed + 1) * 0.7 - 0.05,
+            ];
             let radius = 0.06 + 0.42 * (1.0 - (-age / 0.3).exp());
             let mut color = palette(frame.palette.wrapping_add(2), 1.0, energy);
-            color[3] = envelope * 0.3;
+            color[3] = envelope * GLOW_ALPHA;
             instances.push(Instance {
                 center: [center[0], center[1], 0.0],
-                size: [radius * 1.6 / aspect, radius * 1.6],
+                size: [radius * 1.6, radius * 1.6],
                 color,
                 rotation: 0.0,
                 scene_mix: 0.0,
                 pattern: GLOW,
             });
-            color[3] = envelope * 0.85;
+            color[3] = envelope * SPARK_ALPHA;
             let spin = hash(seed + 2) * std::f32::consts::TAU;
             for spark in 0..SPARKS {
                 let angle = spin + spark as f32 / SPARKS as f32 * std::f32::consts::TAU;
                 let size = 0.05 * (0.4 + envelope);
                 instances.push(Instance {
                     center: [
-                        center[0] + angle.cos() * radius / aspect,
+                        center[0] + angle.cos() * radius,
                         center[1] + angle.sin() * radius,
                         0.0,
                     ],
-                    size: [size / aspect, size],
+                    size: [size, size],
                     color,
                     rotation: 0.0,
                     scene_mix: 0.0,
@@ -416,13 +482,13 @@ mod tests {
     }
 
     #[test]
-    fn onset_storms_start_at_most_three_bursts_per_second() {
+    fn onset_storms_start_at_most_two_bursts_per_second() {
         let mut layers = MicLayers::new(Mode::Both);
         let mut starts = Vec::new();
         for step in 0..600u32 {
             let elapsed = step as f32 / FPS;
             // A new onset every frame, far faster than the cap.
-            layers.step(quiet(), Some(&snapshot(0.5, step)), elapsed);
+            layers.step(quiet(), Some(&snapshot(0.5, step)), elapsed, true);
             if layers.last_burst == Some(elapsed) {
                 starts.push(elapsed);
             }
@@ -436,29 +502,29 @@ mod tests {
                 .iter()
                 .take_while(|&&later| later < start + 1.0)
                 .count();
-            assert!(window <= 3, "{window} bursts within 1 s of {start}");
+            assert!(window <= 2, "{window} bursts within 1 s of {start}");
         }
-        assert!(starts.len() >= 25, "{}", starts.len());
+        assert!(starts.len() >= 18, "{}", starts.len());
     }
 
     #[test]
     fn live_onsets_fire_bursts_that_decay_and_expire() {
         let mut layers = MicLayers::new(Mode::Bursts);
-        layers.step(quiet(), Some(&snapshot(0.0, 7)), 0.0);
+        layers.step(quiet(), Some(&snapshot(0.0, 7)), 0.0, true);
         assert_eq!(live_bursts(&layers), 0, "the first count only seeds");
-        layers.step(quiet(), Some(&snapshot(0.0, 7)), 1.0 / FPS);
+        layers.step(quiet(), Some(&snapshot(0.0, 7)), 1.0 / FPS, true);
         assert_eq!(live_bursts(&layers), 0);
-        layers.step(quiet(), Some(&snapshot(0.0, 8)), 2.0 / FPS);
+        layers.step(quiet(), Some(&snapshot(0.0, 8)), 2.0 / FPS, true);
         assert_eq!(live_bursts(&layers), 1);
         let mut alpha = Vec::new();
         for step in 3..200 {
-            layers.step(quiet(), Some(&snapshot(0.0, 8)), step as f32 / FPS);
+            layers.step(quiet(), Some(&snapshot(0.0, 8)), step as f32 / FPS, true);
             let mut instances = Vec::new();
             layers.build(quiet(), 1.0, &mut instances);
             alpha.push(instances.first().map_or(0.0, |glow| glow.color[3]));
         }
         let peak = alpha.iter().copied().fold(0.0, f32::max);
-        assert!(peak > 0.1 && peak <= 0.3, "{peak}");
+        assert!(peak > 0.1 && peak <= GLOW_ALPHA, "{peak}");
         assert_eq!(alpha.last(), Some(&0.0));
         assert_eq!(live_bursts(&layers), 0);
     }
@@ -473,13 +539,13 @@ mod tests {
         };
         // A held frame keeps its beat flag but not a new count: no repeats.
         for step in 0..30 {
-            layers.step(frame(4), None, step as f32 / FPS);
+            layers.step(frame(4), None, step as f32 / FPS, true);
         }
         assert_eq!(live_bursts(&layers), 0);
-        layers.step(frame(5), None, 0.5);
+        layers.step(frame(5), None, 0.5, true);
         assert_eq!(live_bursts(&layers), 1);
         // Switching to live input re-seeds instead of firing.
-        layers.step(frame(6), Some(&snapshot(0.3, 99)), 1.0);
+        layers.step(frame(6), Some(&snapshot(0.3, 99)), 1.0, true);
         assert_eq!(live_bursts(&layers), 1);
     }
 
@@ -498,14 +564,15 @@ mod tests {
 
         let mut layers = MicLayers::new(Mode::Scope);
         for step in 0..60 {
-            layers.step(frame, None, step as f32 / FPS);
+            layers.step(frame, None, step as f32 / FPS, true);
         }
         assert!(amplitude(&layers) > 0.1);
         let mut instances = Vec::new();
-        layers.build(frame, 16.0 / 9.0, &mut instances);
-        assert_eq!(instances.len(), 2 * (POINTS - 1));
+        let aspect = 16.0 / 9.0;
+        layers.build(frame, aspect, &mut instances);
+        assert_eq!(instances.len(), RIBBON_PASSES.len() * (POINTS - 1));
         assert!(instances.iter().all(|instance| {
-            instance.center[0].abs() <= 1.0 && instance.center[1].abs() <= 1.0
+            instance.center[0].abs() <= aspect && instance.center[1].abs() <= 1.0
         }));
     }
 
@@ -514,7 +581,7 @@ mod tests {
         let mut layers = MicLayers::new(Mode::Scope);
         let mut elapsed = 0.0;
         for _ in 0..60 {
-            layers.step(quiet(), Some(&snapshot(0.8, 0)), elapsed);
+            layers.step(quiet(), Some(&snapshot(0.8, 0)), elapsed, true);
             elapsed += 1.0 / FPS;
         }
         let loud = amplitude(&layers);
@@ -522,7 +589,7 @@ mod tests {
         let mut previous = loud;
         let mut previous_level = layers.level;
         for frame in 0..60 {
-            layers.step(quiet(), Some(&snapshot(0.0, 0)), elapsed);
+            layers.step(quiet(), Some(&snapshot(0.0, 0)), elapsed, true);
             elapsed += 1.0 / FPS;
             let now = amplitude(&layers);
             assert!(now <= previous, "frame {frame}: {now} > {previous}");
@@ -536,10 +603,10 @@ mod tests {
         // The no-mic fallback decays the same way when energy drops to 0.
         let mut fallback = MicLayers::new(Mode::Scope);
         for step in 0..60 {
-            fallback.step(ControlFrame::procedural(9), None, step as f32 / FPS);
+            fallback.step(ControlFrame::procedural(9), None, step as f32 / FPS, true);
         }
         for step in 60..180 {
-            fallback.step(quiet(), None, step as f32 / FPS);
+            fallback.step(quiet(), None, step as f32 / FPS, true);
         }
         assert!(amplitude(&fallback) < 1e-4);
     }
@@ -547,17 +614,213 @@ mod tests {
     #[test]
     fn off_draws_nothing_and_time_never_rewinds() {
         let mut layers = MicLayers::new(Mode::Off);
-        layers.step(quiet(), Some(&snapshot(0.5, 1)), 2.0);
-        layers.step(quiet(), Some(&snapshot(0.5, 2)), 2.5);
-        layers.step(quiet(), Some(&snapshot(0.5, 2)), 2.6);
+        layers.step(quiet(), Some(&snapshot(0.5, 1)), 2.0, true);
+        layers.step(quiet(), Some(&snapshot(0.5, 2)), 2.5, true);
+        layers.step(quiet(), Some(&snapshot(0.5, 2)), 2.6, true);
         let mut instances = Vec::new();
         layers.build(quiet(), 1.0, &mut instances);
         assert!(instances.is_empty());
-        // A burst still started, so turning bursts on shows it.
-        layers.set_mode(Mode::Bursts);
-        layers.build(quiet(), 1.0, &mut instances);
-        assert_eq!(instances.len(), 1 + SPARKS);
-        layers.step(quiet(), Some(&snapshot(0.5, 2)), 1.0);
+        layers.step(quiet(), Some(&snapshot(0.5, 2)), 1.0, true);
         assert_eq!(layers.last_elapsed, Some(2.6));
+    }
+
+    #[test]
+    fn shown_only_over_native_scenes_and_never_when_off() {
+        let native = colour_field::Display::Native(3);
+        let field = colour_field::Display::ColourField(colour_field::Trace {
+            mode: 0,
+            family: 0,
+            layout: 0,
+            combo: 0,
+            rot: 0,
+            lvl: [0; 3],
+        });
+        for mode in [Mode::Scope, Mode::Bursts, Mode::Both] {
+            assert!(shown(mode, native), "{mode:?}");
+            assert!(!shown(mode, field), "{mode:?} over the colour field");
+        }
+        assert!(!shown(Mode::Off, native));
+        assert!(!shown(Mode::Off, field));
+    }
+
+    #[test]
+    fn no_bursts_start_while_hidden_so_none_pop_in() {
+        // Hidden by the display (colour field) or by a mode without bursts:
+        // onsets only re-seed, so showing bursts later starts empty.
+        for (mode, visible) in [(Mode::Both, false), (Mode::Off, true), (Mode::Scope, true)] {
+            let mut layers = MicLayers::new(mode);
+            for step in 0..60u32 {
+                let elapsed = step as f32 / FPS;
+                layers.step(quiet(), Some(&snapshot(0.5, step)), elapsed, visible);
+            }
+            assert_eq!(live_bursts(&layers), 0, "{mode:?} shown={visible}");
+            layers.set_mode(Mode::Bursts);
+            layers.step(quiet(), Some(&snapshot(0.5, 59)), 1.0, true);
+            let mut instances = Vec::new();
+            layers.build(quiet(), 1.0, &mut instances);
+            assert!(instances.is_empty(), "{mode:?}: a held count fires nothing");
+            layers.step(quiet(), Some(&snapshot(0.5, 60)), 1.0 + 1.0 / FPS, true);
+            assert_eq!(live_bursts(&layers), 1, "{mode:?}: the next onset fires");
+        }
+    }
+
+    #[test]
+    fn ribbon_halo_meets_end_to_end_and_keeps_its_width_at_any_aspect() {
+        let mut layers = MicLayers::new(Mode::Scope);
+        let steep = ScopeSnapshot {
+            points: std::array::from_fn(|index| if index % 2 == 0 { -1.0 } else { 1.0 }),
+            onsets: 0,
+        };
+        for step in 0..120 {
+            layers.step(quiet(), Some(&steep), step as f32 / FPS, true);
+        }
+        let segments = POINTS - 1;
+        for aspect in [1.0, 16.0 / 9.0, 4.0 / 3.0, 0.5] {
+            let mut instances = Vec::new();
+            layers.build(quiet(), aspect, &mut instances);
+            assert_eq!(instances.len(), RIBBON_PASSES.len() * segments);
+            for (pass, (thickness, _, kind)) in RIBBON_PASSES.into_iter().enumerate() {
+                let quads = &instances[pass * segments..(pass + 1) * segments];
+                // Every quad keeps the pass thickness in aspect space, which
+                // `transform` maps to the viewport uniformly in x and y.
+                assert!(quads.iter().all(|quad| quad.size[1] == thickness));
+                for pair in quads.windows(2) {
+                    let end = |quad: &Instance, sign: f32| {
+                        let half = quad.size[0] * 0.5 * sign;
+                        [
+                            quad.center[0] + half * quad.rotation.cos(),
+                            quad.center[1] + half * quad.rotation.sin(),
+                        ]
+                    };
+                    let (a, b) = (end(&pair[0], 1.0), end(&pair[1], -1.0));
+                    let gap = (a[0] - b[0]).hypot(a[1] - b[1]);
+                    if kind == Pass::Halo {
+                        assert!(gap < 1e-4, "halo overlaps by {gap} at {aspect}");
+                    } else {
+                        assert!(gap > 0.0, "{kind:?} overlaps to hide joints");
+                    }
+                }
+            }
+            let span = instances[segments - 1].center[0] - instances[0].center[0];
+            let expected =
+                2.0 * RIBBON_HALF_WIDTH * aspect * (segments - 1) as f32 / segments as f32;
+            assert!((span - expected).abs() < 1e-3, "{span} vs {expected}");
+        }
+        let flat = transform(16.0 / 9.0);
+        assert!((flat[0][0] - 9.0 / 16.0).abs() < 1e-6);
+        assert_eq!(flat[1], SCREEN_SPACE_TRANSFORM[1]);
+        assert_eq!(flat[3], SCREEN_SPACE_TRANSFORM[3]);
+    }
+
+    /// Linear relative luminance over black at `point` (aspect space), by
+    /// compositing `instances` in order with the shader's soft-glow coverage
+    /// (`shape_alpha` shape 1). Instances must be unrotated glows.
+    fn luminance(instances: &[Instance], point: [f32; 2]) -> f32 {
+        let mut rgb = [0.0_f32; 3];
+        for instance in instances {
+            assert_eq!(instance.pattern, GLOW);
+            let local = [
+                (point[0] - instance.center[0]) / instance.size[0],
+                (point[1] - instance.center[1]) / instance.size[1],
+            ];
+            if local[0].abs() > 0.5 || local[1].abs() > 0.5 {
+                continue;
+            }
+            let fall = (1.0 - 2.0 * local[0].hypot(local[1])).clamp(0.0, 1.0);
+            let alpha = fall * fall * instance.color[3];
+            for (channel, value) in rgb.iter_mut().zip(instance.color) {
+                *channel = *channel * (1.0 - alpha) + value.clamp(0.0, 1.0) * alpha;
+            }
+        }
+        0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    }
+
+    /// Opposing changes of at least `step` in `series` (WCAG 2.3.1 counts a
+    /// flash as a pair of them), as the indices where each completes.
+    fn transitions(series: &[f32], step: f32) -> Vec<usize> {
+        let mut found = Vec::new();
+        let (mut low, mut high) = (series[0], series[0]);
+        let mut rising: Option<bool> = None;
+        for (index, &value) in series.iter().enumerate() {
+            low = low.min(value);
+            high = high.max(value);
+            if rising != Some(true) && value - low >= step {
+                found.push(index);
+                rising = Some(true);
+                (low, high) = (value, value);
+            } else if rising != Some(false) && high - value >= step {
+                found.push(index);
+                rising = Some(false);
+                (low, high) = (value, value);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn transitions_count_opposing_swings_only() {
+        let series = [0.0, 0.2, 0.25, 0.1, 0.0, 0.05, 0.3, 0.3];
+        assert_eq!(transitions(&series, 0.1), [1, 3, 6]);
+        assert!(transitions(&[0.0, 0.05, 0.0, 0.09], 0.1).is_empty());
+    }
+
+    /// A CPU model of the bursts, not a photometric measurement: onsets every
+    /// frame at full energy, the brightest burst palette, over black. At
+    /// every probe point no 1 s window holds more than 3 flashes (6 opposing
+    /// changes of at least 0.1 relative luminance); with the start-rate cap
+    /// it should hold at most 2.
+    #[test]
+    fn flash_model_stays_under_three_flashes_per_second_at_max_onset_rate() {
+        let aspect = 16.0 / 9.0;
+        // Burst colours use `frame.palette + 2`; palette 0 is white.
+        let frame = ControlFrame {
+            energy: 255,
+            palette: 2,
+            ..quiet()
+        };
+        let mut layers = MicLayers::new(Mode::Bursts);
+        let (columns, rows) = (48, 27);
+        let frames = 6 * FPS as usize;
+        let mut series = vec![Vec::with_capacity(frames); columns * rows];
+        let mut brightest = 0.0_f32;
+        for step in 0..frames {
+            layers.step(
+                frame,
+                Some(&snapshot(0.0, step as u32)),
+                step as f32 / FPS,
+                true,
+            );
+            let mut instances = Vec::new();
+            layers.build(frame, aspect, &mut instances);
+            for (probe, values) in series.iter_mut().enumerate() {
+                let point = [
+                    ((probe % columns) as f32 + 0.5) / columns as f32 * 2.0 * aspect - aspect,
+                    ((probe / columns) as f32 + 0.5) / rows as f32 * 2.0 - 1.0,
+                ];
+                let value = luminance(&instances, point);
+                brightest = brightest.max(value);
+                values.push(value);
+            }
+        }
+        assert!(
+            brightest > 0.1,
+            "the model must see the bursts: {brightest}"
+        );
+        let window = FPS as usize;
+        let mut worst = 0;
+        for values in &series {
+            let found = transitions(values, 0.1);
+            for (index, &start) in found.iter().enumerate() {
+                let within = found[index..]
+                    .iter()
+                    .take_while(|&&later| later < start + window)
+                    .count();
+                worst = worst.max(within);
+            }
+        }
+        assert!(
+            worst <= 4,
+            "{worst} opposing changes in 1 s (2 flashes max)"
+        );
     }
 }

@@ -572,6 +572,39 @@ mod tests {
         }
     }
 
+    /// The mic layers never touch the colour field, and `off` renders exactly
+    /// as a pipeline that never heard of them; over a native scene `both`
+    /// does draw (the no-mic fallback ribbon and beat bursts).
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn mic_layers_skip_the_colour_field_and_off_matches_the_baseline() {
+        let render = |scene: u8, mode: Option<mic_layers::Mode>| {
+            let mut renderer =
+                pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), 160, 90)).unwrap();
+            if let Some(mode) = mode {
+                renderer.pipeline_mut().set_mic_layers(mode);
+            }
+            let mut last = Vec::new();
+            // Two seconds at 60 fps, so beats change and bursts would fire.
+            for index in 0..120 {
+                let frame = ControlFrame {
+                    scene,
+                    ..ControlFrame::procedural(index)
+                };
+                last = renderer.render(frame, elapsed(index)).unwrap();
+            }
+            last
+        };
+        let both = Some(mic_layers::Mode::Both);
+        let off = Some(mic_layers::Mode::Off);
+        let field = render(colour_field::SCENE, None);
+        assert_eq!(render(colour_field::SCENE, both), field, "scene 7 overlaid");
+        assert_eq!(render(colour_field::SCENE, off), field);
+        let native = render(0, None);
+        assert_eq!(render(0, off), native, "off differs from the baseline");
+        assert_ne!(render(0, both), native, "both drew nothing over scene 0");
+    }
+
     /// Scene 7 enters the colour field at power-on and draws flat regions
     /// whose sRGB pixels and boundaries match the CPU model exactly.
     #[test]

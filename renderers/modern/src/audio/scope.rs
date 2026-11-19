@@ -280,29 +280,40 @@ mod tests {
 
     #[test]
     fn shared_scope_is_read_while_another_thread_writes() {
+        use std::sync::atomic::AtomicUsize;
+        const MIN_WRITES: u32 = 2_000;
+        const MIN_READS: usize = 1_000;
         let shared = std::sync::Arc::new(SharedScope::default());
+        // Reads that overlapped the writer; it keeps writing until there
+        // are enough, so the overlap is guaranteed rather than left to timing.
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
         let writer = {
-            let shared = shared.clone();
+            let (shared, reads) = (shared.clone(), reads.clone());
             std::thread::spawn(move || {
-                for onsets in 1..=2_000 {
-                    let value = onsets as f32 / 2_000.0;
+                let mut onsets = 0;
+                while onsets < MIN_WRITES || reads.load(Ordering::Acquire) < MIN_READS {
+                    onsets += 1;
                     shared.store(&ScopeSnapshot {
-                        points: [value; POINTS],
+                        // Exact in f32 far beyond any count reached here.
+                        points: [onsets as f32; POINTS],
                         onsets,
                     });
                 }
+                onsets
             })
         };
         let mut last = 0;
         while !writer.is_finished() {
             let snapshot = shared.load();
             // Points are never older than the onset count they are read with.
-            let floor = snapshot.onsets as f32 / 2_000.0;
+            let floor = snapshot.onsets as f32;
             assert!(snapshot.points.iter().all(|&point| point >= floor));
             assert!(snapshot.onsets >= last);
             last = snapshot.onsets;
+            reads.fetch_add(1, Ordering::Release);
         }
-        writer.join().unwrap();
-        assert_eq!(shared.load().onsets, 2_000);
+        let written = writer.join().unwrap();
+        assert!(reads.load(Ordering::Acquire) >= MIN_READS);
+        assert_eq!(shared.load().onsets, written);
     }
 }

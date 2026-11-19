@@ -148,11 +148,17 @@ default; choose them with `--mic-layers` or cycle them with `M`. They do not
 change the control-frame wire format.
 
 - `scope`: an oscilloscope ribbon across the lower part of the screen. With
-  `--mic`, it shows the latest 2,048 samples, triggered on a rising zero
-  crossing so steady tones hold still and peak-normalised with a floor so room
-  hiss stays flat. Silence flattens it smoothly.
-- `bursts`: a soft glow with a ring of sparks at each detected onset. A burst
-  rises over 80 ms and decays to nothing within 1.6 s.
+  `--mic`, it shows a 2,048-sample window aligned on a rising zero crossing,
+  so steady tones hold still; the crossing is searched for in the newest
+  1,024 samples, so the window can end up to that much (about 21 ms at
+  48 kHz) before the newest sample. It is peak-normalised with a floor so room
+  hiss stays flat, and silence flattens it smoothly. A dark edge under a
+  whitened core keeps it readable over scenes of the same colour.
+- `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
+  rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
+  one arriving less than 0.5 s after the last burst started is skipped, and
+  onsets while bursts are hidden (layers `off` or `scope`, or scene 7) start
+  nothing.
 
 With `--mic`, the analysis thread publishes the samples and onset count
 through a lock-free side channel (atomics only), which the render thread reads
@@ -160,10 +166,17 @@ without waiting. When frames come from the procedural source or over UDP, the
 ribbon is synthesised from the eight spectrum bands and the energy, and bursts
 fire when `beat_count` changes.
 
-Bursts are not gated by the `unmeasured-flash` feature: each one is a single
-smooth, partly transparent rise and fall rather than a full-screen change, and
-new bursts start at most once every 0.34 s (under three per second), with at
-most six alive at once.
+Bursts are not gated by the `unmeasured-flash` feature. This rests on their
+design, not on a photometric measurement: each one is a single smooth, partly
+transparent rise and fall (glow at most 30% and sparks at most 50% opacity)
+over a small part of the screen rather than a full-screen change, and new
+bursts start at most once every 0.5 s (two per second, with margin under the
+three-per-second limit for dark rooms and projection), with at most four alive
+at once. A unit test composites a CPU model of the bursts over black at the
+maximum onset rate and finds at most two flashes (opposing changes of 0.1
+relative luminance) in any 1 s at any sampled point; the scope ribbon is a thin
+line and is not modelled. Measure the actual display before relying on this
+for a photosensitive audience.
 
 ```sh
 just modern-m1 -- --mic --mic-layers both
@@ -354,7 +367,10 @@ flash. Recorded inputs use
 their wire palettes; procedural input uses palette 0. `--input` is `procedural` (default) or a `.cvz` file of
 concatenated control-frame packets, such as the bridge's `--output`, or
 `synth-mic`, a deterministic synthetic microphone (110 Hz and 330 Hz tones with
-a click every 0.5 s, silent from 6 s) analysed exactly like `--mic`.
+a click every 0.5 s, silent from 6 s). It uses the same analyser and scope tap
+as `--mic`, but is fed one capture frame of samples at a time in the capture
+thread, with no device, analysis thread, dropped audio, or wall-clock timing,
+so its results can differ slightly from a live microphone.
 `--mic-layers` draws the [mic layers](#mic-layers) as in the renderer.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`
 for every option. The GPU smoke test is ignored by default; run it with
