@@ -28,6 +28,30 @@ it consumes `control-frame-v0` packets from the host bridge:
 python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
 ```
 
+## Controls
+
+The renderer starts windowed by default.
+
+| Option | Effect |
+| --- | --- |
+| `--fullscreen` | Start in borderless fullscreen (primary display unless `--monitor` is given). |
+| `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
+| `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
+
+```sh
+just modern-m1 -- --list-monitors
+just modern-m1 -- --fullscreen --monitor "Studio Display"
+just modern-m1 -- --fullscreen --monitor 1
+```
+
+| Key | Action |
+| --- | --- |
+| `F`, `Cmd+F`, `Ctrl+Cmd+F` | Toggle fullscreen on the window's current display. |
+| `Esc` | Exit fullscreen (does nothing when windowed). |
+| `Cmd+Q` | Quit (macOS application menu). |
+
+The cursor is hidden while fullscreen and restored when windowed.
+
 ## Scene plan
 
 Scenes live in `src/scenes/`, one module per scene, behind the `REGISTRY`
