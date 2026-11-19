@@ -281,6 +281,7 @@ c64-debug: c64-rom
 c64-colour-field-capture: c64-rom
     @${PYTHON:-python3} scripts/c64_colour_field_capture.py
     @${PYTHON:-python3} scripts/c64_colour_field_capture.py --model ntsc
+    @${PYTHON:-python3} scripts/c64_colour_field_capture.py --model ntsc-old
 
 snes-debug: snes-rom
     @mkdir -p build/retroarch-smoke

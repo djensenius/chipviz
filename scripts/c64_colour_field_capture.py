@@ -14,8 +14,11 @@ never armed: palette keys R and I are refused, except for two negative checks.
 R without the scene key 8 is not an absolute report; 8+R is, but the default
 ROM is built without UNMEASURED_FLASH (#96) and never arms. Both must run as
 hard cuts (mode 2) with a steady picture and the flash latch clear.
-`--model ntsc` runs the same sequence on an NTSC C64 (one model per process:
-the VICE core is a singleton). The script also reads the core's RAM (the `_cf`
+`--model ntsc` runs the same sequence on an NTSC C64 (6567R8) and
+`--model ntsc-old` on an early NTSC C64 (6567R56A, about 60.99 frames a
+second), one model per process because the VICE core is a singleton. Each
+model also counts the steps in 610 frames of scene 7: one per frame, except
+that the 6567R56A drops one in 61 to stay at 60 steps a second or fewer. The script also reads the core's RAM (the `_cf`
 address from the linker map) to measure the scene-7 entry and exit timing in
 frames.
 """
@@ -68,11 +71,14 @@ CORE_OPTIONS = {
   "vice_retropad_options": "disabled",
 }
 
-MODELS = {"pal": "C64 PAL auto", "ntsc": "C64 NTSC auto"}
+MODELS = {"pal": "C64 PAL auto", "ntsc": "C64 NTSC auto", "ntsc-old": "C64 OLD NTSC"}
 # KERNAL PAL/NTSC flag ($02A6) that each model must set: the program picks
 # its raster IRQ line from it.
 KERNAL_PALNTSC = 0x02A6
-PALNTSC_FLAG = {"pal": 1, "ntsc": 0}
+PALNTSC_FLAG = {"pal": 1, "ntsc": 0, "ntsc-old": 0}
+# Steps counted over RATE_FRAMES frames of scene 7 (cf.since_sw).
+RATE_FRAMES = 610
+RATE_STEPS = {"pal": 610, "ntsc": 610, "ntsc-old": 600}
 NATIVE_FRAMES = 60  # frames sampled to check the native demo animates
 
 # Pepto PAL palette (VICE pepto-pal.vpl), indexed by C64 colour number.
@@ -99,6 +105,7 @@ RETRO_MEMORY_SYSTEM_RAM = 2
 # cf_state_t byte offsets (cores/c64/homebrew/src/colour_field.h).
 CF_MODE = 0
 CF_SHOWN = 9
+CF_SINCE_SW = 14  # uint16, steps since the last scene switch
 CF_FLASH = 17
 GAP = 60     # frames between scripted steps (P_STABLE + CUT_MIN margin)
 TAP = 3      # frames a Space tap is held
@@ -412,6 +419,13 @@ def main(argv: list[str] | None = None) -> int:
       lambda: emu.frame is not None and colour_count(emu.frame) == 3, 3)
     advance(GAP)
     capture("held-a-v2", 0, 0, 0, 0)
+
+    def since_sw() -> int:
+      return emu.peek(cf + CF_SINCE_SW) | emu.peek(cf + CF_SINCE_SW + 1) << 8
+
+    start = since_sw()
+    advance(RATE_FRAMES)
+    rate_steps = since_sw() - start
     # Hard cuts (E, p=2): Space taps (beat) cut through all four layouts.
     names = ["v2", "h2", "v3", "h3"]
     state = (0, 0, 0)
@@ -483,9 +497,12 @@ def main(argv: list[str] | None = None) -> int:
               "model": args.model, "palntsc_flag": palntsc, "core_options": CORE_OPTIONS, "boot_frames": BOOT,
               "window_origin": origin, "native_distinct_frames": len(native_frames),
               "native_after_exit_colours": colour_count(native), "timing": timing, "unarmed_r": unarmed,
-              "default_8r": default_8r,
+              "default_8r": default_8r, "rate": {"frames": RATE_FRAMES, "steps": rate_steps},
               "captures": results}
     print(json.dumps(report, indent=2))
+    if rate_steps != RATE_STEPS[args.model]:
+      print(f"{rate_steps} steps in {RATE_FRAMES} frames, expected {RATE_STEPS[args.model]}", file=sys.stderr)
+      return 1
     if len(native_frames) < NATIVE_FRAMES // 2:
       print("native demo is not animating", file=sys.stderr)
       return 1

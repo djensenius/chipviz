@@ -44,8 +44,13 @@ read (measured in VICE). The latest accepted reads are PAL line 3 and NTSC
 line 31, so the writes finish by line 7 or 35, before the first visible
 border line (PAL 16, NTSC 41). If a step ever overruns a frame,
 the late IRQ drops that step entirely (no register writes, input sampling or
-tick) rather than change registers mid-screen or catch up, so there are never
-more than 60 steps a second; keys still held are sampled on the next step.
+tick) rather than change registers mid-screen or catch up; keys still held
+are sampled on the next step. The early NTSC VIC-II (6567R56A: 262 lines of 64
+cycles, about 60.99 frames a second) would otherwise make 61 steps in some
+seconds, so the program counts the raster lines at boot and, on 262 lines,
+drops one IRQ's step in every 61 the same way (59.99 steps a second). The
+6567R8 (263 lines, 59.83 frames a second) and PAL (50.12) never drop a step,
+so there are never more than 60 steps in any second (spec: Step rate).
 The native PETSCII demo keeps drawing in the main loop and pauses while scene 7
 is shown. Its frame counter keeps running during scene 7, so after a visit its
 animation phase jumps ahead instead of resuming where it stopped.
@@ -106,7 +111,8 @@ animation phase jumps ahead instead of resuming where it stopped.
   palette key are held together in the same scan for P_STABLE (30) steps.
 - **Not implemented.** The operator role (`L` pin and the RETURN warning screen)
   and joystick relative palette pulses.
-- **Timing.** Every frame is a step, in or out of scene 7. Holding `8` shows
+- **Timing.** Every frame is a step, in or out of scene 7 (on the 6567R56A,
+  60 frames in every 61). Holding `8` shows
   the field from the 31st sampled step (the debounce decides at the end of the
   30th). Measured in VICE (PAL and NTSC alike): 31–32 frames from the key press until the step that
   shows scene 7, and 33–34 frames until it is on screen (registers land at the
@@ -118,12 +124,15 @@ Tests: `tests/c64_colour_field_tests.c` runs the spec fixtures on the host as
 part of `just c-test`, built twice: by default every flash fixture checks that
 3 and 7 run exactly as 2 and 6 and never latch, and with `-DCF_UNMEASURED_FLASH`
 the spec's flash results are checked. `just c64-colour-field-capture` drives the VICE x64sc
-libretro core headlessly, once as a PAL and once as an NTSC C64. It holds keys,
-saves PNGs to `build/c64-colour-field/` (NTSC files are `c64-ntsc-*`), and
+libretro core headlessly as a PAL, an NTSC (6567R8) and an early NTSC
+(6567R56A, `C64 OLD NTSC`) C64. It holds keys,
+saves PNGs to `build/c64-colour-field/` (NTSC files are `c64-ntsc-*` and
+`c64-ntsc-old-*`), and
 checks every region's exact colour, the boundary positions and the black
 border. It also measures the entry and exit timing from the core's RAM, and
 checks that `R` held without `8`, and `8`+`R` in the default ROM, stay in
-steady hard cuts with the flash latch clear, and that the native
+steady hard cuts with the flash latch clear, that 610 frames of scene 7 make
+610 steps (600 on the 6567R56A), and that the native
 demo animates. It needs a local RetroArch core, so it is not part of
 `just check`.
 

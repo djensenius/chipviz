@@ -26,9 +26,11 @@
  * line 300 does not exist). Bit 8 of the line is D011 bit 7. */
 #define CHIPVIZ_IRQ_LINE_PAL 300u
 #define CHIPVIZ_IRQ_LINE_NTSC 16u
-/* Raster lines per frame. */
-#define CHIPVIZ_LINES_PAL 312u
-#define CHIPVIZ_LINES_NTSC 263u
+/* CPU clocks. NTSC has 65 cycles a line (6567R8, 263 lines) or 64 (early
+ * 6567R56A, 262 lines); PAL has 63 (Drean: 65 at a faster clock, also under
+ * 60 frames a second). The program counts the lines at boot. */
+#define CHIPVIZ_CLOCK_PAL 985248ul
+#define CHIPVIZ_CLOCK_NTSC 1022727ul
 /* D011: display on, 25 rows, scroll 3; bit 6 adds extended colour mode. */
 #define CHIPVIZ_D011_NATIVE 0x1Bu
 #define CHIPVIZ_ECM 0x40u
@@ -207,8 +209,10 @@ static uint8_t raster_irq(void) {
   /* A late IRQ (one that starts CF_IRQ_WINDOW lines after its line or more,
    * after a step overran a frame) drops this frame's step entirely: no
    * register writes (so they never change mid-screen), no input sampling and
-   * no tick, so steps never come closer than a frame (at most 60 a second).
-   * The staged step is presented by the next on-time IRQ. */
+   * no tick, so steps never come closer than a frame. On the 6567R56A
+   * (60.99 frames a second) cf_irq_frame also drops one IRQ's step in 61, so
+   * there are never more than 60 steps in a second. Nothing new is staged on
+   * a dropped step, so the next on-time IRQ writes the same registers again. */
   raster_low = CHIPVIZ_RASTER_LINE; /* D012 first, as cf_irq_on_time expects */
   raster_high = CHIPVIZ_VIC_CONTROL1;
   /* Inline (CF_IRQ_ON_TIME, not cf_irq_on_time): a call costs about 7 lines
@@ -235,6 +239,23 @@ static uint8_t raster_irq(void) {
 /* IRQ entry for the $0314 vector: cc65's handler chain, then the KERNAL's
  * register restore and RTI at $EA81. It skips the KERNAL's own IRQ work
  * (clock, cursor, keyboard buffer), which would only slow the native demo. */
+/* Lines per frame: the highest line with bit 8 set, plus 257. Run with
+ * interrupts off; one pass of the loop is well under a line (63 cycles). */
+static uint16_t count_frame_lines(void) {
+  uint8_t last = 0;
+  uint8_t line;
+
+  while (!(CHIPVIZ_VIC_CONTROL1 & 0x80u)) {
+  }
+  while (CHIPVIZ_VIC_CONTROL1 & 0x80u) {
+    line = CHIPVIZ_RASTER_LINE;
+    if (line > last) {
+      last = line;
+    }
+  }
+  return (uint16_t)(257u + last);
+}
+
 static void irq_entry(void) {
   __asm__("cld");
   __asm__("jsr callirq");
@@ -281,6 +302,7 @@ static void draw_channel_meters(const demo_state_t *state) {
 
 int main(void) {
   uint16_t frame = 0;
+  uint16_t lines;
   demo_state_t state;
 
   /* D018 bits 1-3: uppercase/graphics ROM at $1000; screen at $0400. */
@@ -301,14 +323,19 @@ int main(void) {
   native_border = pending.border;
   native_background = pending.background[0];
   native_scene = demo_scene(frame);
+  __asm__("sei");
+  lines = count_frame_lines();
   if (get_tv() == TV_NTSC) {
     irq_line = CHIPVIZ_IRQ_LINE_NTSC;
-    (void)cf_irq_init(CHIPVIZ_IRQ_LINE_NTSC, CHIPVIZ_LINES_NTSC);
+    /* 262 lines is the 6567R56A (64 cycles a line, about 60.99 frames a
+     * second); anything but the 6567R8's 263 is treated the same way, which
+     * only ever drops more steps. */
+    (void)cf_irq_rate((uint32_t)lines * (lines == 263u ? 65u : 64u), CHIPVIZ_CLOCK_NTSC);
   } else {
     irq_line = CHIPVIZ_IRQ_LINE_PAL;
-    (void)cf_irq_init(CHIPVIZ_IRQ_LINE_PAL, CHIPVIZ_LINES_PAL);
+    (void)cf_irq_rate((uint32_t)lines * 63u, CHIPVIZ_CLOCK_PAL);
   }
-  __asm__("sei");
+  (void)cf_irq_init(irq_line, lines);
   set_irq(raster_irq, irq_stack, sizeof(irq_stack));
   CHIPVIZ_IRQ_VECTOR = (uint16_t)irq_entry;
   irq_line_bit8 = (uint8_t)((irq_line >> 1) & 0x80u);

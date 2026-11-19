@@ -809,8 +809,8 @@ static void keys(void) {
 }
 
 /* The raster IRQ's on-time check for every line of a PAL (312 lines, IRQ at
- * 300) and an NTSC (263 lines, IRQ at 16) frame: the main loop reads D012 and
- * then D011, so bit 8 may also come from the next line. */
+ * 300) and an NTSC (263 lines, or 262 on the 6567R56A, IRQ at 16) frame: the
+ * IRQ reads D012 and then D011, so bit 8 may also come from the next line. */
 static int irq_window(uint16_t line, uint16_t frame_lines) {
   return frame_lines == 312u ? (line >= 300u || line <= 3u) : (line >= 16u && line <= 31u);
 }
@@ -821,9 +821,9 @@ static uint8_t irq_read(uint16_t low_line, uint16_t high_line, uint16_t irq_line
 }
 
 static void irq_lines(void) {
-  static const uint16_t models[2][2] = {{300u, 312u}, {16u, 263u}};
+  static const uint16_t models[3][2] = {{300u, 312u}, {16u, 263u}, {16u, 262u}};
   uint8_t m;
-  for (m = 0; m < 2u; m++) {
+  for (m = 0; m < 3u; m++) {
     uint16_t irq_line = models[m][0];
     uint16_t frame_lines = models[m][1];
     uint16_t line;
@@ -847,7 +847,8 @@ static void irq_lines(void) {
   }
   /* One run of D012 values per bit-8 value fits PAL and NTSC; a window over
    * line 256 and the NTSC wrap (250-255, 256-262, 0-2) would need two. */
-  require(cf_irq_init(300u, 312u) && cf_irq_init(16u, 263u) && !cf_irq_init(250u, 263u), "irq",
+  require(cf_irq_init(300u, 312u) && cf_irq_init(16u, 263u) && cf_irq_init(16u, 262u) && !cf_irq_init(250u, 263u),
+          "irq",
           "cf_irq_init fits PAL and NTSC, refuses two runs per bit-8 value");
   /* The overrun the window must reject: about a frame late, at the bottom of
    * the display or the lower border (PAL 244-255 with bit 8 clear). */
@@ -888,6 +889,7 @@ static void irq_steps(void) {
   uint32_t f;
   int unchanged = 1;
 
+  require(cf_irq_rate(263u * 65u, second) == 0u, "irq steps", "the 6567R8 has no rate drops");
   cf_init();
   keys_none();
   for (f = 0; f < 1200u; f++) {
@@ -929,10 +931,73 @@ static void irq_steps(void) {
           "irq steps", "Space edge and 8+Q held over a late IRQ are sampled next step");
 }
 
+/* The step-rate limit on each VIC-II timing over 100000 frames (about half
+ * an hour), with every IRQ on time and with every 7th one late: no 1-second
+ * window (closed, so 61 steps exactly a second apart also fail) holds more
+ * than 60 steps. The 6567R56A (262 x 64 cycles at 1022727 Hz, 60.99 frames
+ * a second) drops one IRQ's step in 61, so it still makes 59.99 steps a
+ * second; stepping every on-time IRQ (a6906f87) gives 61. The other timings
+ * never drop an on-time step. */
+static void irq_rate(void) {
+  static const struct {
+    const char *name;
+    uint16_t lines;
+    uint16_t cycles;
+    uint32_t clock;
+    uint16_t irq_line;
+    uint8_t period;
+  } models[4] = {
+      {"irq rate PAL", 312u, 63u, 985248u, 300u, 0u},
+      {"irq rate 6567R8", 263u, 65u, 1022727u, 16u, 0u},
+      {"irq rate 6567R56A", 262u, 64u, 1022727u, 16u, 61u},
+      {"irq rate Drean", 312u, 65u, 1023440u, 300u, 0u},
+  };
+  const uint32_t frames = 100000u;
+  uint8_t m;
+  uint8_t pass;
+
+  for (m = 0; m < 4u; m++) {
+    for (pass = 0; pass < 2u; pass++) {
+      uint32_t last[60];
+      uint32_t steps = 0;
+      uint32_t late = 0;
+      uint32_t f;
+      int capped = 1;
+
+      require(cf_irq_rate((uint32_t)models[m].lines * models[m].cycles, models[m].clock) == models[m].period,
+              models[m].name, "rate-drop period");
+      cf_init();
+      keys_none();
+      for (f = 0; f < frames; f++) {
+        uint8_t is_late = pass && f % 7u == 6u;
+        uint32_t line = f * models[m].lines + models[m].irq_line + 6u + (is_late ? 60u : 0u);
+        late += is_late;
+        if (irq_at(line, models[m].irq_line, models[m].lines, 2u) != CF_IRQ_LATE) {
+          uint32_t at = line * models[m].cycles;
+          /* This step and the 60 before it must span more than a second. */
+          if (steps >= 60u && at - last[steps % 60u] <= models[m].clock) {
+            capped = 0;
+          }
+          last[steps % 60u] = at;
+          steps++;
+        }
+      }
+      require(capped, models[m].name, "at most 60 steps in any 1-second window");
+      if (models[m].period == 0u) {
+        require(steps == frames - late, models[m].name, "every on-time IRQ steps");
+      } else if (!pass) {
+        require(steps == frames - frames / models[m].period, models[m].name, "one step in 61 dropped, 59.99 a second");
+      }
+    }
+  }
+  (void)cf_irq_rate(263u * 65u, 1022727u);
+}
+
 int main(void) {
   geometry();
   irq_lines();
   irq_steps();
+  irq_rate();
   colours();
   keys();
   fixture_f0();

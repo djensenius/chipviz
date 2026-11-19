@@ -127,15 +127,28 @@ extern uint8_t cf_irq_n[2];
 uint8_t cf_irq_init(uint16_t irq_line, uint16_t frame_lines);
 uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011);
 
+/* Step-rate limit (spec: Step rate, at most 60 steps in any 1-second
+ * window). A frame of frame_cycles at clock_hz puts at most
+ * w = clock_hz / frame_cycles + 1 IRQs in a 1-second window. When w > 60,
+ * dropping every p-th IRQ, p = w / (w - 60), leaves at most 60 steps in any
+ * w consecutive IRQs. cf_irq_rate stores p (0: no rate drops) and restarts
+ * the count; it returns p. Only the early NTSC VIC-II (6567R56A: 262 lines
+ * of 64 cycles at 1022727 Hz, 60.99 frames a second) needs it: p = 61, so
+ * one IRQ in 61 drops its step (59.99 steps a second). The 6567R8 (263 x 65,
+ * 59.83 frames a second) and PAL (312 x 63 at 985248 Hz, 50.12) never drop. */
+uint8_t cf_irq_rate(uint32_t frame_cycles, uint32_t clock_hz);
+
 /* The step half of one raster IRQ, after the target has checked
  * cf_irq_on_time and, only when on time, presented the staged step (so the
- * border write comes as early as possible). A late IRQ (on_time 0) returns
- * CF_IRQ_LATE without calling sample, reading keys or stepping: the step is
- * dropped, not caught up, so steps stay at most one per frame (spec: Step
- * rate) and the staged output waits for the next on-time IRQ. An on-time IRQ
- * calls sample (scan the keyboard), then cf_read_keys(fallback_scene) and
- * cf_tick, and returns cf_tick's result. Key edges compare against the last
- * sampled keys, so a key still held at the next on-time IRQ is not lost. */
+ * border write comes as early as possible). Every call counts towards the
+ * cf_irq_rate period. A late IRQ (on_time 0) or the period's rate drop
+ * returns CF_IRQ_LATE without calling sample, reading keys or stepping: the
+ * step is dropped, not caught up, so there are never more than 60 steps a
+ * second (spec: Step rate) and the staged output waits for the next IRQ. An
+ * IRQ that steps calls sample (scan the keyboard), then
+ * cf_read_keys(fallback_scene) and cf_tick, and returns cf_tick's result.
+ * Key edges compare against the last sampled keys, so a key still held at
+ * the next stepping IRQ is not lost. */
 #define CF_IRQ_LATE 0xFFu
 typedef void (*cf_irq_hook_t)(void);
 uint8_t cf_irq_frame(uint8_t on_time, cf_irq_hook_t sample, uint8_t fallback_scene);
