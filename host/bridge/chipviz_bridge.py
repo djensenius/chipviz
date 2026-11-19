@@ -137,7 +137,9 @@ def sanitise_flash(wire: bytes, transport: str, allow_flash: bool = False) -> by
     return wire
   safe = bytearray(wire)
   safe[PALETTE_OFFSET] &= 0xFE
-  safe[-1] = checksum(safe[:-1])
+  # XOR checksum: clearing set bit 0 flips checksum bit 0. Adjusting rather
+  # than recomputing keeps a corrupt frame corrupt.
+  safe[-1] ^= 0x01
   return bytes(safe)
 
 
