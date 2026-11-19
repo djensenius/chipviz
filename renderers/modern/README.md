@@ -38,7 +38,7 @@ The renderer starts windowed by default.
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
-| `--allow-flash` | Print the photosensitivity warning to stderr at start-up and arm operator requests for flash/gate (palettes 3 and 7). The opt-in for wire arming is the host's own `--allow-flash`: hosts send 3 or 7 only with it, and a stable absolute wire 3 or 7 in scene 7 arms flash/gate with or without this flag. Procedural and mic frames never arm. |
+| `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -172,7 +172,9 @@ the colour field, whatever the registry length; every other byte selects
   repeats the last step and its cleared one-off flags never count as edges, so
   when mic frames take over, the debounce returns to the native scene after
   about 30 steps.
-  Flash/gate runs only when armed: a stable absolute wire 3 or 7 (held 30
+  Flash/gate runs only when armed, and default builds never latch it (see
+  [Flash/gate is off by default](#flashgate-is-off-by-default)).
+  With the `unmeasured-flash` feature, a stable absolute wire 3 or 7 (held 30
   steps with incoming scene 7 throughout) arms it, since hosts send those
   only when started with `--allow-flash`. Relative palette inputs, procedural
   and mic frames never arm, and unarmed 3 and 7 run as hard cuts (2 and 6).
@@ -274,6 +276,28 @@ sparkle, 3 scanlines (see `src/scenes/object/mod.rs`).
 The Pi 5 profile favors crisp geometry and predictable frame pacing. The M1
 profile favors density, deeper Z spacing, and more aggressive camera motion.
 
+## Flash/gate is off by default
+
+Colour-field modes 3 and 7 (flash/gate) flash the whole field at up to 7.5
+flashes per second, above the WCAG 2.3.1 and Harding limit of 3. Issue #68
+requires an independent photosensitivity analyser (PEAT, or a Harding-style
+general and red flash check) to measure them before any build ships them.
+Until then they sit behind the `unmeasured-flash` Cargo feature, which is off
+by default and must not be enabled for releases:
+
+- **Default builds** (including release packages) never latch flash, whatever
+  arms it: wire selection, operator requests or a local pre-arm. Palettes 3
+  and 7 run as the spec's unarmed requests, hard cuts 2 and 6, and
+  `--allow-flash` only prints a notice.
+- **`--features unmeasured-flash`** runs flash/gate as the spec describes, for
+  measurement and development only.
+
+`just rust-lint` and `just rust-test` run clippy and the tests for both
+builds. The default build's tests check that every armed fixture equals hard
+cuts, and count WCAG 2.3.1 general and red flashes in its rendered sequences
+(at most 3 per second). That count is supporting evidence, not a substitute
+for the analyser.
+
 ## Capture
 
 `chipviz-capture` renders frames through the same pipeline and shader into an
@@ -291,9 +315,10 @@ frame 0, so very large frame indices take longer to capture.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed
-from frame 0 like the camera. Procedural input never arms flash/gate; a
-recording arms it only as a target would, from a stable absolute wire 3 or 7
-held in scene 7. Recorded inputs use
+from frame 0 like the camera. Procedural input never arms flash/gate; with
+the `unmeasured-flash` feature, a recording arms it only as a target would,
+from a stable absolute wire 3 or 7 held in scene 7, and default builds never
+flash. Recorded inputs use
 their wire palettes; procedural input uses palette 0. `--input` is `procedural` (default) or a `.cvz` file of
 concatenated control-frame packets, such as the bridge's `--output`.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`

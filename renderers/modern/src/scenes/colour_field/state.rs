@@ -108,6 +108,19 @@ struct Request {
     wire: bool,
 }
 
+/// Whether this build may latch flash/gate at all. Modes 3 and 7 have not
+/// been measured by an independent photosensitivity analyser (PEAT or a
+/// Harding-style general and red flash check), so default builds never
+/// latch: every armed request, from the wire, an operator or a local
+/// pre-arm, runs as the spec's unarmed request (3 as 2, 7 as 6). Enable the
+/// `unmeasured-flash` Cargo feature only for measurement and development.
+pub const FLASH_BUILD: bool = cfg!(feature = "unmeasured-flash");
+
+/// Arming as this build allows it (see [`FLASH_BUILD`]).
+fn arm(armed: bool) -> bool {
+    FLASH_BUILD && armed
+}
+
 /// `(effective mode, family)`: an unarmed 3 runs as 2.
 fn effective(p: u8, armed: bool) -> (u8, u8) {
     let mode = p & 3;
@@ -222,7 +235,7 @@ impl Field {
     ) -> Self {
         let (p_eff, flash) = match config.palette {
             PaletteSource::Wire => (frame.palette & 7, false),
-            PaletteSource::Local { p, armed } => (p & 7, armed && p & 3 == FLASH),
+            PaletteSource::Local { p, armed } => (p & 7, arm(armed) && p & 3 == FLASH),
         };
         let bands = [frame.bass, frame.mid, frame.treble].map(u16::from);
         let mut field = Self {
@@ -524,6 +537,10 @@ impl Field {
     /// Keeps only the latest request; one that matches the current effective
     /// mode and family is cleared, discarding its arming.
     fn request(&mut self, request: Request) {
+        let request = Request {
+            armed: arm(request.armed),
+            ..request
+        };
         let current = self.mode();
         self.p_req = (effective(request.p, request.armed) != current).then_some(request);
     }
@@ -659,9 +676,18 @@ impl ColourField {
 
     /// Edge and onset detection for one received frame, against the frame
     /// received before it. Re-observing an identical frame raises nothing.
+    ///
+    /// While scene 7 is not shown, a native scene byte takes effect here, on
+    /// every new frame, so changes between native scenes never wait for a
+    /// step (which the step cap or a skipped counter can delay). Entering
+    /// and leaving scene 7 stay with the debounce in [`Self::step`].
     pub fn observe(&mut self, frame: &ControlFrame) {
         self.onsets.observe(frame);
         self.newest = Some(*frame);
+        if !self.shown && frame.scene != SCENE {
+            self.native = frame.scene;
+            self.display = Display::Native(self.native);
+        }
     }
 
     /// True when the newest observed frame's `frame` counter has not been
@@ -783,7 +809,7 @@ impl ColourField {
         }
         if let Some(request) = field.p_req.take() {
             field.p_eff = request.p;
-            field.flash = request.armed && request.p & 3 == FLASH;
+            field.flash = arm(request.armed) && request.p & 3 == FLASH;
             field.mode_entry(frame, false);
         } else if let Some(Some(layout)) = self.pin_req.take() {
             self.pin = Some(layout);

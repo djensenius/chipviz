@@ -15,6 +15,13 @@ rtrb = "0.4"
 wgpu = "0.20"
 winit = "0.29"
 
+[features]
+# Flash/gate (colour-field palettes 3 and 7) can latch only with this feature.
+# It has not been measured by an independent photosensitivity analyser (PEAT
+# or a Harding-style flash and red-flash check), so it is off by default and
+# must not ship until it has been.
+unmeasured-flash = []
+
 [[bin]]
 name = "chipviz-pi5"
 path = "src/bin/chipviz-pi5.rs"

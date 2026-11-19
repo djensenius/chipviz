@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -23,6 +23,9 @@ pub struct ScenePipeline {
     colour_controls: colour_field::Controls,
     /// Wall-clock step cap for live rendering; `None` steps every new frame.
     step_clock: Option<(colour_field::StepClock, Instant)>,
+    /// The colour attachment encodes sRGB on write, so flat colours are
+    /// given in linear light; otherwise they are written as sRGB bytes.
+    srgb_target: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     render_pipeline: wgpu::RenderPipeline,
@@ -239,6 +242,7 @@ impl ScenePipeline {
             colour_field: colour_field::ColourField::new(colour_field::Config::default()),
             colour_controls: colour_field::Controls::default(),
             step_clock: None,
+            srgb_target: format.is_srgb(),
             device,
             queue,
             render_pipeline,
@@ -293,17 +297,16 @@ impl ScenePipeline {
     /// and owns scene 7; otherwise the native scene goes through the
     /// registry unchanged. `frame` is only drawn, never observed here.
     fn dispatch(&mut self, frame: ControlFrame) -> (ControlFrame, colour_field::Display) {
-        let allowed = match &mut self.step_clock {
-            None => true,
-            Some((clock, start)) => {
-                !self.colour_field.has_new_frame() || clock.try_step(start.elapsed())
-            }
+        let (clock, now) = match &mut self.step_clock {
+            Some((clock, start)) => (Some(clock), start.elapsed()),
+            None => (None, Duration::ZERO),
         };
-        if self.colour_field.has_new_frame() && allowed {
-            self.colour_field
-                .step(std::mem::take(&mut self.colour_controls));
-        }
-        let display = self.colour_field.display();
+        let display = colour_field::step_capped(
+            &mut self.colour_field,
+            clock,
+            now,
+            &mut self.colour_controls,
+        );
         match display {
             colour_field::Display::Native(scene) => (ControlFrame { scene, ..frame }, display),
             colour_field::Display::ColourField(_) => (frame, display),
@@ -325,7 +328,7 @@ impl ScenePipeline {
         let (instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
                 let mut instances = Vec::new();
-                colour_field::build(&trace, width, height, &mut instances);
+                colour_field::build(&trace, width, height, self.srgb_target, &mut instances);
                 (instances, CameraMode::ScreenSpace)
             }
             colour_field::Display::Native(_) => (

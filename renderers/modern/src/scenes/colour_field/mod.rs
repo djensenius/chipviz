@@ -14,13 +14,29 @@ mod tests;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-pub use state::{ColourField, Config, Controls, Display, PaletteSource, SCENE, Trace, regions};
+pub use state::{
+    ColourField, Config, Controls, Display, FLASH_BUILD, PaletteSource, SCENE, Trace, regions,
+};
 
 use crate::scene::Instance;
 
 pub const NAME: &str = "ColourField";
 
-/// Shown on stderr when `--allow-flash` is given.
+/// Shown on stderr for `--allow-flash` in a build without the
+/// `unmeasured-flash` feature, which can never flash.
+pub const NO_FLASH_NOTICE: &str = "chipviz: --allow-flash has no effect: this build has no flash/gate (built without the unmeasured-flash feature), so palettes 3 and 7 run as hard cuts (2 and 6).";
+
+/// What `--allow-flash` prints to stderr in this build.
+pub fn allow_flash_notice() -> &'static str {
+    if FLASH_BUILD {
+        FLASH_WARNING
+    } else {
+        NO_FLASH_NOTICE
+    }
+}
+
+/// Shown on stderr when `--allow-flash` is given to a build with the
+/// `unmeasured-flash` feature.
 pub const FLASH_WARNING: &str = "WARNING: Flash/gate mode produces full-field flashing light at up to 7.5 flashes per second. This exceeds the WCAG 2.3.1 and Harding limits of 3 flashes per second. Saturated red flashes are the highest-risk case. It may trigger seizures in people with photosensitive epilepsy. Enable it only where performers and audience have been warned.";
 
 const A_RED: [u8; 3] = [0xE0, 0x10, 0x20];
@@ -103,10 +119,24 @@ fn srgb_to_linear(channel: u8) -> f32 {
     }
 }
 
+/// The instance colour that makes the attachment store `colour`: linear
+/// light for an sRGB attachment (encoded on write), the sRGB value itself
+/// for a UNORM one.
+fn attachment_colour(colour: [u8; 3], srgb_target: bool) -> [f32; 3] {
+    colour.map(|channel| {
+        if srgb_target {
+            srgb_to_linear(channel)
+        } else {
+            f32::from(channel) / 255.0
+        }
+    })
+}
+
 /// One flat `ScreenSpace` quad per region, covering the whole viewport of
 /// `width` x `height` pixels with pixel-exact boundaries. Columns run from
-/// the left and rows from the bottom.
-pub fn build(trace: &Trace, width: u32, height: u32, out: &mut Vec<Instance>) {
+/// the left and rows from the bottom. `srgb_target` says whether the colour
+/// attachment is an sRGB format.
+pub fn build(trace: &Trace, width: u32, height: u32, srgb_target: bool, out: &mut Vec<Instance>) {
     let n = regions(trace.layout);
     let vertical = trace.layout.is_multiple_of(2);
     let size = if vertical { width } else { height };
@@ -116,7 +146,7 @@ pub fn build(trace: &Trace, width: u32, height: u32, out: &mut Vec<Instance>) {
         let to_ndc = |pixel: u32| 2.0 * pixel as f32 / size.max(1) as f32 - 1.0;
         let (start, end) = (to_ndc(edges[region]), to_ndc(edges[region + 1]));
         let (center, extent) = ((start + end) / 2.0, end - start);
-        let [red, green, blue] = colours[region].map(srgb_to_linear);
+        let [red, green, blue] = attachment_colour(colours[region], srgb_target);
         out.push(Instance {
             center: if vertical {
                 [center, 0.0, 0.0]
@@ -134,6 +164,22 @@ pub fn build(trace: &Trace, width: u32, height: u32, out: &mut Vec<Instance>) {
             pattern: [0.0; 2],
         });
     }
+}
+
+/// Steps `field` if it has a new frame and `clock` (when capping) allows a
+/// step at `now`, then returns what to show. A denied step stays pending
+/// for a later call; native scene selection is already current (see
+/// [`ColourField::observe`]).
+pub fn step_capped(
+    field: &mut ColourField,
+    clock: Option<&mut StepClock>,
+    now: Duration,
+    controls: &mut Controls,
+) -> Display {
+    if field.has_new_frame() && clock.is_none_or(|clock| clock.try_step(now)) {
+        field.step(std::mem::take(controls));
+    }
+    field.display()
 }
 
 /// Enforces at most 60 colour-field steps in any one-second window; a

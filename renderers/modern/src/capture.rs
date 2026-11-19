@@ -185,8 +185,9 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         pollster::block_on(OffscreenRenderer::new(args.profile.clone(), width, height))
             .map_err(|error| error.to_string())?;
     // Recorded frames carry wire palettes; procedural frames use a local
-    // palette 0. As on a target, only a recording's stable absolute wire 3
-    // or 7 held in scene 7 can arm flash/gate; procedural input never arms.
+    // palette 0. Default builds never flash. With `unmeasured-flash`, as on a
+    // target, only a recording's stable absolute wire 3 or 7 held in scene 7
+    // can arm flash/gate; procedural input never arms.
     renderer
         .pipeline_mut()
         .configure_colour_field(colour_field::Config {

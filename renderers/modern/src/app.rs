@@ -112,7 +112,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     };
 
     if args.allow_flash {
-        eprintln!("{}", colour_field::FLASH_WARNING);
+        eprintln!("{}", colour_field::allow_flash_notice());
     }
 
     let udp = UdpFrameSource::bind(args.udp_endpoint.as_deref())?;
@@ -251,7 +251,9 @@ Options:
   --layout LAYOUT         colour-field (scene 7) layout pin (default: auto)
   --allow-flash           print the flash/gate warning and arm operator flash requests;
                           scene 7 wire palettes 3 and 7 from a host started with
-                          --allow-flash arm flash/gate without it
+                          --allow-flash arm flash/gate without it. Only builds with
+                          the unmeasured-flash feature can flash; default builds run
+                          3 and 7 as hard cuts and print a notice instead
   -h, --help              print this help
 
 Keys:

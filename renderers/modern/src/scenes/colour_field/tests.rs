@@ -11,6 +11,12 @@ const HELD: [u8; 2] = [0, 4];
 const SPECTRAL: [u8; 2] = [1, 5];
 const CUTS: [u8; 2] = [2, 6];
 const FLASH: [u8; 2] = [3, 7];
+/// Palettes whose armed fixtures flash: 3 and 7 with `unmeasured-flash`,
+/// none in default builds, where armed 3 and 7 equal 2 and 6.
+#[cfg(feature = "unmeasured-flash")]
+const ARMED: [u8; 2] = FLASH;
+#[cfg(not(feature = "unmeasured-flash"))]
+const ARMED: [u8; 0] = [];
 
 /// Unlisted fields are 0; `scene = 7` and `frame = step`.
 fn frame(step: usize) -> ControlFrame {
@@ -92,7 +98,7 @@ fn run(config: Config, input: impl Fn(usize) -> ControlFrame) -> Vec<Trace> {
 }
 
 /// Traces for local `p = 0..7`; also checks that unarmed 3 and 7 equal 2
-/// and 6.
+/// and 6, and that default builds never flash, even when armed.
 fn all_palettes(input: impl Fn(usize) -> ControlFrame + Copy) -> Vec<Vec<Trace>> {
     let traces: Vec<_> = (0..8).map(|p| run(local(p, p & 3 == 3), input)).collect();
     for p in FLASH {
@@ -101,6 +107,13 @@ fn all_palettes(input: impl Fn(usize) -> ControlFrame + Copy) -> Vec<Vec<Trace>>
             traces[usize::from(p - 1)],
             "unarmed {p}"
         );
+        if !FLASH_BUILD {
+            assert_eq!(
+                traces[usize::from(p)],
+                traces[usize::from(p - 1)],
+                "armed {p}"
+            );
+        }
     }
     traces
 }
@@ -174,7 +187,7 @@ fn f0_silence() {
     for p in 0..8 {
         let traces = &traces[usize::from(p)];
         assert!(changes(traces).is_empty(), "p {p}");
-        let expected = if SPECTRAL.contains(&p) || FLASH.contains(&p) {
+        let expected = if SPECTRAL.contains(&p) || ARMED.contains(&p) {
             [0; 3]
         } else {
             [3, 3, 0]
@@ -217,7 +230,7 @@ fn f1_tone_and_drop() {
         assert_eq!(changes(traces), [300]);
         assert_eq!((traces[300].layout, traces[300].combo), (1, 1));
     }
-    for p in FLASH {
+    for p in ARMED {
         let traces = &traces[usize::from(p)];
         assert_eq!(pulse_starts(traces), [300]);
         assert_eq!(changes(traces), [300, 304]);
@@ -242,7 +255,7 @@ fn f2_noise() {
     for p in SPECTRAL {
         assert_eq!(levels(&traces[usize::from(p)], 0), [2, 2, 0]);
     }
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(levels(&traces[usize::from(p)], 0), [1, 1, 0]);
     }
 }
@@ -262,7 +275,7 @@ fn f3_aperiodic() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), [37, 101, 250, 400, 523]);
     }
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(pulse_starts(&traces[usize::from(p)]), spikes);
     }
 }
@@ -280,7 +293,7 @@ fn f4_notes() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), [45, 130, 352]);
     }
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(pulse_starts(&traces[usize::from(p)]), [45, 130, 352]);
     }
 }
@@ -325,7 +338,7 @@ fn f5_rhythmic() {
             .collect();
         assert_eq!(layouts, [(120, 1), (240, 2), (360, 3), (480, 0)]);
     }
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(pulse_starts(&traces[usize::from(p)]), beats);
     }
 }
@@ -356,7 +369,7 @@ fn f6_floor() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), [420, 480]);
     }
-    for p in FLASH {
+    for p in ARMED {
         let traces = &traces[usize::from(p)];
         assert_eq!(pulse_starts(traces), [420, 480]);
         // The dim rest goes dark when silence starts, before step 130.
@@ -406,7 +419,7 @@ fn f7_sweep() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), [300]);
     }
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(pulse_starts(&traces[usize::from(p)]), [300]);
     }
 }
@@ -424,7 +437,7 @@ fn f8_held_note() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), [100, 200]);
     }
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(pulse_starts(&traces[usize::from(p)]), [100, 200]);
     }
 }
@@ -445,7 +458,7 @@ fn f9_beat_and_bar() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), expected);
     }
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(pulse_starts(&traces[usize::from(p)]), expected);
     }
 }
@@ -467,8 +480,14 @@ fn f10(step: usize) -> ControlFrame {
 fn f10_wire_gate() {
     let traces = run(wire(), f10);
     assert!(traces[..230].iter().all(|trace| trace.mode == 0));
-    assert!(traces[230..].iter().all(|trace| trace.mode == 3));
-    assert_eq!(levels(&traces, 230), [1, 1, 0]);
+    if FLASH_BUILD {
+        assert!(traces[230..].iter().all(|trace| trace.mode == 3));
+        assert_eq!(levels(&traces, 230), [1, 1, 0]);
+    } else {
+        // The armed request runs unarmed: hard cuts from the same step.
+        assert!(traces[230..].iter().all(|trace| trace.mode == 2));
+        assert_eq!(levels(&traces, 230), [3, 3, 0]);
+    }
     assert_eq!(changes(&traces), [230]);
 }
 
@@ -483,7 +502,7 @@ fn wire_selection_arms_without_the_renderer_flag() {
     };
     for input in [f10 as fn(usize) -> ControlFrame, f22] {
         let traces = run(Config::default(), input);
-        assert!(traces.iter().any(|trace| trace.mode == 3));
+        assert_eq!(traces.iter().any(|trace| trace.mode == 3), FLASH_BUILD);
         assert_eq!(traces, run(flagged, input));
     }
 }
@@ -582,7 +601,7 @@ fn f14_dim_rest_attack() {
         energy: if step % 5 == 0 { 255 } else { 0 },
         ..frame(step)
     });
-    for p in FLASH {
+    for p in ARMED {
         let traces = &traces[usize::from(p)];
         let expected: Vec<_> = (5..STEPS).step_by(10).collect();
         assert_eq!(pulse_starts(traces), expected);
@@ -627,7 +646,7 @@ fn f15_resampled_onsets() {
         assert_eq!(expected.len(), 30);
         assert_eq!(changes(&run(p)), expected);
     }
-    for p in FLASH {
+    for p in ARMED {
         let expected: Vec<_> = (1..STEPS).step_by(8).collect();
         assert_eq!(expected.len(), 75);
         assert_eq!(pulse_starts(&run(p)), expected);
@@ -660,12 +679,18 @@ fn f16_armed_toggle_keeps_pulse_spacing() {
     let family_changes: Vec<_> = (1..STEPS)
         .filter(|&step| traces[step].family != traces[step - 1].family)
         .collect();
-    let expected: Vec<_> = (99..STEPS).step_by(30).collect();
-    assert_eq!(family_changes, expected);
-    assert!(traces.iter().all(|trace| trace.mode == 3));
-    let starts: Vec<_> = (1..STEPS).step_by(8).collect();
-    assert_eq!(starts.len(), 75);
-    assert_eq!(pulse_starts(&traces), starts);
+    if FLASH_BUILD {
+        let expected: Vec<_> = (99..STEPS).step_by(30).collect();
+        assert_eq!(family_changes, expected);
+        assert!(traces.iter().all(|trace| trace.mode == 3));
+        let starts: Vec<_> = (1..STEPS).step_by(8).collect();
+        assert_eq!(starts.len(), 75);
+        assert_eq!(pulse_starts(&traces), starts);
+    } else {
+        // Operator arming with `--allow-flash` still never latches.
+        assert!(!family_changes.is_empty());
+        assert!(traces.iter().all(|trace| trace.mode == 2));
+    }
 }
 
 #[test]
@@ -679,7 +704,7 @@ fn f17_silence_cut_off() {
         flags: (step % 2) as u8,
         ..frame(step)
     };
-    for p in FLASH {
+    for p in ARMED {
         let mut field = ColourField::new(local(p, true));
         let mut traces = Vec::new();
         let mut entries = Vec::new();
@@ -714,7 +739,7 @@ fn f17_silence_cut_off() {
         assert!(max_changes_per_60(&traces) <= 16);
     }
     // Unarmed 3 and 7 run as 2 and 6.
-    for p in FLASH {
+    for p in ARMED {
         assert_eq!(run(local(p, false), input), run(local(p - 1, false), input));
     }
 }
@@ -753,7 +778,9 @@ fn f18_held_across_entry() {
         match p {
             0 | 4 => assert!(changes(&traces).is_empty()),
             2 | 6 => assert_eq!(changes(&traces), [300]),
-            3 | 7 => assert_eq!(pulse_starts(&traces), [300]),
+            3 | 7 if FLASH_BUILD => assert_eq!(pulse_starts(&traces), [300]),
+            // Default builds: armed 3 and 7 are 2 and 6 (`all_palettes`).
+            3 | 7 => assert_eq!(changes(&traces), [300]),
             _ => {}
         }
     }
@@ -789,7 +816,7 @@ fn f19_hid_digital_only() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), cuts);
     }
-    for p in FLASH {
+    for p in ARMED {
         let traces = &traces[usize::from(p)];
         assert_eq!(pulse_starts(traces), cuts);
         assert!(
@@ -831,7 +858,7 @@ fn f20_level_saturation() {
     for p in CUTS {
         assert_eq!(changes(&traces[usize::from(p)]), [400]);
     }
-    for p in FLASH {
+    for p in ARMED {
         let traces = &traces[usize::from(p)];
         assert_eq!(pulse_starts(traces), [400]);
         assert!(
@@ -891,8 +918,11 @@ fn f22(step: usize) -> ControlFrame {
 fn f22_deferred_exit_never_arms() {
     let traces = run(wire(), f22);
     assert!(traces[..330].iter().all(|trace| trace.mode == 0));
-    assert!(traces[330..].iter().all(|trace| trace.mode == 3));
-    assert_eq!(levels(&traces, 330), [1, 1, 0]);
+    let mode = if FLASH_BUILD { 3 } else { 2 };
+    assert!(traces[330..].iter().all(|trace| trace.mode == mode));
+    if FLASH_BUILD {
+        assert_eq!(levels(&traces, 330), [1, 1, 0]);
+    }
 }
 
 #[test]
@@ -931,8 +961,14 @@ fn f24_relative_palette() {
         ..input(step)
     });
     assert!(absolute[..60].iter().all(|trace| trace.mode == 0));
-    assert!(absolute[60..160].iter().all(|trace| trace.mode == 3));
-    assert!(absolute[160..].iter().all(|trace| trace.mode == 2));
+    if FLASH_BUILD {
+        assert!(absolute[60..160].iter().all(|trace| trace.mode == 3));
+        assert!(absolute[160..].iter().all(|trace| trace.mode == 2));
+    } else {
+        // The armed absolute path runs unarmed; E's 2 then changes nothing.
+        assert!(absolute[60..].iter().all(|trace| trace.mode == 2));
+        assert_eq!(changes(&absolute), [60]);
+    }
 }
 
 #[test]
@@ -1019,7 +1055,7 @@ fn build_covers_the_viewport_with_flat_regions() {
             lvl: [3, 3, 3],
         };
         let mut instances = Vec::new();
-        build(&trace, 1920, 1080, &mut instances);
+        build(&trace, 1920, 1080, true, &mut instances);
         assert_eq!(instances.len(), usize::from(regions(layout)));
         let axis = usize::from(layout % 2);
         let mut edge = -1.0;
@@ -1051,7 +1087,7 @@ fn fingerprint() -> u64 {
     for p in 0..8 {
         for trace in run(local(p, false), f5).iter().step_by(7) {
             let mut instances = Vec::new();
-            build(trace, 1920, 1080, &mut instances);
+            build(trace, 1920, 1080, true, &mut instances);
             for byte in bytemuck::cast_slice::<Instance, u8>(&instances) {
                 fingerprint ^= u64::from(*byte);
                 fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
@@ -1067,4 +1103,172 @@ fn fingerprint() -> u64 {
 #[test]
 fn instances_match_recorded_golden() {
     assert_eq!(fingerprint(), 0x0be3_3778_406b_9e09);
+}
+
+#[test]
+fn build_linearises_only_for_srgb_attachments() {
+    // Combo 0 of family 0 in V2: A_RED then A_BLUE.
+    let trace = Trace {
+        mode: 0,
+        family: 0,
+        layout: 0,
+        combo: 0,
+        rot: 0,
+        lvl: [3, 3, 0],
+    };
+    // What each attachment stores for a shader output in [0, 1].
+    let unorm = |value: f32| (value * 255.0).round() as u8;
+    let srgb = |value: f32| {
+        let encoded = if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded * 255.0).round() as u8
+    };
+    for (srgb_target, store) in [(true, &srgb as &dyn Fn(f32) -> u8), (false, &unorm)] {
+        let mut instances = Vec::new();
+        build(&trace, 1920, 1080, srgb_target, &mut instances);
+        let stored: Vec<[u8; 3]> = instances
+            .iter()
+            .map(|instance| std::array::from_fn(|channel| store(instance.color[channel])))
+            .collect();
+        assert_eq!(
+            stored,
+            [[0xE0, 0x10, 0x20], [0x10, 0x30, 0xC0]],
+            "sRGB {srgb_target}"
+        );
+    }
+}
+
+#[test]
+fn native_scene_selection_ignores_the_step_cap_at_120_hz() {
+    // 120 Hz frames with the live 60-steps-per-second cap: the first 60
+    // frames use up the first second's steps.
+    let mut field = ColourField::new(wire());
+    let mut clock = StepClock::default();
+    let mut controls = Controls::default();
+    let scene = |tick: u64| match tick {
+        0..72 => 0,
+        72..74 => 2, // A two-frame selection at 600 ms.
+        74..96 => 1,
+        _ => 7,
+    };
+    for tick in 0..240 {
+        let frame = ControlFrame {
+            scene: scene(tick),
+            ..flat(tick as usize, 100)
+        };
+        field.observe(&frame);
+        let now = Duration::from_micros(tick * 1_000_000 / 120);
+        let display = step_capped(&mut field, Some(&mut clock), now, &mut controls);
+        if tick < 96 {
+            assert_eq!(display, Display::Native(scene(tick)), "tick {tick}");
+        } else if display != Display::Native(1) {
+            // Scene 7 from 800 ms still waits for 30 debounce steps.
+            assert!(tick >= 96 + 30, "tick {tick}: {display:?}");
+        }
+    }
+    assert!(matches!(field.display(), Display::ColourField(_)));
+}
+
+/// Supporting evidence only, not a substitute for PEAT or a Harding check:
+/// the most WCAG 2.3.1 general and red flashes in any 60-step (one second)
+/// window, at a grid of screen points. A transition is an opposing change
+/// of relative luminance by at least 0.1 with the darker state below 0.8,
+/// or of red `(R - G - B) * 320` by more than 20 with either state at least
+/// 80 % red; a flash is two opposing transitions.
+fn wcag_flashes(traces: &[Trace]) -> (usize, usize) {
+    let linear = |colour: [u8; 3]| colour.map(|channel| attachment_colour([channel; 3], true)[0]);
+    let luminance = |[r, g, b]: [f32; 3]| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let red = |[r, g, b]: [f32; 3]| ((r - g - b) * 320.0).max(0.0);
+    let saturated = |[r, g, b]: [f32; 3]| r + g + b > 0.0 && r / (r + g + b) >= 0.8;
+    let mut worst = (0, 0);
+    for point in 0..9 {
+        let at = |trace: &Trace| {
+            let n = u32::from(regions(trace.layout));
+            let axis = if trace.layout.is_multiple_of(2) {
+                point % 3
+            } else {
+                point / 3
+            };
+            linear(region_colours(trace)[((2 * axis + 1) * n / 6) as usize])
+        };
+        let colours: Vec<_> = traces.iter().map(at).collect();
+        let mut general = Vec::new();
+        let mut reds = Vec::new();
+        for (step, pair) in colours.windows(2).enumerate() {
+            let [a, b] = [pair[0], pair[1]];
+            let (la, lb) = (luminance(a), luminance(b));
+            if (lb - la).abs() >= 0.1 && la.min(lb) < 0.8 {
+                general.push((step + 1, lb > la));
+            }
+            if (red(b) - red(a)).abs() > 20.0 && (saturated(a) || saturated(b)) {
+                reds.push((step + 1, red(b) > red(a)));
+            }
+        }
+        let most = |transitions: &[(usize, bool)]| {
+            // Keep only opposing transitions; count pairs per window.
+            let mut opposing: Vec<usize> = Vec::new();
+            let mut last = None;
+            for &(step, up) in transitions {
+                if last != Some(up) {
+                    opposing.push(step);
+                    last = Some(up);
+                }
+            }
+            (0..opposing.len())
+                .map(|start| {
+                    opposing[start..]
+                        .iter()
+                        .take_while(|&&step| step < opposing[start] + 60)
+                        .count()
+                        / 2
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        worst = (worst.0.max(most(&general)), worst.1.max(most(&reds)));
+    }
+    worst
+}
+
+#[test]
+fn default_build_rendered_sequences_pass_the_wcag_flash_count() {
+    // The last input beats on every other step with wire palette 3.
+    let beats = |step: usize| ControlFrame {
+        flags: (step % 2) as u8,
+        palette: 3,
+        ..flat(step, 100)
+    };
+    let inputs: [fn(usize) -> ControlFrame; 6] = [f1, f5, f10, f22, frame, beats];
+    // With `unmeasured-flash`, armed configs flash by design.
+    if !FLASH_BUILD {
+        for input in inputs {
+            let mut configs: Vec<_> = (0..8).map(|p| local(p, p & 3 == 3)).collect();
+            configs.push(wire());
+            for config in configs {
+                let (general, red) = wcag_flashes(&run(config, input));
+                assert!(
+                    general <= 3 && red <= 3,
+                    "{config:?}: {general} general, {red} red"
+                );
+            }
+        }
+    } else {
+        // The counter does see flash/gate when it can latch.
+        let (general, red) = wcag_flashes(&run(local(3, true), beats));
+        assert!(general > 3 && red > 3, "{general} general, {red} red");
+    }
+}
+
+#[test]
+fn allow_flash_prints_the_warning_only_in_flash_builds() {
+    let expected = if FLASH_BUILD {
+        FLASH_WARNING
+    } else {
+        NO_FLASH_NOTICE
+    };
+    assert_eq!(allow_flash_notice(), expected);
+    assert!(NO_FLASH_NOTICE.contains("unmeasured-flash"));
 }
