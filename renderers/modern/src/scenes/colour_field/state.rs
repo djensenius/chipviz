@@ -555,6 +555,18 @@ impl Field {
     ) {
         if gate && config.palette == PaletteSource::Wire {
             let value = frame.palette & 7;
+            // The value is tracked on every step: a new value, inside or
+            // outside the window, starts a run that can request again; an
+            // unchanged value stays consumed.
+            if value != self.wire.value {
+                self.wire = WireGate {
+                    value,
+                    count: 0,
+                    consumed: false,
+                    relative: controls.relative_palette,
+                    clean: true,
+                };
+            }
             if frame.scene != SCENE {
                 // Outside the scene-7 window: restart the count and drop any
                 // pending wire request with its arming.
@@ -564,15 +576,6 @@ impl Field {
                 }
             } else {
                 let wire = &mut self.wire;
-                if value != wire.value {
-                    *wire = WireGate {
-                        value,
-                        count: 0,
-                        consumed: false,
-                        relative: controls.relative_palette,
-                        clean: true,
-                    };
-                }
                 if wire.count == 0 {
                     wire.clean = true;
                 }
