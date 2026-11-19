@@ -585,23 +585,53 @@ void cf_read_keys(uint8_t fallback_scene) {
   cf_previous_beat_keys = beat_keys;
 }
 
-uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines) {
-  uint16_t line = (uint16_t)(d012 | ((uint16_t)(d011 & 0x80u) << 1));
-  uint16_t late;
+/* Accepted D012 values for line bit 8 clear ([0]) and set ([1]): the first
+ * value and the run length (0: none). */
+uint8_t cf_irq_lo[2];
+uint8_t cf_irq_n[2];
 
-  if (line >= frame_lines) {
-    return 0u;
+uint8_t cf_irq_init(uint16_t irq_line, uint16_t frame_lines) {
+  uint16_t line = irq_line;
+  uint8_t left = CF_IRQ_WINDOW;
+  uint8_t ok = 1u;
+  uint8_t hi;
+  uint16_t end;
+  uint8_t n;
+
+  cf_irq_n[0] = 0u;
+  cf_irq_n[1] = 0u;
+  while (left != 0u) {
+    hi = (uint8_t)(line >> 8);
+    end = hi ? frame_lines : (frame_lines < 256u ? frame_lines : 256u);
+    n = end - line < left ? (uint8_t)(end - line) : left;
+    if (cf_irq_n[hi] != 0u) {
+      ok = 0u; /* a second run for this bit-8 value */
+    } else {
+      cf_irq_lo[hi] = (uint8_t)line;
+      cf_irq_n[hi] = n;
+    }
+    left = (uint8_t)(left - n);
+    line = (uint16_t)(line + n);
+    if (line >= frame_lines) {
+      line = 0u;
+    }
   }
-  late = line >= irq_line ? (uint16_t)(line - irq_line) : (uint16_t)(line + frame_lines - irq_line);
-  return (uint8_t)(late < CF_IRQ_WINDOW);
+  return ok;
 }
 
-uint8_t cf_irq_frame(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines,
-                     cf_irq_hook_t on_time, uint8_t fallback_scene) {
-  if (!cf_irq_on_time(d012, d011, irq_line, frame_lines)) {
+uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011) {
+  uint8_t limit;
+  uint8_t on;
+
+  CF_IRQ_ON_TIME(on, d012, d011, limit);
+  return on;
+}
+
+uint8_t cf_irq_frame(uint8_t on_time, cf_irq_hook_t sample, uint8_t fallback_scene) {
+  if (!on_time) {
     return CF_IRQ_LATE;
   }
-  on_time();
+  sample();
   cf_read_keys(fallback_scene);
   return cf_tick();
 }

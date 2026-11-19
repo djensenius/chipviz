@@ -816,7 +816,8 @@ static int irq_window(uint16_t line, uint16_t frame_lines) {
 }
 
 static uint8_t irq_read(uint16_t low_line, uint16_t high_line, uint16_t irq_line, uint16_t frame_lines) {
-  return cf_irq_on_time((uint8_t)low_line, (uint8_t)((high_line >> 1) & 0x80u), irq_line, frame_lines);
+  (void)cf_irq_init(irq_line, frame_lines);
+  return cf_irq_on_time((uint8_t)low_line, (uint8_t)((high_line >> 1) & 0x80u));
 }
 
 static void irq_lines(void) {
@@ -844,13 +845,17 @@ static void irq_lines(void) {
     require(exact && accepted == 16u, m ? "irq NTSC" : "irq PAL", "accepted lines are exactly the window");
     require(race, m ? "irq NTSC" : "irq PAL", "a D012/D011 read race is never accepted outside the window");
   }
+  /* One run of D012 values per bit-8 value fits PAL and NTSC; a window over
+   * line 256 and the NTSC wrap (250-255, 256-262, 0-2) would need two. */
+  require(cf_irq_init(300u, 312u) && cf_irq_init(16u, 263u) && !cf_irq_init(250u, 263u), "irq",
+          "cf_irq_init fits PAL and NTSC, refuses two runs per bit-8 value");
   /* The overrun the window must reject: about a frame late, at the bottom of
    * the display or the lower border (PAL 244-255 with bit 8 clear). */
   require(!irq_read(244u, 244u, 300u, 312u) && !irq_read(255u, 255u, 300u, 312u), "irq PAL",
           "lines 244-255 are late");
 }
 
-/* cf_irq_frame drops late IRQs: the hook (present and keyboard scan) is not
+/* cf_irq_frame drops late IRQs: the sample hook (keyboard scan) is not
  * called and no input or state changes. On an NTSC timeline (263 lines of 65
  * cycles at 1022727 Hz, 59.83 frames a second) where every 7th frame's step
  * overruns, so the next IRQ fires 60 lines late, no 1-second window holds more
@@ -862,8 +867,10 @@ static void irq_hook(void) {
 
 static uint8_t irq_at(uint32_t line, uint16_t irq_line, uint16_t frame_lines, uint8_t fallback) {
   uint16_t in_frame = (uint16_t)(line % frame_lines);
-  return cf_irq_frame((uint8_t)in_frame, (uint8_t)((in_frame >> 1) & 0x80u), irq_line, frame_lines, irq_hook,
-                      fallback);
+  uint8_t on_time;
+  (void)cf_irq_init(irq_line, frame_lines);
+  on_time = cf_irq_on_time((uint8_t)in_frame, (uint8_t)((in_frame >> 1) & 0x80u));
+  return cf_irq_frame(on_time, irq_hook, fallback);
 }
 
 static void irq_steps(void) {

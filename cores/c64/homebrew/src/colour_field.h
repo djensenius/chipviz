@@ -98,26 +98,46 @@ uint8_t cf_cell_region(uint8_t layout, uint8_t column, uint8_t row);
 extern uint8_t cf_keys[8];
 void cf_read_keys(uint8_t fallback_scene);
 
-/* Raster IRQ lateness check. d012 and d011 are the raster register reads
- * (D011 bit 7 is line bit 8, read after D012, so the line may have moved on
- * between them). Returns 1 when the 9-bit line is a real line of the frame
- * and fewer than CF_IRQ_WINDOW lines after irq_line, counting across the
- * frame wrap. On-time IRQs reach the check about 6 lines late; the window
- * stays in the vertical blank (PAL 300-311 and 0-3, NTSC 16-31). */
+/* Raster IRQ lateness check. The accepted lines run from irq_line to
+ * CF_IRQ_WINDOW - 1 lines after it, across the frame wrap. cf_irq_init (once,
+ * before the IRQ runs) stores them as one run of D012 values for each value
+ * of line bit 8 (D011 bit 7), so the check is a table lookup, a subtraction
+ * and a compare that the IRQ inlines before its border write. It returns 0
+ * if a window would need two runs for one bit-8 value (never for PAL or
+ * NTSC). d012 and d011 are the
+ * raster register reads, D012 first, so bit 8 may come from the next line;
+ * such a mixed read is still checked as a 9-bit line, and lines past the end
+ * of the frame are never accepted. On-time IRQs reach the check about 6 lines
+ * late; the window stays in the vertical blank (PAL 300-311 and 0-3, NTSC
+ * 16-31). cf_irq_on_time is the same check as a function. */
 #define CF_IRQ_WINDOW 16u
-uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines);
+extern uint8_t cf_irq_lo[2];
+extern uint8_t cf_irq_n[2];
+/* Sets on to 1 when on time. d012 and d011 are uint8_t variables holding the
+ * raster reads; the check overwrites them (and limit) as scratch. In this
+ * statement form cc65 emits plain 8-bit loads, sbc and cmp (about 70 cycles);
+ * one expression or a call costs several lines through its runtime stack. */
+#define CF_IRQ_ON_TIME(on, d012, d011, limit) \
+  do { \
+    (d011) = (uint8_t)((d011) >> 7); \
+    (d012) -= cf_irq_lo[d011]; \
+    (limit) = cf_irq_n[d011]; \
+    (on) = (uint8_t)((d012) < (limit)); \
+  } while (0)
+uint8_t cf_irq_init(uint16_t irq_line, uint16_t frame_lines);
+uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011);
 
-/* One raster IRQ. A late IRQ (cf_irq_on_time false) returns CF_IRQ_LATE
- * without calling on_time, sampling input or stepping: the step is dropped,
- * not caught up, so steps stay at most one per frame (spec: Step rate) and
- * the staged output waits for the next on-time IRQ. An on-time IRQ calls
- * on_time (present the staged step, scan the keyboard), then
- * cf_read_keys(fallback_scene) and cf_tick, and returns cf_tick's result.
- * Key edges compare against the last sampled keys, so a key still held at
- * the next on-time IRQ is not lost. */
+/* The step half of one raster IRQ, after the target has checked
+ * cf_irq_on_time and, only when on time, presented the staged step (so the
+ * border write comes as early as possible). A late IRQ (on_time 0) returns
+ * CF_IRQ_LATE without calling sample, reading keys or stepping: the step is
+ * dropped, not caught up, so steps stay at most one per frame (spec: Step
+ * rate) and the staged output waits for the next on-time IRQ. An on-time IRQ
+ * calls sample (scan the keyboard), then cf_read_keys(fallback_scene) and
+ * cf_tick, and returns cf_tick's result. Key edges compare against the last
+ * sampled keys, so a key still held at the next on-time IRQ is not lost. */
 #define CF_IRQ_LATE 0xFFu
 typedef void (*cf_irq_hook_t)(void);
-uint8_t cf_irq_frame(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines,
-                     cf_irq_hook_t on_time, uint8_t fallback_scene);
+uint8_t cf_irq_frame(uint8_t on_time, cf_irq_hook_t sample, uint8_t fallback_scene);
 
 #endif

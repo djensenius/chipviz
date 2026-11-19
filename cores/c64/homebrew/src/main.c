@@ -59,7 +59,6 @@ static volatile uint8_t field_shown;
 static volatile uint8_t irq_frames;
 static uint8_t irq_stack[128];
 static uint16_t irq_line;
-static uint16_t irq_frame_lines;
 static uint8_t irq_line_bit8;
 
 typedef struct {
@@ -192,15 +191,11 @@ static void stage_native(void) {
  * keyboard is sampled and the next step is staged. Only this handler calls
  * these functions, so cc65's static locals are never shared with the main
  * loop; cc65's IRQ wrapper saves the runtime zero page and uses irq_stack. */
-/* The on-time half of a step, before it is sampled and ticked. */
-static void irq_on_time(void) {
-  present();
-  scan_keyboard();
-}
-
 static uint8_t raster_irq(void) {
   uint8_t raster_low;
   uint8_t raster_high;
+  uint8_t raster_limit;
+  uint8_t on_time;
   uint8_t shown;
 
   if (!(CHIPVIZ_VIC_IRQ_STATUS & 1u)) {
@@ -216,7 +211,13 @@ static uint8_t raster_irq(void) {
    * The staged step is presented by the next on-time IRQ. */
   raster_low = CHIPVIZ_RASTER_LINE; /* D012 first, as cf_irq_on_time expects */
   raster_high = CHIPVIZ_VIC_CONTROL1;
-  shown = cf_irq_frame(raster_low, raster_high, irq_line, irq_frame_lines, irq_on_time, native_scene);
+  /* Inline (CF_IRQ_ON_TIME, not cf_irq_on_time): a call costs about 7 lines
+   * before the border write. */
+  CF_IRQ_ON_TIME(on_time, raster_low, raster_high, raster_limit);
+  if (on_time) {
+    present();
+  }
+  shown = cf_irq_frame(on_time, scan_keyboard, native_scene);
   if (shown == CF_IRQ_LATE) {
     return IRQ_HANDLED;
   }
@@ -302,10 +303,10 @@ int main(void) {
   native_scene = demo_scene(frame);
   if (get_tv() == TV_NTSC) {
     irq_line = CHIPVIZ_IRQ_LINE_NTSC;
-    irq_frame_lines = CHIPVIZ_LINES_NTSC;
+    (void)cf_irq_init(CHIPVIZ_IRQ_LINE_NTSC, CHIPVIZ_LINES_NTSC);
   } else {
     irq_line = CHIPVIZ_IRQ_LINE_PAL;
-    irq_frame_lines = CHIPVIZ_LINES_PAL;
+    (void)cf_irq_init(CHIPVIZ_IRQ_LINE_PAL, CHIPVIZ_LINES_PAL);
   }
   __asm__("sei");
   set_irq(raster_irq, irq_stack, sizeof(irq_stack));

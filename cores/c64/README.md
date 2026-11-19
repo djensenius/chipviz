@@ -38,7 +38,11 @@ supported: at boot the program reads the KERNAL's PAL/NTSC flag (`get_tv()`,
 (below the visible border) or line 16 on NTSC (above it). The IRQ runs one step
 per VBlank poll: it writes the previous step's VIC-II registers (border first),
 samples the keyboard, and stages the next step. All changes land in the
-vertical blank, so the screen never tears. If a step ever overruns a frame,
+vertical blank, so the screen never tears. The on-time check is an inline
+8-bit table compare, so the register writes finish 4 raster lines after the
+read (measured in VICE). The latest accepted reads are PAL line 3 and NTSC
+line 31, so the writes finish by line 7 or 35, before the first visible
+border line (PAL 16, NTSC 41). If a step ever overruns a frame,
 the late IRQ drops that step entirely (no register writes, input sampling or
 tick) rather than change registers mid-screen or catch up, so there are never
 more than 60 steps a second; keys still held are sampled on the next step.
