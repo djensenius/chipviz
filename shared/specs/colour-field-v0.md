@@ -56,6 +56,17 @@ same trace on every target. Reduced transports have their own oracle (see
   - `chipsynth_stream.py` never maps a chip ID to scene 7. When the operator
     forces scene 7, it sends a fixed, operator-chosen palette instead of the
     dominant channel.
+  - `live_bridge.py` audio currently cycles `scene = (i // 240) & 7` and
+    `palette = (i // 60) & 7`. It must skip scene 7, or hold a fixed palette
+    there that is not 3 or 7.
+  - `live_bridge.py` MIDI uses CC1 to select the scene and CC2 the palette.
+    Selecting 3 or 7 through CC2 while in scene 7 needs `--allow-flash`.
+  - **Every host path** follows one rule: it never sends `p` of 3 or 7 while in
+    scene 7 unless that host process was started with `--allow-flash`. Host
+    paths include live audio, MIDI, chipsynth, the procedural bridge, and file
+    playback of `.cvz` streams from `chipviz_encode`. Without the flag, the
+    host rewrites such a frame's palette to 2 or 6. This covers recorded files
+    as well as live sources.
 
 ### Palette index selects mode and family
 
@@ -76,14 +87,23 @@ The effective palette `p_eff` comes from one of three sources:
   selected value, starting at 0. The frame's `palette` field is ignored, so
   procedural `(frame/32)%8` and the GBA demo cycling never drive the mode.
   Demo and attract never use flash/gate: a local 3 or 7 runs as 2 or 6.
-- **Operator:** pulses from a [physical operator input](#arming-and-operator-inputs)
-  take effect on the next step.
+- **Operator:** only in an `operator` input role (see
+  [Input roles](#input-roles)). Pulses take effect on the next step.
 - **Wire:** control frames, file playback, Joybus and HID palette bits.
   - On scene entry, `p_eff` is the wire value. If that value is 3 or 7, it runs
     as 2 or 6.
-  - After entry, a new wire value takes effect from the step after it has been
-    received unchanged for `P_STABLE = 30` consecutive steps.
+  - The stability counter starts at scene entry. The entry value counts as
+    step 1.
+  - A wire value, including one present at entry, becomes `p_eff` from the step
+    after it has been received unchanged for `P_STABLE = 30` consecutive steps.
+    A wire 3 or 7 held for 30 steps from entry therefore arms on its 30th step
+    and runs from the 31st.
   - A stable 3 or 7 arms flash (see [arming](#arming-and-operator-inputs)).
+- **Precedence:** a later event overrides an earlier one, whatever its source.
+  - An operator pulse sets `p_eff` directly and restarts the wire stability
+    counter on the current wire value.
+  - That wire value overrides the operator choice again only if it changes and
+    then stays unchanged for 30 steps.
 
 If `p_eff` selects mode 3 and flash is not armed, the target runs mode 2.
 
@@ -104,6 +124,9 @@ uses the rising edges of `beat`, `bar` and `drop`, and ignores `fill` and
 
 - **Region order:** region 0 is leftmost for columns and bottom for rows. Region
   `i` covers `[b_i, b_(i+1))`.
+  - For columns, `b_i` is measured from the left edge.
+  - For rows, `b_i` is measured from the bottom edge. Screen row
+    `y = S - 1 - y_from_bottom`.
 - **Boundaries:** `b_i = g * ((i * (S / g)) / n)` with integer division, and
   `b_n = S`. `S` is the size along the split axis, which must be a multiple of
   `g`.
@@ -134,20 +157,45 @@ When the pin is set, layout equals the pinned layout:
 Setting the pin back to `auto` resumes event-driven changes from the current
 layout.
 
-| Target | Pin control |
-| --- | --- |
-| modern | `--layout auto\|v2\|h2\|v3\|h3` on the CLI, and the `L` key cycles |
-| GBA | `L` button |
-| SNES, NES, GB | `Select` |
-| Genesis | `C` |
-| SMS | button 2 |
-| C64 | `L` key |
-| N64 | controller 1 `L`, only in standalone/procedural mode |
+### Input roles
 
-The pin control works only on a physical operator input. On transports where
-every input is a data channel (Joybus, USB HID), there is no pin and layout is
-event-driven. Ports confirm that the chosen control does not clash with an
-existing binding.
+ROMs cannot tell a physical pad from a USB-HID-driven one, so the safety
+default treats all pad input as data.
+
+Every build or config declares one input role:
+
+- **`data` (default):** pad and keyboard input is a data channel. There is no
+  local pin, no physical arming, and no warning-screen confirmation from pad
+  input. Scene and palette pulses are wire values, so they go through
+  `P_STABLE`.
+- **`operator`:** explicitly declared for standalone builds with a human at the
+  controls. It enables the pin control and physical arming. An operator build
+  must never be fed by USB HID.
+
+| Target | Role mechanism | Pin control (operator role only) |
+| --- | --- | --- |
+| modern | CLI flags are operator by nature | `--layout auto\|v2\|h2\|v3\|h3`, and the `L` key cycles |
+| GBA | `make INPUT_ROLE=operator` (`-DCHIPVIZ_INPUT_ROLE_OPERATOR`) | `L` button |
+| SNES, NES, GB | same build flag | `Select` |
+| Genesis | same build flag | `C` |
+| SMS | same build flag | button 2 |
+| C64 | same build flag | `L` key |
+| N64 | none: always `data` | no pin |
+
+Why `data` is the default:
+
+- **USB HID collisions:** the shoulders carry the high-energy and treble
+  buckets, which collide with the GBA `L` pin. Select is part of the
+  auto/demo/manual combos, and Start is part of the auto combo. A HID feed
+  could therefore pin or arm by accident.
+- **N64:** all four Joybus ports are data. Controller 4 Start/Z carry scene
+  bits. The ROM falls back to procedural only when no controller is connected
+  (`main.c`), so a local controller 1 is never an operator input. The N64 has
+  no console-side pin or arming: its layout is always event-driven, and flash
+  arms only by host selection. The fallback-detection marker in #43 may change
+  this later; this spec does not depend on it.
+- **Clashes:** ports confirm the pin control does not clash with an existing
+  binding.
 
 ## Palettes
 
@@ -189,7 +237,7 @@ confirm them with emulator captures.
 | B.R | `0x03` | `0x00E` | `0x001F` | 2 red | `$16` | `$06` |
 | B.G | `0x0C` | `0x0E0` | `0x03E0` | 5 green | `$19` | `$09` |
 | B.B | `0x30` | `0xE00` | `0x7C00` | 6 blue | `$12` **chosen** | `$02` |
-| B.C | `0x3C` | `0xEE0` | `0x7FE0` | 3 cyan | `$2C` | `$1C` |
+| B.C | `0x3C` | `0xEE0` | `0x7FE0` | 3 cyan | `$3C` | `$2C` |
 | B.M | `0x33` | `0xE0E` | `0x7C1F` | 4 purple **chosen** | `$14` | `$04` |
 | B.Y | `0x0F` | `0x0EE` | `0x03FF` | 7 yellow | `$28` | `$18` |
 
@@ -206,7 +254,7 @@ confirm them with emulator captures.
     `$19` is `#00B800`.
   - The owner chose `$12` for both blues because it is brighter than the
     nearest values (`$02` and `$01`). Against this table, the nearest green is
-    `$19` (`$1A` is second).
+    `$19` (`$1A` is second), and the nearest cyan is `$3C` (`#00FCFC`).
   - Level 3 is the base colour, level 2 uses the L2 column, and levels 1 and 0
     are `$0F`. Never use `$0D`.
   - Each region uses its own background palette.
@@ -233,22 +281,29 @@ confirm them with emulator captures.
 <a id="reduced-transports"></a>**Reduced transports:** one step runs per VBlank
 poll. Unavailable fields are 0.
 
-- **N64 Joybus** (the byte numbers follow the Joybus spec):
+- **N64 Joybus** (bytes as packed by `n64_joybus.py`):
   - `spectrum[0..5]` are bytes 2, 3, 6, 7, 10 and 11, and `spectrum[6..7]` are
     0.
   - `bass` is the larger of `spectrum[0..1]`, `mid` of `spectrum[2..3]`, and
     `treble` of `spectrum[4..5]`.
-  - `energy` is byte 14. `beat` is byte 12 bit 0. There is no `bar` or `drop`.
-  - Scene and palette are decoded as in `cores/n64/homebrew`.
+  - `energy` is byte 14.
+  - Byte 12 bits 0..3 carry `flags & 0x0F`: bit 0 is `beat`, bit 1 is `bar`, and
+    bit 2 is `drop`. Bit 3, `fill`, is ignored.
+  - Scene is `((b12 >> 4) & 3) | (((b13 >> 4) & 3) << 2)`, and palette is
+    `b13 & 0x0F`.
   - A note event is a rising edge of byte 15 crossing `NOTE_VEL`.
-- **USB HID:**
-  - `energy` is the left stick X plus 128. `bass`, `mid` and `treble` all equal
-    `energy`, and the spectrum is 0.
-  - `beat` is the South button, `bar` is East, and `drop` is West. There are no
-    notes.
-  - Scene and palette come from pulses or keys, through the wire stability gate.
+- **USB HID** (as packed by `usb_hid.py`):
+  - `energy` is the left stick X plus 128. `signed_bucket` clamps to -127, so a
+    sent energy of 0 arrives as 1. That is still below every threshold.
+  - `bass`, `mid` and `treble` all equal `energy`, and the spectrum is 0.
+  - `beat` is South and `bar` is East.
+  - West carries `flags & 0x0C`, which is `drop` or the held `fill`. HID cannot
+    tell them apart, so West is ignored and HID has no `X` events.
+  - The shoulders and the left stick Y (`beat_phase`) are ignored, and there are
+    no notes.
+  - Scene and palette come from keys or pulses, through the wire stability gate.
 
-  With no separate bands, dominance never changes.
+  With no separate bands, dominance never changes on HID.
 
 On reduced transports, the oracle is the reference implementation fed the
 mapped frames, stepped once per poll.
@@ -270,7 +325,7 @@ NOTE:    NOTE_VEL 64
 DOM:     DOM_MARGIN 32, DOM_HOLD 30, SECTION_MIN 600
 CUT:     CUT_MIN 20                       (<= 3 cuts/s)
 LEVEL:   UP[1..3] = 48,104,168  DOWN[1..3] = 32,88,152
-         LEVEL_SAME 5, LEVEL_OPP 10       (<= 3 flashes/s per region)
+         LEVEL_OPP 10   field-wide (<= 3 flashes/s for the whole field)
 GATE:    GATE_ON 4, GATE_OFF_MIN 4, REST_DIM_ON 64, REST_DIM_OFF 48
 WIRE:    P_STABLE 30
 ```
@@ -295,10 +350,10 @@ changes. `layout`, `combo` and `rot` are kept, except that held mode sets
 `combo = dom`.
 
 - **Counters:** `act = 0` and `since_cut = CUT_MIN`.
-- **Spectral levels:** each region gets `lvl[i] = count(UP[k] <= v_i)`.
-  `lh[i] = LEVEL_OPP` and `ldir[i] = 0`. `lvl[2] = 0` in 2-region layouts.
+- **Spectral levels:** each region gets `lvl[i] = count(UP[k] <= v_i)`, and
+  `lg = LEVEL_OPP`. `lvl[2] = 0` in 2-region layouts.
 - **Gate:** `pulse = 0`, `gate_off = GATE_OFF_MIN`, and `dim = avg_e >=
-  REST_DIM_ON`.
+  REST_DIM_ON`, where `avg_e` is the current average.
 - **Silence:** in spectral or flash/gate mode, if `silent`, all regions are
   black.
 
@@ -336,13 +391,12 @@ changes. `layout`, `combo` and `rot` are kept, except that held mode sets
      `cand = c`.
    - Otherwise, set `cand = none` and `cand_n = 0`.
    - When `cand_n >= DOM_HOLD`, set `dom = c`, `cand_n = 0`, and `D = 1`.
-6. If not silent, apply the mode rule. Any `next_layout` sets
-   `since_layout = 0`. In spectral mode, it also re-runs the spectral-level part
-   of mode entry for the new region count. `SECTION = X || (D && since_layout >=
-   SECTION_MIN)`.
-7. Increment `since_cut`, `since_layout`, `gate_off` and each `lh[i]`. Then
-   apply the wire stability gate and the pin, so they take effect from the next
-   step.
+6. If not silent, apply the mode rule. `SECTION = X || (D && since_layout >=
+   SECTION_MIN)`. Any `next_layout` sets `since_layout = 0`. In spectral mode,
+   it also re-initialises `lvl` from the current values for the new region
+   count, as in mode entry, and sets `lg = 0`.
+7. Increment `since_cut`, `since_layout`, `gate_off` and `lg`. Then apply the
+   wire stability gate and the pin, so they take effect from the next step.
 
 ## Modes
 
@@ -353,15 +407,18 @@ changes. `layout`, `combo` and `rot` are kept, except that held mode sets
 - **Spectral (1):** each region follows a raw band value `v_i`.
   - In 3-region layouts, the regions follow bass, mid and treble.
   - In 2-region layouts, they follow bass and `max(mid, treble)`.
+  - **Order within the step:**
+    1. On `X` with `since_cut >= CUT_MIN`: `next_layout`, `next_combo`, and
+       `since_cut = 0`.
+    2. Else on `D` with `since_layout >= SECTION_MIN`: `next_layout`.
+    3. Only then, if `lg >= LEVEL_OPP`, update every region's level. A layout
+       change in steps 1 or 2 set `lg = 0`, so it blocks this.
   - **Level up:** `lvl += 1` when `v >= UP[lvl + 1]`.
   - **Level down:** `lvl -= 1` when `v < DOWN[lvl]`.
-  - **Rate limit:** a change needs `lh >= LEVEL_SAME` if it goes the same
-    direction as `ldir`, or `lh >= LEVEL_OPP` if it reverses. A change sets
-    `lh = 0` and records its direction in `ldir`. A full up/down cycle therefore
-    takes at least 20 steps.
-  - On `X` with `since_cut >= CUT_MIN`: `next_layout`, `next_combo`, and
-    `since_cut = 0`.
-  - On `D` with `since_layout >= SECTION_MIN`: `next_layout`.
+  - **Field-wide rate limit:** any region may change in the same step. If any
+    did, set `lg = 0`. Level changes therefore happen at most once per 10 steps
+    across the whole field, which keeps it at or below 3 flashes per second.
+    There are no per-region timers.
 - **Hard cuts (2):** level 3. On `E` with `since_cut >= CUT_MIN`, set
   `since_cut = 0`, then:
   - If `X`: `next_layout` and `next_combo`.
@@ -374,7 +431,8 @@ changes. `layout`, `combo` and `rot` are kept, except that held mode sets
   An `E` that is not accepted is dropped, not queued.
 - **Flash/gate (3, armed only):**
   - **Rest:** the field rests at level 1 when `dim`, otherwise level 0. `dim`
-    becomes true when `avg_e >= REST_DIM_ON` and false when `avg_e <
+    is updated first in this mode's step, from the average updated in step 1.
+    It becomes true when `avg_e >= REST_DIM_ON` and false when `avg_e <
     REST_DIM_OFF`.
   - **Pulse:** if `pulse > 0`, decrement it; when it reaches 0, set
     `gate_off = 0`. Otherwise, an `E` with `gate_off >= GATE_OFF_MIN` starts a
@@ -392,22 +450,24 @@ black.
 
 Flash is armed only by a deliberate source.
 
-- **(a) Physical operator arming:**
-  - **Physical operator input:** a control that is not configured as a data
-    channel for the current connection:
-    - modern: the `--allow-flash` CLI flag, which arms for the process lifetime
-      and prints the full warning to stderr.
-    - consoles: controller 1, when the data transport uses other ports or a
-      non-controller link.
-  - On N64 Joybus, every port is data, including controller 4 Start/Z, which
-    carry scene bits. Targets whose only input is USB HID are in the same
-    position. Those targets have no physical arming.
+- **(a) Operator arming:** only in the `operator` input role (see
+  [Input roles](#input-roles)).
+  - **modern:** the `--allow-flash` CLI flag prints the full warning to stderr
+    when the renderer starts. While the process runs, it re-arms automatically
+    each time mode 3 is selected again after the latch has cleared.
+  - **Consoles built with the `operator` role:** use the warning screen below,
+    confirmed with controller 1 `start`.
+  - **Consoles in the default `data` role and N64:** no operator arming at all.
+    Pad input there may be a HID feed, and the N64's Joybus ports carry
+    controller 4 Start/Z as scene bits.
 - **(b) Deliberate host selection:** a wire `p` of 3 or 7 that passes the
   `P_STABLE` gate while scene is 7.
-  - Hosts emit 3 or 7 only when their operator started them with
-    `--allow-flash`. A host with that flag prints the full warning when it
-    starts.
+  - Hosts emit 3 or 7 only when that host process was started with
+    `--allow-flash` (see [Requirements for scene sources](#scene-index-7-is-the-colour-field)).
+    A host with that flag prints the full warning when it starts.
   - Auto mode on the host may arm flash this way.
+  - After the latch clears, a wire 3 or 7 re-arms once it is again stable for
+    `P_STABLE` steps.
 
 Edges, pulses, or values held for fewer than `P_STABLE` steps on a data channel
 never arm. Demo, attract and procedural sources never arm. The armed latch
@@ -415,9 +475,9 @@ clears at power-on and reset, when leaving scene 7, and when `p_eff` leaves
 mode 3.
 
 **Console warning screen:** this is a local screen added to the interface-v0
-flow, with no wire change.
+flow, with no wire change. It exists only in `operator` builds.
 
-- **When it appears:** a physical operator input selects mode 3 while flash is
+- **When it appears:** an operator palette pulse selects mode 3 while flash is
   unarmed.
 - **While it is shown:**
   - The detector is paused and the projection shows the text below.
@@ -455,7 +515,8 @@ OTHER = CANCEL
 - Each fixture runs for 600 steps on the full path, with `frame = step` and
   `scene = 7`.
 - `p` is selected locally at `p = 0..7`. For `p = 3` and `p = 7`, flash is
-  pre-armed through physical arming. Unarmed 3 and 7 must equal 2 and 6.
+  pre-armed by operator arming (the harness acts as an `operator` build). Unarmed
+  3 and 7 must equal 2 and 6.
 - Unlisted fields are 0. "Bands" means bass, mid and treble. "Spectrum" means
   all 8 bands.
 - **LCG:** `x = (x * 25173 + 13849) & 0xFFFF`, with `x0 = 1`. It advances once
@@ -477,8 +538,8 @@ OTHER = CANCEL
 | F3 aperiodic | `e`, bands and spectrum 40, spiking to 220 for 2 steps at 37, 101, 113, 250, 400 and 523. | Cuts at 37, 101, 250, 400 and 523 (113 is dropped). Pulses at all six. Held never changes. |
 | F4 notes | `e`, bands and spectrum 80. Note 60 at velocity 100 at steps 45, 46, 130 and 352. Note 60 at velocity 40 at 200. | Onsets at 45, 130 and 352 (46 is a repeat and 200 is too quiet). Cuts and pulses at those three steps. |
 | F5 rhythmic | `beat` at `30k` (`k = 1..19`) and `bar` at `120k`. A beat step and the next 3 steps have `e=180`, `bass=200` and `spectrum[0..1]=200`; everything else is 60. | 19 cuts. Layout changes at 120, 240, 360 and 480 (V2→H2→V3→H3→V2). 19 pulses. Held never changes. |
-| F6 floor | Steps 0–59 are 120. Steps 60–419 are a floor of `(x >> 8) % 13` per field. Steps 420–599 are 120, with 220 at 480–481. | Spectral steps 2→1→0 at 60 and 65. Silence starts before step 130. No change from 80 to 419. Cuts and pulses at 420 and 480. Spectral steps 0→1→2 at 420 and 425, 2→3 at 480, and 3→2 at 490 (`LEVEL_OPP`). |
-| F7 sweep | `e=150`. Steps 0–299 have bands 200/60/60 and spectrum 0–3 at 200. Steps 300–599 have bands 60/60/200 and spectrum 4–7 at 200. Everything else is 60. | Held changes combo 0→2 once, between steps 330 and 345, with no layout change. Spectral (V2) goes from 3/1 to 2/2 at 300 and to 1/3 at 305. Cuts and pulses at 300. |
+| F6 floor | Steps 0–59 are 120. Steps 60–419 are a floor of `(x >> 8) % 13` per field. Steps 420–599 are 120, with 220 at 480–481. | Spectral steps 2→1→0 at 60 and 70. Silence starts before step 130. No change from 80 to 419. Cuts and pulses at 420 and 480. Spectral steps 0→1→2 at 420 and 430, 2→3 at 480, and 3→2 at 490 (field-wide `LEVEL_OPP`). |
+| F7 sweep | `e=150`. Steps 0–299 have bands 200/60/60 and spectrum 0–3 at 200. Steps 300–599 have bands 60/60/200 and spectrum 4–7 at 200. Everything else is 60. | Held changes combo 0→2 once, between steps 330 and 345, with no layout change. Spectral (V2) goes from 3/1 to 2/2 at 300 and to 1/3 at 310. Cuts and pulses at 300. |
 | F8 held note | `e`, bands and spectrum 80. Note 60 at velocity 100 for steps 100–299, and note 64 at velocity 100 added for steps 200–299. | Onsets at 100 and 200 only. Cuts and pulses at 100 and 200. |
 | F9 beat/bar | `e`, bands and spectrum 100. `beat` at `20 + 40k` (`k = 0..14`) and `bar` at `40 + 120k` (`k = 0..4`). | 20 cuts and 20 pulses, one at every beat and bar step. Held never changes. |
 | F10 wire gate | F1 input without `drop`. Wire `p` is 0 for steps 0–99, 2 for 100–109, 0 for 110–199, and 3 from 200 on. | `p_eff` is 0 through step 229 and 3 from step 230, when mode 3 enters resting dim (armed by host selection). Steps 100–109 have no effect. |
