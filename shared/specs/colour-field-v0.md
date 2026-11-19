@@ -419,8 +419,9 @@ unarmed 3→2 rule) or the family of `p_eff` changes. `layout`, `combo` and `rot
    - If `silent`: when `e >= SIL_EXIT`, set `silent = 0` and `quiet = 0`.
    - Otherwise: set `quiet` to `quiet + 1` when the new `avg_e <= SIL_AVG`, else
      to 0. When `quiet >= SIL_HOLD`, set `silent = 1`. On that entry,
-     flash/gate goes black at once: `dim = 0`, and if a pulse is lit it ends
-     early (`pulse = 0`, `gate_off = 0`). `since_pulse` is not reset, so the
+     flash/gate goes black at once: `dim = 0`, and if a pulse is lit
+     (`pulse > 0` at this point, including `pulse = 1`) it ends early
+     (`pulse = 0`, `gate_off = 0`). `since_pulse` is not reset, so the
      next pulse still starts no sooner than 8 steps after the previous start.
      Held and cuts hold their state.
    - **Spectral blackout:** in spectral mode, on every step where `silent` is
@@ -558,6 +559,11 @@ a request, so arming always goes through the budget.
       requests are at least `CUT_MIN` = 20 steps apart, so at most 3 per 60
       steps.
 
+    Windows that leave mode 3: switching to a lit mode (held or cuts at level
+    3) turns the light on without a pulse start, but leaving and returning are
+    two applied changes at least `CUT_MIN` (20) steps apart. They cost more
+    pulse starts than they add, so light-ons still stay at most 8 per 60 steps.
+
     Flash cycles therefore never exceed 7.5 per second, and all displayed
     changes together are at most 21 per 60 steps, whatever the energy or
     operator does.
@@ -678,4 +684,4 @@ OTHER = CANCEL
 | F14 dim-rest attack | `e = 255` at steps `5k` (`k = 0..119`), otherwise 0. Bands and spectrum 0. | Flash/gate (`p = 3`, 7): pulses at 5, 15, 25, … (one per 10 steps, 60 in total). The rest level changes only when a pulse ends: it rests at 1 (dim) through step 28, then from step 30 levels repeat `0,0,0,0,0,3,3,3,3,0`. At most 12 displayed level changes in any 60 steps (6 cycles per second). Spectral and held: no change. Cuts: 30, at 5, 25, 45, …, 585. |
 | F15 resampled onsets | 120 Hz source: 1200 frames, `e`, bands and spectrum 100, `beat` set on odd frames only. Step `t` takes frames `2t` and `2t+1`. | Every step from 1 on has `B = 1` from the onset mask. Cuts at 1, 21, 41, …, 581 (30). Pulses at 1, 9, 17, …, 593 (75). Re-encoding the masks into `flags` would give a single edge at step 1, which is non-conforming. |
 | F16 armed 3↔7 toggle | `e`, bands and spectrum 100. `beat` set on odd steps only. `p = 3`, armed. The operator (with `--allow-flash`, so every request is armed) requests 7 at steps `98 + 60k` and 3 at `128 + 60k`. | Requests apply at the end of 98, 128, 158, …, 578. Pulse starts at `1 + 8k` (`k = 0..74`, 75 starts), never closer than 8 steps, even right after a mode entry (without `since_pulse` a start would land at 99). |
-| F17 silence cut-off | `e = 24` at steps `31k` (`k = 1..19`), otherwise 0. Bands and spectrum 0. `beat` set on odd steps only. | Flash/gate (`p = 3`, 7): silence entries at `31k - 1` (30, 61, …, 588); those at 92, 123, 154, 278, 309, 340, 464, 495 and 526 end a lit pulse early. 75 pulse starts, never closer than 8 steps: `1 + 8k` through 177, then 187, 195, … (without `since_pulse` a start would land at 127, 6 after 121). At most 16 displayed level changes in any 60 steps. |
+| F17 silence cut-off | `e = 24` at steps `31k` (`k = 1..19`), otherwise 0. Bands and spectrum 0. `beat` set on odd steps only. | Flash/gate (`p = 3`, 7): silence entries at `31k - 1` (30, 61, …, 588); those at 61, 92, 123, 154, 247, 278, 309, 340, 433, 464, 495 and 526 end a lit pulse early (12). 75 pulse starts, never closer than 8 steps: `1 + 8k` through 177, then 187, 195, … (without `since_pulse` a start would land at 127, 6 after 121). At most 16 displayed level changes in any 60 steps. |
