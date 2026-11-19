@@ -7,7 +7,8 @@
 //! are wait-free: the writer stores one atomic per point and the reader loads
 //! them, so the render thread never waits on audio and memory stays bounded.
 //! A read that races a publish can mix points from two consecutive snapshots;
-//! they are a few milliseconds apart, which is harmless for drawing.
+//! they are a few milliseconds apart, and the drawn ribbon's limiter bounds
+//! whatever the mix draws.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -26,10 +27,13 @@ const MAX_SEARCH: usize = 12_800;
 /// room hiss stays small instead of being amplified to full height.
 pub const PEAK_FLOOR: f32 = 0.02;
 const PEAK_RELEASE_S: f32 = 1.5;
-/// Most vertical coverage (see [`coverage`], in full-scale units) the
-/// published outlines may have: about a loud 440 Hz tone's at 44.1 kHz,
-/// some 20 cycles of one line rising and falling by 2. See
-/// [`limit_coverage`].
+/// Vertical coverage (see [`coverage`], in full-scale units) that
+/// [`limit_coverage`] aims to keep published outlines within: about a loud
+/// 440 Hz tone's at 44.1 kHz, some 20 cycles of one line rising and falling
+/// by 2. It is a target for this cheap first pass, not a guarantee (a
+/// pulse train's full envelope, or a read racing a publish, can exceed
+/// it); the guaranteed limit is applied to the drawn ribbon, see
+/// `limit_ribbon` in `scenes::mic_layers`.
 pub const MAX_COVERAGE: f32 = 84.0;
 /// Points either side held by the envelope: a 9-point (72-sample) window,
 /// over a period of any tone whose outlines alternate point to point.
@@ -239,7 +243,9 @@ fn alternation(points: &[f32]) -> f32 {
     reversals as f32 / points.len().max(1) as f32
 }
 
-/// Keeps the outlines thin lines: no tone (or noise) fills a band.
+/// First pass keeping the outlines thin lines, so steady tones (and noise)
+/// publish as a waveform or an envelope rather than a band. The drawn
+/// ribbon is limited again, with a guarantee, at draw time.
 ///
 /// A tone with a period of a few points (about 1 to 4 kHz at 48 kHz)
 /// makes each raw outline alternate from point to point (exact 3 kHz is
@@ -263,15 +269,7 @@ pub fn limit_coverage(upper: &mut [f32; POINTS], lower: &mut [f32; POINTS]) {
     if least == 0.0 && coverage(upper, lower) <= MAX_COVERAGE {
         return;
     }
-    let hold = |points: &[f32; POINTS], pick: fn(f32, f32) -> f32| -> [f32; POINTS] {
-        std::array::from_fn(|index| {
-            points[index.saturating_sub(HOLD)..(index + HOLD + 1).min(POINTS)]
-                .iter()
-                .copied()
-                .fold(points[index], pick)
-        })
-    };
-    let (high, low) = (hold(upper, f32::max), hold(lower, f32::min));
+    let (high, low) = envelope(upper, lower);
     let blend = |weight: f32| -> ([f32; POINTS], [f32; POINTS]) {
         let mix = |raw: &[f32; POINTS], envelope: &[f32; POINTS]| {
             std::array::from_fn(|index| raw[index] + (envelope[index] - raw[index]) * weight)
@@ -285,6 +283,21 @@ pub fn limit_coverage(upper: &mut [f32; POINTS], lower: &mut [f32; POINTS]) {
         .map(blend)
         .find(|(upper, lower)| coverage(upper, lower) <= MAX_COVERAGE)
         .unwrap_or((high, low));
+}
+
+/// The outlines' envelope: the highest `upper` and lowest `lower` within
+/// `HOLD` points either side. It only widens them, and it cannot alternate
+/// point to point for tones whose period fits the window.
+pub fn envelope(upper: &[f32; POINTS], lower: &[f32; POINTS]) -> ([f32; POINTS], [f32; POINTS]) {
+    let hold = |points: &[f32; POINTS], pick: fn(f32, f32) -> f32| -> [f32; POINTS] {
+        std::array::from_fn(|index| {
+            points[index.saturating_sub(HOLD)..(index + HOLD + 1).min(POINTS)]
+                .iter()
+                .copied()
+                .fold(points[index], pick)
+        })
+    };
+    (hold(upper, f32::max), hold(lower, f32::min))
 }
 
 /// Wait-free single-writer publication of the latest [`ScopeSnapshot`].

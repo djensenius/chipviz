@@ -176,8 +176,8 @@ impl FrameSource {
     }
 }
 
-fn elapsed(index: u64) -> f32 {
-    index as f32 / CAPTURE_FPS
+fn elapsed(index: u64) -> f64 {
+    index as f64 / f64::from(CAPTURE_FPS)
 }
 
 pub const SYNTH_RATE: u32 = 48_000;

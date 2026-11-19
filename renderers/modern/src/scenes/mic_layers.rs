@@ -20,6 +20,9 @@
 //! thin lines through the outlines: one line for slow sound, where they
 //! coincide, and two for tones too fast for the points, so loud high
 //! frequencies never fill a band (see `decimate` in `audio::scope`).
+//! Whatever its source, the ribbon is limited once more as it is drawn
+//! ([`limit_ribbon`]): it never covers more than `RIBBON_SCREEN_FRACTION` of
+//! the screen, at any aspect.
 //!
 //! Flash design (not a measured compliance claim): a burst is one smooth rise
 //! (`ATTACK_S`) and exponential fall, so each is at most one flash. Its
@@ -36,10 +39,12 @@
 //!
 //! Geometry is built in aspect space (x spans `-aspect..aspect`, y `-1..1`)
 //! and flattened by [`transform`], so rotated ribbon segments and round
-//! bursts keep their shape at any aspect ratio.
+//! bursts keep their shape at any aspect ratio. In portrait the whole ribbon
+//! scales with the width. Overlay time is f64 seconds, so burst timing stays
+//! exact however long the renderer runs.
 
 use super::{colour_field, hash, palette};
-use crate::audio::scope::{POINTS, ScopeSnapshot};
+use crate::audio::scope::{POINTS, ScopeSnapshot, envelope};
 use crate::control_frame::ControlFrame;
 use crate::scene::{Instance, SCREEN_SPACE_TRANSFORM};
 
@@ -72,6 +77,13 @@ const RIBBON_PASSES: [(f32, f32, Pass); 3] = [
 ];
 /// Ribbon lines: the waveform's upper and lower outlines.
 const OUTLINES: usize = 2;
+/// Most of the screen the drawn ribbon may cover, at any aspect: its thin-line
+/// budget (see [`limit_ribbon`]).
+pub const RIBBON_SCREEN_FRACTION: f32 = 0.13;
+/// Columns the ribbon's area bound is measured in.
+const AREA_COLUMNS: usize = 2048;
+/// Bisection steps [`limit_ribbon`] takes along its reduction path.
+const LIMIT_STEPS: usize = 8;
 /// Upper bound on overlay instances: a quad per ribbon segment per outline
 /// per pass, plus each burst's glow and sparks.
 pub const MAX_INSTANCES: usize =
@@ -174,7 +186,7 @@ fn rms(wave: &[[f32; POINTS]; OUTLINES]) -> f32 {
 /// The no-mic ribbon: each spectrum band is a sine with its own number of
 /// cycles across the ribbon and its own drift, weighted by its level; the sum
 /// is normalised by the total level and scaled by energy, so silence is flat.
-pub fn synthesise(frame: ControlFrame, elapsed: f32) -> [f32; POINTS] {
+pub fn synthesise(frame: ControlFrame, elapsed: f64) -> [f32; POINTS] {
     let levels = frame.spectrum.map(|value| f32::from(value) / 255.0);
     let total = levels.iter().sum::<f32>();
     let energy = f32::from(frame.energy) / 255.0;
@@ -188,7 +200,9 @@ pub fn synthesise(frame: ControlFrame, elapsed: f32) -> [f32; POINTS] {
             .enumerate()
             .map(|(band, level)| {
                 let cycles = 1.0 + (band as f32 * 0.65).exp2();
-                let drift = elapsed * (1.2 + band as f32 * 0.9);
+                // In f64 and wrapped, so drift stays smooth after days.
+                let drift = (elapsed * (1.2 + band as f64 * 0.9)).rem_euclid(std::f64::consts::TAU);
+                let drift = drift as f32;
                 level * (std::f32::consts::TAU * cycles * x + drift).sin()
             })
             .sum::<f32>();
@@ -196,9 +210,142 @@ pub fn synthesise(frame: ControlFrame, elapsed: f32) -> [f32; POINTS] {
     })
 }
 
+/// The ribbon's size factor at `aspect`: 1 in landscape. In portrait the
+/// whole ribbon (its amplitude and strokes as well as its width) shrinks
+/// with the width, so it stays the same thin line relative to the screen.
+fn ribbon_scale(aspect: f32) -> f32 {
+    aspect.clamp(0.01, 1.0)
+}
+
+/// Aspect-space position of `outline[index]` at `aspect`.
+fn ribbon_point(outline: &[f32; POINTS], index: usize, aspect: f32) -> [f32; 2] {
+    let x = (index as f32 / (POINTS - 1) as f32 * 2.0 - 1.0) * RIBBON_HALF_WIDTH * aspect;
+    [
+        x,
+        RIBBON_Y + outline[index] * RIBBON_AMPLITUDE * ribbon_scale(aspect),
+    ]
+}
+
+/// The quad joining `a` and `b`: centre, size (length plus `overlap`, then
+/// `thickness`) and rotation.
+fn segment(a: [f32; 2], b: [f32; 2], thickness: f32, overlap: f32) -> ([f32; 2], [f32; 2], f32) {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    (
+        [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5],
+        [dx.hypot(dy) + overlap, thickness],
+        dy.atan2(dx),
+    )
+}
+
+/// The ribbon's area budget at `aspect` (aspect-space units squared, the
+/// screen being `4 * aspect`).
+pub fn ribbon_budget(aspect: f32) -> f32 {
+    RIBBON_SCREEN_FRACTION * 4.0 * aspect.max(0.01)
+}
+
+/// An upper bound on the area (aspect-space units squared) the ribbon
+/// covers when `wave` is drawn at `aspect`: the union of its halo quads,
+/// which contain every other pass's. The ribbon is cut into
+/// `AREA_COLUMNS` vertical slabs; in each, every quad contributes the
+/// exact height range it covers within the slab (from its corners there
+/// and its edges' crossings of the slab's sides), each outline's ranges
+/// are joined into one span (an outline is connected, so this only adds
+/// its slope across a slab), and the two outlines' spans are united, so
+/// coinciding outlines count once.
+pub fn ribbon_area_bound(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> f32 {
+    let aspect = aspect.max(0.01);
+    let thickness = RIBBON_PASSES[0].0 * ribbon_scale(aspect);
+    let overlap = thickness * 0.5;
+    // Past every corner: a point's x plus half the overlap and thickness.
+    let reach = RIBBON_HALF_WIDTH * aspect + thickness + overlap;
+    let width = 2.0 * reach / AREA_COLUMNS as f32;
+    let column = |x: f32| (((x + reach) / width).max(0.0) as usize).min(AREA_COLUMNS - 1);
+    let mut spans = [[(f32::INFINITY, f32::NEG_INFINITY); AREA_COLUMNS]; OUTLINES];
+    for (outline, spans) in wave.iter().zip(&mut spans) {
+        let mut include = |index: usize, y: f32| {
+            let span = &mut spans[index];
+            *span = (span.0.min(y), span.1.max(y));
+        };
+        for index in 0..POINTS - 1 {
+            let (center, size, rotation) = segment(
+                ribbon_point(outline, index, aspect),
+                ribbon_point(outline, index + 1, aspect),
+                thickness,
+                overlap,
+            );
+            let (cos, sin) = (rotation.cos(), rotation.sin());
+            let (along, across) = (size[0] * 0.5, size[1] * 0.5);
+            let corners = [
+                (-along, -across),
+                (along, -across),
+                (along, across),
+                (-along, across),
+            ]
+            .map(|(a, c)| [center[0] + a * cos - c * sin, center[1] + a * sin + c * cos]);
+            let (mut left, mut right) = (f32::INFINITY, f32::NEG_INFINITY);
+            for corner in corners {
+                include(column(corner[0]), corner[1]);
+                (left, right) = (left.min(corner[0]), right.max(corner[0]));
+            }
+            // Where edges cross a side shared by two slabs, both get it.
+            for side in column(left) + 1..=column(right) {
+                let x = -reach + side as f32 * width;
+                for (edge, p) in corners.iter().enumerate() {
+                    let q = corners[(edge + 1) % 4];
+                    if p[0] != q[0] && (p[0] - x) * (q[0] - x) <= 0.0 {
+                        let y = p[1] + (x - p[0]) / (q[0] - p[0]) * (q[1] - p[1]);
+                        include(side - 1, y);
+                        include(side, y);
+                    }
+                }
+            }
+        }
+    }
+    let length = |span: (f32, f32)| (span.1 - span.0).max(0.0);
+    let [first, second] = &spans;
+    first
+        .iter()
+        .zip(second)
+        .map(|(&a, &b)| length(a) + length(b) - length((a.0.max(b.0), a.1.min(b.1))))
+        .sum::<f32>()
+        * width
+}
+
+/// The final, guaranteed limit on the drawn ribbon: `wave` unchanged if its
+/// [`ribbon_area_bound`] at `aspect` is within [`ribbon_budget`], else the
+/// least reduction that is. Reductions follow one path: blend towards the
+/// outlines' envelope (see `scope::envelope`), so alternating outlines
+/// become steady lines, then scale that towards the centre line, ending at
+/// a flat line, which is always within budget. Bisection along the path
+/// keeps an end known to be within budget, so whatever the input (live,
+/// synthesised, a torn read, any aspect) the result is.
+pub fn limit_ribbon(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> [[f32; POINTS]; OUTLINES] {
+    let budget = ribbon_budget(aspect);
+    if ribbon_area_bound(wave, aspect) <= budget {
+        return *wave;
+    }
+    let (high, low) = envelope(&wave[0], &wave[1]);
+    let along = |position: f32| -> [[f32; POINTS]; OUTLINES] {
+        let (blend, gain) = (position.min(1.0), (2.0 - position).clamp(0.0, 1.0));
+        [(&wave[0], &high), (&wave[1], &low)].map(|(raw, held)| {
+            std::array::from_fn(|index| (raw[index] + (held[index] - raw[index]) * blend) * gain)
+        })
+    };
+    let (mut over, mut within) = (0.0_f32, 2.0_f32);
+    for _ in 0..LIMIT_STEPS {
+        let middle = 0.5 * (over + within);
+        if ribbon_area_bound(&along(middle), aspect) <= budget {
+            within = middle;
+        } else {
+            over = middle;
+        }
+    }
+    along(within)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Burst {
-    born: f32,
+    born: f64,
     serial: u32,
     /// Peak intensity, from the energy at onset.
     strength: f32,
@@ -224,8 +371,10 @@ pub struct MicLayers {
     bursts: [Option<Burst>; MAX_BURSTS],
     serial: u32,
     last_trigger: Option<Trigger>,
-    last_burst: Option<f32>,
-    last_elapsed: Option<f32>,
+    last_burst: Option<f64>,
+    /// Overlay time, in f64 seconds so burst timing stays exact however
+    /// long the renderer runs (f32 seconds step by 125 ms after 12 days).
+    last_elapsed: Option<f64>,
     /// Tests only: every burst at this aspect-space spot instead of a hashed
     /// one, so a single point sees every burst.
     #[cfg(test)]
@@ -271,12 +420,12 @@ impl MicLayers {
         &mut self,
         frame: ControlFrame,
         live: Option<&ScopeSnapshot>,
-        elapsed: f32,
+        elapsed: f64,
         shown: bool,
     ) {
         let previous = self.last_elapsed.unwrap_or(elapsed);
         let now = previous.max(elapsed);
-        let delta = now - previous;
+        let delta = (now - previous) as f32;
         self.last_elapsed = Some(now);
 
         let ribbon = shown && self.mode.scope();
@@ -315,13 +464,13 @@ impl MicLayers {
 
         let hidden = !shown || !self.mode.bursts();
         for slot in &mut self.bursts {
-            if hidden || slot.is_some_and(|burst| now - burst.born >= LIFETIME_S) {
+            if hidden || slot.is_some_and(|burst| now - burst.born >= f64::from(LIFETIME_S)) {
                 *slot = None;
             }
         }
         let rested = self
             .last_burst
-            .is_none_or(|last| now - last >= MIN_BURST_GAP_S);
+            .is_none_or(|last| now - last >= f64::from(MIN_BURST_GAP_S));
         if onset && rested && !hidden {
             let energy = f32::from(frame.energy) / 255.0;
             let [red, green, blue, _] = palette(frame.palette.wrapping_add(2), 1.0, energy);
@@ -337,7 +486,7 @@ impl MicLayers {
                 .bursts
                 .iter_mut()
                 .min_by(|a, b| {
-                    let age = |slot: &&mut Option<Burst>| slot.map_or(f32::MIN, |b| b.born);
+                    let age = |slot: &&mut Option<Burst>| slot.map_or(f64::MIN, |b| b.born);
                     age(a).total_cmp(&age(b))
                 })
                 .expect("MAX_BURSTS > 0");
@@ -358,14 +507,24 @@ impl MicLayers {
     }
 
     fn build_ribbon(&self, frame: ControlFrame, aspect: f32, instances: &mut Vec<Instance>) {
+        // The final, guaranteed limit, on exactly what is drawn.
+        self.push_ribbon(&limit_ribbon(&self.wave, aspect), frame, aspect, instances);
+    }
+
+    /// Draws `wave` as the ribbon, as it is (unlimited).
+    fn push_ribbon(
+        &self,
+        wave: &[[f32; POINTS]; OUTLINES],
+        frame: ControlFrame,
+        aspect: f32,
+        instances: &mut Vec<Instance>,
+    ) {
         let energy = f32::from(frame.energy) / 255.0;
         let brightness = 0.55 + 0.45 * self.level.min(1.0);
-        let point = |outline: &[f32; POINTS], index: usize| {
-            let x = (index as f32 / (POINTS - 1) as f32 * 2.0 - 1.0) * RIBBON_HALF_WIDTH * aspect;
-            [x, RIBBON_Y + outline[index] * RIBBON_AMPLITUDE]
-        };
+        let scale = ribbon_scale(aspect);
         let tint = palette(frame.palette, brightness, energy);
         for (thickness, alpha, pass) in RIBBON_PASSES {
+            let thickness = thickness * scale;
             let (color, overlap) = match pass {
                 Pass::Halo => (
                     [tint[0] * 0.3, tint[1] * 0.3, tint[2] * 0.3, alpha],
@@ -386,18 +545,21 @@ impl MicLayers {
             };
             // Each pass covers both outlines before the next, so a core is
             // never hidden by the other outline's halo.
-            for (outline, index) in self
-                .wave
+            for (outline, index) in wave
                 .iter()
                 .flat_map(|outline| (0..POINTS - 1).map(move |index| (outline, index)))
             {
-                let (a, b) = (point(outline, index), point(outline, index + 1));
-                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let (center, size, rotation) = segment(
+                    ribbon_point(outline, index, aspect),
+                    ribbon_point(outline, index + 1, aspect),
+                    thickness,
+                    overlap,
+                );
                 instances.push(Instance {
-                    center: [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, 0.0],
-                    size: [dx.hypot(dy) + overlap, thickness],
+                    center: [center[0], center[1], 0.0],
+                    size,
                     color,
-                    rotation: dy.atan2(dx),
+                    rotation,
                     scene_mix: 0.0,
                     pattern: [0.0; 2],
                 });
@@ -412,7 +574,7 @@ impl MicLayers {
         let mut bursts: Vec<Burst> = self.bursts.iter().flatten().copied().collect();
         bursts.sort_by(|a, b| a.born.total_cmp(&b.born));
         for burst in bursts {
-            let age = now - burst.born;
+            let age = (now - burst.born) as f32;
             let envelope = burst_envelope(age) * burst.strength;
             if envelope <= 0.0 {
                 continue;
@@ -544,7 +706,7 @@ mod tests {
         let mut layers = MicLayers::new(Mode::Both);
         let mut starts = Vec::new();
         for step in 0..600u32 {
-            let elapsed = step as f32 / FPS;
+            let elapsed = step as f64 / f64::from(FPS);
             // A new onset every frame, far faster than the cap.
             layers.step(quiet(), Some(&snapshot(0.5, step)), elapsed, true);
             if layers.last_burst == Some(elapsed) {
@@ -570,13 +732,18 @@ mod tests {
         let mut layers = MicLayers::new(Mode::Bursts);
         layers.step(quiet(), Some(&snapshot(0.0, 7)), 0.0, true);
         assert_eq!(live_bursts(&layers), 0, "the first count only seeds");
-        layers.step(quiet(), Some(&snapshot(0.0, 7)), 1.0 / FPS, true);
+        layers.step(quiet(), Some(&snapshot(0.0, 7)), 1.0 / f64::from(FPS), true);
         assert_eq!(live_bursts(&layers), 0);
-        layers.step(quiet(), Some(&snapshot(0.0, 8)), 2.0 / FPS, true);
+        layers.step(quiet(), Some(&snapshot(0.0, 8)), 2.0 / f64::from(FPS), true);
         assert_eq!(live_bursts(&layers), 1);
         let mut alpha = Vec::new();
         for step in 3..200 {
-            layers.step(quiet(), Some(&snapshot(0.0, 8)), step as f32 / FPS, true);
+            layers.step(
+                quiet(),
+                Some(&snapshot(0.0, 8)),
+                step as f64 / f64::from(FPS),
+                true,
+            );
             let mut instances = Vec::new();
             layers.build(quiet(), 1.0, &mut instances);
             alpha.push(instances.first().map_or(0.0, |glow| glow.color[3]));
@@ -597,7 +764,7 @@ mod tests {
         };
         // A held frame keeps its beat flag but not a new count: no repeats.
         for step in 0..30 {
-            layers.step(frame(4), None, step as f32 / FPS, true);
+            layers.step(frame(4), None, step as f64 / f64::from(FPS), true);
         }
         assert_eq!(live_bursts(&layers), 0);
         layers.step(frame(5), None, 0.5, true);
@@ -622,7 +789,7 @@ mod tests {
 
         let mut layers = MicLayers::new(Mode::Scope);
         for step in 0..60 {
-            layers.step(frame, None, step as f32 / FPS, true);
+            layers.step(frame, None, step as f64 / f64::from(FPS), true);
         }
         assert!(amplitude(&layers) > 0.1);
         let mut instances = Vec::new();
@@ -640,10 +807,10 @@ mod tests {
     #[test]
     fn silence_decays_the_ribbon_smoothly() {
         let mut layers = MicLayers::new(Mode::Scope);
-        let mut elapsed = 0.0;
+        let mut elapsed = 0.0_f64;
         for _ in 0..60 {
             layers.step(quiet(), Some(&snapshot(0.8, 0)), elapsed, true);
-            elapsed += 1.0 / FPS;
+            elapsed += 1.0 / f64::from(FPS);
         }
         let loud = amplitude(&layers);
         assert!((loud - 0.8).abs() < 0.01, "{loud}");
@@ -651,7 +818,7 @@ mod tests {
         let mut previous_level = layers.level;
         for frame in 0..60 {
             layers.step(quiet(), Some(&snapshot(0.0, 0)), elapsed, true);
-            elapsed += 1.0 / FPS;
+            elapsed += 1.0 / f64::from(FPS);
             let now = amplitude(&layers);
             assert!(now <= previous, "frame {frame}: {now} > {previous}");
             // Eases out: no frame drops more than a third of the remainder.
@@ -664,10 +831,15 @@ mod tests {
         // The no-mic fallback decays the same way when energy drops to 0.
         let mut fallback = MicLayers::new(Mode::Scope);
         for step in 0..60 {
-            fallback.step(ControlFrame::procedural(9), None, step as f32 / FPS, true);
+            fallback.step(
+                ControlFrame::procedural(9),
+                None,
+                step as f64 / f64::from(FPS),
+                true,
+            );
         }
         for step in 60..180 {
-            fallback.step(quiet(), None, step as f32 / FPS, true);
+            fallback.step(quiet(), None, step as f64 / f64::from(FPS), true);
         }
         assert!(amplitude(&fallback) < 1e-4);
     }
@@ -679,7 +851,7 @@ mod tests {
         for (mode, visible) in [(Mode::Off, true), (Mode::Bursts, true), (Mode::Both, false)] {
             let mut layers = MicLayers::new(mode);
             for step in 0..30 {
-                layers.step(frame, None, step as f32 / FPS, visible);
+                layers.step(frame, None, step as f64 / f64::from(FPS), visible);
             }
             assert_eq!(
                 layers.wave, [[0.0; POINTS]; OUTLINES],
@@ -695,7 +867,7 @@ mod tests {
             // Then it eases as usual: one frame towards silence keeps
             // exp(-1 / (60 SMOOTH_S)) of it.
             let shown_at = amplitude(&layers);
-            layers.step(quiet(), None, 0.5 + 1.0 / FPS, true);
+            layers.step(quiet(), None, 0.5 + 1.0 / f64::from(FPS), true);
             let kept = amplitude(&layers) / shown_at;
             let expected = (-1.0 / (FPS * SMOOTH_S)).exp();
             assert!((kept - expected).abs() < 1e-3, "{mode:?}: {kept}");
@@ -752,7 +924,7 @@ mod tests {
         for (mode, visible) in [(Mode::Both, false), (Mode::Off, true), (Mode::Scope, true)] {
             let mut layers = MicLayers::new(mode);
             for step in 0..60u32 {
-                let elapsed = step as f32 / FPS;
+                let elapsed = step as f64 / f64::from(FPS);
                 layers.step(quiet(), Some(&snapshot(0.5, step)), elapsed, visible);
             }
             assert_eq!(live_bursts(&layers), 0, "{mode:?} shown={visible}");
@@ -761,13 +933,18 @@ mod tests {
             let mut instances = Vec::new();
             layers.build(quiet(), 1.0, &mut instances);
             assert!(instances.is_empty(), "{mode:?}: a held count fires nothing");
-            layers.step(quiet(), Some(&snapshot(0.5, 60)), 1.0 + 1.0 / FPS, true);
+            layers.step(
+                quiet(),
+                Some(&snapshot(0.5, 60)),
+                1.0 + 1.0 / f64::from(FPS),
+                true,
+            );
             assert_eq!(live_bursts(&layers), 1, "{mode:?}: the next onset fires");
         }
     }
 
     #[test]
-    fn ribbon_passes_overlap_opaquely_and_keep_their_width_at_any_aspect() {
+    fn ribbon_passes_overlap_opaquely_and_scale_with_the_width_in_portrait() {
         let mut layers = MicLayers::new(Mode::Scope);
         let zigzag = std::array::from_fn(|index| if index % 2 == 0 { -1.0 } else { 1.0 });
         let steep = ScopeSnapshot {
@@ -776,7 +953,7 @@ mod tests {
             onsets: 0,
         };
         for step in 0..120 {
-            layers.step(quiet(), Some(&steep), step as f32 / FPS, true);
+            layers.step(quiet(), Some(&steep), step as f64 / f64::from(FPS), true);
         }
         let segments = POINTS - 1;
         for aspect in [1.0, 16.0 / 9.0, 4.0 / 3.0, 0.5] {
@@ -788,8 +965,10 @@ mod tests {
                 // Overlapping translucent quads would stack into dashes.
                 assert!(alpha >= 0.95, "{kind:?} is too translucent to overlap");
                 let quads = &instances[pass * lines..(pass + 1) * lines];
-                // Every quad keeps the pass thickness in aspect space, which
-                // `transform` maps to the viewport uniformly in x and y.
+                // Every quad keeps the pass thickness in aspect space (scaled
+                // with the width in portrait), which `transform` maps to the
+                // viewport uniformly in x and y.
+                let thickness = thickness * ribbon_scale(aspect);
                 assert!(quads.iter().all(|quad| quad.size[1] == thickness));
                 for pair in quads.chunks(segments).flat_map(|line| line.windows(2)) {
                     let end = |quad: &Instance, sign: f32| {
@@ -898,7 +1077,12 @@ mod tests {
             let (mut frame, live) = input(step);
             frame.beat_count = step as u16;
             let scope = snapshot(0.0, step as u32);
-            layers.step(frame, live.then_some(&scope), step as f32 / fps, true);
+            layers.step(
+                frame,
+                live.then_some(&scope),
+                step as f64 / f64::from(fps),
+                true,
+            );
             let mut instances = Vec::new();
             layers.build(frame, aspect, &mut instances);
             for (point, values) in probes.iter().zip(&mut series) {
@@ -1011,7 +1195,7 @@ mod tests {
             layers.step(
                 quiet(),
                 Some(&snapshot(0.0, 3)),
-                0.1 + MIN_BURST_GAP_S,
+                0.1 + f64::from(MIN_BURST_GAP_S),
                 true,
             );
             assert_eq!(live_bursts(&layers), 1, "{mode:?}: fires after the gap");
@@ -1024,8 +1208,8 @@ mod tests {
     /// dark scenes and a black backing over bright ones. Only the lower half
     /// is sampled, which holds the whole ribbon.
     fn ribbon_area(instances: &[Instance], aspect: f32) -> f32 {
-        const PIXEL: f32 = 0.004;
-        let (columns, rows) = ((2.0 * aspect / PIXEL) as usize, (1.0 / PIXEL) as usize);
+        let cell = 0.004 * ribbon_scale(aspect);
+        let (columns, rows) = ((2.0 * aspect / cell) as usize, (1.0 / cell) as usize);
         let mut covered = vec![false; columns * rows];
         for quad in instances {
             assert_eq!(quad.pattern, [0.0; 2]);
@@ -1033,10 +1217,10 @@ mod tests {
             let (cos, sin) = (quad.rotation.cos(), quad.rotation.sin());
             // The rotated rectangle's bounding box.
             let (half_width, half_height) = (0.5 * quad.size[0], 0.5 * quad.size[1]);
-            let reach_x = cos.abs() * half_width + sin.abs() * half_height + PIXEL;
-            let reach_y = sin.abs() * half_width + cos.abs() * half_height + PIXEL;
-            let column = |x: f32| ((x + aspect) / PIXEL).clamp(0.0, columns as f32) as usize;
-            let row = |y: f32| (-y / PIXEL).clamp(0.0, rows as f32) as usize;
+            let reach_x = cos.abs() * half_width + sin.abs() * half_height + cell;
+            let reach_y = sin.abs() * half_width + cos.abs() * half_height + cell;
+            let column = |x: f32| ((x + aspect) / cell).clamp(0.0, columns as f32) as usize;
+            let row = |y: f32| (-y / cell).clamp(0.0, rows as f32) as usize;
             let (left, right) = (
                 column(quad.center[0] - reach_x),
                 column(quad.center[0] + reach_x),
@@ -1044,8 +1228,8 @@ mod tests {
             let (top, bottom) = (row(quad.center[1] + reach_y), row(quad.center[1] - reach_y));
             for y_index in top..(bottom + 1).min(rows) {
                 for x_index in left..(right + 1).min(columns) {
-                    let x = (x_index as f32 + 0.5) * PIXEL - aspect - quad.center[0];
-                    let y = -(y_index as f32 + 0.5) * PIXEL - quad.center[1];
+                    let x = (x_index as f32 + 0.5) * cell - aspect - quad.center[0];
+                    let y = -(y_index as f32 + 0.5) * cell - quad.center[1];
                     let (along, across) = (x * cos + y * sin, y * cos - x * sin);
                     if along.abs() <= 0.5 * quad.size[0] && across.abs() <= 0.5 * quad.size[1] {
                         covered[y_index * columns + x_index] = true;
@@ -1053,7 +1237,7 @@ mod tests {
                 }
             }
         }
-        covered.iter().filter(|&&pixel| pixel).count() as f32 * PIXEL * PIXEL
+        covered.iter().filter(|&&covered| covered).count() as f32 * cell * cell
     }
 
     const ASPECT: f32 = 16.0 / 9.0;
@@ -1096,7 +1280,12 @@ mod tests {
                 let samples: Vec<f32> = (start..start + per_frame).map(&audio).collect();
                 tap.push(&samples);
                 let snapshot = tap.snapshot(0);
-                layers.step(quiet(), Some(&snapshot), frame as f32 / FPS, true);
+                layers.step(
+                    quiet(),
+                    Some(&snapshot),
+                    frame as f64 / f64::from(FPS),
+                    true,
+                );
                 let published = coverage(&snapshot.upper, &snapshot.lower);
                 match areas {
                     Areas::Every => (published, area(&layers)),
@@ -1190,9 +1379,14 @@ mod tests {
         };
         layers.step(quiet(), Some(&band), 0.0, true);
         let mut instances = Vec::new();
-        layers.build(quiet(), ASPECT, &mut instances);
+        layers.push_ribbon(&layers.wave, quiet(), ASPECT, &mut instances);
         let filled = ribbon_area(&instances, ASPECT);
         assert!(filled > 2.0 * budget, "{filled} vs budget {budget}");
+        // Which the final limiter draws within the cap.
+        instances.clear();
+        layers.build(quiet(), ASPECT, &mut instances);
+        let limited = ribbon_area(&instances, ASPECT);
+        assert!(limited <= AREA_CAP, "{limited} vs cap {AREA_CAP}");
     }
 
     /// Every loud tone from 0.5 to 8 kHz (every 100 Hz, plus those whose
@@ -1248,6 +1442,307 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The pinned thin-line cap at `aspect`: 13% of the screen (`2 * aspect`
+    /// by 2 units), so the limiter's budget cannot quietly grow.
+    fn cap(aspect: f32) -> f32 {
+        0.13 * 4.0 * aspect
+    }
+
+    /// Asserts `wave`, limited at draw time, is within the limiter's own
+    /// budget and rasterises within [`cap`] at `aspect`.
+    fn assert_drawn_within_cap(wave: &[[f32; POINTS]; OUTLINES], aspect: f32, what: &str) {
+        assert!(ribbon_budget(aspect) <= cap(aspect));
+        let limited = limit_ribbon(wave, aspect);
+        let bound = ribbon_area_bound(&limited, aspect);
+        assert!(
+            bound <= ribbon_budget(aspect),
+            "{what} at {aspect}: bound {bound}"
+        );
+        let mut layers = MicLayers::new(Mode::Scope);
+        layers.wave = *wave;
+        let mut instances = Vec::new();
+        layers.build(quiet(), aspect, &mut instances);
+        let area = ribbon_area(&instances, aspect);
+        assert!(
+            area <= cap(aspect),
+            "{what} at {aspect}: area {area}, cap {}",
+            cap(aspect)
+        );
+    }
+
+    /// Publishes `seconds` of `audio` at `rate` through a scope tap, at 60
+    /// fps; returns every snapshot.
+    fn published(rate: f32, seconds: f32, audio: impl Fn(usize) -> f32) -> Vec<ScopeSnapshot> {
+        let mut tap = crate::audio::scope::ScopeTap::new(rate);
+        let per_frame = (rate / FPS) as usize;
+        (0..(seconds * FPS) as usize)
+            .map(|frame| {
+                let start = frame * per_frame;
+                tap.push(&(start..start + per_frame).map(&audio).collect::<Vec<_>>());
+                tap.snapshot(0)
+            })
+            .collect()
+    }
+
+    const PORTRAITS: [f32; 2] = [9.0 / 16.0, 1.0 / 10.0];
+
+    /// A sparse pulse train's full envelope covers more than the scope's
+    /// first pass allows; the drawn ribbon stays within the cap anyway.
+    #[test]
+    fn a_pulse_train_is_drawn_within_the_cap() {
+        use crate::audio::scope::{MAX_COVERAGE, coverage};
+        let pulses = published(48_000.0, 0.3, |n| match n % 80 {
+            0 => -1.0,
+            1 => 1.0,
+            _ => 0.0,
+        });
+        let first_pass = pulses
+            .iter()
+            .map(|snapshot| coverage(&snapshot.upper, &snapshot.lower))
+            .fold(0.0, f32::max);
+        assert!(first_pass > MAX_COVERAGE, "{first_pass}");
+        for snapshot in pulses.iter().skip(5).step_by(4) {
+            for aspect in [ASPECT, PORTRAITS[0]] {
+                assert_drawn_within_cap(&[snapshot.upper, snapshot.lower], aspect, "pulses");
+            }
+        }
+    }
+
+    /// A read racing a publish mixes two snapshots that were each limited
+    /// by the scope's first pass; what is drawn is limited again.
+    #[test]
+    fn a_torn_read_is_drawn_within_the_cap() {
+        let square = |hz: f32| {
+            move |n: usize| {
+                if (n as f32 * hz / 48_000.0).fract() < 0.5 {
+                    0.9
+                } else {
+                    -0.9
+                }
+            }
+        };
+        let last = |hz| *published(48_000.0, 0.3, square(hz)).last().unwrap();
+        let (a, b) = (last(440.0), last(450.0));
+        let tears: [&dyn Fn(usize) -> bool; 3] = [
+            &|index| index < POINTS / 2,
+            &|index| (index / 8).is_multiple_of(2),
+            &|index| index.is_multiple_of(2),
+        ];
+        for tear in tears {
+            let pick = |a: &[f32; POINTS], b: &[f32; POINTS]| -> [f32; POINTS] {
+                std::array::from_fn(|index| if tear(index) { a[index] } else { b[index] })
+            };
+            let torn = [pick(&a.upper, &b.upper), pick(&a.lower, &b.lower)];
+            for aspect in [ASPECT, 1.0, PORTRAITS[0]] {
+                assert_drawn_within_cap(&torn, aspect, "torn");
+            }
+        }
+    }
+
+    /// The synthesised (procedural and UDP) ribbon goes through the same
+    /// final limit: full energy in only the top band is the densest it
+    /// draws.
+    #[test]
+    fn a_synthesised_top_band_is_drawn_within_the_cap() {
+        use crate::audio::scope::{MAX_COVERAGE, coverage};
+        let mut spectrum = [0; 8];
+        spectrum[7] = 255;
+        let frame = ControlFrame {
+            energy: 255,
+            spectrum,
+            ..ControlFrame::procedural(0)
+        };
+        let mut layers = MicLayers::new(Mode::Scope);
+        let mut densest = 0.0_f32;
+        for step in 0..40 {
+            layers.step(frame, None, f64::from(step) / f64::from(FPS), true);
+            densest = densest.max(coverage(&layers.wave[0], &layers.wave[1]));
+            if step % 8 == 7 {
+                for aspect in [ASPECT, PORTRAITS[0], PORTRAITS[1]] {
+                    assert_drawn_within_cap(&layers.wave, aspect, "band 7");
+                }
+            }
+        }
+        // Denser than the scope's first pass lets live input be.
+        assert!(densest > MAX_COVERAGE, "{densest}");
+    }
+
+    /// In portrait the whole ribbon scales with the width, so it keeps the
+    /// thin-line budget as a fraction of the screen: a loud 440 Hz tone
+    /// draws as is, and a filled band is limited within the cap.
+    #[test]
+    fn portrait_ribbons_keep_the_thin_line_budget() {
+        let tone = *published(48_000.0, 0.3, sine(48_000.0, 440.0))
+            .last()
+            .unwrap();
+        let tone = [tone.upper, tone.lower];
+        let zigzag = std::array::from_fn(|index| if index % 2 == 0 { 1.0 } else { -1.0 });
+        for aspect in PORTRAITS {
+            assert_eq!(limit_ribbon(&tone, aspect), tone, "440 Hz at {aspect}");
+            assert_drawn_within_cap(&tone, aspect, "440 Hz");
+            assert_drawn_within_cap(&[zigzag, zigzag], aspect, "zigzag");
+            // A flat line stays a thin line: under 2% of the screen.
+            let flat = ribbon_area_bound(&[[0.0; POINTS]; OUTLINES], aspect);
+            assert!(flat < 0.02 * 4.0 * aspect, "{aspect}: {flat}");
+        }
+    }
+
+    /// The limiter's last resort, a flat line at the centre, is within
+    /// budget at any aspect, so its bisection always ends within budget.
+    #[test]
+    fn a_flat_ribbon_is_within_budget_at_any_aspect() {
+        for aspect in [
+            0.001,
+            0.01,
+            0.1,
+            9.0 / 16.0,
+            1.0,
+            ASPECT,
+            4.0,
+            21.0 / 9.0,
+            100.0,
+        ] {
+            let flat = ribbon_area_bound(&[[0.0; POINTS]; OUTLINES], aspect);
+            assert!(flat <= 0.25 * ribbon_budget(aspect), "{aspect}: {flat}");
+        }
+    }
+
+    /// A loud 440 Hz tone, the reference thin line, is drawn exactly as
+    /// published at 16:9; a loud 6 kHz tone stays visibly loud.
+    #[test]
+    fn the_final_limiter_keeps_slow_tones_and_loud_high_tones() {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            for snapshot in published(rate, 0.3, sine(rate, 440.0)).iter().skip(5) {
+                let wave = [snapshot.upper, snapshot.lower];
+                assert_eq!(limit_ribbon(&wave, ASPECT), wave, "440 Hz at {rate}");
+            }
+        }
+        let snapshot = *published(48_000.0, 0.3, |n| {
+            (std::f32::consts::TAU * 6_000.0 * n as f32 / 48_000.0).sin()
+        })
+        .last()
+        .unwrap();
+        let [upper, lower] = limit_ribbon(&[snapshot.upper, snapshot.lower], ASPECT);
+        let middle = POINTS / 4..3 * POINTS / 4;
+        assert!(upper[middle.clone()].iter().all(|&value| value >= 0.5));
+        assert!(lower[middle].iter().all(|&value| value <= -0.5));
+    }
+
+    /// A thousand seeded random and adversarial outline pairs (noise,
+    /// zigzags, pulses, extremes, walks, tones and crossed outlines) at
+    /// several aspects all draw within the budget after the final limit;
+    /// some are rasterised against the cap too.
+    #[test]
+    fn the_final_limiter_holds_for_any_outlines() {
+        let mut seed = 0x6d69_635f_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            hash(seed)
+        };
+        let aspects = [0.1, 9.0 / 16.0, 1.0, ASPECT, 3.0];
+        for case in 0..1_000 {
+            let kind = case % 7;
+            let (a, b, c) = (next(), next(), next());
+            let period = 2 + (a * 6.0) as usize;
+            let mut walk = 0.0_f32;
+            let mut outline = |offset: f32| -> [f32; POINTS] {
+                std::array::from_fn(|index| match kind {
+                    0 => next() * 2.0 - 1.0,
+                    1 => {
+                        if (index / period.div_ceil(2)).is_multiple_of(2) {
+                            b
+                        } else {
+                            -c
+                        }
+                    }
+                    2 => {
+                        if (index % (period * 7)) < 1 + (c * 3.0) as usize {
+                            b * 2.0 - 1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    3 => {
+                        if next() < 0.5 {
+                            -1.0
+                        } else {
+                            1.0
+                        }
+                    }
+                    4 => {
+                        walk = (walk + (next() - 0.5) * 0.6).clamp(-1.0, 1.0);
+                        walk
+                    }
+                    5 => {
+                        let cycles = index as f32 * (0.02 + a * 0.6);
+                        b * (std::f32::consts::TAU * cycles + offset).sin()
+                    }
+                    _ => {
+                        if index.is_multiple_of(2) {
+                            offset.signum()
+                        } else {
+                            -offset.signum()
+                        }
+                    }
+                })
+            };
+            let wave = [outline(1.0), outline(-1.0)];
+            let aspect = aspects[case % aspects.len()];
+            let limited = limit_ribbon(&wave, aspect);
+            let bound = ribbon_area_bound(&limited, aspect);
+            assert!(
+                bound <= ribbon_budget(aspect),
+                "case {case} at {aspect}: {bound}"
+            );
+            if case % 40 == 0 {
+                assert_drawn_within_cap(&wave, aspect, &format!("case {case}"));
+            }
+        }
+    }
+
+    /// Overlay time is f64: after 30 days a burst's attack still advances
+    /// frame by frame (f32 seconds would step by 250 ms), and the start-rate
+    /// cap still holds.
+    #[test]
+    fn burst_timing_stays_exact_after_thirty_days() {
+        let start = 30.0 * 86_400.0;
+        let mut layers = MicLayers::new(Mode::Bursts);
+        let mut starts = Vec::new();
+        let mut previous: Option<(u32, f32)> = None;
+        for step in 0..600u32 {
+            let elapsed = start + f64::from(step) / f64::from(FPS);
+            layers.step(quiet(), Some(&snapshot(0.5, step)), elapsed, true);
+            if layers.last_burst == Some(elapsed) {
+                starts.push(elapsed);
+            }
+            let newest = layers
+                .bursts
+                .iter()
+                .flatten()
+                .max_by(|a, b| a.born.total_cmp(&b.born))
+                .copied();
+            if let Some(burst) = newest {
+                let age = (elapsed - burst.born) as f32;
+                let frames = ((elapsed - burst.born) * f64::from(FPS)).round();
+                assert!((age - frames as f32 / FPS).abs() < 1e-4, "{age}");
+                let envelope = burst_envelope(age);
+                if let Some((serial, before)) = previous
+                    && serial == burst.serial
+                {
+                    assert!((envelope - before).abs() < 0.45, "{before} -> {envelope}");
+                }
+                previous = Some((burst.serial, envelope));
+            }
+        }
+        for pair in starts.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= f64::from(MIN_BURST_GAP_S) - 1e-6,
+                "{pair:?}"
+            );
+        }
+        assert!(starts.len() >= 18, "{}", starts.len());
     }
 
     fn max_area(areas: &[f32]) -> f32 {

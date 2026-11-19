@@ -184,7 +184,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let elapsed = start.elapsed().as_secs_f32();
+                let elapsed = start.elapsed().as_secs_f64();
                 let frame = frame_source.next_frame();
                 // The colour field sees each received or generated frame once;
                 // held redraws only repeat its last step.

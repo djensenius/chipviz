@@ -291,11 +291,14 @@ impl ScenePipeline {
 
     /// Steps camera smoothing, the colour field and the mic layers for a
     /// frame that is not drawn.
-    pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
+    ///
+    /// `elapsed` is f64 seconds: the mic layers time bursts with it exactly
+    /// however long the renderer runs; scenes take it as f32.
+    pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, aspect: f32) {
         self.observe(&frame);
         let (frame, display) = self.dispatch(frame);
         self.camera
-            .build_uniforms(&self.profile, frame, elapsed, aspect);
+            .build_uniforms(&self.profile, frame, elapsed as f32, aspect);
         let shown = mic_layers::shown(self.mic_layers.mode(), display);
         self.mic_layers
             .step(frame, self.live_scope.as_ref(), elapsed, shown);
@@ -367,7 +370,7 @@ impl ScenePipeline {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         frame: ControlFrame,
-        elapsed: f32,
+        elapsed: f64,
         size: (u32, u32),
     ) {
         self.encode_frame(encoder, view, frame, elapsed, size, true);
@@ -381,7 +384,7 @@ impl ScenePipeline {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         frame: ControlFrame,
-        elapsed: f32,
+        elapsed: f64,
         size: (u32, u32),
     ) {
         self.encode_frame(encoder, view, frame, elapsed, size, false);
@@ -392,10 +395,12 @@ impl ScenePipeline {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         frame: ControlFrame,
-        elapsed: f32,
+        elapsed: f64,
         size: (u32, u32),
         mic_layers: bool,
     ) {
+        let overlay_elapsed = elapsed;
+        let elapsed = elapsed as f32;
         let (width, height) = size;
         let aspect = width as f32 / height.max(1) as f32;
         let (frame, display) = self.dispatch(frame);
@@ -422,7 +427,7 @@ impl ScenePipeline {
         if mic_layers {
             let shown = mic_layers::shown(self.mic_layers.mode(), display);
             self.mic_layers
-                .step(frame, self.live_scope.as_ref(), elapsed, shown);
+                .step(frame, self.live_scope.as_ref(), overlay_elapsed, shown);
             if shown {
                 self.mic_layers.build(frame, aspect, &mut overlay);
             }
@@ -574,7 +579,7 @@ impl Renderer {
 
     /// Draws `frame`. The caller feeds new frames to the colour field with
     /// [`ScenePipeline::observe`] first, so held redraws repeat its last step.
-    pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<(), RendererError> {
+    pub fn render(&mut self, frame: ControlFrame, elapsed: f64) -> Result<(), RendererError> {
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -653,7 +658,7 @@ impl OffscreenRenderer {
     /// its scene and colour-field state stay those of the earlier frame;
     /// give each frame a distinct counter (or call
     /// [`ScenePipeline::reset_state`]) when rendering unrelated frames.
-    pub fn render(&mut self, frame: ControlFrame, elapsed: f32) -> Result<Vec<u8>, RendererError> {
+    pub fn render(&mut self, frame: ControlFrame, elapsed: f64) -> Result<Vec<u8>, RendererError> {
         self.pipeline.observe(&frame);
         let size = (self.width, self.height);
         self.render_with(|pipeline, encoder, view| {

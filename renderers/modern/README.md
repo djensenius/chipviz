@@ -162,7 +162,13 @@ change the control-frame wire format.
   few kHz draws as two near-flat lines at its peaks. Tones in between keep
   their waveform until the lines would cover more height than a loud 440 Hz
   tone, then blend just enough to stay within that. It is peak-normalised
-  with a floor so room hiss stays flat, and silence flattens it smoothly. Each line is drawn in
+  with a floor so room hiss stays flat, and silence flattens it smoothly.
+  Whatever its source (live, procedural or UDP), the ribbon is limited once
+  more just before drawing: if the drawn lines, strokes included, would cover
+  more than 13% of the screen, they blend towards their envelope and then
+  shrink towards a flat centre line until they fit. A loud 440 Hz tone is
+  drawn unchanged. In portrait windows the whole ribbon (amplitude and stroke
+  widths as well as length) scales with the width. Each line is drawn in
   three near-opaque layers: a dimmed palette-tinted halo, a black backing
   inside it, and a near-white tinted core, which keep it readable over scenes
   of the same colour.
@@ -193,7 +199,12 @@ rasterise the ribbon for a loud 4 kHz tone and white noise gated at 3, 5 and
 10 Hz, and for loud tones every 100 Hz from 0.5 to 8 kHz (plus those that
 divide the point spacing) at 44.1, 48 and 96 kHz, steady and gated. They check
 that it never draws more area than a steady full-scale 440 Hz ribbon, nor more
-than 13% of the screen. Measure the actual display before relying on this for
+than 13% of the screen. Further tests pass a sparse pulse train, mixed
+snapshots (a read racing a publish), the densest synthesised ribbon, portrait
+windows (9:16 and 1:10) and a thousand seeded random outlines through the
+final limit, and check each stays within 13% of the screen. Overlay timing is
+kept in f64 seconds, so burst timing and the 0.5 s cap hold however long the
+renderer runs (a test checks after 30 days). Measure the actual display before relying on this for
 a photosensitive audience.
 
 ```sh
