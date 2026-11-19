@@ -2,16 +2,20 @@
 //!
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
 //! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
-//! with the current five entries scene 0/5/10... is SignalField, 1/6/11... is
-//! SpectrumVolume, 2/7/12... is PulseTunnel, 3/8/13... is Lines and
-//! 4/9/14... is Static. Adding a scene is one new module plus one `REGISTRY`
-//! entry. Appending keeps every index below the old length on the same scene;
-//! wrapped indices (>= length) move with the new length. Adding Lines shifted
-//! bytes 3, 4 and 5 to Lines, SignalField and SpectrumVolume; adding Static
-//! shifted bytes 4..7 (formerly SignalField, SpectrumVolume, PulseTunnel and
-//! Lines) to Static, SignalField, SpectrumVolume and PulseTunnel.
+//! with the current six entries scene 0/6/12... is SignalField, 1/7/13... is
+//! SpectrumVolume, 2/8/14... is PulseTunnel, 3/9/15... is Lines, 4/10/16...
+//! is Static and 5/11/17... is Object. Adding a scene is one new module plus
+//! one `REGISTRY` entry. Appending keeps every index below the old length on
+//! the same scene; wrapped indices (>= length) move with the new length.
+//! Adding Lines shifted bytes 3, 4 and 5 to Lines, SignalField and
+//! SpectrumVolume; adding Static shifted bytes 4..7 (formerly SignalField,
+//! SpectrumVolume, PulseTunnel and Lines) to Static, SignalField,
+//! SpectrumVolume and PulseTunnel; adding Object shifted bytes 5..9 (formerly
+//! SignalField, SpectrumVolume, PulseTunnel, Lines and Static) to Object,
+//! SignalField, SpectrumVolume, PulseTunnel and Lines.
 
 mod lines;
+mod object;
 mod pulse_tunnel;
 #[cfg(test)]
 mod reference;
@@ -52,6 +56,7 @@ pub const REGISTRY: &[SceneEntry] = &[
     pulse_tunnel::ENTRY,
     lines::ENTRY,
     static_noise::ENTRY,
+    object::ENTRY,
 ];
 
 pub fn select(scene: u8) -> &'static SceneEntry {
@@ -148,18 +153,18 @@ mod tests {
                 "PulseTunnel",
                 "Lines",
                 "Static",
+                "Object",
                 "SignalField",
                 "SpectrumVolume",
                 "PulseTunnel",
                 "Lines",
-                "Static",
             ]
         );
         assert_eq!(select(255).name, REGISTRY[255 % REGISTRY.len()].name);
         let cameras: Vec<_> = REGISTRY.iter().map(|entry| entry.camera).collect();
         let orbit = CameraMode::Orbit3D;
         let flat = CameraMode::ScreenSpace;
-        assert_eq!(cameras, [orbit, orbit, orbit, flat, flat]);
+        assert_eq!(cameras, [orbit, orbit, orbit, flat, flat, flat]);
     }
 
     #[test]

@@ -60,11 +60,12 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
-| 0, 5, 10, ... | `SignalField` | `Orbit3D` |
-| 1, 6, 11, ... | `SpectrumVolume` | `Orbit3D` |
-| 2, 7, 12, ... | `PulseTunnel` | `Orbit3D` |
-| 3, 8, 13, ... | `Lines` | `ScreenSpace` |
-| 4, 9, 14, ... | `Static` | `ScreenSpace` |
+| 0, 6, 12, ... | `SignalField` | `Orbit3D` |
+| 1, 7, 13, ... | `SpectrumVolume` | `Orbit3D` |
+| 2, 8, 14, ... | `PulseTunnel` | `Orbit3D` |
+| 3, 9, 15, ... | `Lines` | `ScreenSpace` |
+| 4, 10, 16, ... | `Static` | `ScreenSpace` |
+| 5, 11, 17, ... | `Object` | `ScreenSpace` |
 
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
@@ -111,6 +112,33 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
   characters it lacks (CJK, emoji) render as glyph-like noise. One quad draws
   each cell, so glyph density is limited by the instance budget (about 208x78
   cells on `m1`, 104x39 on `pi5`). Sections are frame-timed, not beat-synced.
+- `Object`: an object in space, presented like a 1980s/90s infomercial or
+  camcorder tape. Six original procedural models (a CRT television, a VHS
+  tape, a CD with a rainbow sheen, a sunglasses-wearing sun, a tree and a
+  beige desktop computer) are built in code from boxes, cylinders and spheres
+  sampled into lit, back-face-culled splats; no downloaded assets are used.
+  Every 512 control frames the object spins in, swings back and forth on a
+  turntable around a three-quarter front view (the CD and sun rock instead),
+  and spins out. Sections cycle the object (6),
+  the background (5: procedural starfield, lava goop, a vaporwave sunset over
+  a grid floor, a rainbow sweep, and a chroma-key colour field), the palette
+  morph (3: a hue swing, a rainbow sweep, or a hue jump every beat; glowing
+  screens and the sun keep their colours) and the overlay (2: camcorder
+  scanlines, rolling tracking noise, tearing, "REC" and a date stamp, or an
+  infomercial caption banner, taglines and a spinning "NEW!" burst), so all
+  30 object/background pairs appear within 30 sections. Beats punch the zoom
+  and drive the screens and spectrum; the drop flag, every eighth beat and
+  each reveal fire a lens flare and sparkles. Flash safety: beat effects only
+  touch the object, the flare and small sparkles; the chroma-key field cuts
+  between hues of equal luminance at most every 32 frames, so there are no
+  full-screen brightness flips. The mesh step coarsens to fit the instance budget
+  (at most about 15,000 object splats on `m1` and 3,500 on `pi5`), and the object is projected on
+  the CPU, so the scene uses `ScreenSpace`. Text reuses Static's 5x8 font.
+  Procedural input never selects it; use `--scene 5` (frames 200, 712, 1224,
+  1736, 2248 and 2760 show each object; 48 past a section start is the
+  reveal flare).
+  Limitations: sections are frame-timed, not beat-synced; there is no depth
+  buffer, so splats are sorted far to near on the CPU.
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
 mode, and append that entry to `REGISTRY`. Appending keeps every byte below the
@@ -120,6 +148,8 @@ scene shifted them: bytes 3, 4 and 5 (formerly `SignalField`, `SpectrumVolume`
 and `PulseTunnel`) now select `Lines`, `SignalField` and `SpectrumVolume`.
 Appending `Static` as the fifth scene shifted bytes 4 to 7 the same way: they
 now select `Static`, `SignalField`, `SpectrumVolume` and `PulseTunnel`.
+Appending `Object` as the sixth scene shifted bytes 5 to 9: they now select
+`Object`, `SignalField`, `SpectrumVolume`, `PulseTunnel` and `Lines`.
 `Orbit3D` scenes use world coordinates and the smoothed orbit camera.
 `ScreenSpace` scenes draw flat: `center.xy` is NDC (`-1..1` spans the viewport,
 `+y` up), depth is ignored, and instances draw in order with their colour
@@ -127,8 +157,10 @@ unchanged (no quad-edge darkening or beat/energy pulse). Builders receive the
 viewport aspect (width / height) for laying out screen-space fields.
 A `ScreenSpace` instance's `pattern` is `[0, 0]` for a solid quad; positive
 values carry a 5x8 glyph bitmap (bits 0 to 19 and 20 to 39) whose unlit pixels
-are discarded, and a negative `pattern.x` asks for per-pixel noise (see
-`src/scenes/static_noise/mod.rs`).
+are discarded, a negative `pattern.x` asks for per-pixel noise (see
+`src/scenes/static_noise/mod.rs`), and `[0, -(1 + shape)]` draws one of
+Object's shapes: 0 an antialiased disc, 1 a soft glow, 2 a four-pointed
+sparkle, 3 scanlines (see `src/scenes/object/mod.rs`).
 
 The Pi 5 profile favors crisp geometry and predictable frame pacing. The M1
 profile favors density, deeper Z spacing, and more aggressive camera motion.

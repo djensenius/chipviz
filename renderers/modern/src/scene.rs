@@ -30,10 +30,12 @@ pub struct Instance {
     pub color: [f32; 4],
     pub rotation: f32,
     pub scene_mix: f32,
-    /// ScreenSpace fill pattern; `[0, 0]` (every scene but Static) is a solid
+    /// ScreenSpace fill pattern; `[0, 0]` (the default) is a solid
     /// quad. Positive values are a 5x8 glyph bitmap (rows 0..3 in `[0]`,
     /// rows 4..7 in `[1]`, 5 bits per row, bit 0 = top-left); a negative `[0]`
     /// is per-pixel noise. See `scenes::static_noise` and `shader.wgsl`.
+    /// `[0, negative]` is an Object shape (disc, glow, sparkle, scanlines);
+    /// see `scenes::object`.
     pub pattern: [f32; 2],
 }
 

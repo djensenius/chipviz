@@ -28,7 +28,7 @@
 //! a full turn (passing behind the plane, where text reads mirrored); the
 //! scene projects cell centres on the CPU as Lines does.
 
-mod font;
+pub(super) mod font;
 mod text;
 
 use super::{CameraMode, SceneEntry, palette};

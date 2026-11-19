@@ -106,10 +106,40 @@ fn pixel_noise(pixel: vec2<f32>, color: vec4<f32>, pattern: vec2<f32>) -> vec4<f
   return vec4<f32>(color.rgb, color.a * level);
 }
 
+// Object shapes: pattern = (0, -(1 + shape)). Coverage of the quad at
+// `local` (-0.5..0.5): 0 disc (antialiased by `aa`), 1 soft glow, 2
+// four-point sparkle, 3 scanlines (rows 0 and 1 of every 4 pixels). Keep in
+// sync with `Shape` in scenes/object/mod.rs.
+fn shape_alpha(local: vec2<f32>, pixel: vec2<f32>, shape: f32, aa: f32) -> f32 {
+  let r = length(local);
+  if (shape < 0.5) {
+    return clamp((0.5 - r) / aa + 0.5, 0.0, 1.0);
+  }
+  if (shape < 1.5) {
+    let fall = clamp(1.0 - 2.0 * r, 0.0, 1.0);
+    return fall * fall;
+  }
+  if (shape < 2.5) {
+    let a = abs(local) * 2.0;
+    let along_x = (1.0 - a.x) * clamp(1.0 - a.y / max(0.14 * (1.0 - a.x), 0.001), 0.0, 1.0);
+    let along_y = (1.0 - a.y) * clamp(1.0 - a.x / max(0.14 * (1.0 - a.y), 0.001), 0.0, 1.0);
+    let core = clamp(1.0 - 4.0 * r, 0.0, 1.0);
+    return clamp(max(max(along_x, along_y), core * core), 0.0, 1.0);
+  }
+  return select(0.0, 1.0, fract(pixel.y * 0.25) < 0.5);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+  // Derivatives must be taken in uniform control flow, before any branch.
+  let aa = max(fwidth(length(input.local)), 0.0001);
   // Flat screen-space fields must tile without seams or global pulsing.
   if (uniforms.screen_space > 0.5) {
+    if (input.pattern.y < -0.5) {
+      let shape = -input.pattern.y - 1.0;
+      let alpha = shape_alpha(input.local, input.position.xy, shape, aa);
+      return vec4<f32>(input.color.rgb, input.color.a * alpha);
+    }
     if (input.pattern.x < -0.5) {
       return pixel_noise(input.position.xy, input.color, input.pattern);
     }
