@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "joybus_link.h"
 #include "visual_math.h"
 
 typedef struct {
@@ -75,8 +76,9 @@ static void decode_transport_packet(const uint8_t packet[16], visual_state_t *st
   }
 }
 
-static bool read_joybus_packet(uint8_t packet[16]) {
-  bool has_controller = false;
+/* Returns a mask with bit p set when controller port p+1 is connected. */
+static unsigned read_joybus_packet(uint8_t packet[16]) {
+  unsigned connected_mask = 0;
 
   joypad_poll();
   for (int p = 0; p < 4; p++) {
@@ -93,24 +95,27 @@ static bool read_joybus_packet(uint8_t packet[16]) {
     buttons_a |= inputs.btn.d_down ? 0x04 : 0;
     buttons_a |= inputs.btn.d_left ? 0x02 : 0;
     buttons_a |= inputs.btn.d_right ? 0x01 : 0;
-    if (p == 3) {
-      buttons_b |= inputs.btn.l ? 0x20 : 0;
-      buttons_b |= inputs.btn.r ? 0x10 : 0;
-      buttons_b |= inputs.btn.c_up ? 0x08 : 0;
-      buttons_b |= inputs.btn.c_down ? 0x04 : 0;
-      buttons_b |= inputs.btn.c_left ? 0x02 : 0;
-      buttons_b |= inputs.btn.c_right ? 0x01 : 0;
-    }
+    /* Buttons-low on every port: ports 1..3 carry the v1 frame marker. */
+    buttons_b |= inputs.btn.l ? 0x20 : 0;
+    buttons_b |= inputs.btn.r ? 0x10 : 0;
+    buttons_b |= inputs.btn.c_up ? 0x08 : 0;
+    buttons_b |= inputs.btn.c_down ? 0x04 : 0;
+    buttons_b |= inputs.btn.c_left ? 0x02 : 0;
+    buttons_b |= inputs.btn.c_right ? 0x01 : 0;
 
     packet[p * 4 + 0] = buttons_a;
     packet[p * 4 + 1] = buttons_b;
     packet[p * 4 + 2] = (uint8_t)inputs.stick_x;
     packet[p * 4 + 3] = (uint8_t)inputs.stick_y;
-    if (joypad_is_connected(port)) {
-      has_controller = true;
+    /* joypad_is_connected() only refreshes on libdragon's ~1 s identify poll;
+     * the style is cleared by the very next failed controller read. The Pico
+     * identifies as a standard N64 pad (05 00 02).
+     */
+    if (joypad_is_connected(port) && joypad_get_style(port) == JOYPAD_STYLE_N64) {
+      connected_mask |= 1u << p;
     }
   }
-  return has_controller;
+  return connected_mask;
 }
 
 static void procedural_packet(int frame, uint8_t packet[16]) {
@@ -209,6 +214,9 @@ static void draw_status_strips(int frame, const visual_state_t *state) {
 
 int main(void) {
   int frame = 0;
+  joybus_link_t link;
+
+  joybus_link_init(&link);
 
   debug_init_emulog();
   debug_init_usblog();
@@ -222,8 +230,13 @@ int main(void) {
     visual_state_t state;
     surface_t *disp = display_get();
 
-    if (frame < 30 || !read_joybus_packet(packet)) {
+    bool connected = joybus_link_ports_ready(read_joybus_packet(packet));
+    joybus_link_mode_t mode = joybus_link_step(&link, connected, packet);
+
+    if (frame < 30 || mode == JOYBUS_LINK_PROCEDURAL) {
       procedural_packet(frame, packet);
+    } else if (mode == JOYBUS_LINK_HOLD) {
+      memcpy(packet, link.held, sizeof(packet));
     }
     decode_transport_packet(packet, &state);
 

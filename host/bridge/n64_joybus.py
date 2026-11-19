@@ -12,6 +12,14 @@ from chipviz_bridge import MAGIC, VERSION, WIRE_SIZE, checksum
 
 
 JOYBUS_SIZE = 16
+# Transport v1 marker in buttons-low bytes 1, 5 and 9. libdragon drops bits
+# 0x80/0x40 of buttons-low, so only six bits per byte reach the ROM.
+JOYBUS_MARKER_MASK = 0x3F
+JOYBUS_MARKER_MAGIC = 0x2D
+JOYBUS_MARKER_SEED = 0xA5
+JOYBUS_MAGIC_BYTE = 1
+JOYBUS_SEQUENCE_BYTE = 5
+JOYBUS_CHECKSUM_BYTE = 9
 
 
 @dataclass(frozen=True)
@@ -49,7 +57,35 @@ def decode_control_frame(wire: bytes) -> DecodedFrame:
   )
 
 
-def pack_joybus_frame(frame: DecodedFrame) -> bytes:
+def joybus_marker_checksum(packet: bytes) -> int:
+  """Rotate-left XOR over all bytes except byte 9, folded to six bits."""
+  if len(packet) != JOYBUS_SIZE:
+    raise ValueError(f"Joybus packet must be {JOYBUS_SIZE} bytes")
+  value = JOYBUS_MARKER_SEED
+  for index, byte in enumerate(packet):
+    if index == JOYBUS_CHECKSUM_BYTE:
+      continue
+    value = (((value << 1) | (value >> 7)) & 0xFF) ^ byte
+  return (value ^ (value >> 6)) & JOYBUS_MARKER_MASK
+
+
+def joybus_marker_valid(packet: bytes) -> bool:
+  return (
+    len(packet) == JOYBUS_SIZE
+    and packet[JOYBUS_MAGIC_BYTE] == JOYBUS_MARKER_MAGIC
+    and packet[JOYBUS_SEQUENCE_BYTE] & ~JOYBUS_MARKER_MASK == 0
+    and packet[JOYBUS_CHECKSUM_BYTE] == joybus_marker_checksum(packet)
+  )
+
+
+def apply_joybus_marker(packet: bytearray, sequence: int) -> None:
+  packet[JOYBUS_MAGIC_BYTE] = JOYBUS_MARKER_MAGIC
+  packet[JOYBUS_SEQUENCE_BYTE] = sequence & JOYBUS_MARKER_MASK
+  packet[JOYBUS_CHECKSUM_BYTE] = joybus_marker_checksum(bytes(packet))
+
+
+def pack_joybus_frame(frame: DecodedFrame, sequence: int) -> bytes:
+  """Pack one Joybus packet; `sequence` must advance once per emitted packet."""
   midi_intensity = max(frame.note_velocities, default=0)
   packet = bytearray(JOYBUS_SIZE)
   packet[0] = ((frame.flags & 0x01) << 7) | (1 if frame.spectrum[0] > 127 else 0) | (2 if frame.spectrum[1] > 127 else 0)
@@ -65,15 +101,17 @@ def pack_joybus_frame(frame: DecodedFrame) -> bytes:
   packet[13] = ((frame.scene & 0x0C) << 2) | (frame.palette & 0x0F)
   packet[14] = frame.energy
   packet[15] = midi_intensity
+  apply_joybus_marker(packet, sequence)
   return bytes(packet)
 
 
-def convert_stream(stream: bytes) -> bytes:
+def convert_stream(stream: bytes, first_sequence: int = 0) -> bytes:
+  """Pack each record; the marker sequence is `first_sequence` + packet index."""
   if len(stream) % WIRE_SIZE != 0:
     raise ValueError("control-frame stream is not aligned to 33-byte records")
   return b"".join(
-    pack_joybus_frame(decode_control_frame(stream[offset:offset + WIRE_SIZE]))
-    for offset in range(0, len(stream), WIRE_SIZE)
+    pack_joybus_frame(decode_control_frame(stream[offset:offset + WIRE_SIZE]), first_sequence + index)
+    for index, offset in enumerate(range(0, len(stream), WIRE_SIZE))
   )
 
 

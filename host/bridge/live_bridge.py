@@ -13,7 +13,7 @@ from pathlib import Path
 
 from chipviz_bridge import ControlFrame, Note, WIRE_SIZE, clamp_byte, make_procedural_frame, pack_frame, parse_udp_endpoint
 from chipsynth_stream import encode_event_log
-from n64_joybus import convert_stream
+from n64_joybus import JOYBUS_MARKER_MASK, JOYBUS_SIZE, convert_stream
 
 
 DEFAULT_AUDIO_RATE = 48000
@@ -224,9 +224,14 @@ class N64SerialSink:
   def __init__(self, device: str, baud: int) -> None:
     serial_module = require_module("serial", "pyserial")
     self._port = serial_module.Serial(device, baudrate=baud, timeout=1)
+    self._sequence = 0
 
   def send(self, frame: bytes) -> None:
-    self._port.write(convert_stream(frame))
+    # Own per-packet marker sequence: advances even if the source repeats or
+    # stalls its control-frame counter.
+    packets = convert_stream(frame, self._sequence)
+    self._sequence = (self._sequence + len(packets) // JOYBUS_SIZE) & JOYBUS_MARKER_MASK
+    self._port.write(packets)
     self._port.flush()
 
   def close(self) -> None:
