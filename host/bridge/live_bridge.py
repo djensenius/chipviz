@@ -9,7 +9,7 @@ import contextlib
 import importlib
 import socket
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 
 from chipviz_bridge import (
@@ -158,25 +158,28 @@ class SceneDebounce:
   exit. Changes between other scenes are sent at once.
 
   Each frame at ``rate`` frames per second is one ``begin`` (which returns the
-  scene to send) and one ``end`` (told whether every output transmitted it).
-  Both minimums must hold: 30 (20 for ``SCENE_CUT_MIN``) transmitted frames,
-  since targets count one step per received frame, and at least 500 ms, so
-  above 60 Hz the source frame counts scale up (60 frames at 120 Hz). The
-  60 fps cap can drop scene-7 frames, so a scene-7 exit at ``--rate 90`` waits
-  for 30 transmitted frames, not just 45 source frames. ``step`` is ``begin``
-  then ``end`` for a frame that was transmitted.
+  scene to send) and one ``end`` (told which outputs transmitted it). Both
+  minimums must hold: every output has transmitted at least 30 (20 for
+  ``SCENE_CUT_MIN``) frames, since targets count one step per received frame,
+  and at least 500 ms has passed, so above 60 Hz the source frame counts scale
+  up (60 frames at 120 Hz). Each output is counted separately: outputs whose
+  60 fps caps pass different frames still each reach 30. The cap can drop
+  scene-7 frames, so a scene-7 exit at ``--rate 90`` waits for 30 transmitted
+  frames, not just 45 source frames. ``step`` is ``begin`` then ``end`` for a
+  frame transmitted on its one output.
   """
 
   def __init__(self, scene: int = 0, rate: int = DEFAULT_FPS) -> None:
     self.scene = scene
     self._candidate = scene
     self._frames = 0
-    self._sent = 0
+    self._sent: list[int] = []
     scale = max(rate, DEFAULT_FPS)
     self._stable = -(-SCENE_P_STABLE * scale // DEFAULT_FPS)
     self._cut_min = -(-SCENE_CUT_MIN * scale // DEFAULT_FPS)
     self._since_cut = self._cut_min
-    self._sent_since_cut = SCENE_CUT_MIN
+    self._sent_since_cut: list[int] = []
+    self._cut = False
 
   def begin(self, raw: int) -> int:
     """Start one frame with the raw scene value; return the scene to send."""
@@ -185,27 +188,38 @@ class SceneDebounce:
     else:
       self._candidate = raw
       self._frames = 1
-      self._sent = 0
+      self._sent = [0] * len(self._sent)
     self._since_cut += 1
     if (raw == COLOUR_FIELD_SCENE) == (self.scene == COLOUR_FIELD_SCENE):
       self.scene = raw
     return self.scene
 
-  def end(self, transmitted: bool = True) -> None:
-    """Finish the frame; a pending scene-7 change takes effect from the next."""
-    if transmitted:
-      self._sent += 1
-      self._sent_since_cut += 1
+  def end(self, transmitted: bool | Sequence[bool] = True) -> None:
+    """Finish the frame; a pending scene-7 change takes effect from the next.
+
+    ``transmitted`` holds one flag per output (a single bool means one output).
+    """
+    if isinstance(transmitted, bool):
+      transmitted = [transmitted]
+    transmitted = list(transmitted) or [True]
+    while len(self._sent) < len(transmitted):
+      self._sent.append(0)
+      self._sent_since_cut.append(0 if self._cut else SCENE_CUT_MIN)
+    for output, sent in enumerate(transmitted):
+      if sent:
+        self._sent[output] += 1
+        self._sent_since_cut[output] += 1
     if (
       (self._candidate == COLOUR_FIELD_SCENE) != (self.scene == COLOUR_FIELD_SCENE)
       and self._frames >= self._stable
-      and self._sent >= SCENE_P_STABLE
+      and min(self._sent) >= SCENE_P_STABLE
       and self._since_cut >= self._cut_min
-      and self._sent_since_cut >= SCENE_CUT_MIN
+      and min(self._sent_since_cut) >= SCENE_CUT_MIN
     ):
       self.scene = self._candidate
       self._since_cut = 0
-      self._sent_since_cut = 0
+      self._sent_since_cut = [0] * len(self._sent_since_cut)
+      self._cut = True
 
   def step(self, raw: int) -> int:
     """Advance one transmitted frame; return the scene to send."""
@@ -395,12 +409,13 @@ def iter_midi_frames(
   port_name: str | None,
   frame_count: int,
   fps: int,
-  transmitted: Callable[[], bool] | None = None,
+  transmitted: Callable[[], Sequence[bool]] | None = None,
 ) -> Iterator[bytes]:
   """Yield control frames captured from a MIDI port at real-time cadence.
 
-  ``transmitted`` is asked, once the consumer has sent a frame, whether every
-  output transmitted it; the CC1 debounce counts only those frames.
+  ``transmitted`` is asked, once the consumer has sent a frame, which outputs
+  transmitted it (one flag per output); the CC1 debounce counts each output's
+  transmitted frames separately.
 
   Each iteration spends one ``1/fps`` interval polling the port, so the
   generator paces itself to wall-clock time and downstream sinks must not add
@@ -453,7 +468,7 @@ def iter_midi_frames(
 
 def open_frame_source(
   args: argparse.Namespace,
-  transmitted: Callable[[], bool] | None = None,
+  transmitted: Callable[[], Sequence[bool]] | None = None,
 ) -> tuple[Iterable[bytes], bool]:
   """Return a frame iterable and whether it paces itself to real time.
 
@@ -546,9 +561,9 @@ class N64SerialSink:
     self._port.close()
 
 
-def all_transmitted(sinks: list) -> Callable[[], bool]:
-  """Whether every sink transmitted its last frame (uncapped sinks always do)."""
-  return lambda: all(getattr(sink, "last_transmitted", True) for sink in sinks)
+def sinks_transmitted(sinks: list) -> Callable[[], list[bool]]:
+  """Per sink, whether it transmitted its last frame (uncapped sinks always do)."""
+  return lambda: [getattr(sink, "last_transmitted", True) for sink in sinks]
 
 
 def stream_frames(frames: Iterable[bytes], realtime: bool, rate: int, sinks: list) -> None:
@@ -601,7 +616,7 @@ def main() -> int:
   announce_allow_flash(args.allow_flash)
 
   sinks: list = []
-  frames, realtime = open_frame_source(args, all_transmitted(sinks))
+  frames, realtime = open_frame_source(args, sinks_transmitted(sinks))
   with contextlib.ExitStack() as stack:
     if args.output:
       sinks.append(stack.enter_context(contextlib.closing(FileSink(args.output, args.allow_flash))))

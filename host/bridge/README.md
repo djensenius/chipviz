@@ -146,11 +146,12 @@ bridge debounces with the target's scene-7 constants, counted in 60 Hz steps:
   the previous one.
 - Changes between other scenes are sent at once.
 
-Both minimums must hold. Every output must have transmitted at least 30
+Both minimums must hold. Each output must have transmitted at least 30
 frames (20 for `CUT_MIN`), because targets count one step per received frame;
-frames dropped by the 60 fps cap below do not count. The wait must also last
-at least 500 ms (333 ms for `CUT_MIN`): above 60 Hz the source frame counts
-scale with the rate (60 frames at `--rate 120`). At `--rate 90`, entering
+frames dropped by the 60 fps cap below do not count. Outputs are counted
+separately, so two caps that pass alternate frames each still reach 30. The
+wait must also last at least 500 ms (333 ms for `CUT_MIN`): above 60 Hz the
+source frame counts scale with the rate (60 frames at `--rate 120`). At `--rate 90`, entering
 scene 7 takes 45 frames (500 ms), and leaving takes 30 transmitted frames
 (about 60 frames, roughly 660 ms), because the cap passes only about 45
 scene-7 frames per second. Targets apply their own scene-7 debounce as a

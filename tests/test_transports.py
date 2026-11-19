@@ -762,6 +762,20 @@ class MidiRateTests(unittest.TestCase):
         scenes = [frame[20] for frame in live_bridge.iter_midi_frames("fake", frames + 1, fps)]
       self.assertEqual(scenes, [0] * frames + [7])
 
+  def test_cc1_debounce_counts_frames_per_output(self) -> None:
+    # Two outputs that transmit alternate frames: each must reach 30 frames.
+    debounce = live_bridge.SceneDebounce(scene=7, rate=90)
+    sent = [0, 0]
+    for frame in range(200):
+      if debounce.begin(0) != 7:
+        break
+      transmitted = [frame % 2 == 0, frame % 2 == 1]
+      sent = [count + flag for count, flag in zip(sent, transmitted)]
+      debounce.end(transmitted)
+    self.assertEqual(debounce.scene, 0)
+    self.assertEqual(min(sent), 30)
+    self.assertGreaterEqual(frame, 45)
+
   def test_cc1_debounce_counts_transmitted_frames_end_to_end(self) -> None:
     # CC1 selects scene 7 at poll 1 and scene 0 at poll 150. Each output must
     # transmit at least 30 frames, over at least 500 ms, before it changes.
@@ -776,8 +790,36 @@ class MidiRateTests(unittest.TestCase):
             self.assertGreaterEqual(first_new, 30, f"{name}: only {first_new} frames transmitted before the change")
             self.assertGreaterEqual(after[first_new][0] - change_at, 500_000_000, name)
 
-  def _run_midi_main(self, rate: int, frames: int, exit_poll: int) -> dict:
+  def test_cc1_debounce_counts_each_output_when_caps_alternate(self) -> None:
+    # From 0.6 s the serial cap reads the clock 1.5 ms after the UDP cap, so at
+    # 90 Hz the two caps lock into passing alternate scene-7 frames. The exit
+    # must still come once each output has sent 30 frames over 500 ms.
+    for lag_from in (511_000_000, 533_000_000):
+      with self.subTest(lag_from=lag_from):
+        outputs = self._run_midi_main(90, frames=300, exit_poll=150, joybus_lag=(lag_from, 1_500_000))
+        exit_at = outputs.pop("changes")[1]
+        udp_times = {at for at, scene in outputs["udp"] if scene == 7 and at >= exit_at}
+        joybus_times = {at for at, scene in outputs["joybus"] if scene == 7 and at >= exit_at}
+        self.assertFalse(udp_times & joybus_times, "the caps should pass different frames")
+        for name, sent in outputs.items():
+          after = [(at, scene) for at, scene in sent if at >= exit_at]
+          first_new = next((index for index, (_, scene) in enumerate(after) if scene != 7), None)
+          self.assertIsNotNone(first_new, f"{name}: scene 7 never exited")
+          self.assertGreaterEqual(first_new, 30, name)
+          self.assertGreaterEqual(after[first_new][0] - exit_at, 500_000_000, name)
+
+  def _run_midi_main(self, rate: int, frames: int, exit_poll: int, joybus_lag: tuple[int, int] = (0, 0)) -> dict:
+    # ``joybus_lag`` is (from_ns, lag_ns): from ``from_ns`` on, the serial
+    # sink's cap reads the clock ``lag_ns`` later than the UDP sink's, as when
+    # the two reads straddle a scheduling delay.
     clock = _FakeClock()
+    real_cap = live_bridge.ColourFieldRateCap
+
+    def make_cap(transport: str):
+      if transport != "joybus":
+        return real_cap(transport, clock.monotonic_ns)
+      lag_from, lag_ns = joybus_lag
+      return real_cap(transport, lambda: clock.ns + (lag_ns if clock.ns >= lag_from else 0))
     outputs: dict = {"udp": [], "joybus": [], "changes": []}
 
     class _Message:
@@ -834,8 +876,10 @@ class MidiRateTests(unittest.TestCase):
     argv = ["live_bridge", "--midi-port", "fake", "--rate", str(rate), "--frames", str(frames),
             "--udp", "127.0.0.1:9", "--n64-serial", "fake"]
     with contextlib.ExitStack() as stack:
-      for name in ("monotonic", "monotonic_ns", "sleep"):
+      for name in ("monotonic", "monotonic_ns"):
         stack.enter_context(mock.patch.object(live_bridge.time, name, getattr(clock, name)))
+      stack.enter_context(mock.patch.object(live_bridge.time, "sleep", clock.sleep))
+      stack.enter_context(mock.patch.object(live_bridge, "ColourFieldRateCap", make_cap))
       stack.enter_context(mock.patch.object(live_bridge.socket, "socket", _Socket))
       stack.enter_context(mock.patch.dict(sys.modules, {"mido": fake_mido, "serial": fake_serial}))
       stack.enter_context(mock.patch.object(sys, "argv", argv))
