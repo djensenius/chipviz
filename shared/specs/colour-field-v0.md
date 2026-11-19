@@ -38,7 +38,9 @@ same trace on every target. Reduced transports have their own oracle (see
   `u8` field. Every target checks for 7 before applying its existing scene
   mapping.
 - Existing scene mappings stay the same for other indices:
-  - The modern renderer uses `scene % 3`.
+  - The modern renderer checks `scene == 7` first, then uses
+    `REGISTRY[scene % REGISTRY.len()]`. The registry length may grow; scene 7
+    still means the colour field whatever that length is.
   - The N64 homebrew uses the raw 0..15 scene as a drawing parameter.
   - The GBA homebrew displays `(phrase + override) & 3`, which changes over
     time.
