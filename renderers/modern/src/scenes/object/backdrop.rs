@@ -33,6 +33,8 @@ const CHROMA_KEYS: [Vec3; 4] = [
 ];
 pub(super) const TAGLINES: [&str; 4] = ["AS SEEN ON TV!", "CALL NOW!", "ONLY 19.95", "BUT WAIT..."];
 const GOLD: [f32; 4] = [1.0, 0.8, 0.15, 1.0];
+/// Overlay text keeps at least this much NDC x from the frame's edges.
+pub(super) const TEXT_MARGIN: f32 = 0.02;
 
 pub(super) fn luminance(color: Vec3) -> f32 {
     0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
@@ -307,7 +309,9 @@ pub(super) fn flare(stage: &Stage, strength: f32, out: &mut Vec<Instance>) {
 }
 
 /// Text centred on `center` in Static's 5x8 font, `height` NDC tall, with a
-/// drop shadow. Characters the font lacks are skipped.
+/// drop shadow. Characters the font lacks are skipped. Text too wide for
+/// the room either side of `center` (narrow or portrait frames) shrinks
+/// uniformly so it, and its shadow, stays `TEXT_MARGIN` inside the edges.
 pub(super) fn text(
     stage: &Stage,
     line: &str,
@@ -316,9 +320,17 @@ pub(super) fn text(
     color: [f32; 4],
     out: &mut Vec<Instance>,
 ) {
+    let count = line.chars().count() as f32;
+    // Glyphs span 6 * count - 1 pixels; the shadow adds 0.7 on each side.
+    let span = (count * 6.0 + 0.4) * height / 8.0 / stage.aspect;
+    let room = 2.0 * (1.0 - TEXT_MARGIN - center[0].abs()).max(0.0);
+    let height = if span > room {
+        height * room / span
+    } else {
+        height
+    };
     let pixel = height / 8.0;
     let pixel_x = pixel / stage.aspect;
-    let count = line.chars().count() as f32;
     let left = center[0] - (count * 6.0 - 1.0) * pixel_x * 0.5;
     let shadow = [0.0, 0.0, 0.0, color[3] * 0.8];
     for (index, character) in line.chars().enumerate() {

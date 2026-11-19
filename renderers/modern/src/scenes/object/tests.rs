@@ -225,6 +225,37 @@ fn overlay_text_uses_only_font_characters() {
 }
 
 #[test]
+fn overlay_text_stays_inside_the_frame() {
+    for aspect in [WIDE, 9.0 / 16.0] {
+        for index in 0..12 {
+            for local in [0, 128, 256, 384] {
+                let frame = ControlFrame {
+                    beat_phase: 0,
+                    ..frame_in(index, local)
+                };
+                let stage = stage(frame, section(frame), aspect);
+                let mut overlay = Vec::new();
+                backdrop::camcorder(&stage, &mut overlay);
+                backdrop::infomercial(&stage, section(frame).object, &mut overlay);
+                // Glyphs are the only quads with a non-negative, non-zero pattern.
+                let glyphs = overlay.iter().filter(|instance| {
+                    instance.pattern.iter().all(|&bits| bits >= 0.0) && instance.pattern != [0.0; 2]
+                });
+                let limit = 1.0 - backdrop::TEXT_MARGIN + 1e-4;
+                for glyph in glyphs {
+                    let [left, right] =
+                        [-0.5, 0.5].map(|side| glyph.center[0] + side * glyph.size[0]);
+                    assert!(
+                        left >= -limit && right <= limit,
+                        "{aspect} {index}: {left} {right}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn zoom_punch_lands_on_the_beat() {
     let on_beat = ControlFrame {
         beat_phase: 0,
