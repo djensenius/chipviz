@@ -99,3 +99,51 @@ Inputs and their expected outputs live under
 [`../fixtures/`](../fixtures). Regenerate the golden outputs after an
 intentional encoder change with `--write-fixtures`.
 
+
+## Colour-field flash guard
+
+Scene 7 is the colour-field scene, and palette `p = palette & 7` of 3 or 7
+selects its flash/gate mode (see
+[`colour-field-v0`](../../shared/specs/colour-field-v0.md)). Every host
+scene source (`live_bridge.py`, `chipsynth_stream.py`, `chipviz_bridge.py`,
+`chipviz_encode.py`, `n64_joybus.py` and `usb_hid.py`) sends frames through
+one shared guard, `chipviz_bridge.sanitise_flash`. Unless the process was
+started with `--allow-flash`, a frame whose *decoded scene* is 7 has palette
+bit 0 cleared before transmission, so 3 and 7 go out as 2 and 6. The decoded
+scene is the one the receiver sees on each transport:
+
+| Transport | Decoded scene |
+| --- | --- |
+| Full control frame, `.cvz` file, UDP | `scene` byte |
+| N64 Joybus | `scene & 0x0F` (23 decodes as 7) |
+| USB HID | `scene & 0x07` (15 decodes as 7) |
+
+The guard runs per transport, so one frame sent to a file and to Joybus is
+checked separately for each. In `live_bridge.py` MIDI mode this also covers
+CC2: selecting palette 3 or 7 while in scene 7 needs `--allow-flash`.
+
+`--allow-flash` disables the guard and prints this warning to stderr:
+
+> WARNING: Flash/gate mode produces full-field flashing light at up to 7.5
+> flashes per second. This exceeds the WCAG 2.3.1 and Harding limits of 3
+> flashes per second. Saturated red flashes are the highest-risk case. It may
+> trigger seizures in people with photosensitive epilepsy. Enable it only where
+> performers and audience have been warned.
+
+`live_bridge.py` audio mode cycles scenes 0–6 and never selects scene 7.
+
+### MIDI CC1 scene debounce
+
+`live_bridge.py` MIDI mode maps CC1 to `scene = value // 16`. A control
+resting near the 6/7 boundary must not toggle the sent scene across 7, so the
+bridge debounces with the target's scene-7 constants, counted in sent frames:
+
+- A change into or out of scene 7 is sent only after the CC1-derived scene
+  has been unchanged for 30 consecutive frames (`P_STABLE`). It takes effect
+  at the end of the 30th frame and is sent from the next one. Any change
+  restarts the count.
+- No scene-7 entry or exit is sent sooner than 20 frames (`CUT_MIN`) after
+  the previous one.
+- Changes between other scenes are sent at once.
+
+Targets apply their own scene-7 debounce as a backstop.

@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from chipviz_bridge import MAGIC, VERSION, WIRE_SIZE, checksum
+from chipviz_bridge import MAGIC, VERSION, WIRE_SIZE, add_allow_flash_argument, announce_allow_flash, checksum, sanitise_flash
 
 
 JOYBUS_SIZE = 16
@@ -105,12 +105,19 @@ def pack_joybus_frame(frame: DecodedFrame, sequence: int) -> bytes:
   return bytes(packet)
 
 
-def convert_stream(stream: bytes, first_sequence: int = 0) -> bytes:
-  """Pack each record; the marker sequence is `first_sequence` + packet index."""
+def convert_stream(stream: bytes, first_sequence: int = 0, allow_flash: bool = False) -> bytes:
+  """Pack each record; the marker sequence is `first_sequence` + packet index.
+
+  Records pass the colour-field flash guard for the Joybus decoded scene
+  (`scene & 0x0F`) unless `allow_flash` is set.
+  """
   if len(stream) % WIRE_SIZE != 0:
     raise ValueError("control-frame stream is not aligned to 33-byte records")
   return b"".join(
-    pack_joybus_frame(decode_control_frame(stream[offset:offset + WIRE_SIZE]), first_sequence + index)
+    pack_joybus_frame(
+      decode_control_frame(sanitise_flash(stream[offset:offset + WIRE_SIZE], "joybus", allow_flash)),
+      first_sequence + index,
+    )
     for index, offset in enumerate(range(0, len(stream), WIRE_SIZE))
   )
 
@@ -119,12 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--input", type=Path, required=True, help="raw control-frame-v0 stream")
   parser.add_argument("--output", type=Path, help="16-byte Joybus packet stream; stdout if omitted")
+  add_allow_flash_argument(parser)
   return parser
 
 
 def main_from_args(argv: list[str] | None = None) -> int:
   args = build_parser().parse_args(argv)
-  output = convert_stream(args.input.read_bytes())
+  announce_allow_flash(args.allow_flash)
+  output = convert_stream(args.input.read_bytes(), allow_flash=args.allow_flash)
   if args.output is None or str(args.output) == "-":
     sys.stdout.buffer.write(output)
   else:

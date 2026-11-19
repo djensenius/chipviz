@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import pathlib
 import sys
@@ -10,6 +12,8 @@ sys.path.insert(0, str(ROOT / "host" / "bridge"))
 sys.path.insert(0, str(ROOT / "shared" / "tools"))
 
 import chipviz_bridge
+import chipviz_encode
+import chipsynth_stream
 import cvz_to_c
 import live_bridge
 import n64_joybus
@@ -243,6 +247,200 @@ class TransportTests(unittest.TestCase):
     header = cvz_to_c.render_header(self.wire, "custom_frames")
 
     self.assertIn("CHIPVIZ_GENERATED_CUSTOM_FRAMES_H", header)
+
+
+def _scene_frame(scene: int, palette: int) -> bytes:
+  return chipviz_bridge.pack_frame(chipviz_bridge.ControlFrame(
+    frame=0, bpm=120, beat_phase=0, beat_count=0, energy=100, bass=100, mid=100, treble=100,
+    spectrum=(100,) * 8, scene=scene, palette=palette, flags=0, notes=(),
+  ))
+
+
+class FlashGuardTests(unittest.TestCase):
+  """colour-field-v0 host flash guard (F23) and the CC1 scene debounce."""
+
+  def test_f23_hid_alias_scene_15_palette_3(self) -> None:
+    states = usb_hid.convert_stream(_scene_frame(15, 3) * 600)
+    self.assertTrue(all(state.keys[:2] == ("8", "E") for state in states))
+    self.assertEqual(usb_hid.map_frame(_scene_frame(15, 3), allow_flash=True).keys[:2], ("8", "R"))
+
+  def test_f23_joybus_alias_scene_23_palette_3(self) -> None:
+    converted = n64_joybus.convert_stream(_scene_frame(23, 3) * 600)
+    packets = [converted[i:i + 16] for i in range(0, len(converted), 16)]
+    for packet in packets:
+      scene_nibble = ((packet[13] >> 2) & 0x0C) | ((packet[12] >> 4) & 0x03)
+      self.assertEqual(scene_nibble, 7)
+      self.assertEqual(packet[13] & 0x0F, 2)
+      self.assertEqual(packet[12] >> 6, 2)
+    allowed = n64_joybus.convert_stream(_scene_frame(23, 3), allow_flash=True)
+    self.assertEqual(allowed[13] & 0x0F, 3)
+
+  def test_f23_full_path_scene_15_is_not_rewritten(self) -> None:
+    wire = _scene_frame(15, 3)
+    self.assertEqual(chipviz_bridge.sanitise_flash(wire, "full"), wire)
+
+  def test_full_path_scene_7_palette_3_and_7_sanitised_without_flag(self) -> None:
+    for palette, expected in ((3, 2), (7, 6), (0x0B, 0x0A), (1, 1), (2, 2), (6, 6)):
+      with self.subTest(palette=palette):
+        wire = _scene_frame(7, palette)
+        safe = chipviz_bridge.sanitise_flash(wire, "full")
+        self.assertEqual(safe, _scene_frame(7, expected))
+        self.assertEqual(safe[-1], chipviz_bridge.checksum(safe[:-1]))
+        self.assertEqual(chipviz_bridge.sanitise_flash(wire, "full", allow_flash=True), wire)
+
+  def test_sanitise_keeps_corrupt_frame_corrupt(self) -> None:
+    corrupt = bytearray(_scene_frame(7, 3))
+    corrupt[-1] ^= 0x40
+    safe = chipviz_bridge.sanitise_flash(bytes(corrupt), "full")
+    self.assertEqual(safe[21], 2)
+    self.assertNotEqual(safe[-1], chipviz_bridge.checksum(safe[:-1]))
+    with self.assertRaisesRegex(ValueError, "checksum"):
+      n64_joybus.decode_control_frame(safe)
+
+  def test_live_bridge_sinks_sanitise_per_transport(self) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+      path = pathlib.Path(temp_dir) / "out.cvz"
+      for allow_flash, expected in ((False, 2), (True, 3)):
+        sink = live_bridge.FileSink(path, allow_flash)
+        live_bridge.stream_frames([_scene_frame(7, 3), _scene_frame(15, 3)], True, 60, [sink])
+        sink.close()
+        written = path.read_bytes()
+        self.assertEqual((written[21], written[33 + 21]), (expected, 3))
+
+  def test_live_bridge_audio_never_emits_scene_7(self) -> None:
+    scenes = {live_bridge.frame_from_bands(index, (0,) * 8)[20] for index in range(0, 240 * 16, 240)}
+    self.assertNotIn(7, scenes)
+
+  def test_live_bridge_one_frame_sanitised_per_sink_transport(self) -> None:
+    class _Port:
+      def __init__(self) -> None:
+        self.written: list[bytes] = []
+
+      def write(self, data: bytes) -> None:
+        self.written.append(data)
+
+      def flush(self) -> None:
+        pass
+
+    # Scene 23 decodes as 23 on the full path and as 7 on Joybus.
+    with tempfile.TemporaryDirectory() as temp_dir:
+      path = pathlib.Path(temp_dir) / "out.cvz"
+      file_sink = live_bridge.FileSink(path)
+      serial_sink = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
+      serial_sink._port = _Port()
+      serial_sink._sequence = 0
+      live_bridge.stream_frames([_scene_frame(23, 3), _scene_frame(7, 3)], True, 60, [file_sink, serial_sink])
+      file_sink.close()
+      written = path.read_bytes()
+    self.assertEqual((written[21], written[33 + 21]), (3, 2))
+    self.assertEqual([packet[13] & 0x0F for packet in serial_sink._port.written], [2, 2])
+
+  def test_midi_path_debounces_cc1_into_scene_7(self) -> None:
+    class _Message:
+      def __init__(self, control: int, value: int) -> None:
+        self.type = "control_change"
+        self.control = control
+        self.value = value
+
+    class _Port:
+      def __init__(self) -> None:
+        self.polls = 0
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc) -> None:
+        return None
+
+      def iter_pending(self):
+        self.polls += 1
+        if self.polls == 1:
+          return [_Message(1, 127), _Message(2, 48)]
+        if 40 <= self.polls < 50:
+          return [_Message(1, 112 if self.polls % 2 else 111)]
+        return []
+
+    fake_mido = type(sys)("mido")
+    fake_mido.open_input = lambda name: _Port()
+    original_sleep = live_bridge.time.sleep
+    original_mido = sys.modules.get("mido")
+    sys.modules["mido"] = fake_mido
+    live_bridge.time.sleep = lambda delay: None
+    try:
+      frames = list(live_bridge.iter_midi_frames("fake", 80, 60))
+    finally:
+      live_bridge.time.sleep = original_sleep
+      if original_mido is None:
+        del sys.modules["mido"]
+      else:
+        sys.modules["mido"] = original_mido
+    scenes = [frame[20] for frame in frames]
+    self.assertEqual(scenes[:30], [0] * 30)
+    self.assertEqual(scenes[30:80], [7] * 50, "CC1 jitter at 111/112 must not leave scene 7")
+    self.assertTrue(all(frame[21] == 3 for frame in frames))
+    file_frame = chipviz_bridge.sanitise_flash(frames[30], "full")
+    self.assertEqual(file_frame[21], 2)
+
+  def test_cc1_debounce_enters_scene_7_after_30_stable_frames(self) -> None:
+    debounce = live_bridge.SceneDebounce()
+    sent = [debounce.step(7) for _ in range(31)]
+    self.assertEqual(sent[:30], [0] * 30)
+    self.assertEqual(sent[30], 7)
+
+  def test_cc1_debounce_ignores_jitter_across_7_boundary(self) -> None:
+    debounce = live_bridge.SceneDebounce(6)
+    sent = [debounce.step(7 if index % 20 < 10 else 6) for index in range(600)]
+    self.assertEqual(set(sent), {6})
+    debounce = live_bridge.SceneDebounce(7)
+    sent = [debounce.step(6 if index % 2 else 7) for index in range(600)]
+    self.assertEqual(set(sent), {7})
+
+  def test_cc1_debounce_limits_scene_7_changes(self) -> None:
+    debounce = live_bridge.SceneDebounce()
+    sent = [debounce.step(7 if (index // 30) % 2 else 0) for index in range(600)]
+    changes = [index for index in range(1, 600) if (sent[index] == 7) != (sent[index - 1] == 7)]
+    self.assertTrue(changes)
+    self.assertTrue(all(b - a >= 30 for a, b in zip(changes, changes[1:])))
+    for start in range(600 - 60):
+      self.assertLessEqual(sum(1 for index in changes if start <= index < start + 60), 2)
+
+  def test_cc1_debounce_passes_native_scene_changes_at_once(self) -> None:
+    debounce = live_bridge.SceneDebounce()
+    self.assertEqual([debounce.step(scene) for scene in (1, 2, 5, 0)], [1, 2, 5, 0])
+
+  def test_allow_flash_cli_warning_only_with_flag(self) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+      root = pathlib.Path(temp_dir)
+      cvz = root / "input.cvz"
+      cvz.write_bytes(_scene_frame(7, 3))
+      music = ROOT / "host" / "fixtures" / "musical" / "scale.musicsource.json"
+      out = str(root / "out")
+
+      def via_argv(main, argv):
+        def run(extra):
+          original = sys.argv
+          sys.argv = ["prog", *argv, *extra]
+          try:
+            return main()
+          finally:
+            sys.argv = original
+        return run
+
+      clis = {
+        "usb_hid": lambda extra: usb_hid.main_from_args(["--input", str(cvz), "--output", out, *extra]),
+        "n64_joybus": lambda extra: n64_joybus.main_from_args(["--input", str(cvz), "--output", out, *extra]),
+        "chipviz_bridge": via_argv(chipviz_bridge.main, ["--frames", "1", "--output", out]),
+        "chipsynth_stream": via_argv(chipsynth_stream.main, ["--output", out]),
+        "chipviz_encode": via_argv(chipviz_encode.main, ["--music", str(music), "--output", out]),
+        "live_bridge": via_argv(live_bridge.main, ["--input", str(cvz), "--output", out]),
+      }
+      for name, run in clis.items():
+        for extra, expect_warning in (([], False), (["--allow-flash"], True)):
+          with self.subTest(cli=name, allow_flash=expect_warning):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+              self.assertEqual(run(extra), 0)
+            self.assertEqual(chipviz_bridge.FLASH_WARNING in stderr.getvalue(), expect_warning)
 
 
 if __name__ == "__main__":
