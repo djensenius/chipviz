@@ -6,6 +6,7 @@
 //! can replace or extend [`Embedded`] without touching the scene. This phase
 //! adds no networking.
 
+use super::super::sin_cos;
 use std::f64::consts::{E, PI, SQRT_2};
 
 /// A list of phrases the scene can show. Phrases should use characters the
@@ -66,16 +67,14 @@ pub(crate) fn constant(index: usize) -> [String; 2] {
 /// roughly -1..1.
 pub(crate) fn knot_point(t: f32, angle: f32) -> [f32; 3] {
     let u = t * std::f32::consts::TAU;
-    let radius = 2.0 + (3.0 * u).cos();
-    let point = [
-        radius * (2.0 * u).cos(),
-        (3.0 * u).sin(),
-        radius * (2.0 * u).sin(),
-    ];
-    let (sin, cos) = angle.sin_cos();
+    let (sin3, cos3) = sin_cos(3.0 * u);
+    let (sin2, cos2) = sin_cos(2.0 * u);
+    let radius = 2.0 + cos3;
+    let point = [radius * cos2, sin3, radius * sin2];
+    let (sin, cos) = sin_cos(angle);
     let x = point[0] * cos + point[2] * sin;
     let z = -point[0] * sin + point[2] * cos;
-    let (tip_sin, tip_cos) = 0.45f32.sin_cos();
+    let (tip_sin, tip_cos) = sin_cos(0.45);
     let y = point[1] * tip_cos - z * tip_sin;
     let z = point[1] * tip_sin + z * tip_cos;
     [x / 3.2, y / 3.2, z / 3.2]

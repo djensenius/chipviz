@@ -1,6 +1,6 @@
 //! PulseTunnel: beat-driven planes and bars moving through depth.
 
-use super::{CameraMode, SceneBuild, SceneEntry, note_emphasis, palette};
+use super::{CameraMode, SceneBuild, SceneEntry, note_emphasis, palette, sin_cos};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -36,8 +36,9 @@ fn build(
             }
             let angle = bar as f32 / bars_per_ring as f32 * std::f32::consts::TAU;
             let band = frame.spectrum[bar % frame.spectrum.len()] as f32 / 255.0;
-            let x = angle.cos() * radius * (2.4 + band);
-            let y = angle.sin() * radius * (1.3 + band);
+            let (sin, cos) = sin_cos(angle);
+            let x = cos * radius * (2.4 + band);
+            let y = sin * radius * (1.3 + band);
 
             instances.push(Instance {
                 center: [x, y, z],

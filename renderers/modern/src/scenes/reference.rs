@@ -1,8 +1,11 @@
 //! Verbatim pre-registry scene code (from scene.rs before #70), kept only to
 //! prove the registry refactor produces byte-identical instance data.
+//! The one deviation: `pulse_tunnel` uses [`sin_cos`] so its output does not
+//! depend on the build profile (see #112).
 //! Intentional visual changes to an existing scene must re-baseline this copy
 //! and the recorded golden in `scenes/mod.rs`, or delete both checks.
 
+use super::sin_cos;
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -130,8 +133,9 @@ fn pulse_tunnel(
             }
             let angle = bar as f32 / bars_per_ring as f32 * std::f32::consts::TAU;
             let band = frame.spectrum[bar % frame.spectrum.len()] as f32 / 255.0;
-            let x = angle.cos() * radius * (2.4 + band);
-            let y = angle.sin() * radius * (1.3 + band);
+            let (sin, cos) = sin_cos(angle);
+            let x = cos * radius * (2.4 + band);
+            let y = sin * radius * (1.3 + band);
 
             instances.push(Instance {
                 center: [x, y, z],
