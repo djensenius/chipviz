@@ -15,6 +15,20 @@ VERSION = 0
 SPECTRUM_BANDS = 8
 MAX_NOTES = 4
 WIRE_SIZE = 33
+SCENE_OFFSET = 20
+PALETTE_OFFSET = 21
+
+# colour-field-v0: scene 7 is the colour field; palette 3/7 is flash/gate.
+COLOUR_FIELD_SCENE = 7
+# Scene value the receiver decodes on each transport.
+TRANSPORT_SCENE_MASKS = {"full": 0xFF, "joybus": 0x0F, "hid": 0x07}
+FLASH_WARNING = (
+  "WARNING: Flash/gate mode produces full-field flashing light at up to 7.5 "
+  "flashes per second. This exceeds the WCAG 2.3.1 and Harding limits of 3 "
+  "flashes per second. Saturated red flashes are the highest-risk case. It may "
+  "trigger seizures in people with photosensitive epilepsy. Enable it only where "
+  "performers and audience have been warned."
+)
 
 
 @dataclass(frozen=True)
@@ -108,6 +122,51 @@ def pack_frame(frame: ControlFrame) -> bytes:
   return bytes(wire)
 
 
+def sanitise_flash(wire: bytes, transport: str, allow_flash: bool = False) -> bytes:
+  """Clear palette bit 0 when the decoded scene is 7 and p is 3 or 7.
+
+  Every host path sends frames through this before each transport's encoding
+  (colour-field-v0 "Requirements for scene sources"), unless the process was
+  started with ``--allow-flash``.
+  """
+  if allow_flash or len(wire) != WIRE_SIZE:
+    return wire
+  if wire[SCENE_OFFSET] & TRANSPORT_SCENE_MASKS[transport] != COLOUR_FIELD_SCENE:
+    return wire
+  if wire[PALETTE_OFFSET] & 0x03 != 0x03:
+    return wire
+  safe = bytearray(wire)
+  safe[PALETTE_OFFSET] &= 0xFE
+  # XOR checksum: clearing set bit 0 flips checksum bit 0. Adjusting rather
+  # than recomputing keeps a corrupt frame corrupt.
+  safe[-1] ^= 0x01
+  return bytes(safe)
+
+
+def sanitise_stream(stream: bytes, transport: str, allow_flash: bool = False) -> bytes:
+  if allow_flash:
+    return stream
+  if len(stream) % WIRE_SIZE != 0:
+    raise ValueError("control-frame stream is not aligned to 33-byte records")
+  return b"".join(
+    sanitise_flash(stream[offset:offset + WIRE_SIZE], transport)
+    for offset in range(0, len(stream), WIRE_SIZE)
+  )
+
+
+def add_allow_flash_argument(parser: argparse.ArgumentParser) -> None:
+  parser.add_argument(
+    "--allow-flash",
+    action="store_true",
+    help="allow colour-field flash/gate (scene 7, palette 3 or 7); prints a seizure warning",
+  )
+
+
+def announce_allow_flash(allow_flash: bool) -> None:
+  if allow_flash:
+    print(FLASH_WARNING, file=sys.stderr)
+
+
 def parse_udp_endpoint(endpoint: str) -> tuple[str, int]:
   host, separator, port_text = endpoint.rpartition(":")
   if not separator or not host or not port_text:
@@ -137,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     type=parse_udp_endpoint,
     help="also send each frame to HOST:PORT over UDP",
   )
+  add_allow_flash_argument(parser)
   return parser
 
 
@@ -146,8 +206,12 @@ def main() -> int:
     raise SystemExit("--frames must be at least 1")
   if args.output is None and args.udp is None:
     raise SystemExit("choose --output, --udp, or both")
+  announce_allow_flash(args.allow_flash)
 
-  packets = [pack_frame(make_procedural_frame(index)) for index in range(args.frames)]
+  packets = [
+    sanitise_flash(pack_frame(make_procedural_frame(index)), "full", args.allow_flash)
+    for index in range(args.frames)
+  ]
 
   if args.output is not None:
     if str(args.output) == "-":
