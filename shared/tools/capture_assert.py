@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import pathlib
+import re
 import struct
 import sys
 import zlib
@@ -27,6 +28,8 @@ SUPPORTED_COLOR_TYPES = {2: 3, 6: 4}  # RGB, RGBA -> bytes per pixel
 MAX_PIXELS = 64 * 1024 * 1024
 DEFAULT_LIT_THRESHOLD = 8
 SEQUENCE_MODES = ("identical", "changes", "every-step-changes")
+MAX_FRACTION_TEXT = 32
+FRACTION_TEXT = re.compile(r"(?:\d+(?:\.\d+)?|\.\d+|\d+/\d+)")
 
 
 class CaptureError(ValueError):
@@ -281,9 +284,18 @@ def _display(stats: dict[str, object]) -> dict[str, object]:
 
 
 def parse_fraction(option: str, text: str) -> fractions.Fraction:
-  """Parse decimal or ratio text ("0.3", "1/3") exactly, without a float round trip."""
+  """Parse decimal or ratio text ("0.3", "1/3") exactly, without a float round trip.
+
+  Exponents, signs and long text are rejected so a tiny argument cannot expand
+  into a huge integer.
+  """
+  text = text.strip()
+  if len(text) > MAX_FRACTION_TEXT or not FRACTION_TEXT.fullmatch(text):
+    raise CaptureError(
+      f"{option} must be a plain decimal or ratio of at most {MAX_FRACTION_TEXT} characters, such as 0.3 or 1/3"
+    )
   try:
-    return fractions.Fraction(text.strip())
+    return fractions.Fraction(text)
   except (ValueError, ZeroDivisionError) as error:
     raise CaptureError(f"{option} must be a finite decimal or ratio such as 0.3 or 1/3") from error
 
@@ -314,8 +326,8 @@ def validate(args: argparse.Namespace) -> None:
       raise CaptureError(f"--{option.replace('_', '-')} must be non-negative")
   if args.min_colors is not None and args.max_colors is not None and args.min_colors > args.max_colors:
     raise CaptureError("--min-colors must not exceed --max-colors")
-  if args.min_luma_stddev is not None and not (math.isfinite(args.min_luma_stddev) and args.min_luma_stddev >= 0):
-    raise CaptureError("--min-luma-stddev must be finite and non-negative")
+  if args.min_luma_stddev is not None and not 0 <= args.min_luma_stddev <= 255:
+    raise CaptureError("--min-luma-stddev must be between 0 and 255")
   args.exact = exact
 
 

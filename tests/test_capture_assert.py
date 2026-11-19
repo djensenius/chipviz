@@ -335,6 +335,11 @@ class ExactBoundaryTests(CaptureAssertCase):
         self.assertEqual(self.code(*pair, "--sequence", "identical", "--change-fraction", value), identical)
         self.assertEqual(self.code(*pair, "--sequence", "changes", "--change-fraction", value), changes)
 
+  def test_plain_decimal_and_ratio_forms_are_accepted(self) -> None:
+    for value in (".3", "0.3", "3/10", " 0.3 ", "0." + "0" * 29 + "1"):
+      with self.subTest(value=value):
+        self.assertEqual(self.code(self.image, "--max-lit-fraction", "1", "--min-lit-fraction", value), 0)
+
   def test_parameters_report_exact_change_fraction(self) -> None:
     _, report, _ = self.invoke(self.dark, self.image, "--change-fraction", "0.30")
     self.assertEqual(report["parameters"]["change_fraction"], "3/10")
@@ -355,6 +360,12 @@ class OptionValidationTests(CaptureAssertCase):
       ["--min-lit-fraction", "4/3"],
       ["--min-luma-stddev", "inf"],
       ["--min-luma-stddev", "nan"],
+      ["--min-luma-stddev", "255.5"],
+      ["--change-fraction", "1e-999999999"],
+      ["--min-lit-fraction", "1E-3"],
+      ["--max-lit-fraction", "0." + "1" * 40],
+      ["--change-fraction", "1/" + "9" * 40],
+      ["--change-fraction", "-0"],
       ["--min-colors", "5", "--max-colors", "4"],
       ["--min-lit-fraction", "0.5", "--max-lit-fraction", "0.4"],
       ["--min-lit-fraction", "1.5"],

@@ -50,12 +50,15 @@ It always prints measurements as JSON: file SHA-256, dimensions, distinct RGB
 colours, Rec.601 luma mean/stddev and lit pixel count/fraction for the
 selected region, plus the changed-pixel count/fraction and maximum channel
 delta between consecutive images. `steps_comparable` is `false` when image or
-region sizes differ (no steps are reported). Fractions in the JSON are rounded
+region sizes differ (no steps are reported). Measured `lit_fraction` and
+`changed_fraction` values in `frames` and `steps` are rounded to six decimals
 for display only; assertions compare exact pixel counts, so a single changed
 or lit pixel in a 1080p frame still counts. It applies only the assertions you
-request. Fraction options accept decimal or ratio text (`0.3`, `3/10`, `1/3`)
-and are parsed exactly, so `--max-lit-fraction 0.3` accepts exactly 3 of 10
-lit pixels. Trailing bytes after the zlib stream and `PLTE` after `IDAT` are
+request. Fraction options accept plain decimal or ratio text (`0.3`, `.3`,
+`3/10`, `1/3`) of at most 32 characters, without signs or exponents, and are
+parsed exactly, so `--max-lit-fraction 0.3` accepts exactly 3 of 10 lit
+pixels. `parameters.change_fraction` in the report is that exact parsed value
+as a string, such as `"3/10"`. Trailing bytes after the zlib stream and `PLTE` after `IDAT` are
 rejected. Exit status is `0` when every requested assertion passes, `1` when
 one fails and `2` for invalid input, usage or out-of-range options.
 
@@ -79,7 +82,7 @@ python3 shared/tools/capture_assert.py --sequence changes \
 | `--region X,Y,W,H` | Measure and compare only this rectangle |
 | `--expect-size WxH` | Each image has exactly these dimensions |
 | `--min-colors N`, `--max-colors N` | Distinct RGB colour bounds (non-negative, min <= max) |
-| `--min-luma-stddev F` | Minimum luma standard deviation (finite, 0-255 scale) |
+| `--min-luma-stddev F` | Minimum luma standard deviation (0-255) |
 | `--min-lit-fraction F`, `--max-lit-fraction F` | Lit-pixel fraction bounds (0-1, min <= max) |
 | `--lit-threshold N` | A pixel is lit when its integer luma exceeds `N` (0-255, default 8) |
 | `--sequence identical` | No consecutive step changes |
