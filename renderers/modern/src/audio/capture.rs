@@ -477,8 +477,9 @@ struct LossDetector {
     jitter_since: Instant,
     /// Seconds filled that have not been taken back.
     filled: f64,
-    /// Seconds taken back since the last fill (loss or stall).
-    reversed: f64,
+    /// Start of the current take-back episode (since the last fill, at most
+    /// `STALL_RESET` long) and the seconds taken back in it.
+    reversed: Option<(Instant, f64)>,
 }
 
 impl LossDetector {
@@ -490,7 +491,7 @@ impl LossDetector {
             previous_jitter: 0.0,
             jitter_since: now,
             filled: 0.0,
-            reversed: 0.0,
+            reversed: None,
         }
     }
 
@@ -499,7 +500,7 @@ impl LossDetector {
     fn stalled(&mut self, silence: f64) {
         self.excess = None;
         self.filled += silence;
-        self.reversed = 0.0;
+        self.reversed = None;
     }
 
     /// Late real samples already cancelled this much stall silence.
@@ -530,10 +531,19 @@ impl LossDetector {
             self.filled -= back;
             // Fill taken back was a delay, not a loss: learn the whole
             // reversal as jitter so the same delay is not filled again. It
-            // accumulates until the next fill, so a delay that recovers in
-            // steps (or a take-back that `spare` splits) counts in full.
-            self.reversed += back;
-            self.note_jitter(now, self.reversed);
+            // accumulates over an episode, so a delay that recovers in steps
+            // (or a take-back that `spare` splits) counts in full. Episodes
+            // last at most `STALL_RESET`: a device clock running fast keeps
+            // taking back stall silence for hours, and that slow trend must
+            // not pile up into a margin that hides real losses.
+            let (since, total) = self.reversed.get_or_insert((now, 0.0));
+            if now.duration_since(*since) >= STALL_RESET {
+                *since = now;
+                *total = 0.0;
+            }
+            *total += back;
+            let total = *total;
+            self.note_jitter(now, total);
             self.excess = None;
             return -back;
         }
@@ -556,7 +566,7 @@ impl LossDetector {
         let lost = *smallest;
         self.excess = None;
         self.filled += lost;
-        self.reversed = 0.0;
+        self.reversed = None;
         lost
     }
 }
@@ -1110,6 +1120,39 @@ mod tests {
                 "{delays:?}: {silence}"
             );
         }
+    }
+
+    #[test]
+    fn fast_clock_after_an_outage_still_fills_a_later_loss() {
+        // 10 ms callbacks from a device clock 500 ppm fast for 330 s, polled
+        // every 5-8 ms, with a 1 s outage at 10 s, after which the timeline
+        // keeps taking back the outage's silence as the clock gains. A 40 ms
+        // loss at 300 s must still be filled.
+        let chunk = samples(Duration::from_millis(10));
+        let lost = |i: u64| (30_001..=30_004).contains(&i);
+        let run = |lose: bool| {
+            let start = Instant::now();
+            let mut clock = SampleClock::new(RATE, start);
+            let mut gap = random_lateness(0xFA57, 3);
+            let (mut next, mut elapsed, mut silence) = (1u64, Duration::ZERO, 0);
+            while next <= 33_000 {
+                elapsed += POLL + gap(0);
+                let mut real = 0;
+                while next <= 33_000
+                    && Duration::from_secs_f64(next as f64 * 0.01 / 1.0005) <= elapsed
+                {
+                    let outage = (1001..=1100).contains(&next);
+                    if !(outage || lose && lost(next)) {
+                        real += chunk;
+                    }
+                    next += 1;
+                }
+                silence += clock.poll(start + elapsed, real).silence;
+            }
+            silence
+        };
+        let filled = run(true).abs_diff(run(false));
+        assert_close(filled, Duration::from_millis(40));
     }
 
     #[test]
