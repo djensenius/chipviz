@@ -100,10 +100,11 @@ The effective palette `p_eff` comes from one of three sources:
     and runs from the 31st.
   - A stable 3 or 7 arms flash (see [arming](#arming-and-operator-inputs)).
 - **Precedence:** a later event overrides an earlier one, whatever its source.
-  - An operator pulse sets `p_eff` directly and restarts the wire stability
-    counter on the current wire value.
-  - That wire value overrides the operator choice again only if it changes and
-    then stays unchanged for 30 steps.
+  - An operator pulse sets `p_eff` directly and consumes the current wire
+    value: that value never becomes `p_eff` again, however long it stays.
+  - The stability counter restarts only when a new wire value (different from
+    the consumed one) arrives. That new value overrides the operator choice
+    once it has stayed unchanged for 30 steps.
 
 If `p_eff` selects mode 3 and flash is not armed, the target runs mode 2.
 
@@ -179,7 +180,7 @@ Every build or config declares one input role:
 | SNES, NES, GB | same build flag | `Select` |
 | Genesis | same build flag | `C` |
 | SMS | same build flag | button 2 |
-| C64 | same build flag | `L` key |
+| C64 | same build flag | `L` key (`RETURN` confirms the warning screen) |
 | N64 | none: always `data` | no pin |
 
 Why `data` is the default:
@@ -408,11 +409,14 @@ changes. `layout`, `combo` and `rot` are kept, except that held mode sets
   - In 3-region layouts, the regions follow bass, mid and treble.
   - In 2-region layouts, they follow bass and `max(mid, treble)`.
   - **Order within the step:**
-    1. On `X` with `since_cut >= CUT_MIN`: `next_layout`, `next_combo`, and
-       `since_cut = 0`.
-    2. Else on `D` with `since_layout >= SECTION_MIN`: `next_layout`.
+    1. On `X` with `since_cut >= CUT_MIN` and `lg >= LEVEL_OPP`:
+       `next_layout`, `next_combo`, and `since_cut = 0`.
+    2. Else on `D` with `since_layout >= SECTION_MIN` and
+       `lg >= LEVEL_OPP`: `next_layout`.
     3. Only then, if `lg >= LEVEL_OPP`, update every region's level. A layout
        change in steps 1 or 2 set `lg = 0`, so it blocks this.
+    An `X` or `D` that arrives while `lg < LEVEL_OPP` is dropped, not queued,
+    so layout changes and level changes together stay 10 or more steps apart.
   - **Level up:** `lvl += 1` when `v >= UP[lvl + 1]`.
   - **Level down:** `lvl -= 1` when `v < DOWN[lvl]`.
   - **Field-wide rate limit:** any region may change in the same step. If any
@@ -456,7 +460,9 @@ Flash is armed only by a deliberate source.
     when the renderer starts. While the process runs, it re-arms automatically
     each time mode 3 is selected again after the latch has cleared.
   - **Consoles built with the `operator` role:** use the warning screen below,
-    confirmed with controller 1 `start`.
+    confirmed with the target's confirm input: controller 1 `start` as the port
+    maps it for interface-v0, or the `RETURN` key on C64, which has no Start
+    button.
   - **Consoles in the default `data` role and N64:** no operator arming at all.
     Pad input there may be a HID feed, and the N64's Joybus ports carry
     controller 4 Start/Z as scene bits.
@@ -481,7 +487,8 @@ flow, with no wire change. It exists only in `operator` builds.
   unarmed.
 - **While it is shown:**
   - The detector is paused and the projection shows the text below.
-  - `start` arms flash and returns to the visualizer. It is consumed there, so
+  - The confirm input (`start`, or `RETURN` on C64) arms flash and returns
+    to the visualizer. It is consumed there, so
     it does not trigger interface-v0's visualizer-to-`scene_select`
     transition.
   - Any other input, or 600 steps without input, cancels. The target then
