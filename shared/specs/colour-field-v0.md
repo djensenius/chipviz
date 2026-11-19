@@ -26,8 +26,16 @@ same trace on every target. Reduced transports have their own oracle (see
   registers at VBlank. Layouts flip between two prepared screen matrices via
   `$D018`. The border (`$D020`) stays black.
 - Cuts are abrupt, with no forced fades or easing.
-- Modes 0–2 must stay within 3 flashes per second, following WCAG 2.3.1 and the
-  Harding test. Flash/gate exceeds that limit and is opt-in only.
+- Displayed hardware colours are a pure function of the step's trace tuple
+  (see **Trace** under [Modes](#modes)); ports must not add temporal
+  dithering, palette cycling or fades.
+- Modes 0–2 must stay within 3 flashes per second while scene 7 is shown,
+  following WCAG 2.3.1 and the Harding test. Scene-7 entry and exit are single
+  full-field changes outside the mode rules. Outside the `operator` role, the
+  [scene-7 debounce](#scene-7-debounce) keeps them at least `P_STABLE` (30)
+  steps apart, so they add at most 2 changes per 60 steps. What native scenes
+  show on either side is outside this contract. Flash/gate exceeds that limit
+  and is opt-in only.
 
 ## Selection through existing fields
 
@@ -47,6 +55,26 @@ same trace on every target. Reduced transports have their own oracle (see
 
   When the effective scene is 7, ports must stop deriving the displayed scene
   from time.
+- <a id="scene-7-debounce"></a>**Scene-7 debounce:** outside the `operator`
+  input role, a target changes from or to scene 7 only once the new scene value
+  (from the wire, Joybus, HID keys, or a ring `next`/`prev` input) has been
+  received unchanged for `P_STABLE` (30) consecutive steps, and never sooner
+  than `CUT_MIN` (20) steps after the previous scene-7 entry or exit took
+  effect.
+  - The step on which the new value first arrives counts as step 1. The change
+    is made at the end of its 30th consecutive step, and the new scene runs from
+    the next step; for scene 7 that step is the [Entry](#entry) step.
+  - Steps are counted on the target's step clock whether or not scene 7 is
+    shown. A value that changes before reaching 30 steps restarts the count,
+    and a value on the same side of the boundary as the current scene changes
+    nothing.
+  - Power-on entry into scene 7 is exempt: a target that powers on with
+    scene 7 enters it on its first step.
+  - Because each change needs 30 steps of a value that differs from the one
+    that caused the previous change, entries and exits take effect at least 30
+    steps apart (so the `CUT_MIN` floor is always met), and any 60 consecutive
+    steps contain at most 2 of them (F21).
+  - Changes between native scenes are not affected.
 - Controller scene-select rings become `native scenes..., 7`. `next` from the
   last native scene goes to 7, and `next` from 7 goes to the first. `prev` works
   the same way in reverse. This applies to HID D-pad up/down, the shared
@@ -63,6 +91,10 @@ same trace on every target. Reduced transports have their own oracle (see
     there that is not 3 or 7.
   - `live_bridge.py` MIDI uses CC1 to select the scene and CC2 the palette.
     Selecting 3 or 7 through CC2 while in scene 7 needs `--allow-flash`.
+  - Hosts must debounce continuous scene controls, such as MIDI CC1
+    (`scene = value // 16`), so that a control resting near a boundary does not
+    toggle the sent scene across 7. The target's
+    [scene-7 debounce](#scene-7-debounce) is a backstop, not a substitute.
   - **Every host path** follows one rule: it never sends `p` of 3 or 7 while in
     scene 7 unless that host process was started with `--allow-flash`. Host
     paths include live audio, MIDI, chipsynth, the procedural bridge, and file
@@ -253,7 +285,8 @@ confirm them with emulator captures.
 | B.Y | `0x0F` | `0x0EE` | `0x03FF` | 7 yellow | `$28` | `$18` |
 
 - **SMS, Genesis, SNES, GBA:** dim levels apply `(v * L + 1) / 3` to each
-  hardware channel. On the SMS, A.R and B.R are identical.
+  hardware channel. On Genesis, `v` is the 3-bit channel value (0..7). On the
+  SMS, A.R and B.R are identical.
 - **N64:** uses exact sRGB. A 16-bit framebuffer quantises like BGR555.
 - **C64:**
   - Levels 3 and 2 use the base colour; levels 1 and 0 use black.
@@ -305,17 +338,35 @@ poll. Unavailable fields are 0.
     `b13 & 0x0F`.
   - A note event is a rising edge of byte 15 crossing `NOTE_VEL`.
 - **USB HID** (as packed by `usb_hid.py`):
-  - `energy` is the left stick X plus 128. `signed_bucket` clamps to -127, so a
-    sent energy of 0 arrives as 1. That is still below every threshold.
+  - `energy`:
+    - Receivers that can read the left stick X use stick X plus 128.
+      `signed_bucket` clamps to -127, so a sent energy of 0 arrives as 1. That
+      is still below every threshold.
+    - Digital-only receivers (every HID-fed console ROM, which has no stick)
+      use `energy = HID_E_HI` (200) while the left shoulder is held and
+      `HID_E_LO` (64) otherwise. The bridge sets the left shoulder when
+      `energy > 170`.
+    - The C64 keyboard mapping has no energy key, so its `energy` is always
+      `HID_E_LO`.
   - `bass`, `mid` and `treble` all equal `energy`, and the spectrum is 0.
   - `beat` is South and `bar` is East.
   - West carries `flags & 0x0C`, which is `drop` or the held `fill`. HID cannot
     tell them apart, so West is ignored and HID has no `X` events.
-  - The shoulders and the left stick Y (`beat_phase`) are ignored, and there are
-    no notes.
-  - Scene and palette come from keys or pulses, through the wire stability gate.
+  - Only the right shoulder and the left stick Y (`beat_phase`) are ignored.
+    Stick readers take energy from stick X, so the left shoulder adds nothing
+    for them. There are no notes.
+  - Palette comes from keys through the wire stability gate (`P_STABLE`).
+    Scene changes from keys or D-pad pulses go through the
+    [scene-7 debounce](#scene-7-debounce).
 
-  With no separate bands, dominance never changes on HID.
+  With no separate bands, dominance never changes on HID. With the digital-only
+  values, `energy` never drops below `SIL_EXIT`, so digital-only receivers
+  never enter silence. Every South press raises `B`, and therefore `E`. A
+  shoulder press is a transient: from a settled `avg_e` of 64, `de = db = 136
+  >= T_E_ON, T_B_ON`.
+  Spectral rests at level 1 (`UP[1] <= 64 < UP[2]`, and `64 >= DOWN[1]`) and
+  steps up to 3 while the shoulder is held (`200 >= UP[3]`). Flash/gate rests
+  dim, because `avg_e` never falls below 64 (`REST_DIM_ON`). See F19.
 
 On reduced transports, the oracle is the reference implementation fed the
 mapped frames, stepped once per poll.
@@ -324,8 +375,9 @@ mapped frames, stepped once per poll.
 steps per second.
 
 - Renderers and ROMs must advance colour-field logic (detector, counters and
-  mode rules) at most 60 times per second of wall-clock time. Extra display
-  frames repeat the previous step's output and do not advance any counter.
+  mode rules) at most 60 steps in any 1-second wall-clock window; a renderer
+  that falls behind drops steps rather than catching up. Extra display frames
+  repeat the previous step's output and do not advance any counter.
 - Hosts must not send more than 60 colour-field frames per second, for example
   `live_bridge --rate 120` must drop to 60 while scene is 7. A target that
   receives frames faster must resample to at most 60 steps per second rather
@@ -374,7 +426,8 @@ CUT:     CUT_MIN 20                       (<= 3 cuts/s)
 LEVEL:   UP[1..3] = 48,104,168  DOWN[1..3] = 32,88,152
          LEVEL_OPP 10   field-wide (<= 3 flashes/s for the whole field)
 GATE:    GATE_ON 4, GATE_OFF_MIN 4, REST_DIM_ON 64, REST_DIM_OFF 48
-WIRE:    P_STABLE 30
+WIRE:    P_STABLE 30                      (also the scene-7 debounce)
+HID:     HID_E_HI 200, HID_E_LO 64        (digital-only HID energy)
 ```
 
 ### Entry
@@ -517,8 +570,11 @@ a request, so arming always goes through the budget.
        change in steps 1 or 2 set `lg = 0`, so it blocks this.
     An `X` or `D` that arrives while `lg < LEVEL_OPP` is dropped, not queued,
     so layout changes and level changes together stay 10 or more steps apart.
-  - **Level up:** `lvl += 1` when `v >= UP[lvl + 1]`.
-  - **Level down:** `lvl -= 1` when `v < DOWN[lvl]`.
+  - **Level up:** if `lvl < 3` and `v >= UP[lvl + 1]`, `lvl += 1`.
+  - **Level down:** otherwise, if `lvl > 0` and `v < DOWN[lvl]`, `lvl -= 1`.
+  - At most one level step per region per update. The `lvl < 3` and `lvl > 0`
+    guards keep `UP` and `DOWN` indexed at 1..3. In 2-region layouts only
+    regions 0 and 1 are updated; `lvl[2]` stays 0 (F20).
   - **Field-wide rate limit:** any region may change in the same step. If any
     did, set `lg = 0`. Level changes therefore happen at most once per 10 steps
     across the whole field, which keeps it at or below 3 flashes per second.
@@ -563,16 +619,25 @@ a request, so arming always goes through the budget.
       steps apart (exit, then 30 quiet steps), so at most 2 per 60 steps;
     - an applied mode or family change, or a pin applied while lit or at rest:
       requests are at least `CUT_MIN` = 20 steps apart, so at most 3 per 60
-      steps.
+      steps;
+    - scene-7 entry and exit, outside the `operator` role: the
+      [scene-7 debounce](#scene-7-debounce) keeps them at least `P_STABLE` =
+      30 steps apart, so at most 2 per 60 steps. The flash latch clears on
+      exit. A re-entry takes effect at least 30 steps after the exit, so pulse
+      starts stay at least 8 steps apart across visits, even though entry sets
+      `since_pulse` to 8.
 
     Windows that leave mode 3: switching to a lit mode (held or cuts at level
     3) turns the light on without a pulse start, but leaving and returning are
     two applied changes at least `CUT_MIN` (20) steps apart. They cost more
     pulse starts than they add, so light-ons still stay at most 8 per 60 steps.
 
-    Flash cycles therefore never exceed 7.5 per second, and all displayed
-    changes together are at most 21 per 60 steps, whatever the energy or
-    operator does.
+    Outside the `operator` role, flash cycles therefore never exceed 7.5 per
+    second. All displayed changes in scene 7 together are at most 21 per 60
+    steps, or 23 counting scene-7 entry and exit, whatever the energy or
+    operator does. In the `operator` role, scene changes are made by the person
+    at the controls and are not debounced, so these bounds hold only while
+    scene 7 stays shown.
 
 **Trace:** each step records
 `(mode, family, layout, combo, rot, lvl0, lvl1, lvl2)`, where `lvl` is the
@@ -692,3 +757,6 @@ OTHER = CANCEL
 | F16 armed 3↔7 toggle | `e`, bands and spectrum 100. `beat` set on odd steps only. `p = 3`, armed. The operator (with `--allow-flash`, so every request is armed) requests 7 at steps `98 + 60k` and 3 at `128 + 60k`. | Requests apply at the end of 98, 128, 158, …, 578. Pulse starts at `1 + 8k` (`k = 0..74`, 75 starts), never closer than 8 steps, even right after a mode entry (without `since_pulse` a start would land at 99). |
 | F17 silence cut-off | `e = 24` at steps `31k` (`k = 1..19`), otherwise 0. Bands and spectrum 0. `beat` set on odd steps only. | Flash/gate (`p = 3`, 7): silence entries at `31k - 1` (30, 61, …, 588); those at 61, 92, 123, 154, 247, 278, 309, 340, 433, 464, 495 and 526 end a lit pulse early (12). 75 pulse starts, never closer than 8 steps: `1 + 8k` through 177, then 187, 195, … (without `since_pulse` a start would land at 127, 6 after 121). At most 16 displayed level changes in any 60 steps. |
 | F18 held across entry | `e`, bands and spectrum 100. `beat` set and note 60 at velocity 100 for steps 0–9, then both clear; `beat` set again at step 300 only. Run on the full path and resampled: a 120 Hz source of 1200 frames where frames `2t` and `2t+1` carry step `t`'s input, and step `t` takes those two frames. | Both paths give identical traces. No `B` or `N` at step 1 (or anywhere in steps 1–9), because the previous flags and notes are seeded from the entry frame. The only event is `B` at step 300: cuts and pulses at 300 only. Held never changes. Treating the previous flags and notes as empty at entry would give an onset at step 1 on the full path only, which is non-conforming. |
+| F19 HID digital-only | Digital-only USB HID receiver, one step per poll for 600 polls, scene 7 from power-on. Left shoulder held for polls 320–379 (`energy` 200), otherwise released (`energy` 64). South pressed for one poll at `50 + 60k` (`k = 0..9`). Nothing else is pressed. | Never silent. `T` at 320 only (the shoulder rise); the release at 380 is not a transient. `B` at 50, 110, …, 590. Held never changes. Spectral (V2) rests at 1/1, goes to 2/2 at 320 and 3/3 at 330, then back to 2/2 at 380 and 1/1 at 390. Cuts at 50, 110, 170, 230, 290, 320, 350, 410, 470, 530 and 590 (11). Flash/gate: pulses at the same 11 steps, and the rest is level 1 (dim) everywhere else, never 0. |
+| F20 level saturation | `e = 100`, spectrum 0. Bands 250 for steps 0–199 and 400–599, and 10 for steps 200–399. | Spectral (`p = 1`, 5; V2): 3/3 from entry through 199 with no change (`lvl < 3` guards `UP`). 2/2 at 200, 1/1 at 210 and 0/0 at 220, then 0/0 through 399 without silence (`lvl > 0` guards `DOWN`). 1/1 at 400, 2/2 at 410 and 3/3 at 420 (one step per update even though `250 >= UP[3]`), then 3/3 through 599. `T` at 400 only. Held never changes. Cuts: one, at 400. Flash/gate: one pulse at 400, otherwise resting at level 1 (dim). |
+| F21 scene-7 debounce | Default `data` input role, `p = 0`. `e`, bands and spectrum 100. Overrides the setup's `scene = 7`: scene 6 for steps 0–99; for steps 100–199, 7 on even steps and 6 on odd steps; 7 for 200–299; 6 for 300–319; 7 for 320–449; 6 for 450–599. | Native scene 6 through step 229: the jitter at 100–199 never enters scene 7. Scene-7 entry at step 230 (7 first arrives at 200, and 229 is its 30th consecutive step). No exit at 300–319 (only 20 steps). Exit at the end of 479 (6 first arrives at 450), so native scene 6 runs from 480. Exactly one entry and one exit. In scene 7 (steps 230–479) the trace is held, V2, combo 0, level 3, with no changes. |
