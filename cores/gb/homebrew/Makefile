@@ -5,6 +5,9 @@ INPUT_ROLE ?= data
 FIXTURE ?= 0
 
 ifeq ($(FIXTURE),1)
+ifneq ($(INPUT_ROLE),data)
+$(error FIXTURE=1 builds the data role only; drop INPUT_ROLE=$(INPUT_ROLE))
+endif
 ROM = chipviz-gb-fixture.gb
 OBJ_DIR = $(BUILD_DIR)/fixture
 ASFLAGS = -D CHIPVIZ_FIXTURE

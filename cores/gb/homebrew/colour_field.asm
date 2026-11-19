@@ -179,6 +179,7 @@ wPowerOn:   ds 1
 wBooted:    ds 1
 wDebVal:    ds 1
 wDebN:      ds 1
+wSinceScene: ds 1     ; steps since a scene-7 entry or exit took effect
 wSceneIn:   ds 1      ; incoming scene this step
 wPalIn:     ds 1      ; incoming palette p = palette & 7
 wInAbs:     ds 1      ; scene and palette were carried absolutely
@@ -215,6 +216,8 @@ InitState:
   ld [wPin], a
   ld [wPinReq], a
   ld [wCand], a
+  ld a, CUT_MIN          ; no previous scene change bounds the first one
+  ld [wSinceScene], a
   ret
 
 ; One step: input, rings, field logic, output, then the scene-7 debounce.
@@ -250,6 +253,8 @@ ENDC
   ld [wShown7], a
   ld [wEntryPending], a
   ld [wPowerOn], a
+  xor a
+  ld [wSinceScene], a
 .run
   ld a, [wShown7]
   or a
@@ -513,9 +518,14 @@ ENDC
   ret
 
 ; Scene-7 debounce at the end of the step. Data role: a change needs the
-; incoming scene unchanged for P_STABLE steps. Operator role: local Up/Down
-; scene inputs are exempt and take effect at once.
+; incoming scene unchanged for P_STABLE steps, and at least CUT_MIN steps
+; since the last entry or exit. Operator role: local Up/Down scene inputs are
+; exempt and take effect at once. The DMG has no wire or link-cable scene
+; source today, so the floor never binds (P_STABLE > CUT_MIN). A future
+; debounced source on the operator build must take the gated path below, so
+; that wSinceScene spaces it after an exempt local change.
 SceneDebounce:
+  INCSAT wSinceScene
   ld a, [wSceneIn]
   ld b, a
   ld a, [wDebVal]
@@ -540,7 +550,12 @@ IF !DEF(CHIPVIZ_INPUT_ROLE_OPERATOR)
   ld a, [wDebN]
   cp P_STABLE
   ret c
+  ld a, [wSinceScene]
+  cp CUT_MIN
+  ret c
 ENDC
+  xor a
+  ld [wSinceScene], a
   ld a, c
   ld [wShown7], a
   or a

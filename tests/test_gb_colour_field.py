@@ -350,7 +350,9 @@ class GbColourFieldFixtures(unittest.TestCase):
       self.assertEqual(changes(runs[p]), [], p)
     spectral = runs[1]
     levels = [(t, spectral[t][5]) for t in changes(spectral)]
-    self.assertEqual(levels[:9], [(30, 0), (40, 1), (50, 2), (60, 3), (92, 0), (102, 1), (112, 2), (122, 3), (154, 0)])
+    # Black at 30, up at 40, 50 and 60, then the same every 62 steps.
+    want = [(base + d, level) for base in range(30, 600, 62) for d, level in ((0, 0), (10, 1), (20, 2), (30, 3))]
+    self.assertEqual(levels, [(t, level) for t, level in want if t < 600])
     self.assertLessEqual(max_in_window(changes(spectral)), 4)
 
   def test_f14_dim_rest_attack(self):
@@ -558,10 +560,29 @@ class GbColourFieldCaptures(unittest.TestCase):
 
   def test_data_role_never_flashes(self):
     rom = self.start()
-    press = {10: "up", 14: "b", 50: "right", 54: "right", 58: "right", **{t: "b" for t in range(100, 400, 9)}}
+    # Mode 3 by the ring, then Start and Select, alone and held together
+    # with other buttons: the data role has no confirm, pin or arming input.
+    press = {10: "up", 14: "b", 50: "right", 54: "right", 58: "right", **{t: "b" for t in range(100, 400, 9)},
+             70: "start", 74: "select", 78: ("start", "b"), 82: ("start", "select"), 86: ("start", "a"),
+             90: ("start", "left"), 94: ("start", "right")}
     rom.run(400, held(press))
     self.assertEqual({s[1] for s in rom.trace[45:] if s[0] == 1}, {0, 2})
+    self.assertNotIn(2, {s[0] for s in rom.trace})
+    self.assertEqual({s[2] for s in rom.trace[45:]}, {0})
     self.assertEqual(rom.trace[399][1], 2)
+
+  def test_data_role_adversarial_cuts(self):
+    rom = self.start()
+    # Hard cuts with B on every other step and palette ring flips (3, 2, ...)
+    # every 31 steps: still at most 3 visible changes in 60 steps, 20 apart.
+    setup = held({10: "up", 14: "b", 50: "right", 54: "right"})
+    flips = held({t: "right" if (t - 100) // 31 % 2 == 0 else "left" for t in range(100, 1000, 31)})
+    rom.run(1000, lambda t: setup(t) if t < 100 else (("b",) if t % 2 == 0 else ()) + flips(t))
+    self.assertEqual({s[1] for s in rom.trace[100:]}, {2})
+    visible = [t for t in range(101, 1000) if rom.trace[t] != rom.trace[t - 1]]
+    self.assertGreaterEqual(len(visible), 40)
+    self.assertLessEqual(max_in_window(visible), 3)
+    self.assertGreaterEqual(min(b - a for a, b in zip(visible, visible[1:])), 20)
 
   def test_operator_warning_and_gate(self):
     rom = self.start("operator")
@@ -581,6 +602,37 @@ class GbColourFieldCaptures(unittest.TestCase):
     self.assert_frame(rom, rest, "operator-gate-rest-dim")
     starts = [t for t in range(101, 300) if rom.trace[t][6] == 3 and rom.trace[t - 1][6] != 3]
     self.assertGreaterEqual(min(b - a for a, b in zip(starts, starts[1:])), 8)
+
+  def operator_warning(self, steps, press):
+    """Operator ROM: Up, B, then Right three times selects unarmed mode 3."""
+    rom = self.start("operator")
+    rom.run(steps, held({10: "up", 14: "b", 20: "right", 24: "right", 28: "right", **press}))
+    warning = [t for t, s in enumerate(rom.trace) if s[0] == 2]
+    self.assertEqual(warning, list(range(warning[0], warning[-1] + 1)))
+    self.assertLess(warning[0], 40)
+    return rom.trace, warning
+
+  def test_operator_warning_cancel(self):
+    trace, warning = self.operator_warning(200, {60: "a"})
+    self.assertIn(warning[-1], (59, 60, 61))
+    self.assertTrue(all(s[0] == 1 for s in trace[warning[-1] + 1:]))
+    self.assertTrue(all(s[1] == 2 for s in trace[warning[-1] + 10:]))
+
+  def test_operator_warning_timeout(self):
+    # 600 steps without input cancel: the warning shows on 599 steps (the
+    # step that times out renders the field), then unarmed mode 2.
+    trace, warning = self.operator_warning(750, {})
+    self.assertEqual(len(warning), 599)
+    self.assertTrue(all(s[0] == 1 for s in trace[warning[-1] + 1:]))
+    self.assertTrue(all(s[1] == 2 for s in trace[warning[-1] + 10:]))
+
+  def test_operator_warning_held_start(self):
+    # Start held into the warning is not a new press: it does not confirm.
+    # A fresh Start later arms mode 3.
+    held_start = {t: ("start",) for t in range(26, 60)}
+    trace, warning = self.operator_warning(200, {**held_start, 28: ("start", "right"), 29: ("start", "right"), 90: "start"})
+    self.assertIn(warning[-1], (89, 90, 91))
+    self.assertTrue(all(s[1] == 3 for s in trace[warning[-1] + 10:]))
 
   def test_fixture_black_rests(self):
     # Silence (F0) on the fixture build: spectral black, and the flash/gate
@@ -606,7 +658,10 @@ class GbColourFieldCaptures(unittest.TestCase):
 def held(table):
   """Each press is held for two steps: the core latches the pad at a frame
   boundary, so a one-step press can land on either step."""
-  return lambda t: (table[t],) if t in table else (table[t - 1],) if t - 1 in table else ()
+  def buttons(t):
+    press = table.get(t, table.get(t - 1, ()))
+    return (press,) if isinstance(press, str) else press
+  return buttons
 
 
 if __name__ == "__main__":

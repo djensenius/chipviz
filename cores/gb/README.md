@@ -113,7 +113,16 @@ no border) and skips when RGBDS or the core is missing:
   its region's expected shade at the spec boundaries. PNGs go to
   `build/gb-colour-field/`.
 
-This is emulator evidence only; it has not been checked on hardware.
+This is emulator evidence only; it has not been checked on hardware. CI
+installs no SameBoy libretro core (and the Python and check jobs have no
+RGBDS), so these tests skip there; run them locally, where `just check`
+includes them.
+
+The spec's `CUT_MIN` floor after a scene-7 entry or exit is kept by a
+since-last-scene-change counter on the debounced path. It cannot bind today:
+the DMG has no wire or link-cable scene source, data-role changes already need
+30 stable steps, and operator scene presses are exempt. A future debounced
+source on the operator build must use the same path.
 
 ## Current scaffold
 
