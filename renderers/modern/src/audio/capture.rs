@@ -12,8 +12,9 @@
 //! device stops delivering, the thread feeds silence so the published levels
 //! decay instead of freezing. [`SampleClock`] counts each stretch of time
 //! once: the stall threshold adapts to devices that deliver in large batches
-//! (and returns to its base after a second of normal deliveries), and real samples that arrive late for time already filled with silence are
-//! discarded rather than analysed a second time.
+//! (and returns to its base after a second of normal deliveries), and real
+//! samples that arrive late for time already filled with silence are discarded
+//! rather than analysed a second time.
 //!
 //! The stream is not reopened: if the device is unplugged or fails, cpal
 //! reports an error (printed, rate-limited) and the levels decay to silence
