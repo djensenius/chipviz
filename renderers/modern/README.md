@@ -200,7 +200,8 @@ the colour field, whatever the registry length; every other byte selects
   one bar apart. The timings in seconds assume 60 control frames per second.
   The drop flag is ignored unless the renderer runs with `--lines-drop-cuts`;
   then a rising drop flag cuts straight to the next section (a refold of the
-  same lines, not a screen flash), within the one-bar limit. The camera
+  same lines, not a screen flash). A drop (or phrase boundary) that arrives
+  within one bar of the last section change is ignored, not delayed. The camera
   swings around the plane and eases into the hallway entrance. The scene projects its own camera on the CPU, so
   it uses `ScreenSpace`. Procedural input never selects it; use `--scene 3`
   (procedural frames 250, 316 and 400 show plane, mid-fold and hallway).
@@ -322,7 +323,8 @@ frame 0, so very large frame indices take longer to capture.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed
-from frame 0 like the camera. Procedural input never arms flash/gate; with
+from frame 0 like the camera. `--lines-drop-cuts` turns on Lines drop cuts
+as in the renderer, replayed from frame 0. Procedural input never arms flash/gate; with
 the `unmeasured-flash` feature, a recording arms it only as a target would,
 from a stable absolute wire 3 or 7 held in scene 7, and default builds never
 flash. Recorded inputs use

@@ -746,6 +746,151 @@ mod tests {
         assert_eq!(state.section(), 2);
     }
 
+    /// CPU stand-in for the GPU pass at `WIDTH` x `HEIGHT`: point-samples
+    /// each screen-space quad at pixel centres, as the shader places it
+    /// (rotated in NDC), alpha-blending its linear colour over black in draw
+    /// order. Returns each pixel's relative luminance (Rec. 709 weights on
+    /// linear light, as WCAG uses).
+    fn rasterise(instances: &[Instance]) -> Vec<f32> {
+        const WIDTH: usize = 1280;
+        const HEIGHT: usize = 720;
+        let mut rgb = vec![[0.0f32; 3]; WIDTH * HEIGHT];
+        for instance in instances {
+            let (sin, cos) = instance.rotation.sin_cos();
+            let half = [instance.size[0] * 0.5, instance.size[1] * 0.5];
+            let reach = [
+                cos.abs() * half[0] + sin.abs() * half[1],
+                sin.abs() * half[0] + cos.abs() * half[1],
+            ];
+            let [cx, cy, _] = instance.center;
+            let to_pixel = |ndc: f32, size: usize| ((ndc + 1.0) * 0.5 * size as f32).floor();
+            let x_range = to_pixel(cx - reach[0], WIDTH).max(0.0) as usize
+                ..(to_pixel(cx + reach[0], WIDTH) + 1.0).clamp(0.0, WIDTH as f32) as usize;
+            let y_range = to_pixel(cy - reach[1], HEIGHT).max(0.0) as usize
+                ..(to_pixel(cy + reach[1], HEIGHT) + 1.0).clamp(0.0, HEIGHT as f32) as usize;
+            let alpha = instance.color[3];
+            for y in y_range {
+                let ny = (y as f32 + 0.5) / HEIGHT as f32 * 2.0 - 1.0 - cy;
+                for x in x_range.clone() {
+                    let nx = (x as f32 + 0.5) / WIDTH as f32 * 2.0 - 1.0 - cx;
+                    let along = nx * cos + ny * sin;
+                    let across = -nx * sin + ny * cos;
+                    if along.abs() <= half[0] && across.abs() <= half[1] {
+                        let pixel = &mut rgb[y * WIDTH + x];
+                        for (value, source) in pixel.iter_mut().zip(instance.color) {
+                            *value = source * alpha + *value * (1.0 - alpha);
+                        }
+                    }
+                }
+            }
+        }
+        rgb.iter()
+            .map(|[r, g, b]| 0.2126 * r + 0.7152 * g + 0.0722 * b)
+            .collect()
+    }
+
+    /// Mean luminance, lit share (luminance above 0.02) and the share of
+    /// pixels whose luminance changes by at least WCAG's 0.1 between `a`
+    /// and `b`.
+    fn change(a: &[f32], b: &[f32]) -> (f32, f32, f32, f32, f32) {
+        let count = a.len() as f32;
+        let mean = |image: &[f32]| image.iter().sum::<f32>() / count;
+        let lit = |image: &[f32]| image.iter().filter(|&&l| l > 0.02).count() as f32 / count;
+        let flipped = a
+            .iter()
+            .zip(b)
+            .filter(|(x, y)| (*x - *y).abs() >= 0.1)
+            .count() as f32
+            / count;
+        (mean(a), mean(b), lit(a), lit(b), flipped)
+    }
+
+    /// Luminance images of the frames before and after `index` (procedural
+    /// input with drops on `drops`, cuts on), and whether `index` changed
+    /// section.
+    fn around(index: u64, drops: &[u64]) -> (Vec<f32>, Vec<f32>, bool) {
+        let profile = RenderProfile::m1();
+        let mut state = SceneState::new(super::super::SceneConfig {
+            lines_drop_cuts: true,
+        });
+        let frames = with_drops(drops, 0..index + 1);
+        let mut images = Vec::new();
+        let mut sections = Vec::new();
+        for (at, frame) in frames.iter().enumerate() {
+            state.observe(frame);
+            if at as u64 + 1 >= index {
+                let mut instances = Vec::new();
+                build(
+                    &profile,
+                    *frame,
+                    at as f32 / 60.0,
+                    16.0 / 9.0,
+                    &state,
+                    &mut instances,
+                );
+                images.push(rasterise(&instances));
+                sections.push(state.lines.section());
+            }
+        }
+        let after = images.pop().unwrap();
+        (images.pop().unwrap(), after, sections[0] != sections[1])
+    }
+
+    /// Flash policy: a cut refolds the same lines, so whole-screen
+    /// luminance barely moves, but many thin-line pixels change at once.
+    ///
+    /// Measured with `rasterise` (m1 profile, 1280x720, procedural input):
+    ///
+    /// | transition | mean luminance | lit share | changed >= 0.1 |
+    /// | --- | --- | --- | --- |
+    /// | ordinary plane step (141) | 0.040 -> 0.042 | 0.101 -> 0.104 | 0.058 |
+    /// | ordinary hallway step (451) | 0.103 -> 0.083 | 0.199 -> 0.174 | 0.090 |
+    /// | mid-fold step (316) | 0.038 -> 0.044 | 0.089 -> 0.097 | 0.100 |
+    /// | fourth-section cut, plane to hallway (768) | 0.039 -> 0.036 | 0.098 -> 0.116 | 0.197 |
+    /// | drop cut, plane to hallway (150) | 0.042 -> 0.095 | 0.096 -> 0.179 | 0.251 |
+    /// | drop cut, hallway to plane (290) | 0.058 -> 0.034 | 0.145 -> 0.095 | 0.191 |
+    ///
+    /// The mean changes by at most 0.053, under WCAG's 0.1 relative
+    /// luminance step even if the whole screen moved together. The pixels
+    /// that individually change by 0.1 or more cover up to a quarter of the
+    /// screen, about 2.5 times an ordinary frame and more than WCAG's
+    /// "25% of 10 degrees" area (roughly 11% of a 1024x768 screen at normal
+    /// viewing distance). A cut is one transition, though, not an on/off
+    /// pair, and section changes are at least one bar (60 frames, 1 s at
+    /// 60 fps) apart, so cuts stay well under 3 flashes per second. If a
+    /// stricter policy is wanted, crossfade the cut over a few frames.
+    #[test]
+    fn cuts_keep_luminance_change_bounded() {
+        const MAX_MEAN_CHANGE: f32 = 0.08;
+        const MAX_CHANGED_SHARE: f32 = 0.30;
+        const MAX_ORDINARY_CHANGED_SHARE: f32 = 0.12;
+        for (index, drops, cut) in [
+            (141, &[][..], false),
+            (451, &[], false),
+            (316, &[], false),
+            (768, &[], true),
+            (150, &[150, 290], true),
+            (290, &[150, 290], true),
+        ] {
+            let (before, after, changed_section) = around(index, drops);
+            assert_eq!(changed_section, cut, "frame {index}");
+            let (mean_before, mean_after, lit_before, lit_after, changed) = change(&before, &after);
+            assert!(
+                (mean_after - mean_before).abs() < MAX_MEAN_CHANGE,
+                "frame {index}: mean {mean_before} -> {mean_after}"
+            );
+            assert!(lit_before > 0.05 && lit_after > 0.05, "frame {index}");
+            let bound = if cut {
+                MAX_CHANGED_SHARE
+            } else {
+                MAX_ORDINARY_CHANGED_SHARE
+            };
+            assert!(changed < bound, "frame {index}: changed share {changed}");
+        }
+        // Cuts are at most one per second, whatever the tempo.
+        assert!((0..=u8::MAX).all(|bpm| bar_frames(bpm) >= FRAME_RATE));
+    }
+
     #[test]
     fn repeated_frame_counters_do_not_step() {
         let mut state = LinesState::default();
