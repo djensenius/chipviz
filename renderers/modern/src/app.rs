@@ -675,13 +675,12 @@ impl FrameSource {
         let since_udp = self.last_udp.map(|last| now.duration_since(last));
         match idle_source(self.mic.is_some(), self.udp.socket.is_some(), since_udp) {
             IdleSource::Hold => {
-                // Beat, bar, and drop are one-off events: with a mic, a held
-                // packet keeps its levels but must not repeat them every
-                // redraw. Notes are sustained voice state (active/gated voices
-                // that producers resend until note-off), so they are kept.
-                if self.mic.is_some() {
-                    self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
-                }
+                // Beat, bar, and drop are one-off events: a held packet (with
+                // or without a mic) keeps its levels but must not repeat them
+                // every redraw, or a paused sender pulses forever. Notes are
+                // sustained voice state (active/gated voices that producers
+                // resend until note-off), so they are kept.
+                self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
             }
             // Generated frames number from `fallback_index`, independent of
             // UDP counters. On a handover the first one can equal the last
@@ -1172,6 +1171,62 @@ mod tests {
         // After the hold, mic frames are new frames and step again.
         let (fresh, _, stepped) = redraw(&mut source, &mut field, start + UDP_HOLD * 2);
         assert_eq!((fresh, stepped), (1, true));
+    }
+
+    /// UDP-only (no mic): a paused sender's last packet is held indefinitely.
+    /// Its one-off beat/bar/drop flags show on the first draw only; levels,
+    /// notes, scene, palette, and the fill/manual flags stay held.
+    #[test]
+    fn udp_only_held_redraws_clear_one_off_flags() {
+        let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+        let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+        let mut source = FrameSource::with_feed(udp, None);
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let start = Instant::now();
+        let onsets = audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG;
+        let sustained = 0x08 | 0x10;
+        let send = |source: &mut FrameSource, counter: u16| {
+            let mut packet = wire_packet(77, onsets | sustained, Some((60, 100)));
+            packet[2..4].copy_from_slice(&counter.to_le_bytes());
+            packet[20] = 2;
+            packet[21] = 5;
+            packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+            sender.send_to(&packet, address).unwrap();
+            // About 2 s, for loaded CI hosts.
+            for _ in 0..1000 {
+                let frame = source.next_frame_at(start);
+                if frame.frame == counter && !source.fresh().is_empty() {
+                    return frame;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("UDP packet {counter} never arrived");
+        };
+
+        for counter in [1001, 1002] {
+            // The first draw of each packet carries its events.
+            let first = send(&mut source, counter);
+            assert_eq!(first.flags, onsets | sustained, "{first:?}");
+            // Held redraws of a paused sender, long past any hold window.
+            for elapsed in [
+                Duration::ZERO,
+                UDP_HOLD,
+                UDP_HOLD * 2,
+                Duration::from_secs(60),
+            ] {
+                let held = source.next_frame_at(start + elapsed);
+                assert!(source.fresh().is_empty());
+                assert_eq!(held.frame, counter);
+                assert_eq!(held.flags, sustained, "{held:?}");
+                assert!(!held.beat_onset());
+                assert_eq!(
+                    (held.energy, held.scene, held.palette, held.note_count),
+                    (77, 2, 5, 1),
+                    "{held:?}"
+                );
+                assert_eq!((held.notes[0].note, held.notes[0].velocity), (60, 100));
+            }
+        }
     }
 
     #[test]
