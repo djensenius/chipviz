@@ -302,6 +302,8 @@ impl ScenePipeline {
         let shown = mic_layers::shown(self.mic_layers.mode(), display);
         self.mic_layers
             .step(frame, self.live_scope.as_ref(), elapsed, shown);
+        // As a drawn frame builds it, so the ribbon's limiter is replayed.
+        self.mic_layers.advance_limit(aspect);
     }
 
     pub fn set_mic_layers(&mut self, mode: mic_layers::Mode) {

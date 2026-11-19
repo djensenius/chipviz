@@ -330,11 +330,16 @@ pub fn ribbon_area_bound(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> f32 {
 /// (how [`MicLayers`] holds a reduction across frames). Bisection along the
 /// path keeps an end known to be within budget, so whatever the input
 /// (live, synthesised, a torn read, any aspect) and floor, the result is.
-/// Returns the limited ribbon and its position.
+/// If `floor` is over budget but `previous` (the last frame's position,
+/// above `floor`) is within it, `previous` is held exactly instead of
+/// bisecting, so a reduction that still fits does not wander by a bisection
+/// step from frame to frame; pass `floor` to skip this. Returns the limited
+/// ribbon and its position.
 pub fn limit_ribbon(
     wave: &[[f32; POINTS]; OUTLINES],
     aspect: f32,
     floor: f32,
+    previous: f32,
 ) -> ([[f32; POINTS]; OUTLINES], f32) {
     let budget = ribbon_budget(aspect);
     let floor = floor.clamp(0.0, 2.0);
@@ -352,6 +357,12 @@ pub fn limit_ribbon(
         let held = along(floor);
         if ribbon_area_bound(&held, aspect) <= budget {
             return (held, floor);
+        }
+    }
+    if previous > floor && previous <= 2.0 {
+        let held = along(previous);
+        if ribbon_area_bound(&held, aspect) <= budget {
+            return (held, previous);
         }
     }
     let (mut over, mut within) = (floor, 2.0_f32);
@@ -537,6 +548,15 @@ impl MicLayers {
         }
     }
 
+    /// For a frame that is stepped but not drawn: advances the ribbon's
+    /// limiter as [`MicLayers::build`] would at `aspect`, so a later drawn
+    /// frame (a capture still) matches a live run while the limit relaxes.
+    pub fn advance_limit(&self, aspect: f32) {
+        if self.ribbon_shown {
+            self.limited(aspect.max(0.01));
+        }
+    }
+
     fn build_ribbon(&self, frame: ControlFrame, aspect: f32, instances: &mut Vec<Instance>) {
         // The final, guaranteed limit, on exactly what is drawn.
         self.push_ribbon(&self.limited(aspect), frame, aspect, instances);
@@ -547,14 +567,16 @@ impl MicLayers {
     /// reduction by at most the elapsed time over `LIMIT_RELAX_S` (of the
     /// whole path), tightening at once if that is over budget, so every
     /// frame is within budget and the reduction relaxes steadily.
+    /// If that is over budget but the last position still fits, it is held.
     fn limited(&self, aspect: f32) -> [[f32; POINTS]; OUTLINES] {
-        let floor = match (self.limit.get(), self.last_elapsed) {
-            (Some((position, at)), Some(now)) => {
-                position - (now - at).max(0.0) as f32 * 2.0 / LIMIT_RELAX_S
-            }
-            _ => 0.0,
+        let (floor, previous) = match (self.limit.get(), self.last_elapsed) {
+            (Some((position, at)), Some(now)) => (
+                position - (now - at).max(0.0) as f32 * 2.0 / LIMIT_RELAX_S,
+                position,
+            ),
+            _ => (0.0, 0.0),
         };
-        let (wave, position) = limit_ribbon(&self.wave, aspect, floor);
+        let (wave, position) = limit_ribbon(&self.wave, aspect, floor, previous);
         self.limit.set(self.last_elapsed.map(|now| (position, now)));
         wave
     }
@@ -1502,7 +1524,7 @@ mod tests {
     /// budget and rasterises within [`cap`] at `aspect`.
     fn assert_drawn_within_cap(wave: &[[f32; POINTS]; OUTLINES], aspect: f32, what: &str) {
         assert!(ribbon_budget(aspect) <= cap(aspect));
-        let limited = limit_ribbon(wave, aspect, 0.0).0;
+        let limited = limit_ribbon(wave, aspect, 0.0, 0.0).0;
         let bound = ribbon_area_bound(&limited, aspect);
         assert!(
             bound <= ribbon_budget(aspect),
@@ -1629,7 +1651,7 @@ mod tests {
         let zigzag = std::array::from_fn(|index| if index % 2 == 0 { 1.0 } else { -1.0 });
         for aspect in PORTRAITS {
             assert_eq!(
-                limit_ribbon(&tone, aspect, 0.0).0,
+                limit_ribbon(&tone, aspect, 0.0, 0.0).0,
                 tone,
                 "440 Hz at {aspect}"
             );
@@ -1668,7 +1690,11 @@ mod tests {
         for rate in [44_100.0, 48_000.0, 96_000.0] {
             for snapshot in published(rate, 0.3, sine(rate, 440.0)).iter().skip(5) {
                 let wave = [snapshot.upper, snapshot.lower];
-                assert_eq!(limit_ribbon(&wave, ASPECT, 0.0).0, wave, "440 Hz at {rate}");
+                assert_eq!(
+                    limit_ribbon(&wave, ASPECT, 0.0, 0.0).0,
+                    wave,
+                    "440 Hz at {rate}"
+                );
             }
         }
         let snapshot = *published(48_000.0, 0.3, |n| {
@@ -1676,7 +1702,7 @@ mod tests {
         })
         .last()
         .unwrap();
-        let [upper, lower] = limit_ribbon(&[snapshot.upper, snapshot.lower], ASPECT, 0.0).0;
+        let [upper, lower] = limit_ribbon(&[snapshot.upper, snapshot.lower], ASPECT, 0.0, 0.0).0;
         let middle = POINTS / 4..3 * POINTS / 4;
         assert!(upper[middle.clone()].iter().all(|&value| value >= 0.5));
         assert!(lower[middle].iter().all(|&value| value <= -0.5));
@@ -1742,7 +1768,7 @@ mod tests {
             };
             let wave = [outline(1.0), outline(-1.0)];
             let aspect = aspects[case % aspects.len()];
-            let limited = limit_ribbon(&wave, aspect, 0.0).0;
+            let limited = limit_ribbon(&wave, aspect, 0.0, 0.0).0;
             let bound = ribbon_area_bound(&limited, aspect);
             assert!(
                 bound <= ribbon_budget(aspect),
@@ -1750,10 +1776,12 @@ mod tests {
             );
             // Held at any floor, as across frames, it is within budget too.
             let floor = next() * 2.0;
-            let held = ribbon_area_bound(&limit_ribbon(&wave, aspect, floor).0, aspect);
+            let previous = floor + next() * (2.0 - floor);
+            let limited = limit_ribbon(&wave, aspect, floor, previous).0;
+            let held = ribbon_area_bound(&limited, aspect);
             assert!(
                 held <= ribbon_budget(aspect),
-                "case {case} at {aspect} from {floor}: {held}"
+                "case {case} at {aspect} from {floor}, {previous}: {held}"
             );
             if case % 40 == 0 {
                 assert_drawn_within_cap(&wave, aspect, &format!("case {case}"));
@@ -1856,16 +1884,19 @@ mod tests {
     /// or at 3 Hz), every frame is within budget and the limiter relaxes by
     /// at most 1/30 of its path per frame. The drawn bound changes by at
     /// most `STEP` (a fifth: the pulse train's own frame-to-frame changes
-    /// reach about 0.14 of it, unlimited) of the budget between frames,
-    /// and neither it
-    /// nor the limiter position alternates (successive changes over
-    /// `THRESHOLD`, 2% of the budget or of the path, of opposite sign) more
-    /// than `FLIPS` times in the run.
+    /// reach about 0.14 of it, unlimited) of the budget between frames.
+    /// Neither the limiter position nor the bound alternates (successive
+    /// changes of opposite sign, each over `POSITION_THRESHOLD`, 2% of the
+    /// path, or `BOUND_THRESHOLD`, 5% of the budget) more than `FLIPS` times
+    /// in the run. The bound's threshold allows for the input itself: a
+    /// held reduction draws the eased hovering tone's own alternation,
+    /// about 3% of the budget per frame.
     #[test]
     fn the_final_limiter_does_not_jitter() {
         const FRAMES: usize = 600;
         const STEP: f32 = 0.2;
-        const THRESHOLD: f32 = 0.02;
+        const BOUND_THRESHOLD: f32 = 0.05;
+        const POSITION_THRESHOLD: f32 = 0.04;
         const FLIPS: usize = 4;
         let pulses = published(48_000.0, FRAMES as f32 / FPS, |n| match n % 80 {
             0 => -1.0,
@@ -1944,8 +1975,8 @@ mod tests {
             let bounds: Vec<f32> = run.iter().map(|&(bound, _)| bound / budget).collect();
             let positions: Vec<f32> = run.iter().map(|&(_, position)| position).collect();
             let worst = max_area(&bounds);
-            let (largest, flips) = changes(&bounds, THRESHOLD);
-            let (_, position_flips) = changes(&positions, 2.0 * THRESHOLD);
+            let (largest, flips) = changes(&bounds, BOUND_THRESHOLD);
+            let (_, position_flips) = changes(&positions, POSITION_THRESHOLD);
             let relax = positions
                 .windows(2)
                 .fold(0.0_f32, |most, pair| most.max(pair[0] - pair[1]));
@@ -1964,5 +1995,54 @@ mod tests {
                 "{name}: limiter relaxed {relax} in a frame"
             );
         }
+    }
+
+    /// A capture still replays earlier frames with `step` and
+    /// `advance_limit` only, then builds one: while the limit relaxes after
+    /// a loud filled band, it draws exactly what a live run (building every
+    /// frame) draws at that frame. Without the replayed limit it would not.
+    #[test]
+    fn a_replayed_limit_matches_a_live_run() {
+        let zigzag = std::array::from_fn(|index| if index % 2 == 0 { 0.9 } else { -0.9 });
+        let band = ScopeSnapshot {
+            upper: zigzag,
+            lower: zigzag,
+            onsets: 0,
+        };
+        let input = |step: usize| if step < 30 { band } else { snapshot(0.9, 0) };
+        let at = |step: usize| step as f64 / f64::from(FPS);
+        let mut live = MicLayers::new(Mode::Scope);
+        let mut drawn = Vec::new();
+        for step in 0..60 {
+            live.step(quiet(), Some(&input(step)), at(step), true);
+            let mut instances = Vec::new();
+            live.build(quiet(), ASPECT, &mut instances);
+            drawn.push((instances, live.limit.get().unwrap().0));
+        }
+        let mut relaxing = 0;
+        for (still, (instances, position)) in drawn.iter().enumerate().skip(31) {
+            relaxing += usize::from(*position > 0.0);
+            for replay in [true, false] {
+                let mut layers = MicLayers::new(Mode::Scope);
+                for step in 0..still {
+                    layers.step(quiet(), Some(&input(step)), at(step), true);
+                    if replay {
+                        layers.advance_limit(ASPECT);
+                    }
+                }
+                layers.step(quiet(), Some(&input(still)), at(still), true);
+                let mut replayed = Vec::new();
+                layers.build(quiet(), ASPECT, &mut replayed);
+                let same = bytemuck::cast_slice::<Instance, u8>(&replayed)
+                    == bytemuck::cast_slice::<Instance, u8>(instances);
+                if replay {
+                    assert!(same, "frame {still}");
+                } else if *position > 0.0 {
+                    assert!(!same, "frame {still}: unreplayed");
+                }
+            }
+        }
+        // The still frames cover the limit relaxing, not only its end.
+        assert!(relaxing >= 5, "{relaxing}");
     }
 }

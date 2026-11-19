@@ -167,11 +167,13 @@ change the control-frame wire format.
   more just before drawing: if the drawn lines, strokes included, would cover
   more than 13% of the screen, they blend towards their envelope and then
   shrink towards a flat centre line until they fit. A loud 440 Hz tone is
-  drawn unchanged. In portrait windows the whole ribbon (amplitude and stroke
-  widths as well as length) scales with the width. Each line is drawn in
-  three near-opaque layers: a dimmed palette-tinted halo, a black backing
-  inside it, and a near-white tinted core, which keep it readable over scenes
-  of the same colour.
+  drawn unchanged. This limit tightens at once but relaxes over 0.5 s, so
+  input hovering at the limit does not jitter, and just after a loud burst
+  even a 440 Hz tone stays briefly reduced. In portrait windows the whole
+  ribbon (amplitude and stroke widths as well as length) scales with the
+  width. Each line is drawn in three near-opaque layers: a dimmed
+  palette-tinted halo, a black backing inside it, and a near-white tinted
+  core, which keep it readable over scenes of the same colour.
 - `bursts`: a soft glow with a ring of sparks at a detected onset. A burst
   rises over 80 ms and decays to nothing within 1.6 s. Onsets are rate-capped:
   one arriving less than 0.5 s after the last burst started is skipped, and
@@ -191,10 +193,11 @@ with its colour and peak fixed when it starts, over a small part of the screen
 rather than a full-screen change, and new bursts start at most once every
 0.5 s (two per second, with margin under the three-per-second limit for dark
 rooms and projection), with at most four alive at once. A unit test
-composites a CPU model of the bursts over black at the maximum onset rate, including input whose palette and energy change every
-frame at 60, 120 and 240 fps, and finds at most two flashes (opposing changes
-of 0.1 relative luminance) in any 1 s at any sampled point. The scope ribbon
-is outside that model; its exemption rests on staying thin lines. Unit tests
+composites a CPU model of the bursts over black at the maximum onset rate,
+including input whose palette and energy change every frame at 60, 120 and
+240 fps, and finds at most two flashes (opposing changes of 0.1 relative
+luminance) in any 1 s at any sampled point. The scope ribbon is outside that
+model; its exemption rests on staying thin lines. Unit tests
 rasterise the ribbon for a loud 4 kHz tone and white noise gated at 3, 5 and
 10 Hz, and for loud tones every 100 Hz from 0.5 to 8 kHz (plus those that
 divide the point spacing) at 44.1, 48 and 96 kHz, steady and gated. They check
