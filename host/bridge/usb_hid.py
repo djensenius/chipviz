@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from n64_joybus import decode_control_frame
-from chipviz_bridge import WIRE_SIZE
+from chipviz_bridge import WIRE_SIZE, add_allow_flash_argument, announce_allow_flash, sanitise_flash
 
 PALETTE_KEYS = ("Q", "W", "E", "R", "T", "Y", "U", "I")
 
@@ -27,8 +27,9 @@ def signed_bucket(value: int) -> int:
   return max(-127, min(127, value - 128))
 
 
-def map_frame(wire: bytes) -> HidState:
-  frame = decode_control_frame(wire)
+def map_frame(wire: bytes, allow_flash: bool = False) -> HidState:
+  # Flash guard for the HID decoded scene (`scene & 0x07`).
+  frame = decode_control_frame(sanitise_flash(wire, "hid", allow_flash))
   buttons = 0
   if frame.flags & 0x01:
     buttons |= 1 << 0
@@ -63,11 +64,11 @@ def map_frame(wire: bytes) -> HidState:
   )
 
 
-def convert_stream(stream: bytes) -> list[HidState]:
+def convert_stream(stream: bytes, allow_flash: bool = False) -> list[HidState]:
   if len(stream) % WIRE_SIZE != 0:
     raise ValueError("control-frame stream is not aligned to 33-byte records")
   return [
-    map_frame(stream[offset:offset + WIRE_SIZE])
+    map_frame(stream[offset:offset + WIRE_SIZE], allow_flash)
     for offset in range(0, len(stream), WIRE_SIZE)
   ]
 
@@ -76,12 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--input", type=Path, required=True, help="raw control-frame-v0 stream")
   parser.add_argument("--output", type=Path, help="JSON HID state stream; stdout if omitted")
+  add_allow_flash_argument(parser)
   return parser
 
 
 def main_from_args(argv: list[str] | None = None) -> int:
   args = build_parser().parse_args(argv)
-  states = [asdict(state) for state in convert_stream(args.input.read_bytes())]
+  announce_allow_flash(args.allow_flash)
+  states = [asdict(state) for state in convert_stream(args.input.read_bytes(), args.allow_flash)]
   output = json.dumps(states, indent=2).encode("utf-8") + b"\n"
   if args.output is None or str(args.output) == "-":
     sys.stdout.buffer.write(output)

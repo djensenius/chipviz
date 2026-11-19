@@ -7,7 +7,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
-from chipviz_bridge import ControlFrame, Note, pack_frame
+from chipviz_bridge import ControlFrame, Note, add_allow_flash_argument, announce_allow_flash, pack_frame, sanitise_flash, sanitise_stream
 
 
 MAGIC = b"CSV0"
@@ -340,11 +340,13 @@ def build_parser() -> argparse.ArgumentParser:
     help="packet count for --demo-log",
   )
   parser.add_argument("--output", type=Path, help="write mapped control-frame-v0 stream")
+  add_allow_flash_argument(parser)
   return parser
 
 
 def main() -> int:
   args = build_parser().parse_args()
+  announce_allow_flash(args.allow_flash)
 
   if args.demo_packet:
     args.demo_packet.parent.mkdir(parents=True, exist_ok=True)
@@ -354,7 +356,7 @@ def main() -> int:
     args.demo_log.write_bytes(make_demo_log(args.demo_log_frames))
 
   if args.stream:
-    stream = encode_event_log(args.stream.read_bytes())
+    stream = sanitise_stream(encode_event_log(args.stream.read_bytes()), "full", args.allow_flash)
     if args.output:
       args.output.parent.mkdir(parents=True, exist_ok=True)
       args.output.write_bytes(stream)
@@ -366,7 +368,7 @@ def main() -> int:
   frame = to_control_frame(parse_packet(packet))
   if args.output:
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(pack_frame(frame))
+    args.output.write_bytes(sanitise_flash(pack_frame(frame), "full", args.allow_flash))
   if not args.demo_packet and not args.demo_log and not args.output:
     print(frame)
   return 0

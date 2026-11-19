@@ -306,10 +306,12 @@ retroarch-smoke:
 rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check
     @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests -- -D warnings
+    @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests --features unmeasured-flash -- -D warnings
     @echo "chipviz Rust lint OK"
 
 rust-test:
     @cargo test --manifest-path {{ modern_manifest }} --bins --lib
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --features unmeasured-flash
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
