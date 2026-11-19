@@ -171,11 +171,8 @@ impl Camera {
         // angle; counter wraps and coupled energy resets are both smoothed.
         let angle = elapsed * profile.camera_speed + self.drift;
         let radius = profile.camera_radius - self.energy * 1.8;
-        let eye = [
-            angle.cos() * radius,
-            1.8 + self.energy * 2.2,
-            angle.sin() * radius,
-        ];
+        let (sin, cos) = scenes::sin_cos(angle);
+        let eye = [cos * radius, 1.8 + self.energy * 2.2, sin * radius];
         let view = look_at(eye, [0.0; 3], [0.0, 1.0, 0.0]);
         let projection = perspective(52.0_f32.to_radians(), aspect, 0.1, 100.0);
 

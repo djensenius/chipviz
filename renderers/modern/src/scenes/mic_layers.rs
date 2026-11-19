@@ -62,7 +62,7 @@
 
 use std::cell::Cell;
 
-use super::{colour_field, hash, palette};
+use super::{colour_field, hash, palette, sin_cos};
 use crate::audio::scope::{POINTS, ScopeSnapshot, envelope};
 use crate::control_frame::ControlFrame;
 use crate::scene::{Instance, SCREEN_SPACE_TRANSFORM};
@@ -316,7 +316,7 @@ pub fn ribbon_area_bound(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> f32 {
                 thickness,
                 overlap,
             );
-            let (cos, sin) = (rotation.cos(), rotation.sin());
+            let (sin, cos) = sin_cos(rotation);
             let (along, across) = (size[0] * 0.5, size[1] * 0.5);
             let corners = [
                 (-along, -across),
@@ -705,12 +705,9 @@ impl MicLayers {
             for spark in 0..SPARKS {
                 let angle = spin + spark as f32 / SPARKS as f32 * std::f32::consts::TAU;
                 let size = 0.05 * (0.4 + envelope) * scale;
+                let (sin, cos) = sin_cos(angle);
                 instances.push(Instance {
-                    center: [
-                        center[0] + angle.cos() * radius,
-                        center[1] + angle.sin() * radius,
-                        0.0,
-                    ],
+                    center: [center[0] + cos * radius, center[1] + sin * radius, 0.0],
                     size: [size, size],
                     color,
                     rotation: 0.0,

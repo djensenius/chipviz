@@ -210,9 +210,12 @@ pub(crate) fn hash(mut value: u32) -> f32 {
 /// one `sincos` libm call (`__sincosf_stret` on Apple), which differs from
 /// separate `sinf`/`cosf` in the last ulp for some inputs, so instance data
 /// (and the recorded goldens) would depend on the build profile.
-/// Golden-covered scenes (Pulse Tunnel, Object, Static) use this instead of
-/// `f32::sin_cos` or a `sin`/`cos` pair; Lines and the camera still use the
-/// fusable forms, which have no goldens.
+/// Scene and camera code that feeds rendered output uses this instead of
+/// `f32::sin_cos` or a `sin`/`cos` pair on the same value.
+///
+/// `clippy.toml` bans `f32::sin_cos` (`clippy::disallowed_methods`), but
+/// clippy cannot see a same-value `x.sin()` and `x.cos()` pair, which fuses
+/// just the same; review new trigonometry for those by hand (see #112, #114).
 pub(crate) fn sin_cos(x: f32) -> (f32, f32) {
     (sin(x), cos(x))
 }
