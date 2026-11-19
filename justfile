@@ -318,7 +318,7 @@ modern-m1 *args:
     @cargo run --manifest-path {{ modern_manifest }} --bin chipviz-m1 -- "$@"
 
 modern-capture *args:
-    @cargo run --release --manifest-path {{ modern_manifest }} --bin chipviz-capture -- {{ args }}
+    @cargo run --release --manifest-path {{ modern_manifest }} --bin chipviz-capture -- "$@"
 
 clean:
     @rm -rf build dist
