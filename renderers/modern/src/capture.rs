@@ -343,10 +343,10 @@ mod tests {
     fn scene_override_selects_registry_entry() {
         let source = FrameSource {
             fixture: None,
-            scene: Some(6),
+            scene: Some(7),
         };
         let frame = source.frame(120).unwrap();
-        assert_eq!(frame.scene, 6);
+        assert_eq!(frame.scene, 7);
         assert_eq!(frame.energy, ControlFrame::procedural(120).energy);
         assert_eq!(scenes::select(frame.scene).name, "SpectrumVolume");
         let unforced = FrameSource {
@@ -581,6 +581,41 @@ mod tests {
                 (0.45..=0.55).contains(&share),
                 "{case}: blank share {share}"
             );
+        }
+    }
+    /// Object's shape patterns `[0, -(1 + shape)]` on a full-screen white
+    /// quad over black: an antialiased disc, a squared radial glow, a
+    /// four-pointed sparkle and alternating two-row scanlines.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn object_shape_patterns_render_on_gpu() {
+        let size = 100;
+        let render = |shape: f32| {
+            let quad = full_screen([1.0; 4], [0.0, -1.0 - shape]);
+            let rgb = render_screen_space(size, size, &[quad]);
+            move |x: u32, y: u32| rgb[((y * size + x) * 3) as usize]
+        };
+        let disc = render(0.0);
+        assert_eq!(disc(50, 50), 255);
+        assert_eq!(disc(20, 50), 255);
+        assert_eq!(disc(2, 2), 0);
+        assert_eq!(disc(98, 97), 0);
+
+        // Linear alpha (1 - 2r)^2 is 0.25 at r = 0.25: sRGB ~137.
+        let glow = render(1.0);
+        assert!(glow(50, 50) > 250, "{}", glow(50, 50));
+        assert!((130..=144).contains(&glow(75, 50)), "{}", glow(75, 50));
+        assert_eq!(glow(5, 5), 0);
+
+        let sparkle = render(2.0);
+        assert!(sparkle(80, 50) > 150, "arm {}", sparkle(80, 50));
+        assert!(sparkle(50, 20) > 150, "arm {}", sparkle(50, 20));
+        assert_eq!(sparkle(80, 80), 0, "diagonal");
+
+        let scanlines = render(3.0);
+        for y in 0..size {
+            let lit = y % 4 < 2;
+            assert_eq!(scanlines(30, y), if lit { 255 } else { 0 }, "row {y}");
         }
     }
 }
