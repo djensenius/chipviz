@@ -32,6 +32,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
 
 use super::analysis::Analyzer;
+use super::scope::{ScopeTap, SharedScope};
 use super::{AudioFeatures, SharedFeatures};
 
 const RING_S: f32 = 1.0;
@@ -136,6 +137,7 @@ impl InputDevices {
 /// both.
 pub struct MicSource {
     shared: Arc<SharedFeatures>,
+    scope: Arc<SharedScope>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     // Dropped after `Drop::drop` has joined the analysis thread.
@@ -167,18 +169,27 @@ impl MicSource {
             .map_err(|error| describe(&name, "could not start capturing", &error))?;
 
         let shared = Arc::new(SharedFeatures::default());
+        let scope = Arc::new(SharedScope::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let shared = shared.clone();
+            let scope = scope.clone();
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("chipviz-audio".to_string())
-                .spawn(move || analysis_loop(&mut analyzer, consumer, &dropped, &shared, &stop))
+                .spawn(move || {
+                    let outputs = Outputs {
+                        features: &shared,
+                        scope: &scope,
+                    };
+                    analysis_loop(&mut analyzer, consumer, &dropped, outputs, &stop)
+                })
                 .map_err(|error| format!("could not start the audio analysis thread: {error}"))?
         };
         eprintln!("microphone: {name} ({sample_rate} Hz, {channels} ch)");
         Ok(Self {
             shared,
+            scope,
             stop,
             thread: Some(thread),
             _stream: stream,
@@ -188,6 +199,11 @@ impl MicSource {
     /// Latest analysed features; never blocks.
     pub fn latest(&self) -> AudioFeatures {
         self.shared.load()
+    }
+
+    /// The waveform and onset side channel for the mic layers.
+    pub fn scope(&self) -> Arc<SharedScope> {
+        self.scope.clone()
     }
 }
 
@@ -666,14 +682,21 @@ fn snapshot(
     }
 }
 
+/// Where the analysis thread publishes each poll's results.
+struct Outputs<'a> {
+    features: &'a SharedFeatures,
+    scope: &'a SharedScope,
+}
+
 fn analysis_loop(
     analyzer: &mut Analyzer,
     mut consumer: rtrb::Consumer<f32>,
     dropped: &AtomicUsize,
-    shared: &SharedFeatures,
+    outputs: Outputs<'_>,
     stop: &AtomicBool,
 ) {
     let rate = analyzer.sample_rate();
+    let mut tap = ScopeTap::new(rate);
     let max_backlog = (rate * MAX_BACKLOG_S) as usize;
     let started = Instant::now();
     let mut clock = SampleClock::new(rate, started);
@@ -686,14 +709,18 @@ fn analysis_loop(
         let drain = Drain::plan(dropped, available, accounting.overlap, max_backlog);
         // Silence covers time before this poll's real samples.
         analyzer.push_silence(accounting.silence);
+        tap.push_silence(accounting.silence);
         if drain.skip > 0 {
             analyzer.skip(drain.skip);
         }
         drain.apply(&mut consumer, |samples| {
             heard_signal |= samples.iter().any(|&s| s != 0.0);
             analyzer.push(samples);
+            tap.push(samples);
         });
-        shared.store(analyzer.features());
+        outputs.features.store(analyzer.features());
+        // The onset count wraps; the mic layers only look for changes.
+        outputs.scope.store(&tap.snapshot(analyzer.onsets() as u32));
 
         if !warned && !heard_signal && now.duration_since(started) > SILENCE_WARNING {
             warned = true;

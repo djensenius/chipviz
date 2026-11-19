@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::colour_field;
+use crate::scenes::{colour_field, mic_layers};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -121,6 +121,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     } else {
         None
     };
+    let scope = mic.as_ref().map(MicSource::scope);
 
     let mut builder = WindowBuilder::new()
         .with_title(profile.window_title)
@@ -146,6 +147,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         .pipeline_mut()
         .configure_colour_field(colour_field_config(&args));
     renderer.pipeline_mut().limit_colour_field_steps();
+    renderer.pipeline_mut().set_mic_layers(args.mic_layers);
     let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
@@ -174,6 +176,10 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                     Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
                     Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
                     Some(KeyAction::CycleLayoutPin) => renderer.pipeline_mut().cycle_layout_pin(),
+                    Some(KeyAction::CycleMicLayers) => {
+                        let mode = renderer.pipeline_mut().cycle_mic_layers();
+                        eprintln!("mic layers: {}", mode.name());
+                    }
                     None => {}
                 }
             }
@@ -185,6 +191,13 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                 for fresh in frame_source.fresh() {
                     renderer.pipeline_mut().observe(fresh);
                 }
+                // The waveform side channel only describes mic frames; UDP
+                // and procedural frames make the layers fall back.
+                let live = scope
+                    .as_ref()
+                    .filter(|_| frame_source.showing_mic())
+                    .map(|scope| scope.load());
+                renderer.pipeline_mut().set_live_scope(live);
                 match renderer.render(frame, elapsed) {
                     Ok(()) => {}
                     Err(RendererError::Surface(
@@ -234,7 +247,7 @@ fn print_monitors(monitors: &[MonitorHandle]) {
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
-       [--layout auto|v2|h2|v3|h3] [--allow-flash]
+       [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
        {program} --list-monitors | --list-audio-devices
 
 Options:
@@ -254,11 +267,16 @@ Options:
                           --allow-flash arm flash/gate without it. Only builds with
                           the unmeasured-flash feature can flash; default builds run
                           3 and 7 as hard cuts and print a notice instead
+  --mic-layers MODE       overlay an oscilloscope ribbon and/or onset bursts on the
+                          native scenes: off (default), scope, bursts or both. With
+                          --mic they follow the microphone; otherwise they are
+                          synthesised from the spectrum, energy and beats
   -h, --help              print this help
 
 Keys:
   F, Cmd+F, Ctrl+Cmd+F    toggle fullscreen
   L                       cycle the colour-field layout pin (auto, V2, H2, V3, H3)
+  M                       cycle the mic layers (off, scope, bursts, both)
   Esc                     exit fullscreen
   Cmd+Q                   quit (macOS application menu)"
     )
@@ -389,6 +407,7 @@ impl KeyInput {
         match physical {
             PhysicalKey::Code(KeyCode::KeyF) => Self::Character('f'),
             PhysicalKey::Code(KeyCode::KeyL) => Self::Character('l'),
+            PhysicalKey::Code(KeyCode::KeyM) => Self::Character('m'),
             PhysicalKey::Code(KeyCode::Escape) => Self::Escape,
             _ => Self::Other,
         }
@@ -408,6 +427,7 @@ enum KeyAction {
     ToggleFullscreen,
     ExitFullscreen,
     CycleLayoutPin,
+    CycleMicLayers,
 }
 
 fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
@@ -421,6 +441,7 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
         }
         (KeyInput::Escape, false, false) if fullscreen => Some(KeyAction::ExitFullscreen),
         (KeyInput::Character('l'), false, false) => Some(KeyAction::CycleLayoutPin),
+        (KeyInput::Character('m'), false, false) => Some(KeyAction::CycleMicLayers),
         _ => None,
     }
 }
@@ -443,6 +464,7 @@ struct AppArgs {
     /// Colour-field layout pin; `None` is `auto`.
     layout: Option<u8>,
     allow_flash: bool,
+    mic_layers: mic_layers::Mode,
 }
 
 /// Wire palettes go through the stability gate, and a stable absolute 3 or 7
@@ -503,6 +525,14 @@ impl AppArgs {
                     parsed.layout = parse_layout(&value)?;
                 }
                 "--allow-flash" => parsed.allow_flash = true,
+                "--mic-layers" => {
+                    let value = required_value(&mut args, "--mic-layers", "off|scope|bursts|both")?;
+                    parsed.mic_layers = mic_layers::Mode::parse(&value).ok_or_else(|| {
+                        invalid_input(format!(
+                            "--mic-layers expects off|scope|bursts|both, got {value}"
+                        ))
+                    })?;
+                }
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
@@ -632,6 +662,8 @@ struct FrameSource {
     last_udp: Option<Instant>,
     mic_beat_count: Option<u16>,
     fresh: Vec<ControlFrame>,
+    /// The last `next_frame_at` returned a mic frame.
+    showing_mic: bool,
 }
 
 impl FrameSource {
@@ -648,6 +680,7 @@ impl FrameSource {
             last_udp: None,
             mic_beat_count: None,
             fresh: Vec::new(),
+            showing_mic: false,
         }
     }
 
@@ -663,7 +696,13 @@ impl FrameSource {
         &self.fresh
     }
 
+    /// Whether the frame from the last `next_frame_at` came from the mic.
+    fn showing_mic(&self) -> bool {
+        self.showing_mic
+    }
+
     fn next_frame_at(&mut self, now: Instant) -> ControlFrame {
+        self.showing_mic = false;
         self.fresh = self.udp.receive_all();
         if let Some(&frame) = self.fresh.last() {
             self.latest = frame;
@@ -700,6 +739,7 @@ impl FrameSource {
                     self.latest = audio::mic_frame(base, features, self.mic_beat_count);
                     self.mic_beat_count = Some(features.beat_count);
                     self.fresh.push(self.latest);
+                    self.showing_mic = true;
                 }
             }
         }
@@ -1041,6 +1081,7 @@ mod tests {
         let frame = source.next_frame_at(start);
         assert!(frame.beat_onset());
         assert_eq!(frame.beat_count, 6);
+        assert!(source.showing_mic());
 
         // A UDP packet wins and is held while recent, even as the mic moves on.
         let onsets = audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG;
@@ -1080,6 +1121,8 @@ mod tests {
                 "{held:?}"
             );
             assert_eq!((held.notes[0].note, held.notes[0].velocity), (60, 100));
+            // The mic layers fall back while UDP frames are shown.
+            assert!(!source.showing_mic());
         }
 
         // Back on the mic: the count jumped while UDP held, but that is not a beat.
@@ -1087,6 +1130,7 @@ mod tests {
         let frame = source.next_frame_at(later);
         assert_eq!(frame.beat_count, 9);
         assert!(!frame.beat_onset(), "{frame:?}");
+        assert!(source.showing_mic());
         set_count(10);
         assert!(source.next_frame_at(later).beat_onset());
     }
@@ -1235,6 +1279,30 @@ mod tests {
     }
 
     #[test]
+    fn mic_layers_option_and_m_key() {
+        assert_eq!(parse_run(&[]).mic_layers, mic_layers::Mode::Off);
+        let args = parse_run(&["--mic-layers", "Both"]);
+        assert_eq!(args.mic_layers, mic_layers::Mode::Both);
+        assert!(parse(&["--mic-layers", "loud"]).is_err());
+        assert!(parse(&["--mic-layers"]).is_err());
+        let plain = KeyModifiers::default();
+        let m = KeyInput::Character('m');
+        assert_eq!(key_action(m, plain, true), Some(KeyAction::CycleMicLayers));
+        let cmd = KeyModifiers {
+            command: true,
+            ..plain
+        };
+        assert_eq!(key_action(m, cmd, false), None);
+        assert_eq!(
+            KeyInput::from_winit(
+                &Key::Character("ь".into()),
+                PhysicalKey::Code(KeyCode::KeyM)
+            ),
+            m
+        );
+    }
+
+    #[test]
     fn cursor_hidden_only_in_fullscreen() {
         assert!(!cursor_visible(true));
         assert!(cursor_visible(false));
@@ -1252,7 +1320,9 @@ mod tests {
             "--list-audio-devices",
             "--layout auto|v2|h2|v3|h3",
             "--allow-flash",
+            "--mic-layers off|scope|bursts|both",
             "cycle the colour-field layout pin",
+            "cycle the mic layers",
             "Esc",
             "Cmd+Q",
         ] {

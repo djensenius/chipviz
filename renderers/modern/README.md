@@ -38,6 +38,7 @@ The renderer starts windowed by default.
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
+| `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 
 ```sh
@@ -51,6 +52,7 @@ just modern-m1 -- --fullscreen --monitor 1
 | `F`, `Cmd+F`, `Ctrl+Cmd+F` | Toggle fullscreen on the window's current display. |
 | `Esc` | Exit fullscreen (does nothing when windowed). |
 | `L` | Cycle the colour-field layout pin: auto, V2, H2, V3, H3. A pin that changes the layout waits for the change budget. |
+| `M` | Cycle the mic layers: off, scope, bursts, both. |
 | `Cmd+Q` | Quit (macOS application menu). |
 
 The cursor is hidden while fullscreen and restored when windowed.
@@ -137,6 +139,35 @@ All renderer binaries, including `chipviz-pi5` and `chipviz-capture`, link
 against ALSA even when `--mic` is not used. Building needs the headers
 (`libasound2-dev` on Debian and Raspberry Pi OS) and running needs the runtime
 library `libasound2` (e.g. `sudo apt install libasound2`).
+
+## Mic layers
+
+Two overlay layers can be drawn on top of any native scene (never over the
+colour field, scene 7, whose colours depend only on its trace). They are off by
+default; choose them with `--mic-layers` or cycle them with `M`. They do not
+change the control-frame wire format.
+
+- `scope`: an oscilloscope ribbon across the lower part of the screen. With
+  `--mic`, it shows the latest 2,048 samples, triggered on a rising zero
+  crossing so steady tones hold still and peak-normalised with a floor so room
+  hiss stays flat. Silence flattens it smoothly.
+- `bursts`: a soft glow with a ring of sparks at each detected onset. A burst
+  rises over 80 ms and decays to nothing within 1.6 s.
+
+With `--mic`, the analysis thread publishes the samples and onset count
+through a lock-free side channel (atomics only), which the render thread reads
+without waiting. When frames come from the procedural source or over UDP, the
+ribbon is synthesised from the eight spectrum bands and the energy, and bursts
+fire when `beat_count` changes.
+
+Bursts are not gated by the `unmeasured-flash` feature: each one is a single
+smooth, partly transparent rise and fall rather than a full-screen change, and
+new bursts start at most once every 0.34 s (under three per second), with at
+most six alive at once.
+
+```sh
+just modern-m1 -- --mic --mic-layers both
+```
 
 ## Scene plan
 
@@ -321,7 +352,10 @@ the `unmeasured-flash` feature, a recording arms it only as a target would,
 from a stable absolute wire 3 or 7 held in scene 7, and default builds never
 flash. Recorded inputs use
 their wire palettes; procedural input uses palette 0. `--input` is `procedural` (default) or a `.cvz` file of
-concatenated control-frame packets, such as the bridge's `--output`.
+concatenated control-frame packets, such as the bridge's `--output`, or
+`synth-mic`, a deterministic synthetic microphone (110 Hz and 330 Hz tones with
+a click every 0.5 s, silent from 6 s) analysed exactly like `--mic`.
+`--mic-layers` draws the [mic layers](#mic-layers) as in the renderer.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`
 for every option. The GPU smoke test is ignored by default; run it with
 `cargo test --manifest-path renderers/modern/Cargo.toml --lib -- --ignored`.

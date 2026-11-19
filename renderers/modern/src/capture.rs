@@ -4,28 +4,37 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::audio::analysis::Analyzer;
+use crate::audio::mic_frame;
+use crate::audio::scope::{ScopeSnapshot, ScopeTap};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
-use crate::renderer::OffscreenRenderer;
-use crate::scenes::{self, CameraMode, colour_field};
+use crate::renderer::{OffscreenRenderer, ScenePipeline};
+use crate::scenes::{self, CameraMode, colour_field, mic_layers};
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
 
 const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scene N]
-                       [--frames 0,60,120] [--input procedural|PATH.cvz] [--size WxH]
+                       [--frames 0,60,120] [--input procedural|synth-mic|PATH.cvz]
+                       [--size WxH] [--mic-layers off|scope|bursts|both]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
   --scene    force the control-frame scene byte: 7 is the colour field,
              otherwise registry index = N % scene count
   --frames   comma-separated frame indices (default 0); elapsed = index / 60 s
-  --input    procedural frames (default) or a raw .cvz control-frame file
-  --size     output size in pixels (default: the profile's target size)";
+  --input    procedural frames (default), synth-mic (a deterministic synthetic
+             microphone: tones plus a click every 0.5 s, silent from 6 s, run
+             through the live analyzer and waveform tap) or a raw .cvz file
+  --size     output size in pixels (default: the profile's target size)
+  --mic-layers
+             overlay the mic layers: off (default), scope, bursts or both";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     Procedural,
+    SynthMic,
     File(PathBuf),
 }
 
@@ -37,6 +46,7 @@ pub struct CaptureArgs {
     pub input: Input,
     pub size: (u32, u32),
     pub out: PathBuf,
+    pub mic_layers: mic_layers::Mode,
 }
 
 #[derive(Debug)]
@@ -52,6 +62,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     let mut input = Input::Procedural;
     let mut size = None;
     let mut out = None;
+    let mut layers = mic_layers::Mode::Off;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -87,10 +98,10 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
             }
             "--input" => {
                 let text = value()?;
-                input = if text == "procedural" {
-                    Input::Procedural
-                } else {
-                    Input::File(PathBuf::from(text))
+                input = match text.as_str() {
+                    "procedural" => Input::Procedural,
+                    "synth-mic" => Input::SynthMic,
+                    _ => Input::File(PathBuf::from(text)),
                 };
             }
             "--size" => {
@@ -102,6 +113,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                 size = Some(parsed.ok_or_else(|| format!("--size expects WxH, got {text}"))?);
             }
             "--out" => out = Some(PathBuf::from(value()?)),
+            "--mic-layers" => {
+                let text = value()?;
+                layers = mic_layers::Mode::parse(&text).ok_or_else(|| {
+                    format!("--mic-layers expects off|scope|bursts|both, got {text}")
+                })?;
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -115,6 +132,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
         input,
         size,
         out,
+        mic_layers: layers,
     }))
 }
 
@@ -162,10 +180,91 @@ fn elapsed(index: u64) -> f32 {
     index as f32 / CAPTURE_FPS
 }
 
+pub const SYNTH_RATE: u32 = 48_000;
+const SYNTH_SAMPLES_PER_FRAME: u64 = SYNTH_RATE as u64 / CAPTURE_FPS as u64;
+const SYNTH_BEAT_S: f64 = 0.5;
+const SYNTH_SILENT_FROM_S: f64 = 6.0;
+
+/// Sample `n` of the synthetic microphone: a 110 Hz tone with its third
+/// harmonic, plus a 40 ms noise click every 0.5 s (120 BPM); silent from
+/// 6 s on, so later frames show the layers decaying.
+pub fn synth_sample(n: u64) -> f32 {
+    let t = n as f64 / f64::from(SYNTH_RATE);
+    if t >= SYNTH_SILENT_FROM_S {
+        return 0.0;
+    }
+    let tau = std::f64::consts::TAU;
+    let tone = 0.25 * (tau * 110.0 * t).sin() + 0.12 * (tau * 330.0 * t + 0.5).sin();
+    let since = t % SYNTH_BEAT_S;
+    let click = if since < 0.04 {
+        let noise = f64::from(scenes::hash(n as u32)) * 2.0 - 1.0;
+        0.6 * (-since / 0.008).exp() * noise
+    } else {
+        0.0
+    };
+    (tone + click) as f32
+}
+
+/// `--input synth-mic`: feeds [`synth_sample`] through the live analyzer and
+/// waveform tap, one capture frame at a time, as the analysis thread would.
+struct SynthMic {
+    analyzer: Analyzer,
+    tap: ScopeTap,
+    next_sample: u64,
+    beat_count: Option<u16>,
+}
+
+impl SynthMic {
+    fn new() -> Result<Self, String> {
+        let analyzer = Analyzer::new(SYNTH_RATE)?;
+        Ok(Self {
+            tap: ScopeTap::new(analyzer.sample_rate()),
+            analyzer,
+            next_sample: 0,
+            beat_count: None,
+        })
+    }
+
+    /// Feeds the audio up to frame `index`'s time; returns the mic frame
+    /// (built on `base`, as live mic frames are) and the scope snapshot.
+    fn advance(&mut self, base: ControlFrame, index: u64) -> (ControlFrame, ScopeSnapshot) {
+        let end = index * SYNTH_SAMPLES_PER_FRAME;
+        let samples: Vec<f32> = (self.next_sample..end).map(synth_sample).collect();
+        self.next_sample = self.next_sample.max(end);
+        self.analyzer.push(&samples);
+        self.tap.push(&samples);
+        let features = self.analyzer.features();
+        let frame = mic_frame(base, features, self.beat_count);
+        self.beat_count = Some(features.beat_count);
+        (frame, self.tap.snapshot(self.analyzer.onsets() as u32))
+    }
+}
+
+/// Hands the pipeline frame `index`'s side-channel snapshot (synthetic mic
+/// only) and returns the frame to draw.
+fn feed(
+    pipeline: &mut ScenePipeline,
+    synth: Option<&mut SynthMic>,
+    base: ControlFrame,
+    index: u64,
+) -> ControlFrame {
+    match synth {
+        Some(synth) => {
+            let (frame, scope) = synth.advance(base, index);
+            pipeline.set_live_scope(Some(scope));
+            frame
+        }
+        None => {
+            pipeline.set_live_scope(None);
+            base
+        }
+    }
+}
+
 pub fn run(args: &CaptureArgs) -> Result<(), String> {
     let source = FrameSource {
         fixture: match &args.input {
-            Input::Procedural => None,
+            Input::Procedural | Input::SynthMic => None,
             Input::File(path) => {
                 let bytes =
                     std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -192,23 +291,31 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         .pipeline_mut()
         .configure_colour_field(colour_field::Config {
             palette: match args.input {
-                Input::Procedural => colour_field::PaletteSource::Local { p: 0, armed: false },
+                Input::Procedural | Input::SynthMic => {
+                    colour_field::PaletteSource::Local { p: 0, armed: false }
+                }
                 Input::File(_) => colour_field::PaletteSource::Wire,
             },
             ..colour_field::Config::default()
         });
+    renderer.pipeline_mut().set_mic_layers(args.mic_layers);
     let mut captures = Vec::new();
 
     for &index in &args.frames {
         // Replay camera smoothing and the colour field from frame 0 so stills
         // match a live run.
         let aspect = renderer.aspect();
+        let mut synth = match args.input {
+            Input::SynthMic => Some(SynthMic::new()?),
+            _ => None,
+        };
         let pipeline = renderer.pipeline_mut();
         pipeline.reset_state();
         for previous in 0..index {
-            pipeline.advance_state(source.frame(previous)?, elapsed(previous), aspect);
+            let frame = feed(pipeline, synth.as_mut(), source.frame(previous)?, previous);
+            pipeline.advance_state(frame, elapsed(previous), aspect);
         }
-        let frame = source.frame(index)?;
+        let frame = feed(pipeline, synth.as_mut(), source.frame(index)?, index);
         let rgb = renderer
             .render(frame, elapsed(index))
             .map_err(|error| error.to_string())?;
@@ -236,12 +343,14 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
 
     let input = match &args.input {
         Input::Procedural => "procedural".to_string(),
+        Input::SynthMic => "synth-mic".to_string(),
         Input::File(path) => path.display().to_string(),
     };
     let manifest = format!(
-        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"captures\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"captures\": [\n{}\n  ]\n}}\n",
         json_string(args.profile.name),
         json_string(&input),
+        json_string(args.mic_layers.name()),
         captures.join(",\n"),
     );
     let path = args.out.join("manifest.json");
@@ -322,8 +431,11 @@ mod tests {
             "1920x1080",
             "--out",
             "shots",
+            "--mic-layers",
+            "scope",
         ])
         .unwrap();
+        assert_eq!(args.mic_layers, mic_layers::Mode::Scope);
         assert_eq!(args.profile.name, "pi5");
         assert_eq!(args.scene, Some(4));
         assert_eq!(args.frames, [0, 60, 120]);
@@ -340,6 +452,9 @@ mod tests {
         assert_eq!(args.frames, [0]);
         assert_eq!(args.input, Input::Procedural);
         assert_eq!(args.size, (3840, 2160));
+        assert_eq!(args.mic_layers, mic_layers::Mode::Off);
+        let synth = parse(&["--out", "o", "--input", "synth-mic"]).unwrap();
+        assert_eq!(synth.input, Input::SynthMic);
     }
 
     #[test]
@@ -352,6 +467,7 @@ mod tests {
             &["--out", "o", "--size", "0x10"],
             &["--out", "o", "--size", "1920"],
             &["--out", "o", "--bogus"],
+            &["--out", "o", "--mic-layers", "all"],
             &["--out"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
@@ -393,6 +509,36 @@ mod tests {
         assert!(source.frame(bytes.len() as u64).is_err());
         assert!(parse_cvz(&bytes[..WIRE_SIZE - 1]).is_err());
         assert!(parse_cvz(&[]).is_err());
+    }
+
+    #[test]
+    fn synthetic_mic_is_deterministic_detects_clicks_and_falls_silent() {
+        let run = || {
+            let mut synth = SynthMic::new().unwrap();
+            (0..=420)
+                .map(|index| synth.advance(ControlFrame::procedural(index), index))
+                .collect::<Vec<_>>()
+        };
+        let frames = run();
+        let again = run();
+        for ((frame, scope), (other, other_scope)) in frames.iter().zip(&again) {
+            assert_eq!(scope, other_scope);
+            assert_eq!(
+                (frame.energy, frame.spectrum),
+                (other.energy, other.spectrum)
+            );
+        }
+        // About one onset per click in the 6 s of sound (12 clicks).
+        let onsets = frames[400].1.onsets;
+        assert!((8..=14).contains(&onsets), "{onsets} onsets");
+        let (loud, loud_scope) = &frames[200];
+        assert!(loud.energy > 40, "{loud:?}");
+        assert!(loud_scope.points.iter().any(|point| point.abs() > 0.3));
+        // From 6 s (frame 360) the input is silent: flat waveform, no onsets.
+        let (quiet, quiet_scope) = &frames[420];
+        assert_eq!(quiet_scope.points, [0.0; crate::audio::scope::POINTS]);
+        assert_eq!(quiet_scope.onsets, frames[380].1.onsets);
+        assert!(quiet.energy < loud.energy);
     }
 
     #[test]

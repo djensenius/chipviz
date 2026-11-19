@@ -392,7 +392,6 @@ impl Analyzer {
     }
 
     /// Total onsets detected since creation.
-    #[cfg(test)]
     pub fn onsets(&self) -> u64 {
         self.onsets
     }

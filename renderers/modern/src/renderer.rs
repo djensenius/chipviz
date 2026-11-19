@@ -4,12 +4,14 @@ use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
+use crate::audio::scope::ScopeSnapshot;
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::{
-    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
+    Camera, Instance, QUAD_VERTICES, SCREEN_SPACE_TRANSFORM, Uniforms, Vertex, build_instances,
+    scene_uniforms,
 };
-use crate::scenes::{self, CameraMode, colour_field};
+use crate::scenes::{self, CameraMode, colour_field, mic_layers};
 
 /// Offscreen capture format; sRGB like the window's preferred surface format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -23,6 +25,11 @@ pub struct ScenePipeline {
     colour_controls: colour_field::Controls,
     /// Wall-clock step cap for live rendering; `None` steps every new frame.
     step_clock: Option<(colour_field::StepClock, Instant)>,
+    /// Waveform/onset overlay over native scenes; see `scenes::mic_layers`.
+    mic_layers: mic_layers::MicLayers,
+    /// The mic side channel's latest snapshot while mic frames are shown;
+    /// `None` makes the layers fall back to the control frame.
+    live_scope: Option<ScopeSnapshot>,
     /// The colour attachment encodes sRGB on write, so flat colours are
     /// given in linear light; otherwise they are written as sRGB bytes.
     srgb_target: bool,
@@ -31,9 +38,12 @@ pub struct ScenePipeline {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
+    /// Scene instances; the overlay's slots follow them in the same buffer.
     instance_capacity: usize,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    overlay_uniform_buffer: wgpu::Buffer,
+    overlay_bind_group: wgpu::BindGroup,
 }
 
 pub struct Renderer {
@@ -190,6 +200,19 @@ impl ScenePipeline {
                 resource: uniform_buffer.as_entire_binding(),
             }],
         });
+        let overlay_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chipviz overlay uniforms"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chipviz overlay bind group"),
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: overlay_uniform_buffer.as_entire_binding(),
+            }],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chipviz pipeline layout"),
             bind_group_layouts: &[&uniform_bind_group_layout],
@@ -231,7 +254,8 @@ impl ScenePipeline {
         let instance_capacity = profile.instance_count.max(1);
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chipviz instances"),
-            size: (instance_capacity * std::mem::size_of::<Instance>()) as u64,
+            size: ((instance_capacity + mic_layers::MAX_INSTANCES)
+                * std::mem::size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -242,6 +266,8 @@ impl ScenePipeline {
             colour_field: colour_field::ColourField::new(colour_field::Config::default()),
             colour_controls: colour_field::Controls::default(),
             step_clock: None,
+            mic_layers: mic_layers::MicLayers::new(mic_layers::Mode::Off),
+            live_scope: None,
             srgb_target: format.is_srgb(),
             device,
             queue,
@@ -251,6 +277,8 @@ impl ScenePipeline {
             instance_capacity,
             uniform_buffer,
             uniform_bind_group,
+            overlay_uniform_buffer,
+            overlay_bind_group,
         }
     }
 
@@ -259,15 +287,35 @@ impl ScenePipeline {
     pub fn reset_state(&mut self) {
         self.camera = Camera::default();
         self.colour_field = colour_field::ColourField::new(self.colour_field.config());
+        self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
     }
 
-    /// Steps camera smoothing and the colour field for a frame that is not
-    /// drawn.
+    /// Steps camera smoothing, the colour field and the mic layers for a
+    /// frame that is not drawn.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f32, aspect: f32) {
         self.observe(&frame);
         let (frame, _) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed, aspect);
+        self.mic_layers
+            .step(frame, self.live_scope.as_ref(), elapsed);
+    }
+
+    pub fn set_mic_layers(&mut self, mode: mic_layers::Mode) {
+        self.mic_layers.set_mode(mode);
+    }
+
+    /// Operator control (`M`): cycles off, scope, bursts, both.
+    pub fn cycle_mic_layers(&mut self) -> mic_layers::Mode {
+        let mode = self.mic_layers.mode().next();
+        self.mic_layers.set_mode(mode);
+        mode
+    }
+
+    /// The mic side channel's snapshot for the next drawn or advanced frame,
+    /// or `None` when the frame does not come from the microphone.
+    pub fn set_live_scope(&mut self, scope: Option<ScopeSnapshot>) {
+        self.live_scope = scope;
     }
 
     /// Replaces the colour-field configuration and restarts it from power-on.
@@ -344,7 +392,14 @@ impl ScenePipeline {
             elapsed,
             aspect,
         );
-        self.encode_instances(encoder, view, &instances, &uniforms);
+        self.mic_layers
+            .step(frame, self.live_scope.as_ref(), elapsed);
+        let mut overlay = Vec::new();
+        // The colour field's colours follow its trace alone: never overlaid.
+        if let colour_field::Display::Native(_) = display {
+            self.mic_layers.build(frame, aspect, &mut overlay);
+        }
+        self.encode_layers(encoder, view, &instances, &uniforms, &overlay);
     }
 
     /// What the latest colour-field step shows.
@@ -353,12 +408,26 @@ impl ScenePipeline {
     }
 
     /// Uploads explicit instances and uniforms, then records the render pass.
+    #[cfg(test)]
     pub(crate) fn encode_instances(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         instances: &[Instance],
         uniforms: &Uniforms,
+    ) {
+        self.encode_layers(encoder, view, instances, uniforms, &[]);
+    }
+
+    /// Records the scene's instances, then `overlay` (`ScreenSpace`
+    /// instances drawn flat on top, with their own uniforms) in one pass.
+    fn encode_layers(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        instances: &[Instance],
+        uniforms: &Uniforms,
+        overlay: &[Instance],
     ) {
         let instance_count = instances.len().min(self.instance_capacity);
         self.queue.write_buffer(
@@ -368,6 +437,23 @@ impl ScenePipeline {
         );
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+        let overlay_count = overlay.len().min(mic_layers::MAX_INSTANCES);
+        let overlay_offset = (self.instance_capacity * std::mem::size_of::<Instance>()) as u64;
+        if overlay_count > 0 {
+            self.queue.write_buffer(
+                &self.instance_buffer,
+                overlay_offset,
+                bytemuck::cast_slice(&overlay[..overlay_count]),
+            );
+            let flat = Uniforms {
+                view_projection: SCREEN_SPACE_TRANSFORM,
+                beat: 0.0,
+                screen_space: 1.0,
+                ..*uniforms
+            };
+            self.queue
+                .write_buffer(&self.overlay_uniform_buffer, 0, bytemuck::bytes_of(&flat));
+        }
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("chipviz render pass"),
@@ -388,6 +474,11 @@ impl ScenePipeline {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         render_pass.draw(0..QUAD_VERTICES.len() as u32, 0..instance_count as u32);
+        if overlay_count > 0 {
+            render_pass.set_bind_group(0, &self.overlay_bind_group, &[]);
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(overlay_offset..));
+            render_pass.draw(0..QUAD_VERTICES.len() as u32, 0..overlay_count as u32);
+        }
     }
 
     fn command_encoder(&self) -> wgpu::CommandEncoder {

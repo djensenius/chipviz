@@ -21,6 +21,7 @@
 
 pub mod colour_field;
 mod lines;
+pub mod mic_layers;
 mod object;
 mod pulse_tunnel;
 #[cfg(test)]
