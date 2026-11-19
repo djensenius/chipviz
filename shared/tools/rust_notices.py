@@ -207,6 +207,8 @@ def licence_alternatives(expression: str) -> list[list[str]]:
     if peek() == "WITH":
       take()
       exception = take()
+      if exception in ("AND", "OR", "WITH", "/", "(", ")"):
+        raise ValueError(f"expected an exception id after WITH, got {exception!r}, in licence expression {expression!r}")
       alternatives = [alternative + [exception] for alternative in alternatives]
     return alternatives
 
@@ -220,6 +222,14 @@ def licence_alternatives(expression: str) -> list[list[str]]:
     if alternative not in unique:
       unique.append(alternative)
   return unique
+
+
+def package_licences(package: dict) -> list[list[str]]:
+  """Parse a crate's declared licence, naming the crate if the expression is invalid."""
+  try:
+    return licence_alternatives(package.get("license") or "")
+  except ValueError as error:
+    raise ValueError(f"{package['name']} {package['version']}: {error}") from error
 
 
 def fallback_text(spdx_id: str, key: tuple[str, str], fallback_dir: Path) -> tuple[tuple[str, str] | None, str | None]:
@@ -244,7 +254,7 @@ def fallback_texts(package: dict, fallback_dir: Path) -> tuple[list[tuple[str, s
   alternative with the fewest missing texts is used and reported as a gap.
   """
   key = (package["name"], package["version"])
-  alternatives = licence_alternatives(package.get("license") or "")
+  alternatives = package_licences(package)
   if not alternatives:
     return [], "no licence declared"
   evaluated = []
@@ -322,7 +332,7 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
       if gap:
         gaps.append((label, gap))
     licence = package.get("license") or "not declared"
-    declared_alternatives = licence_alternatives(package.get("license") or "")
+    declared_alternatives = package_licences(package)
     declared = {token for alternative in declared_alternatives for token in alternative}
     extra = sorted(embedded - declared)
     notes = []
@@ -332,11 +342,14 @@ def render(metadata: dict, fallback_dir: Path | None = None) -> str:
       notes.append(f"{len(protocols)} per-protocol notice{'' if len(protocols) == 1 else 's'}")
     if notes:
       licence += " (" + "; ".join(notes) + ")"
-    copyleft_ids = [spdx_id for spdx_id in extra if COPYLEFT.match(spdx_id)]
-    for spdx_id in sorted(declared):
-      if not COPYLEFT.match(spdx_id) or spdx_id in extra:
+    # Licences found in vendored or embedded files always apply. A declared
+    # copyleft licence is optional only if it is an OR alternative and is not
+    # also found in those files.
+    copyleft_ids = []
+    for spdx_id in sorted(embedded | declared):
+      if not COPYLEFT.match(spdx_id):
         continue
-      if all(spdx_id in alternative for alternative in declared_alternatives):
+      if spdx_id in embedded or all(spdx_id in alternative for alternative in declared_alternatives):
         copyleft_ids.append(spdx_id)
       else:
         copyleft_ids.append(f"{spdx_id} (optional: the crate may be used under an alternative licence)")

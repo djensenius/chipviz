@@ -147,7 +147,7 @@ class RustNoticesTests(unittest.TestCase):
     self.assertEqual(parse("MIT/Apache-2.0"), [["MIT"], ["Apache-2.0"]])
     self.assertEqual(parse("(MIT OR Zlib) AND (Apache-2.0 OR MIT)"), [["MIT", "Apache-2.0"], ["MIT"], ["Zlib", "Apache-2.0"], ["Zlib", "MIT"]])
     self.assertEqual(parse(""), [])
-    for broken in ("(MIT OR Apache-2.0", "MIT OR", "MIT Apache-2.0", "AND MIT"):
+    for broken in ("(MIT OR Apache-2.0", "MIT OR", "MIT Apache-2.0", "AND MIT", "MIT WITH AND", "MIT WITH (", "MIT WITH"):
       with self.assertRaises(ValueError, msg=broken):
         parse(broken)
 
@@ -178,6 +178,20 @@ class RustNoticesTests(unittest.TestCase):
     self.assertIn("## Copyleft components", content)
     self.assertIn("- mpl 1.0.0: MPL-2.0.", content)
     self.assertIn("- either 1.0.0: LGPL-2.1-or-later (optional: the crate may be used under an alternative licence).", content)
+
+  def test_embedded_copyleft_is_required_even_if_also_declared_as_alternative(self) -> None:
+    self.add_shipped("vendors-lgpl", "MIT OR LGPL-2.1-or-later", {
+      "LICENSE": "vendors-lgpl text\n",
+      "vendor/lib/COPYING": "SPDX-License-Identifier: LGPL-2.1-or-later\nLGPL-only component\n",
+    })
+    content = rust_notices.render(self.metadata, self.fallback)
+    self.assertIn("- vendors-lgpl 1.0.0: LGPL-2.1-or-later.", content)
+    self.assertNotIn("vendors-lgpl 1.0.0: LGPL-2.1-or-later (optional", content)
+
+  def test_invalid_licence_expression_names_the_crate(self) -> None:
+    self.add_shipped("broken", "MIT WITH AND", {"LICENSE": "broken text\n"})
+    with self.assertRaisesRegex(ValueError, r"^broken 1\.0\.0: expected an exception id after WITH"):
+      rust_notices.render(self.metadata, self.fallback)
 
   def test_fence_for_is_longer_than_any_backtick_run(self) -> None:
     self.assertEqual(rust_notices.fence_for("plain text"), "```")
