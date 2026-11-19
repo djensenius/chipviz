@@ -1,6 +1,8 @@
 import contextlib
 import io
+import itertools
 import json
+import math
 import pathlib
 import sys
 import tempfile
@@ -100,6 +102,7 @@ class TransportTests(unittest.TestCase):
     sink = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
     sink._port = _Port()
     sink._sequence = 0
+    sink._cap = live_bridge.ColourFieldRateCap("joybus")
     for _ in range(66):
       sink.send(self.wire)
 
@@ -329,6 +332,7 @@ class FlashGuardTests(unittest.TestCase):
       serial_sink = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
       serial_sink._port = _Port()
       serial_sink._sequence = 0
+      serial_sink._cap = live_bridge.ColourFieldRateCap("joybus", clock=itertools.count(0, 20_000_000).__next__)
       live_bridge.stream_frames([_scene_frame(23, 3), _scene_frame(7, 3)], True, 60, [file_sink, serial_sink])
       file_sink.close()
       written = path.read_bytes()
@@ -408,6 +412,17 @@ class FlashGuardTests(unittest.TestCase):
     debounce = live_bridge.SceneDebounce()
     self.assertEqual([debounce.step(scene) for scene in (1, 2, 5, 0)], [1, 2, 5, 0])
 
+  def test_cc1_debounce_lasts_at_least_500_ms_at_any_rate(self) -> None:
+    for rate, frames in ((30, 30), (60, 30), (90, 45), (120, 60), (240, 120)):
+      with self.subTest(rate=rate):
+        debounce = live_bridge.SceneDebounce(rate=rate)
+        sent = [debounce.step(7) for _ in range(frames + 1)]
+        self.assertEqual(sent[:frames], [0] * frames)
+        self.assertEqual(sent[frames], 7)
+        self.assertGreaterEqual(frames / rate, 0.5)
+        exits = [debounce.step(0) for _ in range(frames + 1)]
+        self.assertEqual(exits.index(0), frames)
+
   def test_allow_flash_cli_warning_only_with_flag(self) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
       root = pathlib.Path(temp_dir)
@@ -441,6 +456,122 @@ class FlashGuardTests(unittest.TestCase):
             with contextlib.redirect_stderr(stderr):
               self.assertEqual(run(extra), 0)
             self.assertEqual(chipviz_bridge.FLASH_WARNING in stderr.getvalue(), expect_warning)
+
+
+def _cf_frame(index: int, scene: int = 7, flags: int = 0, notes: tuple = ()) -> bytes:
+  return chipviz_bridge.pack_frame(chipviz_bridge.ControlFrame(
+    frame=index & 0xFFFF, bpm=120, beat_phase=0, beat_count=0, energy=100, bass=100, mid=100, treble=100,
+    spectrum=(100,) * 8, scene=scene, palette=0, flags=flags, notes=notes,
+  ))
+
+
+class _FakeClock:
+  """Integer-nanosecond clock that advances only when the code sleeps."""
+
+  def __init__(self) -> None:
+    self.ns = 0
+
+  def monotonic(self) -> float:
+    return self.ns / 1e9
+
+  def monotonic_ns(self) -> int:
+    return self.ns
+
+  def sleep(self, delay: float) -> None:
+    self.ns += math.ceil(delay * 1e9)
+
+
+class ColourFieldRateCapTests(unittest.TestCase):
+  """colour-field-v0 "Step rate": at most 60 colour-field frames per second."""
+
+  def _stream(self, frames: list[bytes], rate: int):
+    class _Socket:
+      def __init__(self, clock: _FakeClock) -> None:
+        self.sent: list[tuple[int, bytes]] = []
+        self._clock = clock
+
+      def sendto(self, data: bytes, endpoint) -> None:
+        self.sent.append((self._clock.ns, data))
+
+      def close(self) -> None:
+        pass
+
+    class _Port(_Socket):
+      def write(self, data: bytes) -> None:
+        self.sent.append((self._clock.ns, data))
+
+      def flush(self) -> None:
+        pass
+
+    clock = _FakeClock()
+    patched = ("monotonic", "monotonic_ns", "sleep")
+    originals = {name: getattr(live_bridge.time, name) for name in patched}
+    for name in patched:
+      setattr(live_bridge.time, name, getattr(clock, name))
+    try:
+      udp = live_bridge.UdpSink(("127.0.0.1", 9))
+      udp._socket.close()
+      udp._socket = _Socket(clock)
+      serial = live_bridge.N64SerialSink.__new__(live_bridge.N64SerialSink)
+      serial._port = _Port(clock)
+      serial._sequence = 0
+      serial._cap = live_bridge.ColourFieldRateCap("joybus")
+      live_bridge.stream_frames(frames, realtime=False, rate=rate, sinks=[udp, serial])
+    finally:
+      for name, original in originals.items():
+        setattr(live_bridge.time, name, original)
+    return udp._socket.sent, serial._port.sent
+
+  def _assert_at_most_60_per_second(self, times: list[int]) -> None:
+    for first, later in zip(times, times[60:]):
+      self.assertGreaterEqual(later - first, 1_000_000_000)
+
+  def test_rate_120_scene_7_drops_to_60_on_every_output(self) -> None:
+    udp, serial = self._stream([_cf_frame(index) for index in range(240)], rate=120)
+    for sent in (udp, serial):
+      self.assertEqual(len(sent), 120)
+      self._assert_at_most_60_per_second([at for at, _ in sent])
+    self.assertEqual([int.from_bytes(data[2:4], "little") for _, data in udp], list(range(0, 240, 2)))
+
+  def test_rate_60_scene_7_is_not_decimated(self) -> None:
+    udp, serial = self._stream([_cf_frame(index) for index in range(120)], rate=60)
+    self.assertEqual((len(udp), len(serial)), (120, 120))
+
+  def test_leaving_and_entering_scene_7_at_rate_120(self) -> None:
+    scenes = [7] * 60 + [6] * 60 + [7] * 60
+    udp, _ = self._stream([_cf_frame(index, scene) for index, scene in enumerate(scenes)], rate=120)
+    counters = [int.from_bytes(data[2:4], "little") for _, data in udp]
+    self.assertEqual(counters, list(range(0, 60, 2)) + list(range(60, 120)) + list(range(121, 180, 2)))
+    self.assertEqual(counters, sorted(counters))
+    sent_7 = [(at, data) for at, data in udp if data[20] == 7]
+    previous_send = {id(data): udp[index - 1][0] for index, (_, data) in enumerate(udp) if index}
+    for at, data in sent_7[1:]:
+      self.assertGreaterEqual((at - previous_send[id(data)]) * 60, 1_000_000_000)
+
+  def test_cap_follows_each_transport_decoded_scene(self) -> None:
+    # Scene 23 is native on the full path but scene 7 on Joybus (23 & 0x0F).
+    udp, serial = self._stream([_cf_frame(index, 23) for index in range(240)], rate=120)
+    self.assertEqual((len(udp), len(serial)), (240, 120))
+
+  def test_dropped_edges_and_onsets_carry_to_next_sent_frame(self) -> None:
+    cap = live_bridge.ColourFieldRateCap("full", clock=itertools.count(0, 8_333_334).__next__)
+    note = chipviz_bridge.Note(60, 100)
+    frames = []
+    for index in range(40):
+      flags = 0x01 if index % 2 else 0x00  # F15: beat on odd 120 Hz frames only.
+      if index == 5:
+        flags |= 0x02 | 0x04  # One-off bar and drop on a dropped frame.
+      frames.append(_cf_frame(index, flags=flags, notes=(note,) if index == 9 else ()))
+    sent = [out for out in map(cap.filter, frames) if out is not None]
+    self.assertEqual([int.from_bytes(out[2:4], "little") for out in sent], list(range(0, 40, 2)))
+    for out in sent:
+      self.assertEqual(out[-1], chipviz_bridge.checksum(out[:-1]))
+      n64_joybus.decode_control_frame(out)
+    beats = [out[22] & 0x01 for out in sent]
+    self.assertEqual(beats, [0, 1] * 10, "beat must rise on every other sent frame, not be held high")
+    self.assertEqual([index for index, out in enumerate(sent) if out[22] & 0x06], [3])
+    self.assertEqual([index for index, out in enumerate(sent) if out[23]], [5])
+    self.assertEqual(sent[5][24:26], bytes((60, 100)))
 
 
 if __name__ == "__main__":

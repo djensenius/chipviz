@@ -8,16 +8,20 @@ import contextlib
 import importlib
 import socket
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 from chipviz_bridge import (
   COLOUR_FIELD_SCENE,
+  MAX_NOTES,
+  SCENE_OFFSET,
+  TRANSPORT_SCENE_MASKS,
   ControlFrame,
   Note,
   WIRE_SIZE,
   add_allow_flash_argument,
   announce_allow_flash,
+  checksum,
   clamp_byte,
   make_procedural_frame,
   pack_frame,
@@ -33,6 +37,14 @@ DEFAULT_FPS = 60
 # Host CC1 debounce mirrors the colour-field-v0 target scene-7 debounce.
 SCENE_P_STABLE = 30
 SCENE_CUT_MIN = 20
+# colour-field-v0 step rate: at most 60 colour-field frames per second.
+COLOUR_FIELD_MAX_FPS = 60
+NS_PER_SECOND = 1_000_000_000
+FLAGS_OFFSET = 22
+NOTE_COUNT_OFFSET = 23
+# beat, bar and drop: the flags the colour field edge-detects.
+EDGE_FLAGS = 0x07
+NOTE_VEL = 64
 
 
 def require_module(module_name: str, install_hint: str):
@@ -137,17 +149,24 @@ class SceneDebounce:
   """Debounce a continuous scene control (MIDI CC1) across scene 7.
 
   A change into or out of scene 7 is sent only after the raw value has been
-  unchanged for ``SCENE_P_STABLE`` consecutive frames: the change is made at
-  the end of the 30th frame and sent from the next one. It is also never sent
-  sooner than ``SCENE_CUT_MIN`` frames after the previous scene-7 entry or
+  unchanged for ``SCENE_P_STABLE`` consecutive 60 Hz steps: the change is made
+  at the end of the 30th step and sent from the next frame. It is also never
+  sent sooner than ``SCENE_CUT_MIN`` steps after the previous scene-7 entry or
   exit. Changes between other scenes are sent at once.
+
+  ``step`` runs once per frame at ``rate`` frames per second. Above 60 Hz the
+  step counts scale up (60 frames at 120 Hz), so the debounce lasts at least
+  500 ms; at or below 60 Hz it stays 30 frames, which is longer.
   """
 
-  def __init__(self, scene: int = 0) -> None:
+  def __init__(self, scene: int = 0, rate: int = DEFAULT_FPS) -> None:
     self.scene = scene
     self._candidate = scene
     self._count = 0
-    self._since_cut = SCENE_CUT_MIN
+    scale = max(rate, DEFAULT_FPS)
+    self._stable = -(-SCENE_P_STABLE * scale // DEFAULT_FPS)
+    self._cut_min = -(-SCENE_CUT_MIN * scale // DEFAULT_FPS)
+    self._since_cut = self._cut_min
 
   def step(self, raw: int) -> int:
     """Advance one frame with the raw scene value; return the scene to send."""
@@ -161,10 +180,79 @@ class SceneDebounce:
       self.scene = raw
       return self.scene
     sent = self.scene
-    if self._count >= SCENE_P_STABLE and self._since_cut >= SCENE_CUT_MIN:
+    if self._count >= self._stable and self._since_cut >= self._cut_min:
       self.scene = raw
       self._since_cut = 0
     return sent
+
+
+def _wire_notes(wire: bytes) -> list[tuple[int, int]]:
+  count = min(wire[NOTE_COUNT_OFFSET], MAX_NOTES)
+  return [(wire[24 + index * 2], wire[25 + index * 2]) for index in range(count)]
+
+
+class ColourFieldRateCap:
+  """Send at most 60 colour-field frames per second on one output.
+
+  colour-field-v0 "Step rate": a frame whose decoded scene (per transport, as
+  in ``sanitise_flash``) is 7 is dropped when less than 1/60 s has passed since
+  the previous frame sent on this output. Other frames always pass, so the
+  frame counter stays monotonic and only skips values. Rising edges of beat,
+  bar and drop and note onsets on dropped frames are carried into the next
+  sent frame, unless the previous sent frame already shows them (no edge is
+  possible then). ``clock`` returns integer nanoseconds.
+  """
+
+  def __init__(self, transport: str, clock: Callable[[], int] | None = None) -> None:
+    self._mask = TRANSPORT_SCENE_MASKS[transport]
+    self._clock = clock or time.monotonic_ns
+    self._last_sent_ns: int | None = None
+    self._last_sent = b""
+    self._previous = b""
+    self._pending_flags = 0
+    self._pending_notes: list[tuple[int, int]] = []
+
+  def filter(self, wire: bytes) -> bytes | None:
+    """Return the frame to send now, or ``None`` to drop it."""
+    if len(wire) != WIRE_SIZE:
+      return wire
+    now = self._clock()
+    previous, self._previous = self._previous, wire
+    if (
+      wire[SCENE_OFFSET] & self._mask == COLOUR_FIELD_SCENE
+      and self._last_sent_ns is not None
+      and (now - self._last_sent_ns) * COLOUR_FIELD_MAX_FPS < NS_PER_SECOND
+    ):
+      self._pending_flags |= wire[FLAGS_OFFSET] & ~previous[FLAGS_OFFSET] & EDGE_FLAGS
+      previous_notes = _wire_notes(previous)
+      for pair in _wire_notes(wire):
+        if pair[1] >= NOTE_VEL and pair not in previous_notes and pair not in self._pending_notes:
+          self._pending_notes.append(pair)
+      return None
+    sent = self._carry(wire)
+    self._last_sent_ns = now
+    self._last_sent = sent
+    self._pending_flags = 0
+    self._pending_notes = []
+    return sent
+
+  def _carry(self, wire: bytes) -> bytes:
+    if not self._last_sent or not (self._pending_flags or self._pending_notes):
+      return wire
+    out = bytearray(wire)
+    out[FLAGS_OFFSET] |= self._pending_flags & ~self._last_sent[FLAGS_OFFSET]
+    held = _wire_notes(wire) + _wire_notes(self._last_sent)
+    for note, velocity in self._pending_notes:
+      count = out[NOTE_COUNT_OFFSET]
+      if count >= MAX_NOTES:
+        break
+      if (note, velocity) not in held:
+        out[24 + count * 2] = note
+        out[25 + count * 2] = velocity
+        out[NOTE_COUNT_OFFSET] = count + 1
+    # Adjust rather than recompute the XOR checksum so a corrupt frame stays corrupt.
+    out[-1] = wire[-1] ^ checksum(wire[:-1]) ^ checksum(out[:-1])
+    return bytes(out)
 
 
 def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Iterator[bytes]:
@@ -179,7 +267,7 @@ def iter_midi_frames(port_name: str | None, frame_count: int, fps: int) -> Itera
   mido = require_module("mido", "mido python-rtmidi")
   velocity = 0
   raw_scene = 0
-  debounce = SceneDebounce()
+  debounce = SceneDebounce(rate=fps)
   palette = 0
   interval = 1.0 / fps
   with mido.open_input(port_name) as port:
@@ -237,7 +325,11 @@ def open_frame_source(args: argparse.Namespace) -> tuple[Iterable[bytes], bool]:
 
 
 class FileSink:
-  """Write the raw control-frame stream to disk; never paced."""
+  """Write the raw control-frame stream to disk; never paced.
+
+  Not rate-capped: a file has no wall-clock rate, and playback is paced (and
+  capped) by whatever replays it.
+  """
 
   paced = False
   allow_flash = False
@@ -255,7 +347,7 @@ class FileSink:
 
 
 class UdpSink:
-  """Send each control frame to a UDP endpoint; paced on output."""
+  """Send each control frame to a UDP endpoint; paced and capped on output."""
 
   paced = True
   allow_flash = False
@@ -263,9 +355,13 @@ class UdpSink:
   def __init__(self, endpoint: tuple[str, int], allow_flash: bool = False) -> None:
     self._endpoint = endpoint
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self._cap = ColourFieldRateCap("full")
     self.allow_flash = allow_flash
 
   def send(self, frame: bytes) -> None:
+    frame = self._cap.filter(frame)
+    if frame is None:
+      return
     self._socket.sendto(sanitise_flash(frame, "full", self.allow_flash), self._endpoint)
 
   def close(self) -> None:
@@ -273,7 +369,7 @@ class UdpSink:
 
 
 class N64SerialSink:
-  """Send packed 16-byte N64 Joybus frames over serial; paced on output."""
+  """Send packed 16-byte N64 Joybus frames over serial; paced and capped on output."""
 
   paced = True
   allow_flash = False
@@ -282,9 +378,13 @@ class N64SerialSink:
     serial_module = require_module("serial", "pyserial")
     self._port = serial_module.Serial(device, baudrate=baud, timeout=1)
     self._sequence = 0
+    self._cap = ColourFieldRateCap("joybus")
     self.allow_flash = allow_flash
 
   def send(self, frame: bytes) -> None:
+    frame = self._cap.filter(frame)
+    if frame is None:
+      return
     # Own per-packet marker sequence: advances even if the source repeats or
     # stalls its control-frame counter.
     packets = convert_stream(frame, self._sequence, allow_flash=self.allow_flash)
