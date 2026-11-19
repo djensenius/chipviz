@@ -45,7 +45,7 @@ fn build(
                 color: palette(frame.palette, 0.18 + band * 0.82, energy),
                 rotation: angle + elapsed * 0.12,
                 scene_mix: 2.0,
-                _padding: [0.0; 2],
+                pattern: [0.0; 2],
             });
         }
     }

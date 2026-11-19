@@ -58,7 +58,7 @@ fn signal_field(
             color: palette(frame.palette, brightness, energy),
             rotation: 0.0,
             scene_mix: 0.0,
-            _padding: [0.0; 2],
+            pattern: [0.0; 2],
         });
     }
 }
@@ -100,7 +100,7 @@ fn spectrum_volume(
                 ),
                 rotation: 0.0,
                 scene_mix: 1.0,
-                _padding: [0.0; 2],
+                pattern: [0.0; 2],
             });
         }
     }
@@ -139,7 +139,7 @@ fn pulse_tunnel(
                 color: palette(frame.palette, 0.18 + band * 0.82, energy),
                 rotation: angle + elapsed * 0.12,
                 scene_mix: 2.0,
-                _padding: [0.0; 2],
+                pattern: [0.0; 2],
             });
         }
     }

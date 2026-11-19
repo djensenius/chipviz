@@ -30,16 +30,21 @@ pub struct Instance {
     pub color: [f32; 4],
     pub rotation: f32,
     pub scene_mix: f32,
-    pub _padding: [f32; 2],
+    /// ScreenSpace fill pattern; `[0, 0]` (every scene but Static) is a solid
+    /// quad. Positive values are a 5x8 glyph bitmap (rows 0..3 in `[0]`,
+    /// rows 4..7 in `[1]`, 5 bits per row, bit 0 = top-left); a negative `[0]`
+    /// is per-pixel noise. See `scenes::static_noise` and `shader.wgsl`.
+    pub pattern: [f32; 2],
 }
 
 impl Instance {
-    pub const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
       1 => Float32x3,
       2 => Float32x2,
       3 => Float32x4,
       4 => Float32,
       5 => Float32,
+      6 => Float32x2,
     ];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {

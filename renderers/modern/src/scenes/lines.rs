@@ -254,7 +254,7 @@ impl View {
                 color: [color[0] * fog, color[1] * fog, color[2] * fog, color[3]],
                 rotation: delta[1].atan2(delta[0]),
                 scene_mix: 3.0,
-                _padding: [0.0; 2],
+                pattern: [0.0; 2],
             },
         ))
     }

@@ -60,10 +60,11 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
-| 0, 4, 8, ... | `SignalField` | `Orbit3D` |
-| 1, 5, 9, ... | `SpectrumVolume` | `Orbit3D` |
-| 2, 6, 10, ... | `PulseTunnel` | `Orbit3D` |
-| 3, 7, 11, ... | `Lines` | `ScreenSpace` |
+| 0, 5, 10, ... | `SignalField` | `Orbit3D` |
+| 1, 6, 11, ... | `SpectrumVolume` | `Orbit3D` |
+| 2, 7, 12, ... | `PulseTunnel` | `Orbit3D` |
+| 3, 8, 13, ... | `Lines` | `ScreenSpace` |
+| 4, 9, 14, ... | `Static` | `ScreenSpace` |
 
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
@@ -84,6 +85,32 @@ table in `src/scenes/mod.rs`. The control frame's `scene` byte selects
   into the hallway entrance. The scene projects its own camera on the CPU, so
   it uses `ScreenSpace`. Procedural input never selects it; use `--scene 3`
   (frames 120, 560 and 800 show plane, mid-fold and hallway).
+- `Static`: a grid of noise cells, each a random glyph, solid block or
+  bitmap, or blank. Energy sets both the change rate (each cell changes every
+  1 to 12 frames, faster when loud) and the chance of "nothing" (blank cells,
+  80% when quiet down to 20% when loud); each beat reshuffles the field.
+  Palettes 0 to 2 tint the field, palette 3 uses random hues, and every fifth
+  section swaps to a white background with inverted colours. Every 512 control
+  frames a section resolves into content and dissolves back: an embedded
+  multilingual phrase, a constant (π, e, φ or √2 to 15 places), or a rotating
+  3D torus knot traced in the digits of its own coordinates. Cells cycle
+  through random glyphs for 40 frames before landing (frames 160 to 256 of a
+  section), hold, then cycle away from frame 400; every fourth section is
+  plain noise. Odd groups of four sections use pixel noise instead of glyphs:
+  the fragment shader gives each screen pixel its own value. Within a section
+  the camera stays flat, slowly zooms out and tilts, or orbits once around the
+  plane, showing mirrored text from behind; it is projected on the CPU, so the
+  scene uses `ScreenSpace`. Procedural input never selects it; use
+  `--scene 4` (frames 100, 200 and 300 show glyph noise, a mid-transition and
+  resolved text; 3604 shows pixel noise, 4908 a constant on white, 3422 the
+  knot and 4366 the orbit).
+  Limitations: the text is a small embedded phrase list written for chipviz,
+  with no live headlines yet (a `TextSource` trait is the seam for them); the
+  glyphs are a hand-drawn 5x8 uppercase font covering Latin with accents
+  (one-row accents, no cedilla), Greek, Cyrillic, digits and some symbols, and
+  characters it lacks (CJK, emoji) render as glyph-like noise. One quad draws
+  each cell, so glyph density is limited by the instance budget (about 208x78
+  cells on `m1`, 104x39 on `pi5`). Sections are frame-timed, not beat-synced.
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
 mode, and append that entry to `REGISTRY`. Appending keeps every byte below the
@@ -91,11 +118,17 @@ old registry length on the same scene; wrapped bytes follow the new length,
 because selection is `scene % REGISTRY.len()`. Appending `Lines` as the fourth
 scene shifted them: bytes 3, 4 and 5 (formerly `SignalField`, `SpectrumVolume`
 and `PulseTunnel`) now select `Lines`, `SignalField` and `SpectrumVolume`.
+Appending `Static` as the fifth scene shifted bytes 4 to 7 the same way: they
+now select `Static`, `SignalField`, `SpectrumVolume` and `PulseTunnel`.
 `Orbit3D` scenes use world coordinates and the smoothed orbit camera.
 `ScreenSpace` scenes draw flat: `center.xy` is NDC (`-1..1` spans the viewport,
 `+y` up), depth is ignored, and instances draw in order with their colour
 unchanged (no quad-edge darkening or beat/energy pulse). Builders receive the
 viewport aspect (width / height) for laying out screen-space fields.
+A `ScreenSpace` instance's `pattern` is `[0, 0]` for a solid quad; positive
+values carry a 5x8 glyph bitmap (bits 0 to 19 and 20 to 39) whose unlit pixels
+are discarded, and a negative `pattern.x` asks for per-pixel noise (see
+`src/scenes/static_noise/mod.rs`).
 
 The Pi 5 profile favors crisp geometry and predictable frame pacing. The M1
 profile favors density, deeper Z spacing, and more aggressive camera motion.

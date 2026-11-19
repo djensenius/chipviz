@@ -49,7 +49,7 @@ fn build(
                 ),
                 rotation: 0.0,
                 scene_mix: 1.0,
-                _padding: [0.0; 2],
+                pattern: [0.0; 2],
             });
         }
     }

@@ -343,10 +343,10 @@ mod tests {
     fn scene_override_selects_registry_entry() {
         let source = FrameSource {
             fixture: None,
-            scene: Some(5),
+            scene: Some(6),
         };
         let frame = source.frame(120).unwrap();
-        assert_eq!(frame.scene, 5);
+        assert_eq!(frame.scene, 6);
         assert_eq!(frame.energy, ControlFrame::procedural(120).energy);
         assert_eq!(scenes::select(frame.scene).name, "SpectrumVolume");
         let unforced = FrameSource {
@@ -418,7 +418,7 @@ mod tests {
             color: [0.5, 0.5, 0.5, 1.0],
             rotation: 0.0,
             scene_mix: 0.0,
-            _padding: [0.0; 2],
+            pattern: [0.0; 2],
         };
         let frame = ControlFrame {
             energy: 255,
