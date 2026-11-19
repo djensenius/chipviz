@@ -474,6 +474,8 @@ struct LossDetector {
     jitter_since: Instant,
     /// Seconds filled that have not been taken back.
     filled: f64,
+    /// Seconds taken back by the current run of take-backs.
+    reversed: f64,
 }
 
 impl LossDetector {
@@ -485,6 +487,7 @@ impl LossDetector {
             previous_jitter: 0.0,
             jitter_since: now,
             filled: 0.0,
+            reversed: 0.0,
         }
     }
 
@@ -521,8 +524,15 @@ impl LossDetector {
         if lag < latency && self.filled > 0.0 {
             let back = (latency - lag).min(self.filled).min(spare);
             self.filled -= back;
+            // Fill taken back was a delay, not a loss: learn the whole
+            // reversal (over however many deliveries `spare` splits it
+            // into) as jitter so the same delay is not filled again.
+            self.reversed += back;
+            self.note_jitter(now, self.reversed);
+            self.excess = None;
             return -back;
         }
+        self.reversed = 0.0;
         let latency = latency.min(lag);
         self.latency = Some(latency);
         let excess = lag - latency;
@@ -607,6 +617,28 @@ impl Drain {
     }
 }
 
+/// One poll's view of the ring: `(now, dropped, available)`.
+///
+/// The clock is read after the ring, so the snapshot never holds samples
+/// published after `now`. Read first, a preemption before `slots()` would
+/// count newer samples against an older time and permanently lower
+/// [`LossDetector`]'s latency, making later normal deliveries look lost.
+fn snapshot(
+    dropped: &AtomicUsize,
+    consumer: &rtrb::Consumer<f32>,
+    clock: impl FnOnce() -> Instant,
+) -> (Instant, usize, usize) {
+    // The drop count must be read before `slots()`: Acquire pairs with the
+    // callback's Release, so the snapshot below includes every sample
+    // accepted before the drops counted here (plus possibly a few
+    // committed just after), and all of it is discarded on overflow.
+    let dropped = dropped.swap(0, Ordering::Acquire);
+    // One snapshot bounds the whole poll; the callback may publish more
+    // meanwhile, and those samples wait for the next poll's clock.
+    let available = consumer.slots();
+    (clock(), dropped, available)
+}
+
 fn analysis_loop(
     analyzer: &mut Analyzer,
     mut consumer: rtrb::Consumer<f32>,
@@ -622,15 +654,7 @@ fn analysis_loop(
     let mut warned = false;
 
     while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        // The drop count must be read before `slots()`: Acquire pairs with the
-        // callback's Release, so the snapshot below includes every sample
-        // accepted before the drops counted here (plus possibly a few
-        // committed just after), and all of it is discarded on overflow.
-        let dropped = dropped.swap(0, Ordering::Acquire);
-        // One snapshot bounds the whole poll; the callback may publish more
-        // meanwhile, and those samples wait for the next poll's clock.
-        let available = consumer.slots();
+        let (now, dropped, available) = snapshot(dropped, &consumer, Instant::now);
         let accounting = clock.poll(now, dropped + available);
         let drain = Drain::plan(dropped, available, accounting.overlap, max_backlog);
         // Silence covers time before this poll's real samples.
@@ -973,6 +997,71 @@ mod tests {
             silence,
             Duration::from_millis(20) * (500 - delivered) as u32,
         );
+    }
+
+    /// Publishes 10 ms callbacks until `delivered` reaches `until`.
+    fn publish(producer: &mut rtrb::Producer<f32>, delivered: &mut Duration, until: Duration) {
+        let chunk = vec![0.0f32; samples(Duration::from_millis(10))];
+        while *delivered + Duration::from_millis(10) <= until {
+            push_frames(producer, &chunk, 1, |_| panic!("ring overflowed"));
+            *delivered += Duration::from_millis(10);
+        }
+    }
+
+    #[test]
+    fn preemption_after_reading_the_clock_adds_no_silence() {
+        // 10 ms callbacks into a real ring, polled every 5 ms for 3 s. Twice
+        // the analysis thread is preempted for 30 ms just after it reads the
+        // clock, while the callback keeps publishing.
+        let start = Instant::now();
+        let (mut producer, mut consumer) =
+            rtrb::RingBuffer::<f32>::new(samples(Duration::from_secs(1)));
+        let dropped = AtomicUsize::new(0);
+        let mut clock = SampleClock::new(RATE, start);
+        let (mut elapsed, mut delivered, mut silence) = (Duration::ZERO, Duration::ZERO, 0);
+        for poll in 0..600 {
+            publish(&mut producer, &mut delivered, elapsed);
+            let (now, lost, available) = snapshot(&dropped, &consumer, || {
+                let now = start + elapsed;
+                if poll % 200 == 100 {
+                    elapsed += Duration::from_millis(30);
+                    publish(&mut producer, &mut delivered, elapsed);
+                }
+                now
+            });
+            let accounting = clock.poll(now, lost + available);
+            silence += accounting.silence;
+            Drain::plan(
+                lost,
+                available,
+                accounting.overlap,
+                samples(Duration::from_secs(1)),
+            )
+            .apply(&mut consumer, |_| {});
+            elapsed += POLL;
+        }
+        assert_eq!(silence, 0);
+    }
+
+    #[test]
+    fn recurring_delays_are_learned_as_jitter() {
+        // Loss-free 10 ms callbacks for 10 s, delivered 30 ms late for
+        // 200 ms once a second. Only the first delay may pass for a loss.
+        let chunk = samples(Duration::from_millis(10));
+        let mut callbacks: Vec<_> = (1..=1000u64)
+            .map(|i| {
+                let late = if (500..700).contains(&(10 * i % 1000)) {
+                    30
+                } else {
+                    0
+                };
+                (Duration::from_millis(10 * i + late), chunk)
+            })
+            .collect();
+        callbacks.sort_by_key(|&(at, _)| at);
+        let (accounted, silence) = replay(&callbacks, Duration::from_secs(10) + POLL);
+        assert_close(accounted, Duration::from_secs(10));
+        assert!(silence <= samples(Duration::from_millis(35)), "{silence}");
     }
 
     /// Polls every 10 ms over `from..to`, delivering 10 ms of audio per poll
