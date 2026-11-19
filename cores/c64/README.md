@@ -39,7 +39,9 @@ supported: at boot the program reads the KERNAL's PAL/NTSC flag (`get_tv()`,
 per VBlank poll: it writes the previous step's VIC-II registers (border first),
 samples the keyboard, and stages the next step. All changes land in the
 vertical blank, so the screen never tears. If a step ever overruns a frame,
-the late IRQ skips its register writes rather than change them mid-screen.
+the late IRQ drops that step entirely (no register writes, input sampling or
+tick) rather than change registers mid-screen or catch up, so there are never
+more than 60 steps a second; keys still held are sampled on the next step.
 The native PETSCII demo keeps drawing in the main loop and pauses while scene 7
 is shown. Its frame counter keeps running during scene 7, so after a visit its
 animation phase jumps ahead instead of resuming where it stopped.

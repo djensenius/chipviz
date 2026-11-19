@@ -595,3 +595,13 @@ uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t f
   late = line >= irq_line ? (uint16_t)(line - irq_line) : (uint16_t)(line + frame_lines - irq_line);
   return (uint8_t)(late < CF_IRQ_WINDOW);
 }
+
+uint8_t cf_irq_frame(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines,
+                     cf_irq_hook_t on_time, uint8_t fallback_scene) {
+  if (!cf_irq_on_time(d012, d011, irq_line, frame_lines)) {
+    return CF_IRQ_LATE;
+  }
+  on_time();
+  cf_read_keys(fallback_scene);
+  return cf_tick();
+}

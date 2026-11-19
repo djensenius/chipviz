@@ -107,4 +107,17 @@ void cf_read_keys(uint8_t fallback_scene);
 #define CF_IRQ_WINDOW 16u
 uint8_t cf_irq_on_time(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines);
 
+/* One raster IRQ. A late IRQ (cf_irq_on_time false) returns CF_IRQ_LATE
+ * without calling on_time, sampling input or stepping: the step is dropped,
+ * not caught up, so steps stay at most one per frame (spec: Step rate) and
+ * the staged output waits for the next on-time IRQ. An on-time IRQ calls
+ * on_time (present the staged step, scan the keyboard), then
+ * cf_read_keys(fallback_scene) and cf_tick, and returns cf_tick's result.
+ * Key edges compare against the last sampled keys, so a key still held at
+ * the next on-time IRQ is not lost. */
+#define CF_IRQ_LATE 0xFFu
+typedef void (*cf_irq_hook_t)(void);
+uint8_t cf_irq_frame(uint8_t d012, uint8_t d011, uint16_t irq_line, uint16_t frame_lines,
+                     cf_irq_hook_t on_time, uint8_t fallback_scene);
+
 #endif

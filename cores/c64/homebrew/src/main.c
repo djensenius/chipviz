@@ -192,27 +192,35 @@ static void stage_native(void) {
  * keyboard is sampled and the next step is staged. Only this handler calls
  * these functions, so cc65's static locals are never shared with the main
  * loop; cc65's IRQ wrapper saves the runtime zero page and uses irq_stack. */
+/* The on-time half of a step, before it is sampled and ticked. */
+static void irq_on_time(void) {
+  present();
+  scan_keyboard();
+}
+
 static uint8_t raster_irq(void) {
   uint8_t raster_low;
   uint8_t raster_high;
+  uint8_t shown;
 
   if (!(CHIPVIZ_VIC_IRQ_STATUS & 1u)) {
     return IRQ_NOT_HANDLED;
   }
-  /* Acknowledge first: an overrun step is then delayed, not lost. */
+  /* Acknowledge first, so an IRQ that fires while a step overruns is still
+   * taken; it is then late and dropped. */
   CHIPVIZ_VIC_IRQ_STATUS = 1u;
   /* A late IRQ (one that starts CF_IRQ_WINDOW lines after its line or more,
-   * after a step overran a frame) skips this frame's writes, so they never
-   * change mid-screen. The next IRQ writes the step staged after it, so the
-   * skipped step is never shown. */
+   * after a step overran a frame) drops this frame's step entirely: no
+   * register writes (so they never change mid-screen), no input sampling and
+   * no tick, so steps never come closer than a frame (at most 60 a second).
+   * The staged step is presented by the next on-time IRQ. */
   raster_low = CHIPVIZ_RASTER_LINE; /* D012 first, as cf_irq_on_time expects */
   raster_high = CHIPVIZ_VIC_CONTROL1;
-  if (cf_irq_on_time(raster_low, raster_high, irq_line, irq_frame_lines)) {
-    present();
+  shown = cf_irq_frame(raster_low, raster_high, irq_line, irq_frame_lines, irq_on_time, native_scene);
+  if (shown == CF_IRQ_LATE) {
+    return IRQ_HANDLED;
   }
-  scan_keyboard();
-  cf_read_keys(native_scene);
-  if (cf_tick()) {
+  if (shown) {
     stage_field();
     field_shown = 1u;
   } else {

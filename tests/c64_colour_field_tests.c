@@ -850,9 +850,82 @@ static void irq_lines(void) {
           "lines 244-255 are late");
 }
 
+/* cf_irq_frame drops late IRQs: the hook (present and keyboard scan) is not
+ * called and no input or state changes. On an NTSC timeline (263 lines of 65
+ * cycles at 1022727 Hz, 59.83 frames a second) where every 7th frame's step
+ * overruns, so the next IRQ fires 60 lines late, no 1-second window holds more
+ * than 60 steps. Ticking late IRQs (a1cbee3d) gives 61. */
+static unsigned irq_hooks;
+static void irq_hook(void) {
+  irq_hooks++;
+}
+
+static uint8_t irq_at(uint32_t line, uint16_t irq_line, uint16_t frame_lines, uint8_t fallback) {
+  uint16_t in_frame = (uint16_t)(line % frame_lines);
+  return cf_irq_frame((uint8_t)in_frame, (uint8_t)((in_frame >> 1) & 0x80u), irq_line, frame_lines, irq_hook,
+                      fallback);
+}
+
+static void irq_steps(void) {
+  static uint32_t at[1200];
+  const uint32_t second = 1022727u; /* NTSC cycles */
+  const uint16_t frame_lines = 263u;
+  const uint16_t irq_line = 16u;
+  cf_state_t before;
+  cf_input_t in_before;
+  unsigned n = 0;
+  unsigned late = 0;
+  unsigned i;
+  unsigned j;
+  unsigned best = 0;
+  uint32_t f;
+  int unchanged = 1;
+
+  cf_init();
+  keys_none();
+  for (f = 0; f < 1200u; f++) {
+    /* The late IRQs land 60 lines after their line, past the window. */
+    uint32_t line = f * frame_lines + irq_line + 6u + (f % 7u == 6u ? 60u : 0u);
+    unsigned hooks = irq_hooks;
+    memcpy(&before, &cf, sizeof(cf));
+    memcpy(&in_before, &cf_in, sizeof(cf_in));
+    if (irq_at(line, irq_line, frame_lines, 2u) == CF_IRQ_LATE) {
+      late++;
+      unchanged &= irq_hooks == hooks && memcmp(&before, &cf, sizeof(cf)) == 0 &&
+                   memcmp(&in_before, &cf_in, sizeof(cf_in)) == 0;
+    } else {
+      unchanged &= irq_hooks == hooks + 1u;
+      at[n++] = line * 65u;
+    }
+  }
+  require(late == 171u && n == 1029u, "irq steps", "every 7th IRQ is late and dropped");
+  require(unchanged, "irq steps", "a late IRQ calls no hook and changes no state or input");
+  for (i = 0, j = 0; i < n; i++) {
+    while (at[i] - at[j] >= second) {
+      j++;
+    }
+    best = i - j + 1u > best ? i - j + 1u : best;
+  }
+  require(best <= 60u, "irq steps", "at most 60 steps in any 1-second window");
+
+  /* Keys pressed during a dropped IRQ are sampled at the next on-time one:
+   * the Space edge and the 8+Q chord (absolute 7/0) are not lost. */
+  cf_init();
+  keys_none();
+  irq_at(16u + 6u, irq_line, frame_lines, 2u);
+  key(7, 0x10u); /* Space */
+  key(3, 0x08u); /* 8 */
+  key(7, 0x40u); /* Q */
+  require(irq_at(263u + 16u + 66u, irq_line, frame_lines, 2u) == CF_IRQ_LATE, "irq steps", "late IRQ dropped");
+  irq_at(2u * 263u + 16u + 6u, irq_line, frame_lines, 2u);
+  require(cf_in.events == CF_EV_B && cf_in.scene == 7u && cf_in.palette == 0u && cf_in.scene_abs == !!FLASH,
+          "irq steps", "Space edge and 8+Q held over a late IRQ are sampled next step");
+}
+
 int main(void) {
   geometry();
   irq_lines();
+  irq_steps();
   colours();
   keys();
   fixture_f0();
