@@ -168,16 +168,21 @@ as the flash guard) are limited; other frames always go out.
   50 at 100, 55 at 110, about 58 at 144). Rates up to 60 are unchanged.
 - Frames are only dropped, never reordered or renumbered, so the frame
   counter stays monotonic and skips values; targets step once per new value.
-- Events the target edge-detects are carried from dropped frames into a later
-  sent frame, as each transport sees them: `beat`, `bar` and `drop` rising
-  edges, and note onsets (a new note at velocity 64 or more on the full path;
-  byte 15, the highest velocity, rising across 64 on Joybus). An event the
-  previous sent frame already shows cannot be an edge yet, so it is held for
-  at most 2 sends and then dropped.
-- A carried note goes into a free note slot, or else replaces the quietest
-  note below velocity 64; on Joybus that raises byte 15 to the carried
-  velocity. If all 4 slots hold louder notes, it waits up to 30 sends for
-  room, and is dropped as soon as a sent frame shows that note.
+- Events on dropped frames are carried per target event class, so the
+  target sees each class at most once per sent frame, as if it had resampled
+  the input itself: `B` (a `beat` or `bar` rising edge), `X` (a `drop`
+  rising edge) and `N` (a note onset: a new note at velocity 64 or more on the
+  full path; byte 15, the highest velocity, rising across 64 on Joybus).
+- A pending class is cleared as soon as a sent frame already shows that class
+  against the previous sent frame, whichever event caused it (a new beat
+  satisfies a pending bar; any new loud note satisfies a pending note).
+  Otherwise one pending event is written in: a flag bit, or a note in a free
+  slot or in place of the quietest note below velocity 64 (on Joybus that
+  raises byte 15 to the carried velocity).
+- A class that the previous sent frame already shows cannot be an edge yet,
+  so it is held for at most 2 sends and then dropped. A note that only lacks
+  a slot (all 4 hold louder notes) waits up to 30 sends, so it can arrive late
+  but never doubles an onset.
 - Invalid frames (bad magic, version, note count or checksum, or reserved
   flag bits set) never raise or receive carried events, are never the edge
   reference, and go out as they are.

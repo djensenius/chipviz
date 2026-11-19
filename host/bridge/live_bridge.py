@@ -220,17 +220,20 @@ class ColourFieldRateCap:
   pass. Frames are dropped, never renumbered, so the frame counter stays
   monotonic and only skips values. ``clock`` returns integer nanoseconds.
 
-  Events the target edge-detects are kept pending until a sent frame can show
-  them as a new edge against the previous sent frame: rising edges of beat,
-  bar and drop, plus note onsets as each transport sees them (a new
+  Events on dropped frames are carried per target event class, so the target
+  sees each class at most once per sent frame, as if it had resampled the
+  input itself: ``B`` (a rising edge of beat or bar), ``X`` (a rising edge of
+  drop) and ``N`` (a note onset as each transport sees it: a new
   ``(note, velocity)`` pair at ``NOTE_VEL`` or more on the full path; byte 15,
   the highest velocity, rising across ``NOTE_VEL`` on Joybus; none on HID).
-  An event that the previous sent frame already shows is held for at most
-  ``CARRY_HOLD`` sends. A carried note goes into a free note slot, or else
-  replaces the quietest note below ``NOTE_VEL`` (on Joybus this raises byte 15
-  to the carried velocity). If every slot holds a louder note, it waits up to
-  ``CARRY_FULL_HOLD`` sends for room, and is dropped as soon as a sent frame
-  shows it. Only valid frames (magic, version, reserved flag bits
+  A pending class is satisfied, and cleared, as soon as a sent frame shows that
+  class against the previous sent frame, whichever event raised it. Otherwise
+  one pending event is written into the frame: a flag bit the previous sent
+  frame lacks, or a note in a free slot or replacing the quietest note below
+  ``NOTE_VEL`` (on Joybus this raises byte 15 to the carried velocity). A
+  class whose pending events the previous sent frame already shows is held
+  for at most ``CARRY_HOLD`` sends; notes that only lack a slot (all four hold
+  louder notes) wait up to ``CARRY_FULL_HOLD`` sends. Only valid frames (magic, version, reserved flag bits
   clear, note count and checksum) raise events, act as the previous frame, or
   are rewritten; invalid frames pass through unchanged.
   """
@@ -248,8 +251,9 @@ class ColourFieldRateCap:
     self._window: collections.deque[int] = collections.deque(maxlen=COLOUR_FIELD_MAX_FPS)
     self._last_sent = b""
     self._previous = b""
-    # Event key -> [payload, sends held as already shown, sends without room].
-    self._pending: dict[tuple, list] = {}
+    # Event class "B", "X" or "N" -> [flag bits or notes, sends held as
+    # already shown, sends without a free note slot].
+    self._pending: dict[str, list] = {}
 
   def filter(self, wire: bytes) -> bytes | None:
     """Return the frame to send now, or ``None`` to drop it."""
@@ -261,8 +265,15 @@ class ColourFieldRateCap:
     valid = _wire_valid(wire)
     if valid:
       if self._previous:
-        for key, payload in self._events(self._previous, wire):
-          self._pending[key] = [payload, 0, 0]
+        for event_class, item in self._events(self._previous, wire):
+          entry = self._pending.setdefault(event_class, [0 if event_class != "N" else [], 0, 0])
+          if event_class != "N":
+            entry[0] |= item
+          elif self._note_event == "vel":
+            entry[0] = [item]
+          elif item not in entry[0]:
+            entry[0].append(item)
+          entry[1] = entry[2] = 0
       self._previous = wire
     if not send:
       return None
@@ -280,49 +291,62 @@ class ColourFieldRateCap:
       return False
     return self._due is None or now * COLOUR_FIELD_MAX_FPS >= self._due - NS_PER_SECOND // 4
 
-  def _events(self, previous: bytes, wire: bytes) -> list[tuple[tuple, object]]:
-    events: list[tuple[tuple, object]] = [
-      (("flag", bit), None)
-      for bit in (0x01, 0x02, 0x04)
-      if wire[FLAGS_OFFSET] & bit and not previous[FLAGS_OFFSET] & bit
+  def _events(self, previous: bytes, wire: bytes) -> list[tuple[str, object]]:
+    rises = wire[FLAGS_OFFSET] & ~previous[FLAGS_OFFSET]
+    events: list[tuple[str, object]] = [
+      ("X" if bit == 0x04 else "B", bit) for bit in (0x01, 0x02, 0x04) if rises & bit
     ]
     if self._note_event == "note":
       previous_notes = _wire_notes(previous)
       events += [
-        (("note", pair), pair)
+        ("N", pair)
         for pair in _wire_notes(wire)
         if pair[1] >= NOTE_VEL and pair not in previous_notes
       ]
     elif self._note_event == "vel" and _max_velocity(previous) < NOTE_VEL <= _max_velocity(wire):
-      events.append((("vel",), max(_wire_notes(wire), key=lambda pair: pair[1])))
+      events.append(("N", max(_wire_notes(wire), key=lambda pair: pair[1])))
     return events
 
-  @staticmethod
-  def _shows(wire: bytes, key: tuple) -> bool:
-    if key[0] == "flag":
-      return bool(wire[FLAGS_OFFSET] & key[1])
-    if key[0] == "note":
-      return key[1] in _wire_notes(wire)
-    return _max_velocity(wire) >= NOTE_VEL
+  def _shows_class(self, event_class: str, out: bytes, last: bytes) -> bool:
+    """Whether the target sees ``event_class`` at ``out`` after ``last``."""
+    last_flags = last[FLAGS_OFFSET] if last else 0
+    if event_class != "N":
+      bits = 0x04 if event_class == "X" else 0x03
+      return bool(out[FLAGS_OFFSET] & ~last_flags & bits)
+    if self._note_event == "vel":
+      return (_max_velocity(last) if last else 0) < NOTE_VEL <= _max_velocity(out)
+    last_notes = _wire_notes(last) if last else []
+    return any(pair[1] >= NOTE_VEL and pair not in last_notes for pair in _wire_notes(out))
 
   def _deliver(self, wire: bytes) -> bytes:
     out = bytearray(wire)
-    for key, entry in list(self._pending.items()):
-      if self._last_sent and self._shows(self._last_sent, key):
+    last = self._last_sent
+    for event_class, entry in list(self._pending.items()):
+      if self._shows_class(event_class, out, last):
+        del self._pending[event_class]
+        continue
+      if event_class != "N":
+        bits = entry[0] & ~(last[FLAGS_OFFSET] if last else 0)
+        if bits:
+          out[FLAGS_OFFSET] |= bits
+          del self._pending[event_class]
+          continue
+        candidates = []
+      elif self._note_event == "vel":
+        candidates = entry[0] if not (last and _max_velocity(last) >= NOTE_VEL) else []
+      else:
+        last_notes = _wire_notes(last) if last else []
+        candidates = [pair for pair in entry[0] if pair not in last_notes]
+      if not candidates:
         entry[1] += 1
         if entry[1] > self.CARRY_HOLD:
-          del self._pending[key]
-      elif self._shows(out, key):
-        del self._pending[key]
-      elif key[0] == "flag":
-        out[FLAGS_OFFSET] |= key[1]
-        del self._pending[key]
-      elif self._place_note(out, entry[0]):
-        del self._pending[key]
+          del self._pending[event_class]
+      elif any(self._place_note(out, pair) for pair in candidates):
+        del self._pending[event_class]
       else:
         entry[2] += 1
         if entry[2] > self.CARRY_FULL_HOLD:
-          del self._pending[key]
+          del self._pending[event_class]
     out[-1] = checksum(out[:-1])
     return bytes(out)
 

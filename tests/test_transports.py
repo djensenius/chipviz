@@ -670,25 +670,72 @@ class ColourFieldRateCapTests(unittest.TestCase):
     packets = n64_joybus.convert_stream(b"".join(joybus))
     self.assertEqual([packets[i * 16 + 15] for i in range(len(joybus))], [0, 100, 40, 40])
 
-  def test_carried_note_waits_for_room_then_is_bounded(self) -> None:
-    def loud(*numbers: int) -> tuple:
-      return tuple(chipviz_bridge.Note(number, 100) for number in numbers)
-
-    held = loud(70, 71, 72)
-    frames = [_cf_frame(0, notes=held), _cf_frame(1, notes=held + loud(60))]
-    frames += [_cf_frame(i, notes=held + loud(80)) for i in range(2, 10)]
+  def test_onset_shown_by_another_note_satisfies_pending_note(self) -> None:
+    # Reviewer repro: note 60 on dropped frame 1, new note 80 on sent frame 2.
+    held = _loud(70, 71, 72)
+    frames = [_cf_frame(0, notes=held), _cf_frame(1, notes=held + _loud(60))]
+    frames += [_cf_frame(i, notes=held + _loud(80)) for i in range(2, 10)]
     frames += [_cf_frame(i, notes=held) for i in range(10, 14)]
-    sent = [out for out in self._cap("full", frames) if out]
-    shown = [index for index, out in enumerate(sent) if (60, 100) in live_bridge._wire_notes(out)]
-    self.assertEqual(shown, [5], "the onset waits through 4 full sends, then takes the free slot")
-    # Full for longer than CARRY_FULL_HOLD sends: the onset is dropped.
-    limit = live_bridge.ColourFieldRateCap.CARRY_FULL_HOLD
-    frames = [_cf_frame(0, notes=held), _cf_frame(1, notes=held + loud(60))]
-    frames += [_cf_frame(i, notes=held + loud(80)) for i in range(2, 2 * limit + 4)]
-    frames += [_cf_frame(i, notes=held) for i in range(2 * limit + 4, 2 * limit + 8)]
-    sent = [out for out in self._cap("full", frames) if out]
-    self.assertFalse(any((60, 100) in live_bridge._wire_notes(out) for out in sent))
+    outs = self._cap("full", frames)
+    target = [events[2] for events in _target_events([out for out in outs if out])]
+    self.assertEqual(target, [events[2] for events in _resampled_events(frames, outs)])
+    self.assertEqual(target, [1, 1, 0, 0, 0, 0, 0])
 
+  def test_beat_satisfies_pending_bar_and_vice_versa(self) -> None:
+    for name, flags in (("bar then beat", [2, 0, 3, 0, 0, 0, 0, 0]), ("beat then bar", [1, 0, 3, 0, 0, 0, 0, 0])):
+      with self.subTest(name):
+        frames = [_cf_frame(i, flags=f) for i, f in enumerate(flags)]
+        outs = self._cap("full", frames)
+        target = [events[0] for events in _target_events([out for out in outs if out])]
+        self.assertEqual(target, [events[0] for events in _resampled_events(frames, outs)])
+        self.assertEqual(target, [1, 1, 0, 0])
+
+  def test_carried_note_waits_for_room_then_is_bounded(self) -> None:
+    # Every sent frame holds four loud notes and shows no onset, so the onset
+    # from dropped frame 1 is delayed (not doubled) until a slot frees up.
+    full = _loud(70, 71, 72, 73)
+    for full_frames, expected in ((10, [1, 0, 0, 0, 0, 1, 0]), (2 * live_bridge.ColourFieldRateCap.CARRY_FULL_HOLD + 4, None)):
+      with self.subTest(full_frames=full_frames):
+        frames = [_cf_frame(0, notes=full), _cf_frame(1, notes=_loud(60, 71, 72, 73))]
+        frames += [_cf_frame(i, notes=full) for i in range(2, full_frames)]
+        frames += [_cf_frame(i, notes=full[:3]) for i in range(full_frames, full_frames + 4)]
+        outs = self._cap("full", frames)
+        target = [events[2] for events in _target_events([out for out in outs if out])]
+        resampled = [events[2] for events in _resampled_events(frames, outs)]
+        if expected:
+          self.assertEqual(target, expected)
+          self.assertEqual(sum(target), sum(resampled))
+        else:
+          self.assertEqual(sum(target), 1, "past CARRY_FULL_HOLD the onset is dropped")
+
+
+def _loud(*numbers: int) -> tuple:
+  return tuple(chipviz_bridge.Note(number, 100) for number in numbers)
+
+
+def _frame_events(previous: bytes | None, wire: bytes) -> tuple[int, int, int]:
+  """Full-path target (B, X, N) for ``wire`` after ``previous`` (None at start)."""
+  previous_flags = previous[22] if previous else 0
+  previous_notes = live_bridge._wire_notes(previous) if previous else []
+  rises = wire[22] & ~previous_flags
+  onset = any(pair[1] >= 64 and pair not in previous_notes for pair in live_bridge._wire_notes(wire))
+  return int(bool(rises & 0x03)), int(bool(rises & 0x04)), int(onset)
+
+
+def _target_events(sent: list[bytes]) -> list[tuple[int, int, int]]:
+  return [_frame_events(sent[index - 1] if index else None, wire) for index, wire in enumerate(sent)]
+
+
+def _resampled_events(frames: list[bytes], outs: list[bytes | None]) -> list[tuple[int, int, int]]:
+  """Resample the input like a target would: OR each raw frame's events into the next sent step."""
+  steps, mask = [], (0, 0, 0)
+  for index, (wire, out) in enumerate(zip(frames, outs)):
+    events = _frame_events(frames[index - 1] if index else None, wire)
+    mask = tuple(a | b for a, b in zip(mask, events))
+    if out is not None:
+      steps.append(mask)
+      mask = (0, 0, 0)
+  return steps
 
 class MidiRateTests(unittest.TestCase):
   def test_iter_midi_frames_scales_cc1_debounce_with_rate(self) -> None:
