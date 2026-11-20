@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::{self, SceneConfig, TunnelVariant, colour_field, mic_layers, starfield};
+use crate::scenes::{SceneConfig, TunnelVariant, colour_field, mic_layers, starfield};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -75,6 +75,18 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         }
         ArgsCommand::Run(args) => args,
     };
+    // Load and validate a selected catalog before enumerating audio devices,
+    // opening UDP, creating a window, or initializing the GPU.
+    let mut starfield = if args.scene == Some(starfield::SCENE) {
+        args.starfield_config()?
+    } else {
+        None
+    };
+    let live_starfield = args.unix_seconds.is_none() && starfield.is_some();
+    if let Some(config) = &mut starfield {
+        config.follow_elapsed = false;
+    }
+
     // Both list flags may be given together; each list gets a heading then.
     let both_lists = args.list_audio_devices && args.list_monitors;
     if args.list_audio_devices {
@@ -143,11 +155,6 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     window.set_cursor_visible(cursor_visible(args.fullscreen));
 
     let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
-    let mut starfield = args.starfield_config()?;
-    let live_starfield = args.unix_seconds.is_none() && starfield.is_some();
-    if let Some(config) = &mut starfield {
-        config.follow_elapsed = false;
-    }
     renderer
         .pipeline_mut()
         .configure_colour_field(colour_field_config(&args));
@@ -985,6 +992,7 @@ impl FrameSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenes;
 
     fn parse(args: &[&str]) -> Result<ArgsCommand, AppError> {
         AppArgs::parse_from(args.iter().map(|arg| arg.to_string()))
@@ -1093,7 +1101,8 @@ mod tests {
     fn help_documents_starfield_and_tunnel_options() {
         let help = usage("chipviz");
         assert!(help.contains("--star-catalog PATH"));
-        assert!(help.contains("--scene 6"));
+        assert!(help.contains("--scene N"));
+        assert!(help.contains("byte 6 opts into Starfield"));
         assert!(help.contains("--tunnel-variant MODE"));
     }
 
@@ -1210,6 +1219,30 @@ mod tests {
         assert_eq!(config.catalog.stars().len(), 1);
         assert_eq!(config.latitude_degrees, 45.0);
         assert_eq!(config.longitude_degrees, -73.0);
+    }
+
+    #[test]
+    fn invalid_selected_catalog_fails_during_preflight() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chipviz-invalid-starfield-{}-{unique}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "ra,dec,mag\nnot-a-number,0,1\n").expect("write fixture");
+        let args = parse_run(&[
+            "--scene",
+            "6",
+            "--star-catalog",
+            path.to_str().expect("UTF-8 temp path"),
+            "--location",
+            "45,-73",
+        ]);
+        let result = args.starfield_config();
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "invalid catalog must fail preflight");
     }
 
     #[test]
@@ -1869,7 +1902,6 @@ mod tests {
             "--time UNIX_SECONDS",
             "--scene N",
             "Scene 6 requires both --star-catalog and --location",
-            "without this option, incoming and procedural scenes are unchanged",
             "cycle the colour-field layout pin",
             "cycle the mic layers",
             "Esc",

@@ -107,6 +107,7 @@ pub enum ConfiguredCommand {
 
 /// Parsed capture command with explicit Starfield setup.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Keep the new public command variant stable.
 pub enum StarfieldConfiguredCommand {
     Help,
     Capture(CaptureArgs, StarfieldCaptureOptions),
@@ -472,19 +473,16 @@ pub fn run_with_options(args: &CaptureArgs, options: CaptureOptions) -> Result<(
 }
 
 /// Capture with an explicit Starfield opt-in and its separate configuration.
+/// Unlike the CLI's forced-scene option, this API enables Starfield for every
+/// scene-6 frame in a recording, including when `args.scene` is `None`.
 pub fn run_with_starfield_options(
     args: &CaptureArgs,
     options: &StarfieldCaptureOptions,
 ) -> Result<(), String> {
-    run_internal(
-        args,
-        options.capture,
-        &options.starfield,
-        starfield_opt_in(args),
-    )
+    run_internal(args, options.capture, &options.starfield, true)
 }
 
-fn starfield_opt_in(args: &CaptureArgs) -> bool {
+fn cli_starfield_opt_in(args: &CaptureArgs) -> bool {
     args.scene == Some(starfield::SCENE)
 }
 
@@ -767,13 +765,14 @@ fn preflight_replay(
     let Some(last_index) = last_index else {
         return Ok(());
     };
+    // Bounds errors take precedence over a later missing-catalog replay error.
+    source.frame(last_index)?;
     if starfield_enabled && !catalog_available {
         validate_replay_catalog(source, last_index, false, true)
     } else {
-        // A single direct bound check is sufficient; do not replay the
-        // ColourField solely for validation when Starfield is unavailable or
-        // already configured.
-        source.frame(last_index).map(|_| ())
+        // Do not replay the ColourField solely for validation when Starfield
+        // is unavailable or already configured.
+        Ok(())
     }
 }
 
@@ -812,7 +811,12 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(StarfieldConfiguredCommand::Capture(args, options)) => {
-            match run_with_starfield_options(&args, &options) {
+            match run_internal(
+                &args,
+                options.capture,
+                &options.starfield,
+                cli_starfield_opt_in(&args),
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("chipviz-capture: {error}");
@@ -844,6 +848,32 @@ mod tests {
             StarfieldConfiguredCommand::Capture(args, options) => Ok((args, options)),
             StarfieldConfiguredCommand::Help => Err("help".into()),
         }
+    }
+
+    fn encode_test_frame(frame: ControlFrame) -> [u8; WIRE_SIZE] {
+        let mut bytes = [0; WIRE_SIZE];
+        bytes[0] = crate::control_frame::MAGIC;
+        bytes[1] = crate::control_frame::VERSION;
+        bytes[2..4].copy_from_slice(&frame.frame.to_le_bytes());
+        bytes[4] = frame.bpm;
+        bytes[5] = frame.beat_phase;
+        bytes[6..8].copy_from_slice(&frame.beat_count.to_le_bytes());
+        bytes[8] = frame.energy;
+        bytes[9] = frame.bass;
+        bytes[10] = frame.mid;
+        bytes[11] = frame.treble;
+        bytes[12..20].copy_from_slice(&frame.spectrum);
+        bytes[20] = frame.scene;
+        bytes[21] = frame.palette;
+        bytes[22] = frame.flags;
+        bytes[23] = frame.note_count;
+        for (index, note) in frame.notes.iter().enumerate() {
+            bytes[24 + index * 2] = note.note;
+            bytes[25 + index * 2] = note.velocity;
+        }
+        let checksum = bytes[..32].iter().fold(0, |checksum, byte| checksum ^ byte);
+        bytes[32] = checksum;
+        bytes
     }
 
     #[test]
@@ -981,7 +1011,7 @@ mod tests {
             scenes::dispatch_configured(args.scene.unwrap(), false).name(),
             "SignalField"
         );
-        assert!(starfield_opt_in(&args));
+        assert!(cli_starfield_opt_in(&args));
         assert!(matches!(
             parse_args([
                 "--out".into(),
@@ -1010,16 +1040,16 @@ mod tests {
             lines_drop_cuts: false,
         };
         assert!(
-            !starfield_opt_in(&args),
+            !cli_starfield_opt_in(&args),
             "catalogs alone do not enable scene 6"
         );
         args.scene = Some(13);
         assert!(
-            !starfield_opt_in(&args),
+            !cli_starfield_opt_in(&args),
             "wrapped bytes keep legacy dispatch"
         );
         args.scene = Some(6);
-        assert!(starfield_opt_in(&args), "exact --scene 6 is the opt-in");
+        assert!(cli_starfield_opt_in(&args), "exact --scene 6 is the opt-in");
     }
 
     #[test]
@@ -1138,11 +1168,11 @@ mod tests {
             ]),
             scene: None,
         };
-        // The raw requested frame stays scene 7. Debounce keeps displayed
-        // output on scene 0 at frame 1 in both legacy and Starfield modes.
+        // The raw requested frame stays scene 7. It is debounced: legacy
+        // display remains scene 0, while opt-in display remains scene 6.
         assert_eq!(source.frame(1).unwrap().scene, 7);
         assert_eq!(displayed_scene_at(&source, 1, false).unwrap(), 0);
-        assert_eq!(displayed_scene_at(&source, 1, true).unwrap(), 0);
+        assert_eq!(displayed_scene_at(&source, 1, true).unwrap(), 6);
         assert_eq!(scenes::dispatch(6).name(), scenes::REGISTRY[0].name);
         let scene_six = FrameSource {
             fixture: Some(vec![ControlFrame {
@@ -1373,6 +1403,73 @@ mod tests {
                 "replay PNG differs at frame {frame}"
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The programmatic opt-in applies to recorded scene transitions even when
+    /// CaptureArgs.scene is unset; legacy APIs keep raw scene 6 on SignalField.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn recorded_scene_transitions_are_starfield_only_for_explicit_opt_in() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chipviz-starfield-transition-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("transition.cvz");
+        let frames = [0, 6, 0].into_iter().enumerate().map(|(index, scene)| {
+            encode_test_frame(ControlFrame {
+                scene,
+                ..ControlFrame::procedural(index as u64)
+            })
+        });
+        let bytes: Vec<u8> = frames.flatten().collect();
+        std::fs::write(&input, bytes).unwrap();
+        let catalog_path = root.join("synthetic-stars.csv");
+        std::fs::write(&catalog_path, "ra,dec,mag\n18.7,45,-2\n").unwrap();
+
+        let args = CaptureArgs {
+            profile: RenderProfile::pi5(),
+            scene: None,
+            frames: vec![0, 1, 2],
+            input: Input::File(input),
+            size: (160, 90),
+            out: root.join("opt-in"),
+            mic_layers: mic_layers::Mode::Off,
+            lines_drop_cuts: false,
+        };
+        let options = StarfieldCaptureOptions {
+            capture: CaptureOptions::default(),
+            starfield: StarfieldOptions {
+                catalog_path: Some(catalog_path),
+                location: Some((45.0, 0.0)),
+                unix_seconds: Some(946_728_000.0),
+                follow_time: false,
+            },
+        };
+        run_with_starfield_options(&args, &options).unwrap();
+        assert!(
+            root.join("opt-in/frame000001-Starfield.png").exists(),
+            "explicit programmatic opt-in should render the recorded scene-6 frame"
+        );
+        let opted_manifest = std::fs::read_to_string(root.join("opt-in/manifest.json")).unwrap();
+        assert!(opted_manifest.contains("\"scene\": 6, \"displayed_scene\": 6"));
+
+        let legacy_args = CaptureArgs {
+            out: root.join("legacy"),
+            ..args
+        };
+        run_with_options(&legacy_args, CaptureOptions::default()).unwrap();
+        assert!(
+            root.join("legacy/frame000001-SignalField.png").exists(),
+            "legacy capture keeps raw scene 6 on SignalField"
+        );
+        let legacy_manifest = std::fs::read_to_string(root.join("legacy/manifest.json")).unwrap();
+        assert!(legacy_manifest.contains("\"scene\": 6, \"displayed_scene\": 0"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1639,12 +1736,8 @@ mod tests {
                 scene: colour_field::SCENE,
                 ..ControlFrame::procedural(index)
             };
-            renderer
-                .pipeline_mut()
-                .observe(&last, f64::from(index) / 60.0);
-            baseline
-                .pipeline_mut()
-                .observe(&last, f64::from(index) / 60.0);
+            renderer.pipeline_mut().observe(&last, elapsed(index));
+            baseline.pipeline_mut().observe(&last, elapsed(index));
             for _ in 0..3 {
                 let _ = renderer.pipeline_mut().requested_scene(last);
             }

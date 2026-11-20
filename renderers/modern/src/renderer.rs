@@ -945,6 +945,7 @@ impl ScenePipeline {
     }
 
     /// What the latest colour-field step shows.
+    #[cfg(test)]
     pub fn colour_field_display(&self) -> colour_field::Display {
         self.colour_field.display()
     }
@@ -1488,6 +1489,69 @@ mod tests {
         let mut unrelated = make_instance();
         prepare_starfield_attachment_colors(std::slice::from_mut(&mut unrelated), false, false);
         assert_eq!(&unrelated.color[..3], &linear);
+    }
+
+    /// Exercises the rendered output (not only per-instance color) with
+    /// overlapping brightest stars and maximum audio input on both attachment
+    /// formats. This is a regression bound, not photosensitivity certification.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn starfield_gpu_output_stays_bounded_under_hostile_audio_and_overlap() {
+        let csv = b"ra,dec,mag\n18.7,45,-10\n18.7,45,1\n18.7,45,6\n";
+        let catalog =
+            Arc::new(scenes::starfield::StarCatalog::from_reader(csv.as_slice()).unwrap());
+        let config = scenes::starfield::StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        let frame = ControlFrame {
+            scene: scenes::starfield::SCENE,
+            energy: u8::MAX,
+            bass: u8::MAX,
+            mid: u8::MAX,
+            treble: u8::MAX,
+            spectrum: [u8::MAX; 8],
+            flags: crate::audio::BEAT_FLAG | crate::audio::DROP_FLAG,
+            ..ControlFrame::procedural(0)
+        };
+        let decode_srgb = |code: u8| {
+            let value = f32::from(code) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                160,
+                90,
+                format,
+            ))
+            .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(config.clone()));
+            renderer.pipeline_mut().enable_starfield_dispatch(true);
+            let pixels = renderer.render(frame, 0.0).unwrap();
+            let maximum = pixels
+                .chunks_exact(3)
+                .flat_map(|pixel| pixel.iter().copied())
+                .map(decode_srgb)
+                .fold(0.0_f32, f32::max);
+            assert!(
+                (0.04..=0.053).contains(&maximum),
+                "{format:?}: expected bright, overlapping stars bounded near 0.05 linear, got {maximum}"
+            );
+        }
     }
 
     #[test]

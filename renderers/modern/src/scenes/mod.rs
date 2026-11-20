@@ -221,6 +221,7 @@ pub fn select_configured(scene: u8, starfield_enabled: bool) -> &'static SceneEn
 }
 
 /// Variant selection affects only PulseTunnel, including its wrapped bytes.
+#[cfg(test)]
 pub fn selected_camera(scene: u8, config: SceneConfig) -> CameraMode {
     if select(scene).name == pulse_tunnel::ENTRY.name
         && config.tunnel_variant != TunnelVariant::Original
@@ -287,6 +288,7 @@ impl Selected {
     }
 }
 
+#[cfg(test)]
 pub fn dispatch(scene: u8) -> Selected {
     dispatch_configured(scene, false)
 }
@@ -569,10 +571,21 @@ mod tests {
         );
         assert_eq!(
             selected_camera_configured(
-                9,
+                2,
                 true,
                 SceneConfig {
                     tunnel_variant: TunnelVariant::Hallway,
+                    ..SceneConfig::default()
+                }
+            ),
+            CameraMode::ScreenSpace
+        );
+        assert_eq!(
+            selected_camera_configured(
+                8,
+                true,
+                SceneConfig {
+                    tunnel_variant: TunnelVariant::Abstract,
                     ..SceneConfig::default()
                 }
             ),

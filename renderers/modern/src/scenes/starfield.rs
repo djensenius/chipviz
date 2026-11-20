@@ -286,6 +286,7 @@ impl StarCatalog {
             .map_err(|error| CatalogError(format!("invalid catalog {}: {error}", path.display())))
     }
 
+    #[cfg(test)]
     pub fn stars(&self) -> &[Star] {
         &self.stars
     }
@@ -604,8 +605,8 @@ fn build_uncached(
             candidate_order.push(index);
         }
     }
-    for index in 0..visible.len() {
-        if !reserved[index] {
+    for (index, is_reserved) in reserved.iter().enumerate() {
+        if !is_reserved {
             candidate_order.push(index);
         }
     }
@@ -1076,46 +1077,35 @@ mod tests {
                     existing,
                 );
             };
-        let mut longitude_state = SceneState::default();
-        longitude_state.configure_starfield(Some(longitude_changed));
+        assert!(state.starfield_projection().is_some());
+        state.configure_starfield(Some(longitude_changed.clone()));
+        assert!(state.starfield_projection().is_none());
         let mut longitude_output = Vec::new();
-        project(&longitude_state, &profile, &mut longitude_output);
+        project(&state, &profile, &mut longitude_output);
         assert_ne!(
             bytemuck::cast_slice::<Instance, u8>(&longitude_output),
             bytemuck::cast_slice::<Instance, u8>(&first_instances),
             "changing longitude rebuilds actual projected output"
         );
-        assert_eq!(
-            longitude_state
-                .starfield_projection()
-                .as_ref()
-                .unwrap()
-                .rebuilds,
-            1
-        );
+        assert_eq!(state.starfield_projection().as_ref().unwrap().rebuilds, 1);
 
-        let mut catalog_state = SceneState::default();
-        catalog_state.configure_starfield(Some(catalog_changed));
+        assert!(state.starfield_projection().is_some());
+        state.configure_starfield(Some(catalog_changed.clone()));
+        assert!(state.starfield_projection().is_none());
         let mut catalog_output = Vec::new();
-        project(&catalog_state, &profile, &mut catalog_output);
+        project(&state, &profile, &mut catalog_output);
         assert_ne!(
             bytemuck::cast_slice::<Instance, u8>(&catalog_output),
             bytemuck::cast_slice::<Instance, u8>(&first_instances),
             "changing catalog rebuilds actual projected output"
         );
-        assert_eq!(
-            catalog_state
-                .starfield_projection()
-                .as_ref()
-                .unwrap()
-                .rebuilds,
-            1
-        );
+        assert_eq!(state.starfield_projection().as_ref().unwrap().rebuilds, 1);
 
-        let mut existing_state = SceneState::default();
-        existing_state.configure_starfield(Some(config.clone()));
+        assert!(state.starfield_projection().is_some());
+        state.configure_starfield(Some(config.clone()));
+        assert!(state.starfield_projection().is_none());
         let mut baseline_output = Vec::new();
-        project(&existing_state, &profile, &mut baseline_output);
+        project(&state, &profile, &mut baseline_output);
         let mut prefixed_output = vec![Instance {
             center: [0.25, 0.5, 0.0],
             size: [1.0, 1.0],
@@ -1124,15 +1114,11 @@ mod tests {
             scene_mix: 0.0,
             pattern: [0.0, 0.0],
         }];
-        project(&existing_state, &profile, &mut prefixed_output);
+        project(&state, &profile, &mut prefixed_output);
         assert_eq!(prefixed_output[0].center, [0.25, 0.5, 0.0]);
         assert_eq!(prefixed_output.len(), baseline_output.len() + 1);
         assert_eq!(
-            existing_state
-                .starfield_projection()
-                .as_ref()
-                .unwrap()
-                .rebuilds,
+            state.starfield_projection().as_ref().unwrap().rebuilds,
             2,
             "existing instances invalidate the previous projection cache hit"
         );
