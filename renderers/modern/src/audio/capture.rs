@@ -700,6 +700,8 @@ impl LossDetector {
     /// Late real samples already cancelled this much stall silence.
     fn overlapped(&mut self, overlap: f64) {
         self.filled = (self.filled - overlap).max(0.0);
+        // Cancelled fill is not repaid as well.
+        self.owed = self.owed.min(self.filled);
         self.stepped -= overlap;
         self.unfill(overlap);
     }
@@ -804,6 +806,7 @@ impl LossDetector {
             let back = self.owed.min(self.filled).min(spare);
             self.owed -= back;
             self.filled -= back;
+            self.unfill(back);
             return -back;
         }
         let mut latency = *self.latency.get_or_insert(lag);
@@ -2058,6 +2061,46 @@ mod tests {
         // ones that the later fills followed within 30 s.
         let back = loss.check(at(70_000), -0.2, 1.0, true);
         assert!((back + 0.08).abs() < 1e-9, "{back}");
+    }
+
+    #[test]
+    fn overlap_cancels_owed_repayment() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut loss = LossDetector::new(start);
+        assert_eq!(loss.check(at(0), 0.0, 1.0, false), 0.0);
+        assert_eq!(loss.check(at(10), 0.08, 1.0, false), 0.0);
+        assert_eq!(loss.check(at(60), 0.08, 1.0, false), 0.08);
+        // A drift is trusted with all 80 ms of fill owed back, but late real
+        // samples cancel that fill before any of it is repaid.
+        loss.trust(0.0, 0.08);
+        loss.overlapped(0.08);
+        // Nothing is left to repay, so a later loss is detected and filled.
+        assert_eq!(loss.check(at(1_000), 0.08, 1.0, true), 0.0);
+        assert_eq!(loss.check(at(1_010), 0.12, 1.0, true), 0.0);
+        let fill = loss.check(at(1_060), 0.12, 1.0, true);
+        assert!((fill - 0.04).abs() < 1e-9, "{fill}");
+    }
+
+    #[test]
+    fn repaid_fill_is_not_taken_back_again() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut loss = LossDetector::new(start);
+        // 80 ms is filled, then (over `FRESH_FILL` later) 40 ms more.
+        assert_eq!(loss.check(at(0), 0.0, 1.0, false), 0.0);
+        assert_eq!(loss.check(at(10), 0.08, 1.0, false), 0.0);
+        assert_eq!(loss.check(at(60), 0.08, 1.0, false), 0.08);
+        assert_eq!(loss.check(at(39_990), 0.0, 1.0, true), 0.0);
+        assert_eq!(loss.check(at(40_000), 0.04, 1.0, true), 0.0);
+        assert_eq!(loss.check(at(40_050), 0.04, 1.0, true), 0.04);
+        // A drift is trusted with 40 ms owed back, which is repaid.
+        loss.trust(-0.04, 0.04);
+        let back = loss.check(at(41_000), -0.04, 1.0, true);
+        assert!((back + 0.04).abs() < 1e-9, "{back}");
+        // The lag then falls: the recent 40 ms fill was already repaid, and
+        // the older 80 ms is past `FRESH_FILL`, so nothing more is taken.
+        assert_eq!(loss.check(at(42_000), -0.1, 1.0, true), 0.0);
     }
 
     /// Callbacks of `ms` milliseconds of device time for `seconds` of device
