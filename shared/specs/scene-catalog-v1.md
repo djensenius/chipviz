@@ -158,6 +158,45 @@ invalidates the session. Do not reorder, drop, merge or interpolate records.
 Queueing is not a ColourField input: no edge detection, stability counter,
 selection or arming state advances until application.
 
+Every live datagram must have a trustworthy, per-datagram kernel-ingress
+timestamp, not a sender-provided or dequeue timestamp. Use a monotonic clock
+shared with the deadlines below, or convert to it with a proven conservative
+interval `[lo, hi]` containing the actual kernel ingress time. An exact
+timestamp is `[lo, lo]`. At dequeue, require `lo <= hi <= now`; use `lo`
+as the record's ingress time throughout. If timestamp origin, clock
+conversion, bounds or ordering cannot be established, fail closed. Never
+estimate ingress as the current dequeue time. A receiver unable to establish
+and enforce these conditions must not enable extended live UDP.
+
+Capability is implementation- and platform-dependent, not implied by this
+specification. The macOS SDK on the research host declares
+`SO_TIMESTAMP_MONOTONIC` and `SCM_TIMESTAMP_MONOTONIC`; declarations alone
+do not establish runtime support, clock/units, suspend behavior or loss
+detection. A future implementation must verify those properties. Linux
+`SO_TIMESTAMPNS` must not be assumed monotonic. With wall-clock timestamps,
+conversion must conservatively bound ingress on the deadline clock and detect
+clock jumps or uncertainty throughout the relevant interval; if those bounds
+cannot be proven, fail closed or leave extended live UDP unavailable. No
+platform's support is claimed here.
+
+At explicit opt-in/reset, discard the previous socket backlog while black,
+set `start = now`, and initialize both deadlines to `start + 500 ms`. The
+lower bound of every datagram dequeued in the session must be at least
+`start`; otherwise invalidate the session. Preserve the kernel timestamp with
+each queued record. For each validated expected sequence, its `lo` must be at
+least the last validated advancing ingress time; an ambiguous backward
+ordering fails closed. Duplicates and older records are rejected without
+advancing either deadline, even if they carry a newer timestamp.
+
+Receive in kernel order. Configure a bounded kernel receive buffer and use a
+reliable overflow/loss indication, or an equivalent mechanism that detects
+loss before a subsequent datagram is accepted. An overflow, loss indication,
+or inability to establish ordered, complete ingress invalidates the session.
+Do not silently drain a live backlog to catch up; a missing sequence also
+fails closed. Draining for a new session is allowed only while black, before
+the new `start`. Kernel buffering is not an extension of the four-record
+application queue and never changes timestamps or deadlines.
+
 Apply the oldest queued record only when at least **16,666,667 ns** of
 monotonic wall time has elapsed since the most recent extended application or
 ColourField step, including across scene, mode and session changes. The first
@@ -184,17 +223,38 @@ as an exit when enforcing re-entry and the budget, without inventing a scene
 input. Re-entry must satisfy normal debounce and budget, not the power-on
 entry exemption; do not count blackout time as input steps.
 
-Live UDP has no inherent disconnect notification. Use a monotonic real-time
-deadline of **500 ms** after explicit opt-in while awaiting sequence 0, or
-after the last validated record **applied** thereafter. Queueing, duplicates
-and older records never refresh it. At or after the deadline, before processing
-or applying anything else, invalidate the session as above, even if a record
-is waiting. An independent timer must enforce it when no packets arrive or
-the application scheduler stalls. No later packet can resume a timed-out
-session. This permits 30 nominal 60 Hz intervals without applied progress
-while bounding stale armed output; it does not identify a sender or prove a
-disconnect. The timeout does not apply to offline processing or file playback,
-which remain deterministic on their tick clock.
+Live UDP has no inherent disconnect notification. Maintain both a **500 ms
+advancing-ingress deadline** and a **500 ms applied-progress deadline**.
+After a validated expected record is queued, set the ingress deadline to its
+`lo + 500 ms`, never to the dequeue time. Only actual paced application sets
+the progress deadline to `application time + 500 ms`. Queueing never refreshes
+the progress deadline; application never refreshes the ingress deadline.
+Duplicates and older records refresh neither. Also expire every waiting
+record at its own `lo + 500 ms`; an expected record may not enter the queue
+unless `now < lo + 500 ms`.
+
+At `now >=` any deadline, invalidate the session as above, even if a record is
+waiting. Check deadlines with a fresh `now` before processing a datagram,
+before committing validation/queueing, and before applying a record; a record
+exactly at its expiry is too late. Deadline checks, queue commits and timer
+invalidation must be serialized so a late commit cannot revive the session.
+An independent timer must enforce all deadlines even when no packets arrive,
+a kernel backlog is unread, or application stalls. The implementation must
+effect blackout no later than the earliest deadline, including scheduling and
+output latency; if it cannot guarantee that, extended live UDP is unavailable.
+The clock must count elapsed time across suspend, or the receiver must black
+out before suspension and explicitly restart on resume. No later packet can
+revive a timed-out session.
+
+Consequently, if `K` is the latest actual kernel-ingress time of any datagram
+that can advance this session, including unread datagrams, blackout occurs no
+later than `K + 500 ms`, even if old datagrams remain in either queue.
+Conservative timestamp conversion can black out earlier. This bound concerns
+receiver kernel ingress, not when a sender stopped: network in-flight delay is
+unknowable and later datagrams can arrive after the sender stops. Timestamps,
+CRC and sequence do not authenticate the sender or prove a disconnect.
+Offline processing and file playback have no ingress deadlines and remain
+deterministic on their tick clock.
 
 ### Starfield inputs and provenance
 
@@ -323,14 +383,14 @@ is exercised.
   unavailable, stop and reconfirm the new ring before further pulses. An
   empty ring cannot start; `7` alone leaves next/previous unchanged. In ring
   `0, 11`, next from 0 requests 11, not scene 7.
-- In live UDP, opt-in at 0 ms without an applied record times out at 500 ms.
-  If sequence 0 is applied at 0 ms, repeated 0 at 499 ms does not refresh
-  its deadline: at 500 ms clear pending/arming and show steady black, even
-  without another datagram. Sequence 1 at 500 ms cannot revive the session.
-  If sequence 1 is instead applied at 499 ms, the deadline is 999 ms; an
-  older sequence 0 at 998 ms does not extend it.
-  If scene 7 was active, a restart cannot use the power-on exemption to bypass
-  its debounce or budget. Offline processing has no wall-clock timeout.
+- With exact ingress timestamps, opt-in at 0 ms without an applied record
+  times out at 500 ms. If sequence 0 enters and applies at 0 ms, repeated 0
+  at 499 ms refreshes neither deadline: at 500 ms show black, even without
+  another datagram. Sequence 1 at 500 ms cannot revive the session. If
+  sequence 1 instead enters and applies at 499 ms, both deadlines become
+  999 ms; older sequence 0 at 998 ms extends neither. If scene 7 was active,
+  restart cannot use the power-on exemption to bypass its debounce or budget.
+  Offline processing has no wall-clock timeout.
 - If sequence 0 applies at 0 ns and sequences 1 and 2 arrive at 1 ms and
   2 ms, respectively, both wait; their earliest applications are 16,666,667
   ns and 33,333,334 ns. A duplicate queued sequence 1 changes neither the
@@ -340,6 +400,27 @@ is exercised.
   If sequence 1 is queued at 1 ms but the application scheduler stalls,
   the independent timer blackouts at 500 ms: that queued record never
   refreshed the deadline and cannot apply at the deadline.
+- Sequence 0 enters/applies at 0 ms; sequences 1..4 enter at 1..4 ms and
+  queue before 5 ms. If they apply at 100, 200, 300 and 400 ms, respectively,
+  the last application deadline is 900 ms but the ingress deadline is 504 ms.
+  Black out at 504 ms, not 900 ms or 2.5 seconds. Likewise a sequence 1
+  actually entering at 1 ms but dequeued and applied at 499 ms sets ingress
+  expiry to 501 ms, not 999 ms; an unread kernel backlog cannot defer it.
+- If those same sequences 1..4 instead remain in the kernel until dequeued
+  and applied at 100, 200, 300 and 400 ms, their original ingress timestamps
+  still make the ingress deadline 504 ms. Black out then; dequeue times do
+  not extend it. A sequence arriving at 500 ms after no progress from 0 ms
+  is too late, including when its timestamp is exactly 500 ms.
+- If sequence 0 enters at 0 ms and applies at 400 ms, sequence 1 enters at
+  1 ms and queues at 401 ms, and sequence 2 enters at 400 ms and queues at
+  402 ms, sequence 1 expires at 501 ms despite the later ingress and progress
+  deadlines of 900 ms. A record timestamped before the new session start, an
+  absent or ambiguous timestamp, a detected kernel overflow, or a gap causes
+  blackout. For `[10, 12] ms` dequeued at 15 ms, use 10 ms and give that
+  record expiry 510 ms; `[10, 16] ms` is invalid at that dequeue time.
+- With exact timestamps, records entering and applying at 0, 16,666,667 and
+  33,333,334 ns advance both deadlines without a burst. The same ordered
+  records processed offline use ticks 0, 1, 2 without an ingress clock.
 - For a hypothetical receiver supporting `org.example.renderer@1.2.3`, the
   exact UTF-8 bytes below, including the final LF, have SHA-256
   `e755ea1e5fc421dcf034e15a8ded19fbda696a1b39f49b2f54e9c2c9589d4bb3`
