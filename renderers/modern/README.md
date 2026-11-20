@@ -129,7 +129,9 @@ While it does, a clock that has started running slow is filled as before, and
 fills older than about 30 seconds are not taken back. Analysis polls every 5 ms
 or so; if it is held up so that polls come regularly no more often than audio
 blocks arrive, a drifting clock delivers exactly what lost blocks would, and
-the drift is not measured.
+the drift is not measured. When polls are held up to about half a block or
+more apart, a fast clock that regularly loses whole blocks can likewise be
+followed as a slower drift, and those losses are not filled.
 
 The stream is not reopened if the device is unplugged or fails: the renderer
 prints a stream error (at most once every five seconds) and the levels fade to
