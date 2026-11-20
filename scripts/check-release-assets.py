@@ -37,28 +37,41 @@ def main() -> int:
     if any(not path.is_file() or path.is_symlink() for path in entries):
       print("Release assets must be regular files, not directories or symlinks", file=sys.stderr)
       return 1
-    names = [path.name for path in entries]
-    with zipfile.ZipFile(archive) as zipped:
-      names.extend(zipped.namelist())
-  except (OSError, zipfile.BadZipFile) as error:
-    print(f"Cannot inspect release assets: {error}", file=sys.stderr)
-    return 1
-  blocked = sorted(name for name in names if forbidden(name))
-  if blocked:
-    print(f"SNES release assets are withheld (#109): {', '.join(blocked)}", file=sys.stderr)
-    return 1
-  notices = pathlib.Path(__file__).resolve().parents[1] / "THIRD_PARTY_NOTICES"
-  try:
+    asset_names = {path.name for path in entries}
+    notices = pathlib.Path(__file__).resolve().parents[1] / "THIRD_PARTY_NOTICES"
     allowed = ASSET_NAMES | {
       f"THIRD_PARTY_NOTICES-{path.name}"
       for path in notices.iterdir() if path.is_file()
     }
-  except OSError as error:
-    print(f"Cannot inspect release notices: {error}", file=sys.stderr)
-    return 1
-  unexpected = sorted(set(names) - allowed)
-  if unexpected:
-    print(f"Unexpected release assets: {', '.join(unexpected)}", file=sys.stderr)
+    with zipfile.ZipFile(archive) as zipped:
+      infos = zipped.infolist()
+      zip_names = [info.filename for info in infos]
+      names = asset_names | set(zip_names)
+      blocked = sorted(name for name in names if forbidden(name))
+      if blocked:
+        print(f"SNES release assets are withheld (#109): {', '.join(blocked)}", file=sys.stderr)
+        return 1
+      unexpected = sorted(names - allowed)
+      if unexpected:
+        print(f"Unexpected release assets: {', '.join(unexpected)}", file=sys.stderr)
+        return 1
+      if len(zip_names) != len(set(zip_names)):
+        print("Duplicate release archive entries", file=sys.stderr)
+        return 1
+      if asset_names != set(zip_names):
+        print("Release archive entries do not match individual assets", file=sys.stderr)
+        return 1
+      for info in infos:
+        with zipped.open(info) as archived, (assets / info.filename).open("rb") as individual:
+          while True:
+            chunk = archived.read(1024 * 1024)
+            if chunk != individual.read(1024 * 1024):
+              print(f"Release archive content differs from individual asset: {info.filename}", file=sys.stderr)
+              return 1
+            if not chunk:
+              break
+  except (OSError, EOFError, RuntimeError, zipfile.BadZipFile) as error:
+    print(f"Cannot inspect release assets: {error}", file=sys.stderr)
     return 1
   return 0
 

@@ -93,7 +93,8 @@ builds `chipviz-gba.gba` with devkitPro, `chipviz-n64.z64` with libdragon,
 SDK-free fallbacks for local packaging when those toolchains are not installed.
 
 All SNES ROMs, including the generated diagnostic seed and SDK build, are
-temporarily omitted from individual release assets and the combined zip.
+temporarily omitted from future individual release assets and combined zips;
+past releases are unchanged.
 The SDK build links an allocator whose redistribution permission is unresolved;
 this is a precaution, not a legal determination. Restoring releases awaits a
 clean-source or permission resolution and symbol-scan safeguard in

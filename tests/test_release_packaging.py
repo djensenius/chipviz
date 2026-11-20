@@ -148,6 +148,51 @@ if tool == "cargo":
     self.write("dist/chipviz-assets.zip", "not a zip")
     self.assertNotEqual(self.guard().returncode, 0)
 
+  def test_guard_rejects_duplicate_archive_entry(self) -> None:
+    result = self.package()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    with zipfile.ZipFile(self.root / "dist/chipviz-assets.zip", "a") as archive:
+      with self.assertWarnsRegex(UserWarning, "Duplicate name"):
+        archive.writestr("chipviz-genesis.md", b"SNES seed")
+    result = self.guard()
+    self.assertNotEqual(result.returncode, 0)
+    self.assertIn("Duplicate release archive entries", result.stderr)
+
+  def test_guard_rejects_archive_content_mismatch(self) -> None:
+    result = self.package()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    assets = self.root / "dist/assets"
+    with zipfile.ZipFile(self.root / "dist/chipviz-assets.zip", "w") as archive:
+      for path in sorted(assets.iterdir()):
+        if path.name == "chipviz-genesis.md":
+          archive.writestr(path.name, b"SNES seed")
+        else:
+          archive.write(path, path.name)
+    result = self.guard()
+    self.assertNotEqual(result.returncode, 0)
+    self.assertIn("Release archive content differs from individual asset: chipviz-genesis.md", result.stderr)
+
+  def test_guard_rejects_post_archive_individual_modification(self) -> None:
+    result = self.package()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.write("dist/assets/chipviz-genesis.md", "modified after archive creation")
+    result = self.guard()
+    self.assertNotEqual(result.returncode, 0)
+    self.assertIn("Release archive content differs from individual asset: chipviz-genesis.md", result.stderr)
+
+  def test_guard_rejects_missing_or_added_allowed_entry(self) -> None:
+    result = self.package()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.write("dist/assets/chipviz-gba.gba", "added after archive creation")
+    result = self.guard()
+    self.assertNotEqual(result.returncode, 0)
+    self.assertIn("Release archive entries do not match individual assets", result.stderr)
+    (self.root / "dist/assets/chipviz-gba.gba").unlink()
+    (self.root / "dist/assets/chipviz-genesis.md").unlink()
+    result = self.guard()
+    self.assertNotEqual(result.returncode, 0)
+    self.assertIn("Release archive entries do not match individual assets", result.stderr)
+
   def test_workflow_checks_both_uploads_after_rebuilding_archive(self) -> None:
     workflow = (ROOT / ".github/workflows/release-assets.yml").read_text(encoding="utf-8")
     self.assertNotIn("cores/snes/homebrew", workflow)
