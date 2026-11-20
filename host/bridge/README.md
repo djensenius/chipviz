@@ -99,6 +99,53 @@ Inputs and their expected outputs live under
 [`../fixtures/`](../fixtures). Regenerate the golden outputs after an
 intentional encoder change with `--write-fixtures`.
 
+## Offline scene catalog validation
+
+`scene_catalog_v1.py` provides structural validation of complete opt-in
+`.cvxe` files against the
+[scene catalog v1 spec](../../shared/specs/scene-catalog-v1.md). It is a Python
+library, not a playback or transport interface. For example, with
+`host/bridge` on the Python module search path:
+
+```python
+import scene_catalog_v1
+
+
+def inspect_catalog(already_open_fd: int) -> None:
+  with scene_catalog_v1.open_catalog(already_open_fd) as catalog:
+    record = catalog.record(0)
+    print(catalog.count, record.sequence, record.tick, record.family, record.variant)
+```
+
+The caller must safely acquire an **already-open, readable regular-file
+descriptor**; the validator accepts no path and never opens an input device.
+Opening an untrusted path can itself block or have device side effects;
+`O_NONBLOCK` and `O_NOCTTY` alone do not make arbitrary device opens safe.
+The validator duplicates and checks the descriptor, starts reading at offset
+zero and leaves ownership with the caller. The duplicate shares and changes
+the caller's file position: avoid buffered or concurrent access and input
+mutation during validation. Regular-file checks do not bound latency on
+remote, virtual or faulty filesystems.
+
+The entire header, all records and exact EOF are checked before a snapshot
+is returned. Invalid structure or a non-regular descriptor raises
+`ValueError`; an invalid argument type raises `TypeError`; I/O errors raise
+`OSError`. Use the snapshot as a context manager or close it explicitly;
+access is not thread-safe. It retains the header and returns individual
+complete envelopes and metadata, not stripped legacy frames.
+
+The limit is 1,000,000 records, or 145,000,020 input bytes. Input read
+requests are at most 145 bytes; the temporary snapshot uses at most
+145,000,000 bytes, excluding runtime buffers and records retained by the
+caller. Temporary storage can be RAM-backed.
+
+Structural validity does not establish renderer availability, safe playback
+or authorization. Starfield is unavailable: the validator neither reads nor
+verifies private assets or provenance documents. Other renderer availability
+is unassessed. CRC and hashes are not authentication. Never route envelopes or
+stripped payloads to legacy readers; this library does not implement routing,
+UDP, flash sanitization or playback.
+
 ## USB HID JSON conversion
 
 `usb_hid.py --input build/scale.cvz --output build/scale-hid.json` produces
