@@ -432,11 +432,13 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
   brightness and point size; colour index controls approximate hue. At most
-  200 stars are rendered from a bounded candidate index: at most 21 records
-  per fine subcell (290,304 overall) retain the 16 brightest distinct
-  positions plus RA/Dec boundary representatives and a coincident fallback.
-  This helps preserve a visible boundary star behind brighter below-horizon
-  records. Each star's linear-RGB channel is capped at
+  200 stars are rendered from a spatial index that retains every in-limit
+  star, so brighter below-horizon records cannot hide a fainter visible one.
+  At most 131,072 CSV rows are accepted; larger catalogs fail with an
+  actionable error instead of silently dropping stars. Per-frame catalog
+  scanning is therefore bounded, with wholly below-horizon bins skipped;
+  benchmark the largest catalogs on target hardware.
+  Each star's linear-RGB channel is capped at
   0.05; stars are opaque and brightest-first, so changing star membership or
   overlap changes a Starfield pixel by at most 0.05 linear luminance.
   Transitions into or out of Starfield are separately gated to at most two

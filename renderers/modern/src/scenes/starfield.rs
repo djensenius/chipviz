@@ -19,20 +19,9 @@ pub const MAX_RENDERED_MAGNITUDE: f64 = 6.5;
 pub const STARFIELD_SNAPSHOT_PERIOD_SECONDS: f64 = 10.0;
 const MAX_STAR_LINEAR_LUMINANCE: f32 = 0.05;
 const MAX_RENDERED_STARS: usize = 200;
+const MAX_CATALOG_ROWS: usize = 131_072;
 const RIGHT_ASCENSION_BINS: usize = 48;
 const DECLINATION_BINS: usize = 18;
-const FINE_RA_BINS_PER_SKY_BIN: usize = 4;
-const FINE_DEC_BINS_PER_SKY_BIN: usize = 4;
-const FINE_SKY_SUBCELLS: usize = FINE_RA_BINS_PER_SKY_BIN * FINE_DEC_BINS_PER_SKY_BIN;
-const STARS_PER_FINE_SUBCELL: usize = 16;
-#[cfg(test)]
-const EXTRA_BOUNDARY_CANDIDATES_PER_SUBCELL: usize = 4;
-#[cfg(test)]
-const MAX_CANDIDATES_PER_FINE_SUBCELL: usize =
-    STARS_PER_FINE_SUBCELL + EXTRA_BOUNDARY_CANDIDATES_PER_SUBCELL + 1;
-#[cfg(test)]
-const SKY_CANDIDATE_BOUND: usize =
-    RIGHT_ASCENSION_BINS * DECLINATION_BINS * FINE_SKY_SUBCELLS * MAX_CANDIDATES_PER_FINE_SUBCELL;
 const MIN_STAR_MAGNITUDE: f64 = -2.0;
 const BRIGHTNESS_DECADES_PER_MAGNITUDE: f64 = 0.23;
 
@@ -112,7 +101,7 @@ pub struct Star {
 pub struct StarCatalog {
     /// Brightest-first, so the profile's instance cap retains the most visible stars.
     stars: Vec<Star>,
-    /// Bounded bright and coordinate-boundary candidates per J2000 sky subcell.
+    /// All in-limit stars, spatially indexed so wholly-below-horizon bins can be skipped.
     candidate_bins: Vec<Vec<usize>>,
 }
 
@@ -152,6 +141,11 @@ impl StarCatalog {
             let record = result.map_err(|error| {
                 CatalogError(format!("malformed CSV record on line {line}: {error}"))
             })?;
+            if record_index >= MAX_CATALOG_ROWS {
+                return Err(CatalogError(format!(
+                    "catalog exceeds the supported limit of {MAX_CATALOG_ROWS} CSV data rows; reduce the catalog and retry"
+                )));
+            }
             let ra = parse_field(&record, ra_column, "ra", line)?;
             if !(0.0..24.0).contains(&ra) {
                 return Err(CatalogError(format!(
@@ -210,11 +204,6 @@ impl StarCatalog {
 
     fn build_candidate_bins(stars: &[Star]) -> Vec<Vec<usize>> {
         let mut bins = vec![Vec::new(); RIGHT_ASCENSION_BINS * DECLINATION_BINS];
-        let mut candidates: Vec<Vec<Vec<usize>>> =
-            vec![vec![Vec::new(); FINE_SKY_SUBCELLS]; bins.len()];
-        let mut coincident = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
-        let mut extremes: Vec<Vec<[Option<usize>; 4]>> =
-            vec![vec![[None; 4]; FINE_SKY_SUBCELLS]; bins.len()];
         for (index, star) in stars.iter().enumerate() {
             let ra_bin = ((star.right_ascension_hours / 24.0 * RIGHT_ASCENSION_BINS as f64)
                 as usize)
@@ -223,69 +212,7 @@ impl StarCatalog {
                 as usize)
                 .min(DECLINATION_BINS - 1);
             let bin_index = dec_bin * RIGHT_ASCENSION_BINS + ra_bin;
-            let ra_in_bin =
-                star.right_ascension_hours / 24.0 * RIGHT_ASCENSION_BINS as f64 - ra_bin as f64;
-            let dec_in_bin = (star.declination_degrees + 90.0) / 180.0 * DECLINATION_BINS as f64
-                - dec_bin as f64;
-            let fine_ra = (ra_in_bin * FINE_RA_BINS_PER_SKY_BIN as f64) as usize;
-            let fine_dec = (dec_in_bin * FINE_DEC_BINS_PER_SKY_BIN as f64) as usize;
-            let subcell = fine_dec.min(FINE_DEC_BINS_PER_SKY_BIN - 1) * FINE_RA_BINS_PER_SKY_BIN
-                + fine_ra.min(FINE_RA_BINS_PER_SKY_BIN - 1);
-            // The magnitude cap alone can hide a horizon-visible boundary
-            // star behind brighter records just below the horizon. Keep
-            // coordinate extremes independently of that capped list.
-            let subcell_extremes = &mut extremes[bin_index][subcell];
-            if let Some(first) = subcell_extremes[0] {
-                if star.right_ascension_hours < stars[first].right_ascension_hours {
-                    subcell_extremes[0] = Some(index);
-                }
-                if star.right_ascension_hours
-                    > stars[subcell_extremes[1].unwrap()].right_ascension_hours
-                {
-                    subcell_extremes[1] = Some(index);
-                }
-                if star.declination_degrees
-                    < stars[subcell_extremes[2].unwrap()].declination_degrees
-                {
-                    subcell_extremes[2] = Some(index);
-                }
-                if star.declination_degrees
-                    > stars[subcell_extremes[3].unwrap()].declination_degrees
-                {
-                    subcell_extremes[3] = Some(index);
-                }
-            } else {
-                *subcell_extremes = [Some(index); 4];
-            }
-            let subcell_candidates = &mut candidates[bin_index][subcell];
-            if subcell_candidates.len() < STARS_PER_FINE_SUBCELL {
-                let spatially_distinct = subcell_candidates.iter().all(|&candidate| {
-                    let candidate = &stars[candidate];
-                    star.right_ascension_hours != candidate.right_ascension_hours
-                        || star.declination_degrees != candidate.declination_degrees
-                });
-                if spatially_distinct {
-                    subcell_candidates.push(index);
-                } else if coincident[bin_index][subcell].is_none() {
-                    coincident[bin_index][subcell] = Some(index);
-                }
-            }
-        }
-        for bin_index in 0..bins.len() {
-            for subcell in 0..FINE_SKY_SUBCELLS {
-                bins[bin_index].extend(candidates[bin_index][subcell].iter().copied());
-                for index in extremes[bin_index][subcell].iter().flatten() {
-                    if !bins[bin_index].contains(index) {
-                        bins[bin_index].push(*index);
-                    }
-                }
-                if candidates[bin_index][subcell].len() < STARS_PER_FINE_SUBCELL
-                    && let Some(index) = coincident[bin_index][subcell]
-                    && !bins[bin_index].contains(&index)
-                {
-                    bins[bin_index].push(index);
-                }
-            }
+            bins[bin_index].push(index);
         }
         bins
     }
@@ -657,6 +584,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_catalogs_above_the_bounded_scan_limit() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for _ in 0..=MAX_CATALOG_ROWS {
+            csv.push_str("0,0,1\n");
+        }
+        let error = catalog(&csv).unwrap_err();
+        assert!(error.0.contains("supported limit of 131072"), "{error}");
+        assert!(error.0.contains("reduce the catalog"), "{error}");
+    }
+
+    #[test]
     fn skips_blank_optional_fields_and_filters_fainter_than_limit() {
         let parsed_catalog = catalog(
             "proper,ra,dec,mag,ci\nBright,0,90,1.0,0.2\n\"\",1,90,6.5,\nToo faint,2,90,6.51,\n",
@@ -992,15 +930,15 @@ mod tests {
     }
 
     #[test]
-    fn dense_below_horizon_catalog_has_a_bounded_visible_candidate_set() {
+    fn dense_below_horizon_catalog_keeps_all_candidates_and_skips_its_bin() {
         let mut csv = String::from("ra,dec,mag\n");
         for _ in 0..120_000 {
             csv.push_str("0,-85,1\n");
         }
         let catalog = Arc::new(catalog(&csv).unwrap());
         let candidate_count: usize = catalog.candidate_bins.iter().map(Vec::len).sum();
-        assert_eq!(candidate_count, 2);
-        assert!(candidate_count <= SKY_CANDIDATE_BOUND);
+        assert_eq!(candidate_count, 120_000);
+        assert!(candidate_count <= MAX_CATALOG_ROWS);
 
         let mut state = SceneState::default();
         state.configure_starfield(Some(StarfieldConfig {
@@ -1024,28 +962,55 @@ mod tests {
     }
 
     #[test]
-    fn visible_faint_star_survives_sixteen_brighter_below_horizon_candidates_in_its_subcell() {
+    fn diagonal_horizon_target_survives_sixteen_brighter_below_horizon_candidates() {
         let unix_seconds = 946_728_000.0;
-        let ra_hours = 18.697_374_558;
         let mut csv = String::from("ra,dec,mag\n");
-        for index in 0..16 {
-            csv.push_str(&format!("{ra_hours},{},5\n", -46.6 + 0.06 * index as f64));
+        for index in 0..12 {
+            csv.push_str(&format!("{},{},5\n", 12.65 + 0.005 * index as f64, -1.0));
         }
-        csv.push_str(&format!("{ra_hours},-45.2,6\n"));
+        for (ra, dec) in [(12.74, -1.0), (12.65, -0.1), (12.71, -2.3), (12.73, -1.1)] {
+            csv.push_str(&format!("{ra},{dec},5\n"));
+        }
+        csv.push_str("12.72,-0.2,6\n");
         let catalog = Arc::new(catalog(&csv).unwrap());
         let target_index = catalog
             .stars
             .iter()
-            .position(|star| star.declination_degrees == -45.2)
+            .position(|star| {
+                star.right_ascension_hours == 12.72 && star.declination_degrees == -0.2
+            })
             .unwrap();
+        let target = &catalog.stars[target_index];
+        let bright = catalog
+            .stars
+            .iter()
+            .filter(|star| star.magnitude == 5.0)
+            .collect::<Vec<_>>();
+        let min_ra = bright
+            .iter()
+            .map(|star| star.right_ascension_hours)
+            .fold(f64::INFINITY, f64::min);
+        let max_ra = bright
+            .iter()
+            .map(|star| star.right_ascension_hours)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_dec = bright
+            .iter()
+            .map(|star| star.declination_degrees)
+            .fold(f64::INFINITY, f64::min);
+        let max_dec = bright
+            .iter()
+            .map(|star| star.declination_degrees)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(target.right_ascension_hours > min_ra && target.right_ascension_hours < max_ra);
+        assert!(target.declination_degrees > min_dec && target.declination_degrees < max_dec);
         assert!(
             catalog
                 .candidate_bins
                 .iter()
                 .any(|bin| bin.contains(&target_index)),
-            "a visible boundary candidate must survive the bounded index"
+            "the diagonal target must survive in the spatial index"
         );
-        let target = &catalog.stars[target_index];
         let projected = project_star(target, 44.6, 0.0, unix_seconds)
             .expect("review fixture target is above the horizon");
         for star in catalog.stars.iter().filter(|star| star.magnitude == 5.0) {
