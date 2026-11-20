@@ -240,6 +240,8 @@ fn parse_args_internal(
             }
             Ok(value)
         };
+        // Keep new options in is_cli_option and the exhaustive
+        // cli_rejects_all_known_options_as_values_in_any_exclusive_flag_order test.
         match arg.as_str() {
             "--profile" => {
                 profile = match value()?.as_str() {
