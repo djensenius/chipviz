@@ -187,13 +187,138 @@ fn capture_cli_rejects_exclusive_flag_as_a_missing_path_value() {
         assert_eq!(output.status.code(), Some(2), "{option}: {stderr}");
         assert!(
             stderr.contains(&format!(
-                "{option} requires a value; --exclusive-output is a flag"
+                "{option} requires a value; --exclusive-output is an option"
             )),
             "{option}: {stderr}"
         );
         assert_eq!(std::fs::read(&manifest).unwrap(), b"preserve me");
         assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 1);
         assert!(!root.join("--exclusive-output").exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn capture_cli_rejects_known_flags_as_path_values_in_any_order() {
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-capture-option-value-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let output_dir = root.join("existing");
+    std::fs::create_dir(&output_dir).unwrap();
+    let manifest = output_dir.join("manifest.json");
+    std::fs::write(&manifest, b"preserve me").unwrap();
+
+    for option in ["--out", "--input", "--catalog"] {
+        for token in ["--lines-drop-cuts", "--follow-time", "--scene", "--help"] {
+            for position in 0..2 {
+                let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"));
+                command.current_dir(&root);
+                if option != "--out" {
+                    command.arg("--out").arg(&output_dir);
+                }
+                if position == 0 {
+                    command.arg("--exclusive-output");
+                }
+                command.args([option, token]);
+                if position == 1 {
+                    command.arg("--exclusive-output");
+                }
+                let output = command.output().unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{option} {token}, position {position}: {stderr}"
+                );
+                assert!(
+                    stderr.contains(&format!("{option} requires a value; {token} is an option")),
+                    "{option} {token}, position {position}: {stderr}"
+                );
+                assert_eq!(std::fs::read(&manifest).unwrap(), b"preserve me");
+                assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 1);
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+            }
+        }
+    }
+    // Without the opt-in, recognized option names remain valid path values.
+    // An invalid frame list stops parsing before any output or GPU setup.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .current_dir(&root)
+        .args([
+            "--out",
+            "--lines-drop-cuts",
+            "--input",
+            "--scene",
+            "--frames",
+            "not-a-number",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--frames expects indices"), "{stderr}");
+    assert_eq!(std::fs::read(&manifest).unwrap(), b"preserve me");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn exclusive_cli_preserves_existing_png_and_manifest() {
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-capture-collisions-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    for existing in ["frame000000-PulseTunnel.png", "manifest.json"] {
+        let output_dir = root.join(existing);
+        std::fs::create_dir(&output_dir).unwrap();
+        let collision = output_dir.join(existing);
+        let original = b"existing output must remain intact";
+        std::fs::write(&collision, original).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+            .args([
+                "--profile",
+                "pi5",
+                "--scene",
+                "2",
+                "--input",
+                "synth-mic",
+                "--frames",
+                "0",
+                "--size",
+                "160x90",
+                "--exclusive-output",
+                "--out",
+            ])
+            .arg(&output_dir)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{existing}: {stderr}");
+        assert!(
+            stderr.contains(&collision.display().to_string()),
+            "{existing}: {stderr}"
+        );
+        assert_eq!(std::fs::read(&collision).unwrap(), original);
+        if existing == "manifest.json" {
+            // A PNG created before the manifest collision is allowed to remain.
+            let png = std::fs::read(output_dir.join("frame000000-PulseTunnel.png")).unwrap();
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 2);
+        } else {
+            assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 1);
+        }
     }
     std::fs::remove_dir_all(root).unwrap();
 }

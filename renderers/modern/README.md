@@ -688,9 +688,11 @@ just modern-capture --input host/fixtures/musical/groove.cvz --frames 0,30 --out
 By default capture overwrites existing outputs. The CLI's `--exclusive-output`
 instead atomically creates each PNG and manifest, refusing existing files or
 symlinks (including dangling symlinks) and duplicate frames. It does not secure
-an untrusted or mutable parent directory. On failure, newly created partial
-files may remain; existing outputs are never deleted. To use a literal path
-named `--exclusive-output`, prefix it with `./`.
+an untrusted or mutable parent directory. On failure, newly created files
+(including partial files) may remain; existing outputs are never deleted. With
+this opt-in, recognized options cannot be consumed as values; use `./` for a
+literal path named like an option, for example `./--out`. Default CLI parsing
+retains its legacy behavior.
 
 Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
 frame 0, so very large frame indices take longer to capture.

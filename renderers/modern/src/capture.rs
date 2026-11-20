@@ -58,7 +58,9 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --exclusive-output
              create PNGs and manifest exclusively; fail on existing leaves or
              duplicate frames. Requires a trusted, non-mutable output directory;
-             newly created partial files may remain on failure.";
+             newly created files (including partial files) may remain on failure.
+  With --exclusive-output, prefix a literal path named like an option with ./
+  (for example ./--out).";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -140,7 +142,7 @@ pub enum StarfieldConfiguredCommand {
 /// Parse the original capture arguments. Extended flags are rejected rather
 /// than silently dropped; use one of the configured APIs for those flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
-    match parse_args_internal(args, false, false, false)?.0 {
+    match parse_args_internal(args, false, false, false, false)?.0 {
         ConfiguredCommand::Help => Ok(Command::Help),
         ConfiguredCommand::Capture(args, _) => Ok(Command::Capture(args)),
     }
@@ -151,7 +153,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
 pub fn parse_args_with_options(
     args: impl IntoIterator<Item = String>,
 ) -> Result<ConfiguredCommand, String> {
-    parse_args_internal(args, true, false, false).map(|(command, _, _, _)| command)
+    parse_args_internal(args, true, false, false, false).map(|(command, _, _, _)| command)
 }
 
 /// Parse capture arguments with both tunnel and Starfield options.
@@ -165,8 +167,15 @@ fn parse_starfield_args(
     args: impl IntoIterator<Item = String>,
     allow_exclusive: bool,
 ) -> Result<(StarfieldConfiguredCommand, bool), String> {
-    let (parsed, starfield, explicit_starfield, exclusive) =
-        parse_args_internal(args, true, true, allow_exclusive)?;
+    let (parsed, starfield, explicit_starfield, exclusive) = if allow_exclusive {
+        // Inspect the raw CLI tokens so the opt-in cannot be swallowed as a
+        // value and also protects missing values appearing before the flag.
+        let args: Vec<_> = args.into_iter().collect();
+        let strict_values = args.iter().any(|arg| arg == "--exclusive-output");
+        parse_args_internal(args, true, true, true, strict_values)?
+    } else {
+        parse_args_internal(args, true, true, false, false)?
+    };
     let command = match parsed {
         ConfiguredCommand::Help => StarfieldConfiguredCommand::Help,
         ConfiguredCommand::Capture(args, capture_options) => {
@@ -192,6 +201,7 @@ fn parse_args_internal(
     allow_capture_options: bool,
     allow_starfield_options: bool,
     allow_exclusive: bool,
+    strict_values: bool,
 ) -> Result<(ConfiguredCommand, StarfieldOptions, bool, bool), String> {
     let mut profile = RenderProfile::m1();
     let mut scene = None;
@@ -223,9 +233,9 @@ fn parse_args_internal(
             let value = args
                 .next()
                 .ok_or_else(|| format!("{arg} requires a value"))?;
-            if allow_exclusive && value == "--exclusive-output" {
+            if strict_values && is_cli_option(&value) {
                 return Err(format!(
-                    "{arg} requires a value; --exclusive-output is a flag (use ./--exclusive-output for a literal path)"
+                    "{arg} requires a value; {value} is an option (use ./{value} for a literal path)"
                 ));
             }
             Ok(value)
@@ -375,6 +385,30 @@ fn parse_args_internal(
         explicit_starfield,
         exclusive,
     ))
+}
+
+fn is_cli_option(value: &str) -> bool {
+    matches!(
+        value,
+        "--help"
+            | "-h"
+            | "--profile"
+            | "--scene"
+            | "--frames"
+            | "--input"
+            | "--size"
+            | "--out"
+            | "--mic-layers"
+            | "--lines-drop-cuts"
+            | "--exclusive-output"
+            | "--tunnel-variant"
+            | "--catalog"
+            | "--star-catalog"
+            | "--location"
+            | "--time"
+            | "--follow-time"
+            | "--starfield"
+    )
 }
 
 fn validate_unique_frames(frames: &[u64]) -> Result<(), String> {
@@ -1126,7 +1160,7 @@ mod tests {
             .unwrap_err();
             assert!(
                 error.contains(&format!(
-                    "{option} requires a value; --exclusive-output is a flag"
+                    "{option} requires a value; --exclusive-output is an option"
                 )),
                 "{option}: {error}"
             );
@@ -1173,6 +1207,115 @@ mod tests {
             panic!("unexpected help");
         };
         assert_eq!(args.input, Input::File("--exclusive-output".into()));
+    }
+
+    #[test]
+    fn cli_rejects_all_known_options_as_values_in_any_exclusive_flag_order() {
+        let value_options = [
+            "--out",
+            "--input",
+            "--catalog",
+            "--star-catalog",
+            "--profile",
+            "--scene",
+            "--frames",
+            "--size",
+            "--mic-layers",
+            "--tunnel-variant",
+            "--location",
+            "--time",
+        ];
+        let option_tokens = [
+            "--help",
+            "-h",
+            "--profile",
+            "--scene",
+            "--frames",
+            "--input",
+            "--size",
+            "--out",
+            "--mic-layers",
+            "--lines-drop-cuts",
+            "--exclusive-output",
+            "--tunnel-variant",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--follow-time",
+            "--starfield",
+        ];
+        for value_option in value_options {
+            for token in option_tokens {
+                for position in 0..2 {
+                    let mut args = vec!["--out", "shots"];
+                    if position == 0 {
+                        args.push("--exclusive-output");
+                    }
+                    args.extend([value_option, token]);
+                    if position == 1 {
+                        args.push("--exclusive-output");
+                    }
+                    let error = parse_starfield_args(args.into_iter().map(str::to_string), true)
+                        .unwrap_err();
+                    assert!(
+                        error.contains(&format!(
+                            "{value_option} requires a value; {token} is an option"
+                        )),
+                        "{value_option} {token}, position {position}: {error}"
+                    );
+                }
+            }
+        }
+
+        let (command, exclusive) = parse_starfield_args(
+            [
+                "--exclusive-output",
+                "--out",
+                "./--lines-drop-cuts",
+                "--input",
+                "--unknown-path",
+                "--catalog",
+                "./--out",
+                "--location",
+                "-45,-73",
+                "--time",
+                "-1",
+            ]
+            .map(str::to_string),
+            true,
+        )
+        .unwrap();
+        let StarfieldConfiguredCommand::Capture(args, options) = command else {
+            panic!("unexpected help");
+        };
+        assert!(exclusive);
+        assert_eq!(args.out, PathBuf::from("./--lines-drop-cuts"));
+        assert_eq!(args.input, Input::File("--unknown-path".into()));
+        assert_eq!(options.starfield.catalog_path, Some("./--out".into()));
+        assert_eq!(options.starfield.location, Some((-45.0, -73.0)));
+        assert_eq!(options.starfield.unix_seconds, Some(-1.0));
+
+        let (command, exclusive) = parse_starfield_args(
+            ["--out", "--lines-drop-cuts", "--input", "--scene"].map(str::to_string),
+            true,
+        )
+        .unwrap();
+        let StarfieldConfiguredCommand::Capture(args, _) = command else {
+            panic!("unexpected help");
+        };
+        assert!(!exclusive);
+        assert_eq!(args.out, PathBuf::from("--lines-drop-cuts"));
+        assert_eq!(args.input, Input::File("--scene".into()));
+        assert!(!args.lines_drop_cuts);
+
+        let Command::Capture(args) =
+            parse_args(["--out", "--lines-drop-cuts"].map(str::to_string)).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.out, PathBuf::from("--lines-drop-cuts"));
+        assert!(!args.lines_drop_cuts);
     }
 
     fn parse(args: &[&str]) -> Result<CaptureArgs, String> {
