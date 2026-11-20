@@ -241,13 +241,20 @@ impl StaticState {
         self.local = self.local.saturating_add(frames);
         self.since_bar = self.since_bar.saturating_add(frames);
         // Sixtieths of a second since the latest clock seen (`None` when it
-        // has not moved on). At exactly 60 fps this rounds to 1.0, so timed
+        // is exactly that clock, a frame queued for the same redraw). At exactly 60 fps this rounds to 1.0, so timed
         // and untimed replays match.
         let ticks = match (elapsed, self.energy_at) {
             (Some(now), Some(then)) => {
-                // A backward or NaN clock credits no time.
+                // A backward or NaN clock starts a step with no time, so
+                // the energy holds rather than re-aiming the last step.
                 let gap = now - then;
-                (gap > 0.0).then(|| (gap.min(MAX_ENERGY_GAP_S) * f64::from(FRAME_RATE)) as f32)
+                if gap > 0.0 {
+                    Some((gap.min(MAX_ENERGY_GAP_S) * f64::from(FRAME_RATE)) as f32)
+                } else if gap == 0.0 {
+                    None
+                } else {
+                    Some(0.0)
+                }
             }
             _ => Some(1.0),
         };
@@ -699,6 +706,36 @@ mod tests {
             energies.iter().all(|&energy| energy <= credit + 1e-6),
             "{energies:?}"
         );
+        // Copilot review on #120: nor can the energy change while the clock
+        // steps back (or is NaN) and forth, whatever the frames' energies.
+        // From 191 at 0 s, alternating 0 at 1 s and 255 at 0 s (or NaN), the
+        // energy takes the first credited step towards 0, then holds.
+        let frames: Vec<ControlFrame> = (0..40)
+            .map(|index| ControlFrame {
+                energy: match index {
+                    0 => 191,
+                    _ if index % 2 == 1 => 0,
+                    _ => 255,
+                },
+                ..ControlFrame::procedural(index)
+            })
+            .collect();
+        for back in [0.0, f64::NAN] {
+            let times: Vec<f64> = (0..40)
+                .map(|index| match index {
+                    0 => 0.0,
+                    _ if index % 2 == 1 => 1.0,
+                    _ => back,
+                })
+                .collect();
+            let energies = run_at(&frames, &times);
+            let first = 191.0 / 255.0 - credit;
+            assert!((energies[1] - first).abs() < 1e-6, "{}", energies[1]);
+            assert!(
+                energies[1..].iter().all(|&energy| energy == energies[1]),
+                "back to {back}: {energies:?}"
+            );
+        }
     }
 
     /// Copilot review on #120: packets queued between redraws arrive
