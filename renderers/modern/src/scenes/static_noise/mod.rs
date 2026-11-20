@@ -71,8 +71,9 @@
 //! (`ENERGY_SLEW` in `beat.rs`), so silence to full energy takes 0.8 s at
 //! any frame rate. Time is credited per observed frame from the latest time
 //! seen, a gap counting at most 8/60 s and a backward clock none, whatever
-//! the frame counter's step (so counter jumps add no slew); at 60 fps this
-//! is exactly 1/48 a frame. Unlimited, energy strobed the noise density:
+//! the frame counter's step (so counter jumps add no slew); frames at one
+//! clock (packets queued for a redraw) share one step, aimed at the newest
+//! frame's energy. At 60 fps this is exactly 1/48 a frame. Unlimited, energy strobed the noise density:
 //! procedural energy (a 15-frame sawtooth) made 4 flashes in 1 s in a
 //! screen tile, and a square wave between silence and full energy up to 30
 //! (#116); a per-frame limit allowed 4 at 120 fps and 5 at 240. Limited,

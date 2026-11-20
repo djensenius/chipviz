@@ -417,7 +417,8 @@ the colour field, whatever the registry length; every other byte selects
   flash in any second at 60 fps. The noise follows energy through a slew
   limit: it moves at most 1/48 of the range per 1/60 s of the renderer's
   clock (a gap counts at most 8/60 s, time is credited from the latest
-  seen, and frame-counter jumps add nothing), so silence to full energy
+  seen, packets queued for one redraw share one step toward the newest,
+  and frame-counter jumps add nothing), so silence to full energy
   takes 0.8 s at any frame rate, and 60 fps output is as with a per-frame
   limit. Without it, energy strobed the noise density (4 flashes in 1 s in
   a screen tile with procedural input, up to 30 with a square wave; a

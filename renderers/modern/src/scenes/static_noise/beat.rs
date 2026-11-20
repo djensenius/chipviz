@@ -167,8 +167,15 @@ pub struct StaticState {
     flip_at: u16,
     /// The slew-limited energy (see `ENERGY_SLEW`).
     energy: f32,
-    /// The clock (seconds) at the last observation, if it was timed.
+    /// The latest clock (seconds) observed, if the last observation was
+    /// timed.
     energy_at: Option<f64>,
+    /// The energy before, and the slew allowed in, the latest clock step:
+    /// frames observed at the same clock (packets queued for one redraw)
+    /// share that step, each re-aiming it at its own energy, so the newest
+    /// one sets it.
+    energy_from: f32,
+    energy_reach: f32,
 }
 
 impl Default for StaticState {
@@ -187,6 +194,8 @@ impl Default for StaticState {
             flip_at: 0,
             energy: 0.0,
             energy_at: None,
+            energy_from: 0.0,
+            energy_reach: 0.0,
         }
     }
 }
@@ -218,6 +227,8 @@ impl StaticState {
             (self.index, self.local) = (clock.index, clock.local);
             self.energy = clock.energy;
             self.energy_at = elapsed;
+            // Frames queued with this one join at their own energy too.
+            (self.energy_from, self.energy_reach) = (0.0, f32::INFINITY);
             self.last = Some(seen);
             return;
         };
@@ -229,21 +240,16 @@ impl StaticState {
         let frames = if step <= MAX_FRAME_STEP { step } else { 1 };
         self.local = self.local.saturating_add(frames);
         self.since_bar = self.since_bar.saturating_add(frames);
-        // Sixtieths of a second since the last observation. At exactly 60
-        // fps this rounds to 1.0, so timed and untimed replays match.
+        // Sixtieths of a second since the latest clock seen (`None` when it
+        // has not moved on). At exactly 60 fps this rounds to 1.0, so timed
+        // and untimed replays match.
         let ticks = match (elapsed, self.energy_at) {
             (Some(now), Some(then)) => {
-                // A backward or NaN clock credits no time, and time is
-                // credited from the latest seen.
+                // A backward or NaN clock credits no time.
                 let gap = now - then;
-                let gap = if gap > 0.0 {
-                    gap.min(MAX_ENERGY_GAP_S)
-                } else {
-                    0.0
-                };
-                (gap * f64::from(FRAME_RATE)) as f32
+                (gap > 0.0).then(|| (gap.min(MAX_ENERGY_GAP_S) * f64::from(FRAME_RATE)) as f32)
             }
-            _ => 1.0,
+            _ => Some(1.0),
         };
         // Keep the latest time (`max` ignores NaN), so a clock stepping back
         // and forth cannot re-earn the gap.
@@ -251,8 +257,14 @@ impl StaticState {
             (Some(now), Some(then)) => Some(now.max(then)),
             _ => elapsed,
         };
-        let reach = ENERGY_SLEW * ticks;
-        self.energy += (raw_energy(*frame) - self.energy).clamp(-reach, reach);
+        // A new clock step slews from the current energy; a frame at the
+        // same clock re-aims the latest step at its own energy instead of
+        // spending more (or, for an older frame first, all) of it.
+        if let Some(ticks) = ticks {
+            (self.energy_from, self.energy_reach) = (self.energy, ENERGY_SLEW * ticks);
+        }
+        let (from, reach) = (self.energy_from, self.energy_reach);
+        self.energy = from + (raw_energy(*frame) - from).clamp(-reach, reach);
         let beats = frame.beat_count.wrapping_sub(last.beat_count);
         let advanced = (1..=MAX_BEAT_STEP).contains(&beats);
         self.stalled = if advanced {
@@ -638,17 +650,17 @@ mod tests {
             times[at + 10] = 0.0;
             times[at + 20] = f64::NAN;
             let energies = run_at(&frames, &times);
-            let mut latest = times[0];
+            // Each observation stays within its clock step's slew of the
+            // energy before that step (observations that do not advance
+            // the clock share the latest step).
+            let (mut latest, mut from, mut ticks) = (times[0], energies[0], 0.0);
             for (index, pair) in energies.windows(2).enumerate() {
                 let now = times[index + 1];
-                let gap = if now - latest > 0.0 {
-                    now - latest
-                } else {
-                    0.0
-                };
-                latest = latest.max(now);
-                let ticks = gap.min(MAX_ENERGY_GAP_S) * 60.0;
-                let moved = (pair[1] - pair[0]).abs();
+                if now - latest > 0.0 {
+                    (from, ticks) = (pair[0], (now - latest).min(MAX_ENERGY_GAP_S) * 60.0);
+                    latest = now;
+                }
+                let moved = (pair[1] - from).abs();
                 assert!(
                     moved <= ENERGY_SLEW * ticks as f32 + 1e-6,
                     "{fps} fps observation {index}: {moved}"
@@ -687,5 +699,35 @@ mod tests {
             energies.iter().all(|&energy| energy <= credit + 1e-6),
             "{energies:?}"
         );
+    }
+
+    /// Copilot review on #120: packets queued between redraws arrive
+    /// oldest first at one clock. A 120 Hz sender alternating silence and
+    /// full energy, two packets a 60 Hz redraw (the newest, displayed one
+    /// at full), must still raise the energy a slew step a redraw, not
+    /// spend each step on the older, silent packet.
+    #[test]
+    fn queued_packets_slew_towards_the_newest_energy() {
+        let frames: Vec<ControlFrame> = (0..121)
+            .map(|index| ControlFrame {
+                energy: if index % 2 == 1 || index == 0 { 0 } else { 255 },
+                ..ControlFrame::procedural(index)
+            })
+            .collect();
+        // Joined silent on its own, then two packets a redraw: silent,
+        // then full.
+        let times: Vec<f64> = (0..121)
+            .map(|index| ((index + 1) / 2) as f64 / 60.0)
+            .collect();
+        let energies = run_at(&frames, &times);
+        assert_eq!(energies[0], 0.0);
+        for redraw in 1..=60 {
+            let energy = energies[redraw * 2];
+            let expected = (redraw as f32 * ENERGY_SLEW).min(1.0);
+            assert!(
+                (energy - expected).abs() < 1e-4,
+                "redraw {redraw}: {energy}, expected {expected}"
+            );
+        }
     }
 }
