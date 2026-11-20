@@ -414,18 +414,22 @@ the colour field, whatever the registry length; every other byte selects
   change only geometry and characters, never the background or brightness,
   and each change eases or staggers over at least 15 frames; a CPU luminance
   test over all eight section types, up to racing beats, finds at most one
-  flash in any second. The noise follows energy through a slew limit: it
-  moves at most 1/48 of the range per 1/60 s of the renderer's clock (a
-  gap counts at most 8/60 s; frame-counter jumps add nothing), so silence
-  to full energy takes 0.8 s at any frame rate, and 60 fps output is as
-  with a per-frame limit. Without it, energy strobed the noise density (4
-  flashes in 1 s in a screen tile with procedural input, up to 30 with a
-  square wave; a per-frame limit still allowed 4 at 120 fps). With it,
-  CPU tests at 60, 120 and 240 fps find at most 2 flashes in 1 s with
+  flash in any second at 60 fps. The noise follows energy through a slew
+  limit: it moves at most 1/48 of the range per 1/60 s of the renderer's
+  clock (a gap counts at most 8/60 s, time is credited from the latest
+  seen, and frame-counter jumps add nothing), so silence to full energy
+  takes 0.8 s at any frame rate, and 60 fps output is as with a per-frame
+  limit. Without it, energy strobed the noise density (4 flashes in 1 s in
+  a screen tile with procedural input, up to 30 with a square wave; a
+  per-frame limit still allowed 4 at 120 fps). With it, CPU tests at 60,
+  120 and 240 fps find the energy path adds at most 2 flashes in 1 s with
   procedural input and for square waves into full energy (from silence or
-  energy 180) at periods from 2/60 to 1 s, under WCAG 2.3.1's three. Recorded golden fingerprints cover both
-  the frame-timed path (frames built before any is observed) and the
-  beat-synced replay from frame 0 that the renderer and captures use (the
+  energy 180) at periods from 2/60 to 1 s, under WCAG 2.3.1's three. That
+  bound covers the energy path only: section, bar, flip and dissolve
+  timing still counts frames, so it runs faster at high redraw rates (3
+  flashes in 1 s overall measured at 480 fps, at the limit; #119).
+  Recorded golden fingerprints cover both the frame-timed path (frames
+  built before any is observed) and the beat-synced replay from frame 0 that the renderer and captures use (the
   replay's were re-recorded for the slew limit).
   Procedural input never selects it; use
   `--scene 4` (frames 100, 200 and 300 show glyph noise, a mid-transition and

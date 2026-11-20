@@ -69,17 +69,22 @@
 //! The noise follows a slew-limited energy, which the state moves towards
 //! each frame's energy by at most 1/48 per 1/60 s of the renderer's clock
 //! (`ENERGY_SLEW` in `beat.rs`), so silence to full energy takes 0.8 s at
-//! any frame rate. Time is credited per observed frame, a gap counting at
-//! most 8/60 s and a backward clock none, whatever the frame counter's step
-//! (so counter jumps add no slew); at 60 fps this is exactly 1/48 a frame. Unlimited, energy strobed the noise density:
+//! any frame rate. Time is credited per observed frame from the latest time
+//! seen, a gap counting at most 8/60 s and a backward clock none, whatever
+//! the frame counter's step (so counter jumps add no slew); at 60 fps this
+//! is exactly 1/48 a frame. Unlimited, energy strobed the noise density:
 //! procedural energy (a 15-frame sawtooth) made 4 flashes in 1 s in a
 //! screen tile, and a square wave between silence and full energy up to 30
 //! (#116); a per-frame limit allowed 4 at 120 fps and 5 at 240. Limited,
 //! any energy signal ramps a pixel tile's luminance by at most about 0.008
-//! per 1/60 s, so a 0.1 reversal takes at least 13/60 s: at most 2 flashes
-//! in 1 s. `procedural_energy_keeps_noise_flashes_bounded` (at 60, 120 and
-//! 240 fps) and the `square_wave_energy_keeps_*_noise_flashes_bounded`
-//! tests (the pixel one at 60, 120 and 240 fps) measure at most 2.
+//! per 1/60 s, so a 0.1 reversal takes at least 13/60 s: the energy path
+//! adds at most 2 flashes in 1 s at any frame rate.
+//! `procedural_energy_keeps_noise_flashes_bounded` (at 60, 120 and 240 fps)
+//! and the `square_wave_energy_keeps_*_noise_flashes_bounded` tests (the
+//! pixel one at 60, 120 and 240 fps) measure at most 2. That bound is the
+//! energy path's only: section, bar, flip and dissolve timing still counts
+//! frames, so it runs faster at high redraw rates (3 flashes in 1 s overall
+//! measured at 480 fps, at WCAG 2.3.1's limit; #119).
 //! Frames built before any frame is observed (the frame-timed path) use the
 //! frame's own energy, so a state's first frame matches them.
 //!

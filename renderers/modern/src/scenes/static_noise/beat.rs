@@ -233,7 +233,8 @@ impl StaticState {
         // fps this rounds to 1.0, so timed and untimed replays match.
         let ticks = match (elapsed, self.energy_at) {
             (Some(now), Some(then)) => {
-                // A backward or NaN clock credits no time.
+                // A backward or NaN clock credits no time, and time is
+                // credited from the latest seen.
                 let gap = now - then;
                 let gap = if gap > 0.0 {
                     gap.min(MAX_ENERGY_GAP_S)
@@ -244,7 +245,12 @@ impl StaticState {
             }
             _ => 1.0,
         };
-        self.energy_at = elapsed;
+        // Keep the latest time (`max` ignores NaN), so a clock stepping back
+        // and forth cannot re-earn the gap.
+        self.energy_at = match (elapsed, self.energy_at) {
+            (Some(now), Some(then)) => Some(now.max(then)),
+            _ => elapsed,
+        };
         let reach = ENERGY_SLEW * ticks;
         self.energy += (raw_energy(*frame) - self.energy).clamp(-reach, reach);
         let beats = frame.beat_count.wrapping_sub(last.beat_count);
@@ -632,9 +638,15 @@ mod tests {
             times[at + 10] = 0.0;
             times[at + 20] = f64::NAN;
             let energies = run_at(&frames, &times);
+            let mut latest = times[0];
             for (index, pair) in energies.windows(2).enumerate() {
-                let (then, now) = (times[index], times[index + 1]);
-                let gap = if now - then > 0.0 { now - then } else { 0.0 };
+                let now = times[index + 1];
+                let gap = if now - latest > 0.0 {
+                    now - latest
+                } else {
+                    0.0
+                };
+                latest = latest.max(now);
                 let ticks = gap.min(MAX_ENERGY_GAP_S) * 60.0;
                 let moved = (pair[1] - pair[0]).abs();
                 assert!(
@@ -652,5 +664,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A clock alternating between 1 s and 0 earns no time from returning
+    /// to 1 s: the latest time is kept, so after the first gap (capped at
+    /// `MAX_ENERGY_GAP_S`) the energy holds.
+    #[test]
+    fn alternating_clock_cannot_re_earn_the_gap() {
+        let frames: Vec<ControlFrame> = (0..40)
+            .map(|index| ControlFrame {
+                energy: if index == 0 { 0 } else { 255 },
+                ..ControlFrame::procedural(index)
+            })
+            .collect();
+        let times: Vec<f64> = (0..40)
+            .map(|index| if index % 2 == 1 { 1.0 } else { 0.0 })
+            .collect();
+        let energies = run_at(&frames, &times);
+        let credit = ENERGY_SLEW * (MAX_ENERGY_GAP_S * 60.0) as f32;
+        assert!((energies[1] - credit).abs() < 1e-6, "{}", energies[1]);
+        assert!(
+            energies.iter().all(|&energy| energy <= credit + 1e-6),
+            "{energies:?}"
+        );
     }
 }

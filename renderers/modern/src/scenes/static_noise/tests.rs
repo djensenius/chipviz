@@ -1135,7 +1135,6 @@ fn procedural_energy_keeps_noise_flashes_bounded() {
             })
             .map(|halves| halves.map(|run| run.join().unwrap()))
     });
-    eprintln!("procedural {flashes:?}");
     assert!(
         flashes.iter().flatten().all(|&flashes| flashes <= 3),
         "{flashes:?}"
@@ -1222,14 +1221,6 @@ fn sixty_fps_waves() -> Vec<Wave> {
 }
 
 fn assert_bounded(results: Vec<(Wave, usize)>) {
-    eprintln!(
-        "{:?}",
-        results
-            .iter()
-            .filter(|(_, flashes)| *flashes > 1)
-            .map(|(wave, flashes)| (wave.fps, wave.period, wave.low, *flashes))
-            .collect::<Vec<_>>()
-    );
     for (wave, flashes) in results {
         let Wave {
             fps, period, low, ..
