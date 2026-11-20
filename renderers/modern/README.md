@@ -608,6 +608,13 @@ so its results can differ slightly from a live microphone.
 for every option. The GPU smoke test is ignored by default; run it with
 `cargo test --manifest-path renderers/modern/Cargo.toml --lib -- --ignored`.
 
+Library callers can keep constructing `capture::CaptureArgs` and calling
+`capture::run` for the original tunnel. To select a look programmatically,
+pass `capture::CaptureOptions { tunnel_variant: capture::TunnelVariant::Hallway }`
+to `capture::run_with_options`. For command-line parsing in a library caller,
+`capture::parse_args_with_options` returns both arguments and options;
+the original `capture::parse_args` rejects the new flag rather than losing it.
+
 ### PulseTunnel evaluation
 
 After the serialized build slot is available, a catalog-free GPU check is:

@@ -10,7 +10,9 @@ use crate::audio::scope::{ScopeSnapshot, ScopeTap};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{OffscreenRenderer, ScenePipeline};
-use crate::scenes::{self, CameraMode, SceneConfig, TunnelVariant, colour_field, mic_layers};
+use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers};
+
+pub use crate::scenes::TunnelVariant;
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
@@ -56,6 +58,11 @@ pub struct CaptureArgs {
     pub out: PathBuf,
     pub mic_layers: mic_layers::Mode,
     pub lines_drop_cuts: bool,
+}
+
+/// Additional capture options, kept separate to preserve `CaptureArgs` literals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureOptions {
     pub tunnel_variant: TunnelVariant,
 }
 
@@ -65,7 +72,33 @@ pub enum Command {
     Capture(CaptureArgs),
 }
 
+/// Parsed capture command with the optional extended configuration.
+#[derive(Debug)]
+pub enum ConfiguredCommand {
+    Help,
+    Capture(CaptureArgs, CaptureOptions),
+}
+
+/// Parse the original capture arguments. Extended flags are rejected rather
+/// than silently dropped; use [`parse_args_with_options`] for those flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    match parse_args_internal(args, false)? {
+        ConfiguredCommand::Help => Ok(Command::Help),
+        ConfiguredCommand::Capture(args, _) => Ok(Command::Capture(args)),
+    }
+}
+
+/// Parse capture arguments including `--tunnel-variant`.
+pub fn parse_args_with_options(
+    args: impl IntoIterator<Item = String>,
+) -> Result<ConfiguredCommand, String> {
+    parse_args_internal(args, true)
+}
+
+fn parse_args_internal(
+    args: impl IntoIterator<Item = String>,
+    allow_options: bool,
+) -> Result<ConfiguredCommand, String> {
     let mut profile = RenderProfile::m1();
     let mut scene = None;
     let mut frames = vec![0];
@@ -79,7 +112,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
 
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            return Ok(Command::Help);
+            return Ok(ConfiguredCommand::Help);
         }
         let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
         match arg.as_str() {
@@ -133,6 +166,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
             }
             "--lines-drop-cuts" => lines_drop_cuts = true,
             "--tunnel-variant" => {
+                if !allow_options {
+                    return Err("--tunnel-variant requires parse_args_with_options".into());
+                }
                 let text = value()?;
                 tunnel_variant = TunnelVariant::parse(&text).ok_or_else(|| {
                     format!("--tunnel-variant expects original|hallway|abstract, got {text}")
@@ -144,17 +180,19 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
 
     let out = out.ok_or("--out DIR is required")?;
     let size = size.unwrap_or((profile.target_width, profile.target_height));
-    Ok(Command::Capture(CaptureArgs {
-        profile,
-        scene,
-        frames,
-        input,
-        size,
-        out,
-        mic_layers: layers,
-        lines_drop_cuts,
-        tunnel_variant,
-    }))
+    Ok(ConfiguredCommand::Capture(
+        CaptureArgs {
+            profile,
+            scene,
+            frames,
+            input,
+            size,
+            out,
+            mic_layers: layers,
+            lines_drop_cuts,
+        },
+        CaptureOptions { tunnel_variant },
+    ))
 }
 
 /// Splits a `.cvz` file (concatenated control-frame-v0 packets) into frames.
@@ -287,6 +325,11 @@ fn feed(
 }
 
 pub fn run(args: &CaptureArgs) -> Result<(), String> {
+    run_with_options(args, CaptureOptions::default())
+}
+
+/// Capture using explicit extended options; [`run`] keeps the original look.
+pub fn run_with_options(args: &CaptureArgs, options: CaptureOptions) -> Result<(), String> {
     let source = FrameSource {
         fixture: match &args.input {
             Input::Procedural | Input::SynthMic => None,
@@ -331,7 +374,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     renderer.pipeline_mut().set_mic_layers(layers);
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
-        tunnel_variant: args.tunnel_variant,
+        tunnel_variant: options.tunnel_variant,
     });
     let mut captures = Vec::new();
 
@@ -359,13 +402,13 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
             colour_field::Display::ColourField(_) => colour_field::SCENE,
             colour_field::Display::Native(scene) => scene,
         });
-        let name = match (entry.name(), args.tunnel_variant) {
+        let name = match (entry.name(), options.tunnel_variant) {
             ("PulseTunnel", TunnelVariant::Hallway) => "PulseTunnel-Hallway",
             ("PulseTunnel", TunnelVariant::Abstract) => "PulseTunnel-Abstract",
             _ => entry.name(),
         };
         let camera =
-            if entry.name() == "PulseTunnel" && args.tunnel_variant != TunnelVariant::Original {
+            if entry.name() == "PulseTunnel" && options.tunnel_variant != TunnelVariant::Original {
                 CameraMode::ScreenSpace
             } else {
                 entry.camera()
@@ -431,12 +474,12 @@ fn json_string(text: &str) -> String {
 }
 
 pub fn main() -> ExitCode {
-    match parse_args(std::env::args().skip(1)) {
-        Ok(Command::Help) => {
+    match parse_args_with_options(std::env::args().skip(1)) {
+        Ok(ConfiguredCommand::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Ok(Command::Capture(args)) => match run(&args) {
+        Ok(ConfiguredCommand::Capture(args, options)) => match run_with_options(&args, options) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("chipviz-capture: {error}");
@@ -504,7 +547,10 @@ mod tests {
         let synth = parse(&["--out", "o", "--input", "synth-mic"]).unwrap();
         assert_eq!(synth.input, Input::SynthMic);
         assert!(!args.lines_drop_cuts);
-        assert_eq!(args.tunnel_variant, TunnelVariant::Original);
+        assert_eq!(
+            CaptureOptions::default().tunnel_variant,
+            TunnelVariant::Original
+        );
     }
 
     #[test]
@@ -514,15 +560,25 @@ mod tests {
             ("hallway", TunnelVariant::Hallway),
             ("abstract", TunnelVariant::Abstract),
         ] {
-            assert_eq!(
-                parse(&["--out", "o", "--tunnel-variant", text])
-                    .unwrap()
-                    .tunnel_variant,
-                expected
-            );
+            let args = ["--out", "o", "--tunnel-variant", text].map(str::to_string);
+            match parse_args_with_options(args).unwrap() {
+                ConfiguredCommand::Capture(_, options) => {
+                    assert_eq!(options.tunnel_variant, expected)
+                }
+                ConfiguredCommand::Help => panic!("unexpected help"),
+            }
         }
-        assert!(parse(&["--out", "o", "--tunnel-variant", "lines"]).is_err());
-        assert!(parse(&["--out", "o", "--tunnel-variant"]).is_err());
+        assert!(
+            parse_args_with_options(
+                ["--out", "o", "--tunnel-variant", "lines"].map(str::to_string)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_args_with_options(["--out", "o", "--tunnel-variant"].map(str::to_string))
+                .is_err()
+        );
+        assert!(parse(&["--out", "o", "--tunnel-variant", "hallway"]).is_err());
     }
 
     #[test]
