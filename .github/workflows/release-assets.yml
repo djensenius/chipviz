@@ -37,23 +37,6 @@ jobs:
         run: |
           scripts/n64-docker-build.sh
           cp cores/n64/homebrew/chipviz-n64.z64 dist/assets/
-      - name: Build SNES ROM asset
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential bison cmake flex
-          git init "$RUNNER_TEMP/pvsneslib"
-          git -C "$RUNNER_TEMP/pvsneslib" remote add origin https://github.com/alekmaul/pvsneslib.git
-          git -C "$RUNNER_TEMP/pvsneslib" fetch --depth 1 origin d0bd46bc70c16a4cb9c8d40a90468e18a6de9b1c
-          git -C "$RUNNER_TEMP/pvsneslib" checkout --detach FETCH_HEAD
-          git -C "$RUNNER_TEMP/pvsneslib" submodule update --init --recursive --depth 1
-          export PVSNESLIB_HOME="$RUNNER_TEMP/pvsneslib"
-          make -C "$RUNNER_TEMP/pvsneslib/compiler"
-          make -C "$RUNNER_TEMP/pvsneslib/compiler" install
-          make -C "$RUNNER_TEMP/pvsneslib/tools"
-          make -C "$RUNNER_TEMP/pvsneslib/tools" install
-          make -C "$RUNNER_TEMP/pvsneslib/pvsneslib"
-          PVSNESLIB_HOME="$PVSNESLIB_HOME" make -C cores/snes/homebrew
-          cp cores/snes/homebrew/chipviz-snes.sfc dist/assets/
       - name: Build chipsynth-era ROM assets
         run: |
           sudo apt-get update
@@ -85,8 +68,12 @@ jobs:
       - name: Upload individual assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/assets/* --clobber
+        run: |
+          python3 scripts/check-release-assets.py dist/assets dist/chipviz-assets.zip
+          gh release upload "${{ github.event.release.tag_name }}" dist/assets/* --clobber
       - name: Upload combined zip
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/chipviz-assets.zip --clobber
+        run: |
+          python3 scripts/check-release-assets.py dist/assets dist/chipviz-assets.zip
+          gh release upload "${{ github.event.release.tag_name }}" dist/chipviz-assets.zip --clobber

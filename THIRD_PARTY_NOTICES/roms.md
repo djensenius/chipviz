@@ -79,14 +79,22 @@ Built by `scripts/n64-docker-build.sh` from libdragon commit
     by use of this software.
     ```
 
-  - **libcart** (`cart.o`), which libdragon marks "Adapted for use with
-    libdragon" from <https://github.com/devwizard64/libcart>. GitHub reports
-    the upstream repository licence as MIT-0 (default branch, checked on
-    2026-11-19). **To verify:** that this applies to the adapted revision.
+  - **libcart** (`cart.o`), adapted for libdragon from
+    <https://github.com/devwizard64/libcart>. Libdragon commit
+    [`08ab2f7`](https://github.com/DragonMinded/libdragon/commit/08ab2f7857d1c2673733f98e44ad26c4cf7b2abf)
+    identifies its upstream revision as
+    [`82b0278`](https://github.com/devwizard64/libcart/tree/82b0278b854dc29fa1b7fe072090ece5676270f6),
+    whose [licence](https://github.com/devwizard64/libcart/blob/82b0278b854dc29fa1b7fe072090ece5676270f6/LICENSE)
+    is MIT-0. The pinned libdragon revision has the same `cart.c` and `cart.h`
+    blobs as that import.
   - **UNFLoader USB library** (`usb.o`), from
-    <https://github.com/buu342/N64-UNFLoader>. GitHub reports the upstream
-    repository licence as WTFPL (default branch, checked on 2026-11-19).
-    **To verify:** that this applies to the adapted revision.
+    <https://github.com/buu342/N64-UNFLoader>. Libdragon commit
+    [`75c00cd`](https://github.com/DragonMinded/libdragon/commit/75c00cdba67292119a06db55afff20ecbf07c607)
+    identifies its upstream revision as
+    [`56c5b42`](https://github.com/buu342/N64-UNFLoader/tree/56c5b421f0bbcd72a381588ace5135b1a88a5078),
+    whose [licence](https://github.com/buu342/N64-UNFLoader/blob/56c5b421f0bbcd72a381588ace5135b1a88a5078/LICENSE)
+    is WTFPL. The pinned libdragon revision has the same `usb.c` blob as
+    that import.
   - The Shrinkler, LZ4 and aPLib decompressors are libdragon's own code.
     libdragon's `tools/common/shrinkler/LICENSE-shrinkler.txt` says that
     "Runtime code shipped in ROMs is written from scratch and thus distributed
