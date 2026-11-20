@@ -10,7 +10,7 @@ use crate::audio::scope::{ScopeSnapshot, ScopeTap};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{OffscreenRenderer, ScenePipeline};
-use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers};
+use crate::scenes::{self, CameraMode, SceneConfig, TunnelVariant, colour_field, mic_layers};
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
@@ -18,7 +18,7 @@ pub const CAPTURE_FPS: f32 = 60.0;
 const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scene N]
                        [--frames 0,60,120] [--input procedural|synth-mic|PATH.cvz]
                        [--size WxH] [--mic-layers off|scope|bursts|both]
-                       [--lines-drop-cuts]
+                       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
@@ -35,7 +35,9 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --lines-drop-cuts
              Lines (scene 3) cuts on a rising drop flag, as the renderer's
              flag of the same name (default: drops are ignored); only
-             .cvz inputs carry drop flags, procedural input never does";
+             .cvz inputs carry drop flags, procedural input never does
+  --tunnel-variant
+             PulseTunnel look: original (default), hallway or abstract";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -54,6 +56,7 @@ pub struct CaptureArgs {
     pub out: PathBuf,
     pub mic_layers: mic_layers::Mode,
     pub lines_drop_cuts: bool,
+    pub tunnel_variant: TunnelVariant,
 }
 
 #[derive(Debug)]
@@ -71,6 +74,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     let mut out = None;
     let mut layers = mic_layers::Mode::Off;
     let mut lines_drop_cuts = false;
+    let mut tunnel_variant = TunnelVariant::Original;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -128,6 +132,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                 })?;
             }
             "--lines-drop-cuts" => lines_drop_cuts = true,
+            "--tunnel-variant" => {
+                let text = value()?;
+                tunnel_variant = TunnelVariant::parse(&text).ok_or_else(|| {
+                    format!("--tunnel-variant expects original|hallway|abstract, got {text}")
+                })?;
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -143,6 +153,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
         out,
         mic_layers: layers,
         lines_drop_cuts,
+        tunnel_variant,
     }))
 }
 
@@ -320,6 +331,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     renderer.pipeline_mut().set_mic_layers(layers);
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
+        tunnel_variant: args.tunnel_variant,
     });
     let mut captures = Vec::new();
 
@@ -347,7 +359,18 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
             colour_field::Display::ColourField(_) => colour_field::SCENE,
             colour_field::Display::Native(scene) => scene,
         });
-        let file = format!("frame{index:06}-{}.png", entry.name());
+        let name = match (entry.name(), args.tunnel_variant) {
+            ("PulseTunnel", TunnelVariant::Hallway) => "PulseTunnel-Hallway",
+            ("PulseTunnel", TunnelVariant::Abstract) => "PulseTunnel-Abstract",
+            _ => entry.name(),
+        };
+        let camera =
+            if entry.name() == "PulseTunnel" && args.tunnel_variant != TunnelVariant::Original {
+                CameraMode::ScreenSpace
+            } else {
+                entry.camera()
+            };
+        let file = format!("frame{index:06}-{name}.png");
         write_png(&args.out.join(&file), width, height, &rgb)?;
         println!("wrote {}", args.out.join(&file).display());
         captures.push(format!(
@@ -355,8 +378,8 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
             json_string(&file),
             elapsed(index),
             frame.scene,
-            json_string(entry.name()),
-            json_string(match entry.camera() {
+            json_string(name),
+            json_string(match camera {
                 CameraMode::Orbit3D => "orbit3d",
                 CameraMode::ScreenSpace => "screen_space",
             }),
@@ -481,6 +504,25 @@ mod tests {
         let synth = parse(&["--out", "o", "--input", "synth-mic"]).unwrap();
         assert_eq!(synth.input, Input::SynthMic);
         assert!(!args.lines_drop_cuts);
+        assert_eq!(args.tunnel_variant, TunnelVariant::Original);
+    }
+
+    #[test]
+    fn parses_tunnel_variants() {
+        for (text, expected) in [
+            ("original", TunnelVariant::Original),
+            ("hallway", TunnelVariant::Hallway),
+            ("abstract", TunnelVariant::Abstract),
+        ] {
+            assert_eq!(
+                parse(&["--out", "o", "--tunnel-variant", text])
+                    .unwrap()
+                    .tunnel_variant,
+                expected
+            );
+        }
+        assert!(parse(&["--out", "o", "--tunnel-variant", "lines"]).is_err());
+        assert!(parse(&["--out", "o", "--tunnel-variant"]).is_err());
     }
 
     #[test]
@@ -596,6 +638,134 @@ mod tests {
                 rgb.iter().any(|&value| value > 16),
                 "scene {scene} is blank"
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn tunnel_variants_render_synthetic_input_at_representative_aspects() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for (width, height) in [(320, 180), (320, 240), (180, 320)] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                let mut images = Vec::new();
+                for variant in [
+                    TunnelVariant::Original,
+                    TunnelVariant::Hallway,
+                    TunnelVariant::Abstract,
+                ] {
+                    renderer.pipeline_mut().configure_scenes(SceneConfig {
+                        tunnel_variant: variant,
+                        ..SceneConfig::default()
+                    });
+                    renderer.pipeline_mut().reset_state();
+                    let mut synth = SynthMic::new().unwrap();
+                    for index in 0..120 {
+                        let base = ControlFrame {
+                            scene: 2,
+                            palette: 1,
+                            ..ControlFrame::procedural(index)
+                        };
+                        let frame = feed(renderer.pipeline_mut(), Some(&mut synth), base, index);
+                        renderer.pipeline_mut().advance_state(
+                            frame,
+                            elapsed(index),
+                            (width, height),
+                        );
+                    }
+                    let base = ControlFrame {
+                        scene: 2,
+                        palette: 1,
+                        ..ControlFrame::procedural(120)
+                    };
+                    let frame = feed(renderer.pipeline_mut(), Some(&mut synth), base, 120);
+                    let rgb = renderer.render(frame, elapsed(120)).unwrap();
+                    assert!(
+                        rgb.iter().any(|&value| value > 16),
+                        "{} {width}x{height} {variant:?} blank",
+                        profile.name
+                    );
+                    assert!(
+                        images.iter().all(|other| other != &rgb),
+                        "{} {width}x{height} {variant:?} identical",
+                        profile.name
+                    );
+                    images.push(rgb);
+                }
+            }
+        }
+    }
+
+    /// Supporting evidence only: this tests sampled whole-frame changes, not
+    /// the WCAG viewing-area calculation or physical display behaviour.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn tunnel_variants_bound_gpu_luminance_changes() {
+        fn linear(byte: u8) -> f32 {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(rgb: &[u8]) -> Vec<f32> {
+            rgb.chunks_exact(3)
+                .map(|p| 0.2126 * linear(p[0]) + 0.7152 * linear(p[1]) + 0.0722 * linear(p[2]))
+                .collect()
+        }
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for (width, height) in [(320, 180), (180, 320)] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                for variant in [TunnelVariant::Hallway, TunnelVariant::Abstract] {
+                    renderer.pipeline_mut().configure_scenes(SceneConfig {
+                        tunnel_variant: variant,
+                        ..SceneConfig::default()
+                    });
+                    renderer.pipeline_mut().reset_state();
+                    let mut previous: Option<Vec<f32>> = None;
+                    let mut max_changed = 0.0_f32;
+                    let mut max_mean_delta = 0.0_f32;
+                    for index in 0..120 {
+                        // Deliberately hostile input: jump audio and palette every
+                        // frame, including a warm palette.
+                        let high = index % 2 == 0;
+                        let frame = ControlFrame {
+                            scene: 2,
+                            palette: if high { 0 } else { 2 },
+                            energy: if high { 255 } else { 0 },
+                            bass: if high { 255 } else { 0 },
+                            treble: if high { 255 } else { 0 },
+                            ..ControlFrame::procedural(index)
+                        };
+                        let current = luminance(&renderer.render(frame, elapsed(index)).unwrap());
+                        if let Some(before) = &previous {
+                            let count = current.len() as f32;
+                            let changed = before
+                                .iter()
+                                .zip(&current)
+                                .filter(|(a, b)| (*a - *b).abs() >= 0.1)
+                                .count() as f32
+                                / count;
+                            let mean_delta =
+                                (before.iter().sum::<f32>() - current.iter().sum::<f32>()).abs()
+                                    / count;
+                            max_changed = max_changed.max(changed);
+                            max_mean_delta = max_mean_delta.max(mean_delta);
+                        }
+                        previous = Some(current);
+                    }
+                    println!(
+                        "{} {width}x{height} {variant:?}: max changed={max_changed:.4}, max mean delta={max_mean_delta:.4}",
+                        profile.name
+                    );
+                    assert!(max_changed < 0.12);
+                    assert!(max_mean_delta < 0.08);
+                }
+            }
         }
     }
 

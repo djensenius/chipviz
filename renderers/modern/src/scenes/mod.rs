@@ -81,6 +81,26 @@ pub struct SceneConfig {
     /// Lines cuts straight to its other shape on a drop flag (at most once
     /// per bar); see [`lines`].
     pub lines_drop_cuts: bool,
+    pub tunnel_variant: TunnelVariant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TunnelVariant {
+    #[default]
+    Original,
+    Hallway,
+    Abstract,
+}
+
+impl TunnelVariant {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "original" => Some(Self::Original),
+            "hallway" => Some(Self::Hallway),
+            "abstract" => Some(Self::Abstract),
+            _ => None,
+        }
+    }
 }
 
 /// State registry scenes keep between frames. [`observe`](Self::observe)
@@ -92,6 +112,7 @@ pub struct SceneState {
     config: SceneConfig,
     pub(crate) lines: lines::LinesState,
     pub(crate) static_noise: static_noise::StaticState,
+    pub(crate) tunnel: pulse_tunnel::TunnelState,
 }
 
 impl SceneState {
@@ -100,6 +121,7 @@ impl SceneState {
             config,
             lines: lines::LinesState::new(config.lines_drop_cuts),
             static_noise: static_noise::StaticState::default(),
+            tunnel: pulse_tunnel::TunnelState::default(),
         }
     }
 
@@ -113,6 +135,7 @@ impl SceneState {
     pub fn observe(&mut self, frame: &ControlFrame) {
         self.lines.observe(frame);
         self.static_noise.observe(frame);
+        self.tunnel.observe_at(frame, self.tunnel.next_test_time());
     }
 
     /// As [`observe`](Self::observe) at `elapsed` seconds on the renderer's
@@ -121,6 +144,7 @@ impl SceneState {
     pub fn observe_at(&mut self, frame: &ControlFrame, elapsed: f64) {
         self.lines.observe(frame);
         self.static_noise.observe_at(frame, elapsed);
+        self.tunnel.observe_at(frame, elapsed);
     }
 }
 
@@ -137,6 +161,34 @@ pub const REGISTRY: &[SceneEntry] = &[
 /// [`colour_field::SCENE`] first (see [`dispatch`]).
 pub fn select(scene: u8) -> &'static SceneEntry {
     &REGISTRY[usize::from(scene) % REGISTRY.len()]
+}
+
+/// Variant selection affects only PulseTunnel, including its wrapped bytes.
+pub fn selected_camera(scene: u8, config: SceneConfig) -> CameraMode {
+    if select(scene).name == pulse_tunnel::ENTRY.name
+        && config.tunnel_variant != TunnelVariant::Original
+    {
+        CameraMode::ScreenSpace
+    } else {
+        select(scene).camera
+    }
+}
+
+pub(crate) fn build_tunnel_variant(
+    profile: &RenderProfile,
+    frame: ControlFrame,
+    elapsed: f32,
+    aspect: f32,
+    state: &SceneState,
+    instances: &mut Vec<Instance>,
+) -> bool {
+    if select(frame.scene).name != pulse_tunnel::ENTRY.name
+        || state.config.tunnel_variant == TunnelVariant::Original
+    {
+        return false;
+    }
+    pulse_tunnel::build_variant(profile, frame, elapsed, aspect, state, instances);
+    true
 }
 
 /// What a scene byte selects: 7 is the colour field on every target,
@@ -260,6 +312,99 @@ mod tests {
 
     const INDICES: [u64; 9] = [0, 1, 17, 95, 96, 200, 511, 1000, 65_600];
     const ELAPSED: [f32; 4] = [0.0, 0.5, 3.25, 120.0];
+
+    #[test]
+    fn tunnel_variants_are_selected_only_for_tunnel_and_follow_audio() {
+        let frame = ControlFrame {
+            scene: 2,
+            palette: 1,
+            ..ControlFrame::procedural(0)
+        };
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for variant in [TunnelVariant::Hallway, TunnelVariant::Abstract] {
+                let config = SceneConfig {
+                    tunnel_variant: variant,
+                    ..SceneConfig::default()
+                };
+                let mut quiet = SceneState::new(config);
+                let mut loud = SceneState::new(config);
+                let silent = ControlFrame {
+                    energy: 0,
+                    bass: 0,
+                    treble: 0,
+                    ..frame
+                };
+                let strong = ControlFrame {
+                    energy: 255,
+                    bass: 255,
+                    treble: 255,
+                    ..frame
+                };
+                for i in 0..120 {
+                    quiet.observe_at(&silent, f64::from(i) / 60.0);
+                    loud.observe_at(&strong, f64::from(i) / 60.0);
+                }
+                for aspect in [16.0 / 9.0, 4.0 / 3.0] {
+                    let a = build_instances(&profile, frame, 2.0, aspect, &quiet);
+                    let b = build_instances(&profile, frame, 2.0, aspect, &loud);
+                    let again = build_instances(&profile, frame, 2.0, aspect, &quiet);
+                    assert!(!a.is_empty() && a.len() <= profile.instance_count);
+                    assert_eq!(
+                        bytemuck::cast_slice::<Instance, u8>(&a),
+                        bytemuck::cast_slice::<Instance, u8>(&again)
+                    );
+                    assert_ne!(
+                        bytemuck::cast_slice::<Instance, u8>(&a),
+                        bytemuck::cast_slice::<Instance, u8>(&b)
+                    );
+                    let later = build_instances(&profile, frame, 3.0, aspect, &quiet);
+                    assert_ne!(
+                        bytemuck::cast_slice::<Instance, u8>(&a),
+                        bytemuck::cast_slice::<Instance, u8>(&later)
+                    );
+                    assert_eq!(
+                        selected_camera(frame.scene, config),
+                        CameraMode::ScreenSpace
+                    );
+                    assert_eq!(selected_camera(8, config), CameraMode::ScreenSpace);
+                    let other = ControlFrame { scene: 0, ..frame };
+                    assert_eq!(selected_camera(other.scene, config), CameraMode::Orbit3D);
+                    assert_eq!(
+                        bytemuck::cast_slice::<Instance, u8>(&build_instances(
+                            &profile, other, 2.0, aspect, &quiet
+                        )),
+                        bytemuck::cast_slice::<Instance, u8>(&build_instances(
+                            &profile,
+                            other,
+                            2.0,
+                            aspect,
+                            &SceneState::default()
+                        ))
+                    );
+                }
+                let hallway = SceneState::new(SceneConfig {
+                    tunnel_variant: TunnelVariant::Hallway,
+                    ..SceneConfig::default()
+                });
+                let abstract_space = SceneState::new(SceneConfig {
+                    tunnel_variant: TunnelVariant::Abstract,
+                    ..SceneConfig::default()
+                });
+                assert_ne!(
+                    bytemuck::cast_slice::<Instance, u8>(&build_instances(
+                        &profile, frame, 2.0, 1.5, &hallway
+                    )),
+                    bytemuck::cast_slice::<Instance, u8>(&build_instances(
+                        &profile,
+                        frame,
+                        2.0,
+                        1.5,
+                        &abstract_space
+                    ))
+                );
+            }
+        }
+    }
 
     /// FNV-1a over the instance bytes for every profile/frame/elapsed sample,
     /// with the scene byte forced to `scene` or its wrapped `scene + REGISTRY.len()`.

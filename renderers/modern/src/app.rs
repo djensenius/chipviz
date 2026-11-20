@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::{SceneConfig, colour_field, mic_layers};
+use crate::scenes::{SceneConfig, TunnelVariant, colour_field, mic_layers};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -149,6 +149,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         .configure_colour_field(colour_field_config(&args));
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
+        tunnel_variant: args.tunnel_variant,
     });
     renderer.pipeline_mut().limit_colour_field_steps();
     if mic_layers::allowed(args.mic_layers) != args.mic_layers {
@@ -260,7 +261,7 @@ fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
-       [--lines-drop-cuts]
+       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
        {program} --list-monitors | --list-audio-devices
 
 Options:
@@ -288,6 +289,7 @@ Options:
                           default builds print a notice and draw nothing
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
+  --tunnel-variant MODE   PulseTunnel look: original (default), hallway or abstract
   -h, --help              print this help
 
 Keys:
@@ -484,6 +486,7 @@ struct AppArgs {
     allow_flash: bool,
     mic_layers: mic_layers::Mode,
     lines_drop_cuts: bool,
+    tunnel_variant: TunnelVariant,
 }
 
 /// Wire palettes go through the stability gate, and a stable absolute 3 or 7
@@ -553,6 +556,15 @@ impl AppArgs {
                     })?;
                 }
                 "--lines-drop-cuts" => parsed.lines_drop_cuts = true,
+                "--tunnel-variant" => {
+                    let value =
+                        required_value(&mut args, "--tunnel-variant", "original|hallway|abstract")?;
+                    parsed.tunnel_variant = TunnelVariant::parse(&value).ok_or_else(|| {
+                        invalid_input(format!(
+                            "--tunnel-variant expects original|hallway|abstract, got {value}"
+                        ))
+                    })?;
+                }
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
@@ -1324,6 +1336,21 @@ mod tests {
     fn lines_drop_cuts_are_opt_in() {
         assert!(!AppArgs::default().lines_drop_cuts);
         assert!(parse_run(&["--lines-drop-cuts"]).lines_drop_cuts);
+    }
+
+    #[test]
+    fn tunnel_variant_is_explicit_and_validated() {
+        assert_eq!(AppArgs::default().tunnel_variant, TunnelVariant::Original);
+        assert_eq!(
+            parse_run(&["--tunnel-variant", "hallway"]).tunnel_variant,
+            TunnelVariant::Hallway
+        );
+        assert_eq!(
+            parse_run(&["--tunnel-variant", "abstract"]).tunnel_variant,
+            TunnelVariant::Abstract
+        );
+        assert!(parse(&["--tunnel-variant", "lines"]).is_err());
+        assert!(parse(&["--tunnel-variant"]).is_err());
     }
 
     #[test]

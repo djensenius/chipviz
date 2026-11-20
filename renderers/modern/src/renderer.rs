@@ -453,7 +453,7 @@ impl ScenePipeline {
             }
             colour_field::Display::Native(_) => (
                 build_instances(&self.profile, frame, elapsed, aspect, &self.scene_state),
-                scenes::select(frame.scene).camera,
+                scenes::selected_camera(frame.scene, self.scene_state.config()),
             ),
         };
         let uniforms = scene_uniforms(

@@ -98,6 +98,9 @@ pub fn build_instances(
     state: &SceneState,
 ) -> Vec<Instance> {
     let mut instances = Vec::with_capacity(profile.instance_count);
+    if scenes::build_tunnel_variant(profile, frame, elapsed, aspect, state, &mut instances) {
+        return instances;
+    }
     match scenes::select(frame.scene).build {
         SceneBuild::Stateless(build) => build(profile, frame, elapsed, aspect, &mut instances),
         SceneBuild::Stateful(build) => {
