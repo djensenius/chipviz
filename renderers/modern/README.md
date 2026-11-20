@@ -432,19 +432,22 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
   brightness and point size; colour index controls approximate hue. At most
-  200 stars are rendered from a bounded candidate index: at most 16 distinct
-  sky positions per fine subcell (221,184 overall) are retained before the
-  horizon test. Thus up to 15 brighter below-horizon records cannot hide the
-  next visible star in a subcell. Each star's linear-RGB channel is capped at
+  200 stars are rendered from a bounded candidate index: at most 21 records
+  per fine subcell (290,304 overall) retain the 16 brightest distinct
+  positions plus RA/Dec boundary representatives and a coincident fallback.
+  This helps preserve a visible boundary star behind brighter below-horizon
+  records. Each star's linear-RGB channel is capped at
   0.05; stars are opaque and brightest-first, so changing star membership or
   overlap changes a Starfield pixel by at most 0.05 linear luminance.
   Transitions into or out of Starfield are separately gated to at most two
-  successful crossings in any rolling one-second window. While the gate is
-  full, it continues showing the last committed scene and retries the latest
-  request; native-to-native changes are immediate. Optional mic overlays are
-  not composited over Starfield. The monotonic-time gate is committed only
-  after successful surface acquisition, survives resize, and is replayed
-  deterministically in captures.
+  crossings per rolling second, using monotonic timestamps after the window
+  surface's `present()` call returns. Acquisition, rendering and present-call
+  stalls therefore count against the gate; wgpu does not expose physical
+  scanout timestamps, so this is not a physical presentation-time guarantee.
+  While the gate is full, it continues showing the last committed scene and
+  retries the latest request; native-to-native changes are immediate.
+  Optional mic overlays are not composited over Starfield. The gate survives
+  resize and capture replay uses deterministic frame time.
   This bounds Starfield crossings, not native-to-native or ColourField-internal
   flashing, which remain separate safety work (#119/#124); it is not
   independent photosensitivity certification.
@@ -455,7 +458,9 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   so faint linear-light stars survive attachment quantization. Stars fainter
   than magnitude 6.5 are excluded. Below-horizon stars are culled; the
   visible candidates are selected by brightness with a screen-quarter coverage
-  reserve, and output respects each profile's instance budget.
+  reserve, and output respects each profile's instance budget. Seam-crossing
+  stars use two instance slots atomically; with only one slot remaining, that
+  star is skipped rather than drawn at just one edge.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.

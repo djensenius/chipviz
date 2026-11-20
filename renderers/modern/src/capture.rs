@@ -491,6 +491,7 @@ fn starfield_metadata(config: Option<&starfield::StarfieldConfig>) -> (String, S
     }
 }
 
+#[cfg(test)]
 fn displayed_scene_at(source: &FrameSource, index: u64) -> Result<u8, String> {
     let mut field = colour_field::ColourField::new(colour_field::Config::default());
     let mut display = colour_field::Display::Native(0);
@@ -790,6 +791,40 @@ mod tests {
         assert!(error.contains("replay frame 1"), "{error}");
         assert!(error.contains("--star-catalog PATH"), "{error}");
         assert!(validate_replay_catalog(&source, 2, true).is_ok());
+    }
+
+    /// State-only replay must produce the same next image as rendering every
+    /// skipped frame, while avoiding instance construction when layers are off.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn lazy_undrawn_replay_matches_full_scene_rendering() {
+        let (width, height) = (160, 90);
+        let mut full =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        let mut lazy =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+
+        for index in 0..60 {
+            let frame = ControlFrame {
+                scene: 0,
+                ..ControlFrame::procedural(index)
+            };
+            full.render(frame, elapsed(index)).unwrap();
+            lazy.pipeline_mut()
+                .advance_state(frame, elapsed(index), (width, height));
+        }
+
+        let final_frame = ControlFrame {
+            scene: 0,
+            ..ControlFrame::procedural(60)
+        };
+        assert_eq!(
+            full.render(final_frame, elapsed(60)).unwrap(),
+            lazy.render(final_frame, elapsed(60)).unwrap(),
+            "lazy state advancement changed the next rendered frame"
+        );
     }
 
     #[test]

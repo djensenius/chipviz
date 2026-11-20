@@ -242,8 +242,8 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                         renderer.pipeline_mut().observe(fresh, elapsed);
                     },
                 );
-                let displayed_scene = renderer.pipeline_mut().displayed_scene(frame, elapsed);
-                if needs_starfield_catalog(displayed_scene) && starfield.is_none() {
+                let requested_scene = renderer.pipeline_mut().requested_scene(frame);
+                if needs_starfield_catalog(requested_scene) && starfield.is_none() {
                     if !missing_starfield_warning {
                         eprintln!(
                             "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON; \

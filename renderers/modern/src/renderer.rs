@@ -59,7 +59,7 @@ pub struct ScenePipeline {
     phosphor: Option<phosphor::Phosphor>,
     /// Holds off remaking the phosphor while the target is being resized.
     settle: phosphor::Settle,
-    /// Rate-limits only actual transitions into and out of Starfield.
+    /// Rate-limits Starfield crossings using post-`present()` monotonic times.
     crossing_gate: StarfieldCrossingGate,
 }
 
@@ -68,6 +68,10 @@ pub struct Renderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     pipeline: ScenePipeline,
+    /// Monotonic clock for accounting rendered surface crossings. The
+    /// timestamp is sampled after `present()` returns, not by the caller
+    /// before surface acquisition.
+    presentation_clock: Instant,
 }
 
 /// Renders the same pipeline into a texture and reads it back as RGB8.
@@ -194,6 +198,10 @@ fn is_starfield_display(display: colour_field::Display) -> bool {
 
 fn mic_layers_shown(mode: mic_layers::Mode, display: colour_field::Display) -> bool {
     mic_layers::shown(mode, display) && !is_starfield_display(display)
+}
+
+fn can_skip_undrawn_instance_build(mode: mic_layers::Mode, has_phosphor: bool) -> bool {
+    mode == mic_layers::Mode::Off && !has_phosphor
 }
 
 fn displayed_scene_byte(display: colour_field::Display) -> u8 {
@@ -449,19 +457,34 @@ impl ScenePipeline {
         self.crossing_gate.reset();
     }
 
-    /// Steps camera smoothing, the colour field and the mic layers for a
-    /// frame that is not drawn, at a target of `size` pixels.
+    /// Advances a frame that is not drawn, at a target of `size` pixels.
     ///
-    /// Advances scene, camera, debounce, crossing-gate and mic-layer state
-    /// without drawing a frame. Capture replay uses this for stateful scenes.
+    /// Advances scene, camera, debounce, crossing-gate and any active
+    /// mic-layer state without drawing a frame. Capture replay uses this for
+    /// stateful scenes; with layers off it skips unused scene-instance builds.
     ///
     /// `elapsed` is f64 seconds: the mic layers time bursts with it exactly
     /// however long the renderer runs; scenes take it as f32.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame, elapsed);
-        let (frame, display) = self.dispatch(frame, true, elapsed);
+        let (frame, display, _) = self.dispatch(frame, true, elapsed);
         let (width, height) = size;
         let aspect = size_aspect(size);
+        if can_skip_undrawn_instance_build(self.mic_layers.mode(), self.phosphor.is_some()) {
+            let camera = match display {
+                colour_field::Display::ColourField(_) => CameraMode::ScreenSpace,
+                colour_field::Display::Native(_) => scenes::select(frame.scene).camera,
+            };
+            let _ = scene_uniforms(
+                camera,
+                &mut self.camera,
+                &self.profile,
+                frame,
+                elapsed as f32,
+                aspect,
+            );
+            return;
+        }
         let (mut instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
                 let mut instances = Vec::new();
@@ -562,11 +585,19 @@ impl ScenePipeline {
     /// Previews dispatch without consuming a fallback or recording a
     /// Starfield crossing. Surface acquisition can fail after this query.
     pub fn displayed_scene(&mut self, frame: ControlFrame, elapsed: f64) -> u8 {
-        let (_, display) = self.dispatch(frame, false, elapsed);
+        let (_, display, _) = self.dispatch(frame, false, elapsed);
         displayed_scene_byte(display)
     }
 
-    /// Scene byte of the last successfully encoded/replayed frame.
+    /// Scene selected after ColourField debounce, before the live crossing
+    /// gate. Used to validate required scene inputs without a stale clock
+    /// sample affecting the decision.
+    pub fn requested_scene(&mut self, frame: ControlFrame) -> u8 {
+        let (_, display, _) = self.resolve_requested_display(frame);
+        displayed_scene_byte(display)
+    }
+
+    /// Scene byte of the last successfully presented/replayed frame.
     pub fn committed_displayed_scene(&self) -> u8 {
         displayed_scene_byte(self.crossing_gate.displayed)
     }
@@ -579,14 +610,31 @@ impl ScenePipeline {
 
     /// Scene dispatch: the colour field steps once per new observed frame
     /// and owns scene 7; otherwise the native scene goes through the
-    /// registry unchanged. The crossing gate commits only when this frame
-    /// will be encoded; `frame` is never observed here.
+    /// registry unchanged. Live surface rendering previews the gate and
+    /// commits after `present()` returns; replay commits on its frame clock.
+    /// `frame` is never observed here.
     fn dispatch(
         &mut self,
         frame: ControlFrame,
         commit: bool,
         elapsed: f64,
-    ) -> (ControlFrame, colour_field::Display) {
+    ) -> (ControlFrame, colour_field::Display, bool) {
+        let (frame, requested, fallback_applied) = self.resolve_requested_display(frame);
+        let display = self.crossing_gate.resolve(requested, elapsed, commit);
+        let mut frame = frame;
+        if let colour_field::Display::Native(scene) = display {
+            frame.scene = scene;
+        }
+        if commit && fallback_applied && !is_starfield_display(display) {
+            self.next_native_fallback = None;
+        }
+        (frame, display, fallback_applied)
+    }
+
+    fn resolve_requested_display(
+        &mut self,
+        frame: ControlFrame,
+    ) -> (ControlFrame, colour_field::Display, bool) {
         let (clock, now) = match &mut self.step_clock {
             Some((clock, start)) => (Some(clock), start.elapsed()),
             None => (None, Duration::ZERO),
@@ -597,17 +645,7 @@ impl ScenePipeline {
             now,
             &mut self.colour_controls,
         );
-        let (frame, requested, fallback_applied) =
-            resolve_dispatch_frame(frame, display, self.next_native_fallback);
-        let display = self.crossing_gate.resolve(requested, elapsed, commit);
-        let mut frame = frame;
-        if let colour_field::Display::Native(scene) = display {
-            frame.scene = scene;
-        }
-        if commit && fallback_applied && display == requested {
-            self.next_native_fallback = None;
-        }
-        (frame, display)
+        resolve_dispatch_frame(frame, display, self.next_native_fallback)
     }
 
     /// Uploads this frame's instances and uniforms, then records its render pass.
@@ -619,7 +657,30 @@ impl ScenePipeline {
         elapsed: f64,
         size: (u32, u32),
     ) {
-        self.encode_frame(encoder, view, frame, elapsed, size, true);
+        let _ = self.encode_frame(encoder, view, frame, elapsed, elapsed, size, true, true);
+    }
+
+    /// Encodes a window frame using acquisition time only for the gate.
+    /// Commits the selected display after the surface `present()` call returns.
+    fn encode_live(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame: ControlFrame,
+        elapsed: f64,
+        acquired_elapsed: f64,
+        size: (u32, u32),
+    ) -> (colour_field::Display, bool) {
+        self.encode_frame(
+            encoder,
+            view,
+            frame,
+            elapsed,
+            acquired_elapsed,
+            size,
+            true,
+            false,
+        )
     }
 
     /// `encode` as it was before the mic layers: neither steps nor draws
@@ -633,7 +694,7 @@ impl ScenePipeline {
         elapsed: f64,
         size: (u32, u32),
     ) {
-        self.encode_frame(encoder, view, frame, elapsed, size, false);
+        let _ = self.encode_frame(encoder, view, frame, elapsed, elapsed, size, false, true);
     }
 
     fn encode_frame(
@@ -642,14 +703,16 @@ impl ScenePipeline {
         view: &wgpu::TextureView,
         frame: ControlFrame,
         elapsed: f64,
+        gate_elapsed: f64,
         size: (u32, u32),
         mic_layers: bool,
-    ) {
+        commit_gate: bool,
+    ) -> (colour_field::Display, bool) {
         let overlay_elapsed = elapsed;
         let elapsed = elapsed as f32;
         let (width, height) = size;
         let aspect = size_aspect(size);
-        let (frame, display) = self.dispatch(frame, true, overlay_elapsed);
+        let (frame, display, fallback_applied) = self.dispatch(frame, commit_gate, gate_elapsed);
         let (mut instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
                 let mut instances = Vec::new();
@@ -696,6 +759,23 @@ impl ScenePipeline {
                 self.encode_phosphor(encoder, Some(view), count, overlay_elapsed);
             }
             None => self.encode_layers(encoder, view, &instances, &uniforms),
+        }
+        (display, fallback_applied)
+    }
+
+    fn commit_presented_display(
+        &mut self,
+        display: colour_field::Display,
+        fallback_applied: bool,
+        elapsed: f64,
+    ) {
+        let committed = self.crossing_gate.resolve(display, elapsed, true);
+        debug_assert_eq!(
+            committed, display,
+            "a display selected during encode must remain allowed at commit"
+        );
+        if fallback_applied && !is_starfield_display(display) {
+            self.next_native_fallback = None;
         }
     }
 
@@ -906,6 +986,7 @@ impl Renderer {
             surface,
             config,
             pipeline,
+            presentation_clock: Instant::now(),
         })
     }
 
@@ -932,17 +1013,22 @@ impl Renderer {
     /// [`ScenePipeline::observe`] first, so held redraws repeat its last step.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f64) -> Result<(), RendererError> {
         let output = self.surface.get_current_texture()?;
+        let acquired_elapsed = self.presentation_clock.elapsed().as_secs_f64();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let size = (self.config.width, self.config.height);
         let mut encoder = self.pipeline.command_encoder();
-        self.pipeline
-            .encode(&mut encoder, &view, frame, elapsed, size);
+        let (display, fallback_applied) =
+            self.pipeline
+                .encode_live(&mut encoder, &view, frame, elapsed, acquired_elapsed, size);
         self.pipeline
             .queue
             .submit(std::iter::once(encoder.finish()));
         output.present();
+        let presented_elapsed = self.presentation_clock.elapsed().as_secs_f64();
+        self.pipeline
+            .commit_presented_display(display, fallback_applied, presented_elapsed);
         Ok(())
     }
 }
@@ -1204,6 +1290,33 @@ mod tests {
     }
 
     #[test]
+    fn crossing_gate_accounts_for_surface_and_present_stalls() {
+        let mut gate = StarfieldCrossingGate::default();
+        let starfield = colour_field::Display::Native(6);
+        let native = colour_field::Display::Native(0);
+        let attempts = [
+            (0.0, 0.60, starfield),
+            (1.01, 1.01, native),
+            (1.03, 1.03, starfield),
+        ];
+        let mut shown = Vec::new();
+
+        for (acquired_at, present_returned_at, requested) in attempts {
+            let selected = gate.resolve(requested, acquired_at, false);
+            let committed = gate.resolve(selected, present_returned_at, true);
+            shown.push(committed);
+        }
+
+        assert_eq!(shown.as_slice(), &[starfield, native, native]);
+        let crossings: Vec<_> = gate.recent_crossings.iter().copied().collect();
+        assert_eq!(
+            crossings.as_slice(),
+            &[0.60, 1.01],
+            "crossings use the monotonic time after presentation returns"
+        );
+    }
+
+    #[test]
     fn optional_mic_layers_are_not_composited_over_starfield() {
         let mode = mic_layers::Mode::Both;
         assert!(mic_layers_shown(mode, colour_field::Display::Native(4)));
@@ -1219,6 +1332,22 @@ mod tests {
                 rot: 0,
                 lvl: [0; 3],
             })
+        ));
+    }
+
+    #[test]
+    fn undrawn_instance_build_is_skipped_only_without_overlay_state() {
+        assert!(can_skip_undrawn_instance_build(
+            mic_layers::Mode::Off,
+            false
+        ));
+        assert!(!can_skip_undrawn_instance_build(
+            mic_layers::Mode::Off,
+            true
+        ));
+        assert!(!can_skip_undrawn_instance_build(
+            mic_layers::Mode::Both,
+            false
         ));
     }
 

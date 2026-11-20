@@ -25,8 +25,14 @@ const FINE_RA_BINS_PER_SKY_BIN: usize = 4;
 const FINE_DEC_BINS_PER_SKY_BIN: usize = 4;
 const FINE_SKY_SUBCELLS: usize = FINE_RA_BINS_PER_SKY_BIN * FINE_DEC_BINS_PER_SKY_BIN;
 const STARS_PER_FINE_SUBCELL: usize = 16;
+#[cfg(test)]
+const EXTRA_BOUNDARY_CANDIDATES_PER_SUBCELL: usize = 4;
+#[cfg(test)]
+const MAX_CANDIDATES_PER_FINE_SUBCELL: usize =
+    STARS_PER_FINE_SUBCELL + EXTRA_BOUNDARY_CANDIDATES_PER_SUBCELL + 1;
+#[cfg(test)]
 const SKY_CANDIDATE_BOUND: usize =
-    RIGHT_ASCENSION_BINS * DECLINATION_BINS * FINE_SKY_SUBCELLS * STARS_PER_FINE_SUBCELL;
+    RIGHT_ASCENSION_BINS * DECLINATION_BINS * FINE_SKY_SUBCELLS * MAX_CANDIDATES_PER_FINE_SUBCELL;
 const MIN_STAR_MAGNITUDE: f64 = -2.0;
 const BRIGHTNESS_DECADES_PER_MAGNITUDE: f64 = 0.23;
 
@@ -106,7 +112,7 @@ pub struct Star {
 pub struct StarCatalog {
     /// Brightest-first, so the profile's instance cap retains the most visible stars.
     stars: Vec<Star>,
-    /// Brightest representative of each fine J2000 sky subcell; caps per-frame work.
+    /// Bounded bright and coordinate-boundary candidates per J2000 sky subcell.
     candidate_bins: Vec<Vec<usize>>,
 }
 
@@ -207,6 +213,8 @@ impl StarCatalog {
         let mut candidates: Vec<Vec<Vec<usize>>> =
             vec![vec![Vec::new(); FINE_SKY_SUBCELLS]; bins.len()];
         let mut coincident = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
+        let mut extremes: Vec<Vec<[Option<usize>; 4]>> =
+            vec![vec![[None; 4]; FINE_SKY_SUBCELLS]; bins.len()];
         for (index, star) in stars.iter().enumerate() {
             let ra_bin = ((star.right_ascension_hours / 24.0 * RIGHT_ASCENSION_BINS as f64)
                 as usize)
@@ -223,6 +231,32 @@ impl StarCatalog {
             let fine_dec = (dec_in_bin * FINE_DEC_BINS_PER_SKY_BIN as f64) as usize;
             let subcell = fine_dec.min(FINE_DEC_BINS_PER_SKY_BIN - 1) * FINE_RA_BINS_PER_SKY_BIN
                 + fine_ra.min(FINE_RA_BINS_PER_SKY_BIN - 1);
+            // The magnitude cap alone can hide a horizon-visible boundary
+            // star behind brighter records just below the horizon. Keep
+            // coordinate extremes independently of that capped list.
+            let subcell_extremes = &mut extremes[bin_index][subcell];
+            if let Some(first) = subcell_extremes[0] {
+                if star.right_ascension_hours < stars[first].right_ascension_hours {
+                    subcell_extremes[0] = Some(index);
+                }
+                if star.right_ascension_hours
+                    > stars[subcell_extremes[1].unwrap()].right_ascension_hours
+                {
+                    subcell_extremes[1] = Some(index);
+                }
+                if star.declination_degrees
+                    < stars[subcell_extremes[2].unwrap()].declination_degrees
+                {
+                    subcell_extremes[2] = Some(index);
+                }
+                if star.declination_degrees
+                    > stars[subcell_extremes[3].unwrap()].declination_degrees
+                {
+                    subcell_extremes[3] = Some(index);
+                }
+            } else {
+                *subcell_extremes = [Some(index); 4];
+            }
             let subcell_candidates = &mut candidates[bin_index][subcell];
             if subcell_candidates.len() < STARS_PER_FINE_SUBCELL {
                 let spatially_distinct = subcell_candidates.iter().all(|&candidate| {
@@ -240,8 +274,14 @@ impl StarCatalog {
         for bin_index in 0..bins.len() {
             for subcell in 0..FINE_SKY_SUBCELLS {
                 bins[bin_index].extend(candidates[bin_index][subcell].iter().copied());
+                for index in extremes[bin_index][subcell].iter().flatten() {
+                    if !bins[bin_index].contains(index) {
+                        bins[bin_index].push(*index);
+                    }
+                }
                 if candidates[bin_index][subcell].len() < STARS_PER_FINE_SUBCELL
                     && let Some(index) = coincident[bin_index][subcell]
+                    && !bins[bin_index].contains(&index)
                 {
                     bins[bin_index].push(index);
                 }
@@ -439,7 +479,7 @@ fn build(
                 .then_with(|| spatial_order_key(*left_bin).cmp(&spatial_order_key(*right_bin)))
         },
     );
-    let candidate_limit = MAX_RENDERED_STARS.min(profile.instance_count);
+    let candidate_limit = MAX_RENDERED_STARS;
     let mut candidate_order = Vec::with_capacity(candidate_limit);
     let mut reserved = vec![false; visible.len()];
     for quarter in 0..4 {
@@ -520,10 +560,12 @@ fn crosses_horizontal_seam(instance: Instance) -> bool {
 }
 
 fn seam_wrap_within_budget(wraps: bool, available: usize) -> Option<bool> {
-    if available == 0 {
-        None
+    if wraps {
+        (available >= 2).then_some(true)
+    } else if available > 0 {
+        Some(false)
     } else {
-        Some(wraps && available >= 2)
+        None
     }
 }
 
@@ -763,11 +805,13 @@ mod tests {
         assert!(luminance(pixels[45 * 160 + 159]) > 0.0);
 
         let mut limited = Vec::new();
-        let draw_wrap = seam_wrap_within_budget(true, 1).expect("one slot keeps the edge star");
-        append_wrapped(edge, draw_wrap, 1, &mut limited);
-        assert_eq!(limited.len(), 1);
+        assert_eq!(seam_wrap_within_budget(true, 1), None);
+        if let Some(wrap) = seam_wrap_within_budget(true, 1) {
+            append_wrapped(edge, wrap, 1, &mut limited);
+        }
+        assert!(limited.is_empty(), "a seam star is atomic under the cap");
         let pixels = raster(&limited, (160, 90));
-        assert!(luminance(pixels[45 * 160]) > 0.0);
+        assert_eq!(luminance(pixels[45 * 160]), 0.0);
         assert_eq!(luminance(pixels[45 * 160 + 159]), 0.0);
         assert_eq!(seam_wrap_within_budget(true, 2), Some(true));
         assert_eq!(seam_wrap_within_budget(false, 1), Some(false));
@@ -980,31 +1024,36 @@ mod tests {
     }
 
     #[test]
-    fn visible_faint_star_survives_twelve_brighter_below_horizon_candidates_in_its_subcell() {
+    fn visible_faint_star_survives_sixteen_brighter_below_horizon_candidates_in_its_subcell() {
         let unix_seconds = 946_728_000.0;
-        let julian_date = unix_seconds / 86_400.0 + 2_440_587.5;
-        let ra_hours = greenwich_mean_sidereal_degrees(julian_date) / 15.0;
+        let ra_hours = 18.697_374_558;
         let mut csv = String::from("ra,dec,mag\n");
-        for index in 0..12 {
-            csv.push_str(&format!("{ra_hours},{},5\n", -44.95 + 0.02 * index as f64));
+        for index in 0..16 {
+            csv.push_str(&format!("{ra_hours},{},5\n", -46.6 + 0.06 * index as f64));
         }
-        csv.push_str(&format!("{ra_hours},-44.3,6\n"));
+        csv.push_str(&format!("{ra_hours},-45.2,6\n"));
         let catalog = Arc::new(catalog(&csv).unwrap());
         let target_index = catalog
             .stars
             .iter()
-            .position(|star| star.declination_degrees == -44.3)
+            .position(|star| star.declination_degrees == -45.2)
             .unwrap();
         assert!(
             catalog
                 .candidate_bins
                 .iter()
                 .any(|bin| bin.contains(&target_index)),
-            "a spatially distinct candidate must survive the bounded index"
+            "a visible boundary candidate must survive the bounded index"
         );
         let target = &catalog.stars[target_index];
         let projected = project_star(target, 44.6, 0.0, unix_seconds)
             .expect("review fixture target is above the horizon");
+        for star in catalog.stars.iter().filter(|star| star.magnitude == 5.0) {
+            assert!(
+                project_star(star, 44.6, 0.0, unix_seconds).is_none(),
+                "fixture's brighter candidates should be below the horizon"
+            );
+        }
         let mut state = SceneState::default();
         state.configure_starfield(Some(StarfieldConfig {
             catalog,
@@ -1028,7 +1077,7 @@ mod tests {
                 (instance.center[0] - projected[0]).abs() < 1.0e-5
                     && (instance.center[1] - projected[1]).abs() < 1.0e-5
             }),
-            "the visible faint target must survive actual scene construction"
+            "the only visible target must survive actual scene construction"
         );
     }
 
