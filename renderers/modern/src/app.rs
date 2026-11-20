@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::{SceneConfig, colour_field, mic_layers, starfield};
+use crate::scenes::{self, SceneConfig, colour_field, mic_layers, starfield};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -204,23 +204,27 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
             }
             WindowEvent::RedrawRequested => {
                 let elapsed = start.elapsed().as_secs_f64();
-                let frame = with_scene_override(frame_source.next_frame(), args.scene);
-                if frame.scene == starfield::SCENE && starfield.is_none() {
+                let mut frame = with_scene_override(frame_source.next_frame(), args.scene);
+                // The colour field sees each received or generated frame once;
+                // held redraws only repeat its last step.
+                observe_fresh_frames(
+                    frame_source.fresh(),
+                    args.scene,
+                    elapsed,
+                    |fresh, elapsed| {
+                        renderer.pipeline_mut().observe(fresh, elapsed);
+                    },
+                );
+                let displayed_scene = renderer.pipeline_mut().displayed_scene(frame);
+                if needs_starfield_catalog(displayed_scene) && starfield.is_none() {
                     if !missing_starfield_warning {
                         eprintln!(
                             "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON; \
-                             this frame is skipped. Supply both options to render it; \
-                             other scenes remain available."
+                             rendering scene 0 until both options are supplied."
                         );
                         missing_starfield_warning = true;
                     }
-                    return;
-                }
-                // The colour field sees each received or generated frame once;
-                // held redraws only repeat its last step.
-                for fresh in frame_source.fresh() {
-                    let fresh = with_scene_override(*fresh, args.scene);
-                    renderer.pipeline_mut().observe(&fresh, elapsed);
+                    frame = safe_starfield_fallback(frame);
                 }
                 // The waveform side channel only describes mic frames; UDP
                 // and procedural frames make the layers fall back.
@@ -287,7 +291,7 @@ Options:
   --star-catalog PATH     HYG-compatible star CSV for scene 6 (not bundled)
   --catalog FILE          alias for --star-catalog
   --location LAT,LON      observer position in decimal degrees (longitude east)
-  --time UNIX_SECONDS     UTC observation time for scene 6 (default: current UTC)
+  --time UNIX_SECONDS     UTC observation time for scene 6 (1800..2200; default: current UTC)
   --scene N               override the displayed scene byte (0-255), including UDP;
                           without this option, incoming and procedural scenes are unchanged
   --mic                   drive frames from live microphone analysis instead of
@@ -565,6 +569,7 @@ impl AppArgs {
             latitude_degrees,
             longitude_degrees,
             unix_seconds,
+            follow_elapsed: self.unix_seconds.is_none(),
         }))
     }
 
@@ -629,10 +634,10 @@ impl AppArgs {
                         invalid_input(format!("--time must be finite UNIX seconds, got {value}"))
                     })?;
                     if !seconds.is_finite()
-                        || !(-62_135_596_800.0..=253_402_300_799.0).contains(&seconds)
+                        || !(-5_364_662_400.0..7_289_654_400.0).contains(&seconds)
                     {
                         return Err(invalid_input(format!(
-                            "--time must be finite UNIX seconds in the UTC year 0001..9999 range, got {value}"
+                            "--time must be finite UNIX seconds in the UTC year 1800..2200 range, got {value}"
                         )));
                     }
                     parsed.unix_seconds = Some(seconds);
@@ -657,7 +662,7 @@ impl AppArgs {
                 "--time requires --star-catalog and --location".to_string(),
             ));
         }
-        if parsed.scene == Some(starfield::SCENE) && parsed.catalog_path.is_none() {
+        if parsed.scene.is_some_and(needs_starfield_catalog) && parsed.catalog_path.is_none() {
             return Err(invalid_input(
                 "--scene 6 (Starfield) requires --star-catalog PATH and --location LAT,LON"
                     .to_string(),
@@ -675,6 +680,26 @@ fn with_scene_override(mut frame: ControlFrame, scene: Option<u8>) -> ControlFra
     frame
 }
 
+fn observe_fresh_frames(
+    frames: &[ControlFrame],
+    scene_override: Option<u8>,
+    elapsed: f64,
+    mut observe: impl FnMut(&ControlFrame, f64),
+) {
+    for frame in frames {
+        let frame = with_scene_override(*frame, scene_override);
+        observe(&frame, elapsed);
+    }
+}
+
+fn needs_starfield_catalog(scene: u8) -> bool {
+    scenes::dispatch(scene).name() == "Starfield"
+}
+
+fn safe_starfield_fallback(mut frame: ControlFrame) -> ControlFrame {
+    frame.scene = 0;
+    frame
+}
 fn parse_location(value: &str) -> Result<(f64, f64), AppError> {
     let Some((latitude, longitude)) = value.split_once(',') else {
         return Err(invalid_input(format!(
@@ -951,6 +976,46 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_scene_selection_requires_catalog_and_falls_back_without_losing_frame_data() {
+        assert!(needs_starfield_catalog(6));
+        assert!(needs_starfield_catalog(13));
+        assert!(!needs_starfield_catalog(7));
+
+        let frame = ControlFrame {
+            scene: 13,
+            flags: audio::BEAT_FLAG | audio::DROP_FLAG,
+            energy: 177,
+            ..ControlFrame::procedural(44)
+        };
+        let fallback = safe_starfield_fallback(frame);
+        assert_eq!(fallback.scene, 0);
+        assert_eq!(fallback.flags, frame.flags);
+        assert_eq!(fallback.energy, frame.energy);
+    }
+
+    #[test]
+    fn missing_starfield_fallback_does_not_skip_earlier_udp_batch_events() {
+        let frames = [
+            ControlFrame {
+                flags: audio::BEAT_FLAG | audio::DROP_FLAG,
+                ..ControlFrame::procedural(1)
+            },
+            ControlFrame {
+                scene: 13,
+                ..ControlFrame::procedural(2)
+            },
+        ];
+        let mut observed = Vec::new();
+        observe_fresh_frames(&frames, None, 1.5, |frame, elapsed| {
+            observed.push((frame.scene, frame.flags, elapsed));
+        });
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0], (0, audio::BEAT_FLAG | audio::DROP_FLAG, 1.5));
+        assert_eq!(observed[1], (13, 0, 1.5));
+        assert!(needs_starfield_catalog(observed[1].0));
+    }
+
+    #[test]
     fn parses_fullscreen_monitor_and_udp() {
         let args = parse_run(&["--fullscreen", "--monitor", "1", "--udp", "127.0.0.1:6464"]);
         assert!(args.fullscreen);
@@ -961,6 +1026,8 @@ mod tests {
 
     #[test]
     fn parses_starfield_catalog_location_and_time() {
+        let wrapped_error = parse(&["--scene", "13"]).unwrap_err().to_string();
+        assert!(wrapped_error.contains("requires --star-catalog PATH"));
         let args = parse_run(&[
             "--scene",
             "6",
@@ -985,6 +1052,29 @@ mod tests {
         assert_eq!(
             parse_run(&["--catalog", "stars.csv", "--location", "0,180"]).location,
             Some((0.0, 180.0))
+        );
+        assert_eq!(
+            parse_run(&[
+                "--catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+                "--time",
+                "7289654399",
+            ])
+            .unix_seconds,
+            Some(7_289_654_399.0)
+        );
+        assert!(
+            parse(&[
+                "--catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+                "--time",
+                "7289654400",
+            ])
+            .is_err()
         );
     }
 

@@ -12,7 +12,7 @@ use crate::scenes::SceneState;
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "Starfield",
     camera: CameraMode::ScreenSpace,
-    build: SceneBuild::Stateful(build),
+    build: SceneBuild::ViewportStateful(build),
 };
 pub const SCENE: u8 = 6;
 pub const MAX_RENDERED_MAGNITUDE: f64 = 6.5;
@@ -23,6 +23,19 @@ pub struct StarfieldConfig {
     pub latitude_degrees: f64,
     pub longitude_degrees: f64,
     pub unix_seconds: f64,
+    /// Advance from the base UTC epoch with the renderer's monotonic clock.
+    pub follow_elapsed: bool,
+}
+
+impl StarfieldConfig {
+    pub fn epoch_at(&self, elapsed: f32) -> f64 {
+        self.unix_seconds
+            + if self.follow_elapsed {
+                f64::from(elapsed.max(0.0))
+            } else {
+                0.0
+            }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +81,7 @@ impl StarCatalog {
         let magnitude_column = columns["mag"];
         let colour_column = columns.get("ci").copied();
         let name_column = columns.get("proper").copied();
+        let distance_column = columns.get("dist").copied();
 
         let mut stars = Vec::new();
         for (record_index, result) in reader.records().enumerate() {
@@ -75,6 +89,12 @@ impl StarCatalog {
             let record = result.map_err(|error| {
                 CatalogError(format!("malformed CSV record on line {line}: {error}"))
             })?;
+            if let Some(column) = distance_column
+                && !record.get(column).unwrap_or_default().trim().is_empty()
+                && parse_field(&record, column, "dist", line)? == 0.0
+            {
+                continue;
+            }
             let ra = parse_field(&record, ra_column, "ra", line)?;
             if !(0.0..24.0).contains(&ra) {
                 return Err(CatalogError(format!(
@@ -172,6 +192,11 @@ pub fn horizontal_coordinates(
     unix_seconds: f64,
 ) -> (f64, f64) {
     let julian_date = unix_seconds / 86_400.0 + 2_440_587.5;
+    let (right_ascension, declination) = precess_j2000(
+        (star.right_ascension_hours * 15.0).to_radians(),
+        star.declination_degrees.to_radians(),
+        julian_date,
+    );
     let centuries = (julian_date - 2_451_545.0) / 36_525.0;
     let gmst_degrees = 280.460_618_37
         + 360.985_647_366_29 * (julian_date - 2_451_545.0)
@@ -180,8 +205,6 @@ pub fn horizontal_coordinates(
     let local_sidereal = (gmst_degrees + longitude_degrees)
         .rem_euclid(360.0)
         .to_radians();
-    let right_ascension = (star.right_ascension_hours * 15.0).to_radians();
-    let declination = star.declination_degrees.to_radians();
     let latitude = latitude_degrees.to_radians();
     let hour_angle = local_sidereal - right_ascension;
 
@@ -195,6 +218,27 @@ pub fn horizontal_coordinates(
         )
         .rem_euclid(std::f64::consts::TAU);
     (azimuth, altitude)
+}
+
+/// IAU 1976 precession from mean equatorial J2000 coordinates to the date.
+fn precess_j2000(right_ascension: f64, declination: f64, julian_date: f64) -> (f64, f64) {
+    let centuries = (julian_date - 2_451_545.0) / 36_525.0;
+    let t2 = centuries * centuries;
+    let t3 = t2 * centuries;
+    let arcseconds_to_radians = std::f64::consts::PI / (180.0 * 3_600.0);
+    let zeta = (2_306.218_1 * centuries + 0.301_88 * t2 + 0.017_998 * t3) * arcseconds_to_radians;
+    let z = (2_306.218_1 * centuries + 1.094_68 * t2 + 0.018_203 * t3) * arcseconds_to_radians;
+    let theta = (2_004.310_9 * centuries - 0.426_65 * t2 - 0.041_833 * t3) * arcseconds_to_radians;
+    let a = right_ascension + zeta;
+    let sin_declination = declination.sin();
+    let cos_declination = declination.cos();
+    let x = cos_declination * a.sin();
+    let y = theta.cos() * cos_declination * a.cos() - theta.sin() * sin_declination;
+    let zed = theta.sin() * cos_declination * a.cos() + theta.cos() * sin_declination;
+    (
+        (x.atan2(y) + z).rem_euclid(std::f64::consts::TAU),
+        zed.clamp(-1.0, 1.0).asin(),
+    )
 }
 
 /// Projects the visible local sky to an azimuth/altitude panorama. North wraps
@@ -218,16 +262,17 @@ pub fn project_star(
 
 fn build(
     profile: &RenderProfile,
-    frame: ControlFrame,
-    _elapsed: f32,
+    _frame: ControlFrame,
+    elapsed: f32,
     aspect: f32,
+    viewport: (u32, u32),
     state: &SceneState,
     instances: &mut Vec<Instance>,
 ) {
     let Some(config) = state.starfield() else {
         return;
     };
-    let audio_level = frame.energy as f32 / 255.0;
+    let unix_seconds = config.epoch_at(elapsed);
     for star in config
         .catalog
         .stars()
@@ -238,24 +283,25 @@ fn build(
             star,
             config.latitude_degrees,
             config.longitude_degrees,
-            config.unix_seconds,
+            unix_seconds,
         ) else {
             continue;
         };
         // Lift the catalog's large naked-eye dynamic range for an emissive
         // display while keeping magnitude ordering monotonic.
-        let brightness = (10.0_f64.powf(-0.2 * (star.magnitude + 1.5)) as f32).clamp(0.0, 1.0)
-            * (0.85 + audio_level * 0.15);
+        let brightness = (10.0_f64.powf(-0.2 * (star.magnitude + 1.5)) as f32).clamp(0.0, 1.0);
         let tint = star
             .colour_index
             .map(color_index_rgb)
             .unwrap_or([1.0, 1.0, 1.0]);
         let point_size = 0.0025 + brightness * 0.009;
-        // Keep the catalog-derived hue while allowing the audio envelope only
-        // to make a bounded, non-flashing brightness adjustment.
-        instances.push(Instance {
+        // A two-pixel minimum keeps bright stars visible at small output sizes.
+        // Sizes are NDC full-width/full-height values.
+        let point_size = point_size.max(4.0 / viewport.1.max(1) as f32);
+        let size = [point_size / aspect.max(f32::MIN_POSITIVE), point_size];
+        let instance = Instance {
             center: [center[0], center[1], 0.0],
-            size: [point_size / aspect.max(f32::MIN_POSITIVE), point_size],
+            size,
             color: [
                 tint[0] * brightness,
                 tint[1] * brightness,
@@ -265,10 +311,33 @@ fn build(
             rotation: 0.0,
             scene_mix: 0.0,
             pattern: [0.0; 2],
-        });
+        };
+        append_wrapped(instance, profile.instance_count, instances);
         if instances.len() >= profile.instance_count {
             break;
         }
+    }
+}
+
+fn append_wrapped(instance: Instance, budget: usize, instances: &mut Vec<Instance>) {
+    if instances.len() >= budget {
+        return;
+    }
+    let half_width = instance.size[0] / 2.0;
+    let wrap_offset = if instance.center[0] - half_width < -1.0 {
+        Some(2.0)
+    } else if instance.center[0] + half_width > 1.0 {
+        Some(-2.0)
+    } else {
+        None
+    };
+    instances.push(instance);
+    if let Some(offset) = wrap_offset
+        && instances.len() < budget
+    {
+        let mut wrapped = instance;
+        wrapped.center[0] += offset;
+        instances.push(wrapped);
     }
 }
 
@@ -345,19 +414,24 @@ mod tests {
 
     #[test]
     fn skips_blank_optional_fields_and_filters_fainter_than_limit() {
-        let catalog = catalog(
+        let parsed_catalog = catalog(
             "proper,ra,dec,mag,ci\nBright,0,90,1.0,0.2\n\"\",1,90,6.5,\nToo faint,2,90,6.51,\n",
         )
         .expect("blank optional fields are allowed");
-        assert_eq!(catalog.stars()[1].name, None);
-        assert_eq!(catalog.stars()[1].colour_index, None);
+        assert_eq!(parsed_catalog.stars()[1].name, None);
+        assert_eq!(parsed_catalog.stars()[1].colour_index, None);
+        let with_distance = catalog("ra,dec,mag,dist\n0,0,1,0\n6,0,2,\n")
+            .expect("distance is optional and a blank value is allowed");
+        assert_eq!(with_distance.stars().len(), 1);
+        assert_eq!(with_distance.stars()[0].right_ascension_hours, 6.0);
 
         let mut state = SceneState::default();
         state.configure_starfield(Some(StarfieldConfig {
-            catalog: Arc::new(catalog),
+            catalog: Arc::new(parsed_catalog),
             latitude_degrees: 45.0,
             longitude_degrees: 0.0,
             unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
         }));
         let mut instances = Vec::new();
         build(
@@ -365,11 +439,14 @@ mod tests {
             ControlFrame::procedural(0),
             0.0,
             16.0 / 9.0,
+            (160, 90),
             &state,
             &mut instances,
         );
-        assert_eq!(instances.len(), 2);
-        assert!(instances[0].size[0] > instances[1].size[0]);
+        assert!(instances.len() >= 2);
+        assert!(instances.len() <= 4);
+        assert!(instances[0].color[0] > instances[2].color[0]);
+        assert!(instances[0].size[1] * 90.0 / 2.0 >= 2.0);
     }
 
     #[test]
@@ -391,5 +468,107 @@ mod tests {
         let different_latitude = project_star(&star, 45.0, 0.0, timestamp).unwrap();
         assert!((different_latitude[1] - actual[1]).abs() > 0.1);
         assert!(project_star(&star, 0.0, 0.0, timestamp + 21_600.0).is_none());
+    }
+
+    #[test]
+    fn precession_matches_iau_1976_reference_and_changes_2100_horizon_classification() {
+        let julian_date = 2_451_545.0 + 36_525.0;
+        let (ra, dec) = precess_j2000(0.0, 0.0, julian_date);
+        assert!((ra.to_degrees() / 15.0 - 0.085_444).abs() < 1.0e-5);
+        assert!((dec.to_degrees() - 0.556_588).abs() < 1.0e-5);
+
+        let star = Star {
+            right_ascension_hours: 0.0,
+            declination_degrees: 0.0,
+            magnitude: 1.0,
+            colour_index: None,
+            name: None,
+        };
+        // 2100-01-01 at the equator: date precession moves this star just
+        // above the horizon where its unprecessed J2000 position is below.
+        assert!(
+            project_star(&star, 0.0, -9.5, 4_102_444_800.0).is_some(),
+            "supported-century precession must affect horizon visibility"
+        );
+    }
+
+    #[test]
+    fn live_epoch_advances_but_explicit_epoch_stays_fixed() {
+        let catalog = Arc::new(catalog("ra,dec,mag\n6,0,1\n").unwrap());
+        let live = StarfieldConfig {
+            catalog: Arc::clone(&catalog),
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 1_000.0,
+            follow_elapsed: true,
+        };
+        let fixed = StarfieldConfig {
+            follow_elapsed: false,
+            ..live.clone()
+        };
+        assert_eq!(live.epoch_at(12.5), 1_012.5);
+        assert_eq!(fixed.epoch_at(12.5), 1_000.0);
+    }
+
+    #[test]
+    fn north_seam_wraps_quads_without_exceeding_the_instance_budget() {
+        let edge = Instance {
+            center: [-0.999, 0.0, 0.0],
+            size: [0.02, 0.02],
+            color: [1.0; 4],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern: [0.0; 2],
+        };
+        let mut instances = Vec::new();
+        append_wrapped(edge, 2, &mut instances);
+        assert_eq!(instances.len(), 2);
+        assert!(instances[1].center[0] > 1.0);
+        let mut limited = Vec::new();
+        append_wrapped(edge, 1, &mut limited);
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn brightness_is_invariant_to_audio_even_for_dense_overlap_at_multiple_rates() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for _ in 0..16_500 {
+            csv.push_str("0,0,1\n");
+        }
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let mut reference = None;
+            for fps in [60.0, 120.0, 240.0] {
+                for energy in [0, 255, 0, 255] {
+                    let mut frame = ControlFrame::procedural(6);
+                    frame.energy = energy;
+                    let mut instances = Vec::new();
+                    build(
+                        &profile,
+                        frame,
+                        1.0 / fps,
+                        16.0 / 9.0,
+                        (160, 90),
+                        &state,
+                        &mut instances,
+                    );
+                    assert!(instances.len() <= profile.instance_count);
+                    let colors: Vec<_> = instances.iter().map(|instance| instance.color).collect();
+                    if let Some(reference) = &reference {
+                        assert_eq!(&colors, reference, "energy={energy}, fps={fps}");
+                    } else {
+                        reference = Some(colors);
+                    }
+                }
+            }
+        }
     }
 }

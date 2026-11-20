@@ -30,21 +30,21 @@ just modern-m1 -- --udp 127.0.0.1:6464 \
   --star-catalog /path/to/stars.csv --location 45.5,-73.25
 just modern-m1 -- --scene 6 --star-catalog /path/to/stars.csv \
   --location 45.5,-73.25
-just modern-pi5 -- --star-catalog /path/to/stars.csv \
+just modern-pi5 -- --scene 6 --star-catalog /path/to/stars.csv \
   --location 45.5,-73.25 --time 946728000
 ```
 
 The CSV must have `ra` (hours), `dec` (degrees) and `mag` columns; `ci` and
 `proper` are optional. Standard CSV quoting is supported. Scene 6 without both
-setup options prints an actionable message and skips that scene, while other
-scenes remain usable. `--catalog` is an alias for `--star-catalog`; both load
+setup options prints an actionable message and temporarily displays scene 0,
+while continuing to observe all incoming frames. `--catalog` is an alias for `--star-catalog`; both load
 the file at runtime and never embed it in the executable. Scene 7 stays the
 colour field. `--scene 6` forces Starfield for procedural or microphone frames
 without a UDP sender; it also overrides UDP scene bytes when explicitly set.
 Without `--scene`, UDP, microphone and procedural scene selection is unchanged.
 Scene 6 requires its catalog and location at startup when selected with
-`--scene`; a scene-6 UDP frame without setup is skipped with a clear message,
-and subsequent non-star scenes continue normally.
+`--scene`; a scene-6 UDP frame without setup displays scene 0 with a clear
+message, and subsequent non-star scenes continue normally.
 
 Without `--udp` or `--mic`, the renderer uses deterministic procedural frames. With UDP,
 it consumes `control-frame-v0` packets from the host bridge:
@@ -65,7 +65,7 @@ The renderer starts windowed by default.
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
 | `--star-catalog PATH` | Read a user-supplied HYG-compatible CSV for scene 6; catalogs are not bundled or embedded. `--catalog` is an alias. |
 | `--location LAT,LON` | Observer latitude and longitude in decimal degrees, longitude east positive. Required with `--star-catalog`. |
-| `--time UNIX_SECONDS` | Observation time in UTC seconds since the Unix epoch; defaults to current UTC and requires `--star-catalog` plus `--location`. |
+| `--time UNIX_SECONDS` | Observation time in UTC seconds since the Unix epoch (1800–2200); defaults to current UTC, advances while live, and requires `--star-catalog` plus `--location`. Capture manifests record the resolved epoch and whether it advances. |
 | `--scene N` | Force the displayed scene byte (0-255), including UDP frames; absent by default, preserving the selected input's scene. Scene 6 requires `--star-catalog` and `--location`. |
 | `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
@@ -427,11 +427,13 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   rotation and local horizon conversion. Visible stars are mapped to a
   rectangular azimuth/altitude panorama (north wraps at both horizontal
   edges; east, south and west map across the middle; horizon at the bottom).
-  There is no precession, proper-motion correction, parallax or atmospheric
-  refraction, so this is a useful sky view rather than a precision
-  planetarium. Magnitude and colour index control bounded point brightness
-  and approximate hue; display brightness is lifted for visibility and audio
-  only adjusts it within a narrow range. Stars fainter than magnitude 6.5 are
+  IAU 1976 precession transforms J2000 coordinates to date for supported UTC
+  dates from 1800 through 2200. Proper motion, parallax and atmospheric
+  refraction are not modeled, so this is a useful sky view rather than a
+  precision planetarium. Magnitude and colour index control bounded point
+  brightness and approximate hue; display brightness is lifted for visibility
+  and does not react to audio, avoiding flashing under overlapping catalogs.
+  Stars fainter than magnitude 6.5 are
   excluded. Below-horizon stars are culled, brightest stars are considered
   first, and output respects each profile's instance budget.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D

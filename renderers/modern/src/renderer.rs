@@ -9,7 +9,7 @@ use crate::control_frame::ControlFrame;
 use crate::phosphor;
 use crate::profile::RenderProfile;
 use crate::scene::{
-    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
+    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances_for_viewport, scene_uniforms,
 };
 use crate::scenes::{self, CameraMode, SceneConfig, SceneState, colour_field, mic_layers};
 
@@ -326,7 +326,7 @@ impl ScenePipeline {
     /// however long the renderer runs; scenes take it as f32.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame, elapsed);
-        let (frame, display) = self.dispatch(frame);
+        let (_, display) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed as f32, size_aspect(size));
         if let Some(count) = self.prepare_mic_layers(frame, display, elapsed, size) {
@@ -390,6 +390,17 @@ impl ScenePipeline {
     pub fn observe(&mut self, frame: &ControlFrame, elapsed: f64) {
         self.colour_field.observe(frame);
         self.scene_state.observe_at(frame, elapsed);
+    }
+
+    /// Advances dispatch for a frame and returns the registry scene that would
+    /// be shown by the next encode. Re-dispatching the same frame during encode
+    /// is safe: the colour field only steps once per observed frame.
+    pub fn displayed_scene(&mut self, frame: ControlFrame) -> u8 {
+        let (_, display) = self.dispatch(frame);
+        match display {
+            colour_field::Display::Native(scene) => scene,
+            colour_field::Display::ColourField(_) => colour_field::SCENE,
+        }
     }
 
     /// Scene dispatch: the colour field steps once per new observed frame
@@ -459,7 +470,14 @@ impl ScenePipeline {
                 (instances, CameraMode::ScreenSpace)
             }
             colour_field::Display::Native(_) => (
-                build_instances(&self.profile, frame, elapsed, aspect, &self.scene_state),
+                build_instances_for_viewport(
+                    &self.profile,
+                    frame,
+                    elapsed,
+                    aspect,
+                    size,
+                    &self.scene_state,
+                ),
                 scenes::select(frame.scene).camera,
             ),
         };

@@ -97,12 +97,39 @@ pub fn build_instances(
     aspect: f32,
     state: &SceneState,
 ) -> Vec<Instance> {
+    build_instances_for_viewport(
+        profile,
+        frame,
+        elapsed,
+        aspect,
+        (profile.target_width, profile.target_height),
+        state,
+    )
+}
+
+pub fn build_instances_for_viewport(
+    profile: &RenderProfile,
+    frame: ControlFrame,
+    elapsed: f32,
+    aspect: f32,
+    viewport: (u32, u32),
+    state: &SceneState,
+) -> Vec<Instance> {
     let mut instances = Vec::with_capacity(profile.instance_count);
     match scenes::select(frame.scene).build {
         SceneBuild::Stateless(build) => build(profile, frame, elapsed, aspect, &mut instances),
         SceneBuild::Stateful(build) => {
             build(profile, frame, elapsed, aspect, state, &mut instances)
         }
+        SceneBuild::ViewportStateful(build) => build(
+            profile,
+            frame,
+            elapsed,
+            aspect,
+            viewport,
+            state,
+            &mut instances,
+        ),
     }
     instances
 }

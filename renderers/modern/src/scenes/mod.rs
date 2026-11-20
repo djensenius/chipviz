@@ -58,6 +58,10 @@ pub type SceneBuilder = fn(&RenderProfile, ControlFrame, f32, f32, &mut Vec<Inst
 pub type StatefulBuilder =
     fn(&RenderProfile, ControlFrame, f32, f32, &SceneState, &mut Vec<Instance>);
 
+/// A stateful scene that also uses the output viewport in pixels.
+pub type ViewportStatefulBuilder =
+    fn(&RenderProfile, ControlFrame, f32, f32, (u32, u32), &SceneState, &mut Vec<Instance>);
+
 /// How a registry scene builds its instances. Most scenes derive everything
 /// from the control frame and elapsed time; a stateful one also reads the
 /// state [`SceneState::observe`] kept from earlier frames.
@@ -65,6 +69,7 @@ pub type StatefulBuilder =
 pub enum SceneBuild {
     Stateless(SceneBuilder),
     Stateful(StatefulBuilder),
+    ViewportStateful(ViewportStatefulBuilder),
 }
 
 pub struct SceneEntry {
@@ -352,6 +357,7 @@ mod tests {
             latitude_degrees: 45.0,
             longitude_degrees: 0.0,
             unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
         }));
         for (profile, budget) in [(RenderProfile::m1(), 16_384), (RenderProfile::pi5(), 4_096)] {
             let frame = ControlFrame {

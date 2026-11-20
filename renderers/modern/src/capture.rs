@@ -41,7 +41,7 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
              user-supplied HYG-compatible star CSV for scene 6; not bundled
   --catalog  alias for --star-catalog
   --location observer latitude,longitude in decimal degrees; longitude east
-  --time     observation UTC as Unix seconds; defaults to current UTC";
+  --time     observation UTC as Unix seconds (1800..2200); defaults to current UTC";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -147,11 +147,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                 let seconds = text
                     .parse::<f64>()
                     .map_err(|_| format!("--time must be finite UNIX seconds, got {text}"))?;
-                if !seconds.is_finite()
-                    || !(-62_135_596_800.0..=253_402_300_799.0).contains(&seconds)
-                {
+                if !seconds.is_finite() || !(-5_364_662_400.0..7_289_654_400.0).contains(&seconds) {
                     return Err(format!(
-                        "--time must be finite UNIX seconds in the UTC year 0001..9999 range, got {text}"
+                        "--time must be finite UNIX seconds in the UTC year 1800..2200 range, got {text}"
                     ));
                 }
                 unix_seconds = Some(seconds);
@@ -359,8 +357,8 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     };
     // Validate every frame before touching the GPU or the output directory.
     for &index in &args.frames {
-        let frame = source.frame(index)?;
-        if scenes::dispatch(frame.scene).name() == "Starfield" && args.catalog_path.is_none() {
+        let displayed_scene = displayed_scene_at(&source, index)?;
+        if scenes::dispatch(displayed_scene).name() == "Starfield" && args.catalog_path.is_none() {
             return Err(
                 "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON".to_string(),
             );
@@ -380,6 +378,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
                 latitude_degrees,
                 longitude_degrees,
                 unix_seconds,
+                follow_elapsed: args.unix_seconds.is_none(),
             })
         }
         _ => None,
@@ -465,8 +464,9 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         Input::SynthMic => "synth-mic".to_string(),
         Input::File(path) => path.display().to_string(),
     };
+    let (starfield_epoch, starfield_advances) = starfield_metadata(starfield.as_ref());
     let manifest = format!(
-        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"captures\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"starfield_epoch_unix_seconds\": {starfield_epoch},\n  \"starfield_epoch_advances_with_elapsed\": {starfield_advances},\n  \"captures\": [\n{}\n  ]\n}}\n",
         json_string(args.profile.name),
         json_string(&input),
         json_string(layers.name()),
@@ -474,6 +474,32 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     );
     let path = args.out.join("manifest.json");
     std::fs::write(&path, manifest).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn starfield_metadata(config: Option<&starfield::StarfieldConfig>) -> (String, String) {
+    match config {
+        Some(config) => (
+            config.unix_seconds.to_string(),
+            config.follow_elapsed.to_string(),
+        ),
+        None => ("null".to_string(), "null".to_string()),
+    }
+}
+
+fn displayed_scene_at(source: &FrameSource, index: u64) -> Result<u8, String> {
+    let mut field = colour_field::ColourField::new(colour_field::Config::default());
+    let mut display = colour_field::Display::Native(0);
+    for frame_index in 0..=index {
+        field.observe(&source.frame(frame_index)?);
+        if field.has_new_frame() {
+            field.step(colour_field::Controls::default());
+        }
+        display = field.display();
+    }
+    Ok(match display {
+        colour_field::Display::Native(scene) => scene,
+        colour_field::Display::ColourField(_) => colour_field::SCENE,
+    })
 }
 
 fn write_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<(), String> {
@@ -570,6 +596,8 @@ mod tests {
     fn parses_starfield_options_and_requires_them_for_scene_six() {
         let error = parse(&["--out", "shots", "--scene", "6"]).unwrap_err();
         assert!(error.contains("--star-catalog PATH and --location LAT,LON"));
+        let wrapped_error = parse(&["--out", "shots", "--scene", "13"]).unwrap_err();
+        assert!(wrapped_error.contains("--star-catalog PATH and --location LAT,LON"));
 
         let args = parse(&[
             "--out",
@@ -629,6 +657,19 @@ mod tests {
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }
+        assert!(
+            parse(&[
+                "--out",
+                "shots",
+                "--star-catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+                "--time",
+                "7289654400",
+            ])
+            .is_err()
+        );
         assert!(matches!(parse_args(["-h".to_string()]), Ok(Command::Help)));
     }
 
@@ -651,6 +692,47 @@ mod tests {
             unforced.frame(200).unwrap().scene,
             ControlFrame::procedural(200).scene
         );
+    }
+
+    #[test]
+    fn capture_preflight_checks_debounced_displayed_scene() {
+        let source = FrameSource {
+            fixture: Some(vec![
+                ControlFrame {
+                    scene: 6,
+                    ..ControlFrame::procedural(0)
+                },
+                ControlFrame {
+                    scene: 7,
+                    ..ControlFrame::procedural(1)
+                },
+            ]),
+            scene: None,
+        };
+        assert_eq!(source.frame(1).unwrap().scene, 7);
+        assert_eq!(displayed_scene_at(&source, 1).unwrap(), 6);
+        assert_eq!(
+            scenes::dispatch(displayed_scene_at(&source, 1).unwrap()).name(),
+            "Starfield"
+        );
+    }
+
+    #[test]
+    fn capture_manifest_records_resolved_starfield_epoch_and_clock_mode() {
+        let catalog =
+            starfield::StarCatalog::from_reader("ra,dec,mag\n0,0,1\n".as_bytes()).unwrap();
+        let config = starfield::StarfieldConfig {
+            catalog: std::sync::Arc::new(catalog),
+            latitude_degrees: 45.0,
+            longitude_degrees: 80.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: true,
+        };
+        assert_eq!(
+            starfield_metadata(Some(&config)),
+            ("946728000".to_string(), "true".to_string())
+        );
+        assert_eq!(starfield_metadata(None), ("null".into(), "null".into()));
     }
 
     #[test]
@@ -710,6 +792,9 @@ mod tests {
     fn renders_every_registry_scene_offscreen() {
         let mut renderer =
             pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), 160, 90)).unwrap();
+        renderer
+            .pipeline_mut()
+            .configure_starfield(Some(synthetic_starfield_config()));
         for scene in 0..scenes::REGISTRY.len() as u8 {
             // A distinct counter per scene: a repeated counter is not a new
             // frame, so the colour field would keep showing the first scene.
@@ -728,6 +813,43 @@ mod tests {
                 "scene {scene} is blank"
             );
         }
+    }
+
+    fn synthetic_starfield_config() -> starfield::StarfieldConfig {
+        let catalog =
+            starfield::StarCatalog::from_reader("ra,dec,mag\n0,0,1\n".as_bytes()).unwrap();
+        starfield::StarfieldConfig {
+            catalog: std::sync::Arc::new(catalog),
+            latitude_degrees: 45.0,
+            longitude_degrees: 80.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }
+    }
+
+    /// Scene 6 must retain a visible footprint for a centered bright star on
+    /// the smallest display used by the registry smoke test.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn centered_magnitude_one_star_is_visible_at_160_by_90() {
+        let (width, height) = (160, 90);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        renderer
+            .pipeline_mut()
+            .configure_starfield(Some(synthetic_starfield_config()));
+        let frame = ControlFrame {
+            scene: 6,
+            ..ControlFrame::procedural(6)
+        };
+        let rgb = renderer.render(frame, 0.0).unwrap();
+        let pixel = ((height / 2 * width + width / 2) * 3) as usize;
+        assert!(
+            rgb[pixel..pixel + 3].iter().any(|&channel| channel > 20),
+            "center pixel was not lit: {:?}",
+            &rgb[pixel..pixel + 3]
+        );
     }
 
     /// The mic layers never touch the colour field, and `off` renders exactly
