@@ -137,6 +137,120 @@ fn capture_cli_rejects_explicit_starfield_without_catalog_or_location() {
 }
 
 #[test]
+fn capture_cli_rejects_exclusive_duplicate_frames_before_gpu_setup() {
+    let output_dir = std::env::temp_dir().join(format!(
+        "chipviz-capture-duplicates-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .args(["--frames", "0,60,0", "--exclusive-output", "--out"])
+        .arg(&output_dir)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("duplicate output frame: 0"), "{stderr}");
+    assert!(!output_dir.exists());
+}
+
+#[test]
+fn capture_cli_rejects_exclusive_flag_as_a_missing_path_value() {
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-capture-missing-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let output_dir = root.join("existing");
+    std::fs::create_dir(&output_dir).unwrap();
+    let manifest = output_dir.join("manifest.json");
+    std::fs::write(&manifest, b"preserve me").unwrap();
+
+    for option in ["--out", "--input", "--catalog", "--star-catalog"] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"));
+        command.current_dir(&root);
+        if option != "--out" {
+            command.arg("--out").arg(&output_dir);
+        }
+        let output = command
+            .args([option, "--exclusive-output"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{option}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "{option} requires a value; --exclusive-output is a flag"
+            )),
+            "{option}: {stderr}"
+        );
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"preserve me");
+        assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 1);
+        assert!(!root.join("--exclusive-output").exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn exclusive_cli_matches_legacy_synthetic_capture() {
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-capture-exclusive-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    for (directory, exclusive) in [("legacy", false), ("exclusive", true)] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"));
+        command.args([
+            "--profile",
+            "pi5",
+            "--scene",
+            "2",
+            "--input",
+            "synth-mic",
+            "--frames",
+            "0,60",
+            "--size",
+            "160x90",
+            "--out",
+        ]);
+        command.arg(root.join(directory));
+        if exclusive {
+            command.arg("--exclusive-output");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for file in [
+        "frame000000-PulseTunnel.png",
+        "frame000060-PulseTunnel.png",
+        "manifest.json",
+    ] {
+        assert_eq!(
+            std::fs::read(root.join("legacy").join(file)).unwrap(),
+            std::fs::read(root.join("exclusive").join(file)).unwrap(),
+            "{file}"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "requires a GPU adapter"]
 fn capture_api_and_cli_select_variants_without_changing_the_default() {
     let root = std::env::temp_dir().join(format!(

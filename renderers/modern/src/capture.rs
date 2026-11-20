@@ -1,6 +1,8 @@
 //! `chipviz-capture`: renders selected frames through the real renderer
 //! pipeline into an offscreen texture and writes PNGs plus `manifest.json`.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -23,6 +25,7 @@ const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scen
                        [--catalog FILE --location LAT,LON]
                        [--time UNIX_SECONDS] [--follow-time]
                        [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
+                       [--exclusive-output]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
@@ -51,7 +54,11 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --time     observation UTC as Unix seconds (1800..2200); defaults to current UTC
   --follow-time advance from --time (or current UTC), for reproducible moving-sky captures
   --tunnel-variant
-             PulseTunnel look: original (default), hallway or abstract";
+             PulseTunnel look: original (default), hallway or abstract
+  --exclusive-output
+             create PNGs and manifest exclusively; fail on existing leaves or
+             duplicate frames. Requires a trusted, non-mutable output directory;
+             newly created partial files may remain on failure.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -133,7 +140,7 @@ pub enum StarfieldConfiguredCommand {
 /// Parse the original capture arguments. Extended flags are rejected rather
 /// than silently dropped; use one of the configured APIs for those flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
-    match parse_args_internal(args, false, false)?.0 {
+    match parse_args_internal(args, false, false, false)?.0 {
         ConfiguredCommand::Help => Ok(Command::Help),
         ConfiguredCommand::Capture(args, _) => Ok(Command::Capture(args)),
     }
@@ -144,17 +151,28 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
 pub fn parse_args_with_options(
     args: impl IntoIterator<Item = String>,
 ) -> Result<ConfiguredCommand, String> {
-    parse_args_internal(args, true, false).map(|(command, _, _)| command)
+    parse_args_internal(args, true, false, false).map(|(command, _, _, _)| command)
 }
 
 /// Parse capture arguments with both tunnel and Starfield options.
 pub fn parse_args_with_starfield_options(
     args: impl IntoIterator<Item = String>,
 ) -> Result<StarfieldConfiguredCommand, String> {
-    let (parsed, starfield, explicit_starfield) = parse_args_internal(args, true, true)?;
-    Ok(match parsed {
+    parse_starfield_args(args, false).map(|(command, _)| command)
+}
+
+fn parse_starfield_args(
+    args: impl IntoIterator<Item = String>,
+    allow_exclusive: bool,
+) -> Result<(StarfieldConfiguredCommand, bool), String> {
+    let (parsed, starfield, explicit_starfield, exclusive) =
+        parse_args_internal(args, true, true, allow_exclusive)?;
+    let command = match parsed {
         ConfiguredCommand::Help => StarfieldConfiguredCommand::Help,
         ConfiguredCommand::Capture(args, capture_options) => {
+            if exclusive {
+                validate_unique_frames(&args.frames)?;
+            }
             let starfield_enabled = cli_starfield_opt_in(&args, &starfield, explicit_starfield);
             StarfieldConfiguredCommand::Capture(
                 args,
@@ -165,14 +183,16 @@ pub fn parse_args_with_starfield_options(
                 },
             )
         }
-    })
+    };
+    Ok((command, exclusive))
 }
 
 fn parse_args_internal(
     args: impl IntoIterator<Item = String>,
     allow_capture_options: bool,
     allow_starfield_options: bool,
-) -> Result<(ConfiguredCommand, StarfieldOptions, bool), String> {
+    allow_exclusive: bool,
+) -> Result<(ConfiguredCommand, StarfieldOptions, bool, bool), String> {
     let mut profile = RenderProfile::m1();
     let mut scene = None;
     let mut frames = vec![0];
@@ -186,14 +206,30 @@ fn parse_args_internal(
     let mut unix_seconds = None;
     let mut follow_time = false;
     let mut explicit_starfield = false;
+    let mut exclusive = false;
     let mut tunnel_variant = TunnelVariant::Original;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            return Ok((ConfiguredCommand::Help, StarfieldOptions::default(), false));
+            return Ok((
+                ConfiguredCommand::Help,
+                StarfieldOptions::default(),
+                false,
+                false,
+            ));
         }
-        let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
+        let mut value = || {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("{arg} requires a value"))?;
+            if allow_exclusive && value == "--exclusive-output" {
+                return Err(format!(
+                    "{arg} requires a value; --exclusive-output is a flag (use ./--exclusive-output for a literal path)"
+                ));
+            }
+            Ok(value)
+        };
         match arg.as_str() {
             "--profile" => {
                 profile = match value()?.as_str() {
@@ -244,6 +280,12 @@ fn parse_args_internal(
                 })?;
             }
             "--lines-drop-cuts" => lines_drop_cuts = true,
+            "--exclusive-output" => {
+                if !allow_exclusive {
+                    return Err("--exclusive-output is only supported by the capture CLI".into());
+                }
+                exclusive = true;
+            }
             "--tunnel-variant" => {
                 if !allow_capture_options {
                     return Err("--tunnel-variant requires parse_args_with_options".into());
@@ -331,7 +373,18 @@ fn parse_args_internal(
             follow_time,
         },
         explicit_starfield,
+        exclusive,
     ))
+}
+
+fn validate_unique_frames(frames: &[u64]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for &frame in frames {
+        if !seen.insert(frame) {
+            return Err(format!("duplicate output frame: {frame}"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_location(value: &str) -> Result<(f64, f64), String> {
@@ -496,7 +549,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
 /// Capture using #139's tunnel options. Legacy scene bytes, including scene 6,
 /// keep their original native mapping in this API.
 pub fn run_with_options(args: &CaptureArgs, options: CaptureOptions) -> Result<(), String> {
-    run_internal(args, options, &StarfieldOptions::default(), false)
+    run_internal(args, options, &StarfieldOptions::default(), false, false)
 }
 
 /// Capture with an explicit Starfield opt-in and its separate configuration.
@@ -511,6 +564,7 @@ pub fn run_with_starfield_options(
         options.capture,
         &options.starfield,
         options.starfield_enabled,
+        false,
     )
 }
 
@@ -530,7 +584,11 @@ fn run_internal(
     options: CaptureOptions,
     starfield_options: &StarfieldOptions,
     starfield_enabled: bool,
+    exclusive: bool,
 ) -> Result<(), String> {
+    if exclusive {
+        validate_unique_frames(&args.frames)?;
+    }
     if starfield_options.catalog_path.is_some() != starfield_options.location.is_some() {
         return Err("--star-catalog and --location must be supplied together for scene 6".into());
     }
@@ -637,6 +695,7 @@ fn run_internal(
         .pipeline_mut()
         .enable_starfield_dispatch(starfield_enabled);
     let mut captures = Vec::new();
+    let mut outputs = OutputFiles::new(exclusive);
 
     for &index in &args.frames {
         // Replay camera smoothing and the colour field from frame 0 so stills
@@ -672,7 +731,7 @@ fn run_internal(
                 entry.camera()
             };
         let file = format!("frame{index:06}-{name}.png");
-        write_png(&args.out.join(&file), width, height, &rgb)?;
+        write_png(&mut outputs, &args.out.join(&file), width, height, &rgb)?;
         println!("wrote {}", args.out.join(&file).display());
         let frame_starfield_epoch = starfield.as_ref().map_or_else(
             || "null".to_string(),
@@ -704,7 +763,7 @@ fn run_internal(
         captures.join(",\n"),
     );
     let path = args.out.join("manifest.json");
-    std::fs::write(&path, manifest).map_err(|error| format!("{}: {error}", path.display()))
+    write_manifest(&mut outputs, &path, manifest.as_bytes())
 }
 
 fn starfield_metadata(config: Option<&starfield::StarfieldConfig>) -> (String, String) {
@@ -815,9 +874,49 @@ fn preflight_replay(
     }
 }
 
-fn write_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<(), String> {
+struct OutputFiles {
+    exclusive: bool,
+    paths: HashSet<PathBuf>,
+}
+
+impl OutputFiles {
+    fn new(exclusive: bool) -> Self {
+        Self {
+            exclusive,
+            paths: HashSet::new(),
+        }
+    }
+
+    fn create(&mut self, path: &Path) -> Result<std::fs::File, String> {
+        if self.exclusive && !self.paths.insert(path.to_path_buf()) {
+            return Err(format!("duplicate output path: {}", path.display()));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(!self.exclusive)
+            .create_new(self.exclusive)
+            .open(path)
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+}
+
+fn write_manifest(outputs: &mut OutputFiles, path: &Path, manifest: &[u8]) -> Result<(), String> {
+    outputs
+        .create(path)?
+        .write_all(manifest)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn write_png(
+    outputs: &mut OutputFiles,
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+) -> Result<(), String> {
     let error = |error: &dyn std::fmt::Display| format!("{}: {error}", path.display());
-    let file = std::fs::File::create(path).map_err(|e| error(&e))?;
+    let file = outputs.create(path)?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
@@ -844,13 +943,19 @@ fn json_string(text: &str) -> String {
 }
 
 pub fn main() -> ExitCode {
-    match parse_args_with_starfield_options(std::env::args().skip(1)) {
-        Ok(StarfieldConfiguredCommand::Help) => {
+    match parse_starfield_args(std::env::args().skip(1), true) {
+        Ok((StarfieldConfiguredCommand::Help, _)) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Ok(StarfieldConfiguredCommand::Capture(args, options)) => {
-            match run_with_starfield_options(&args, &options) {
+        Ok((StarfieldConfiguredCommand::Capture(args, options), exclusive)) => {
+            match run_internal(
+                &args,
+                options.capture,
+                &options.starfield,
+                options.starfield_enabled,
+                exclusive,
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("chipviz-capture: {error}");
@@ -869,6 +974,206 @@ pub fn main() -> ExitCode {
 mod tests {
     use super::*;
     use crate::phosphor;
+
+    fn output_test_dir() -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chipviz-capture-output-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn exclusive_outputs_preserve_existing_png_and_manifest_and_default_overwrites() {
+        let root = output_test_dir();
+        let png = root.join("frame000000-SignalField.png");
+        let manifest = root.join("manifest.json");
+        std::fs::write(&png, b"existing png").unwrap();
+        std::fs::write(&manifest, b"existing manifest").unwrap();
+
+        let mut exclusive = OutputFiles::new(true);
+        assert!(write_png(&mut exclusive, &png, 1, 1, &[1, 2, 3]).is_err());
+        assert!(write_manifest(&mut exclusive, &manifest, b"new manifest").is_err());
+        assert_eq!(std::fs::read(&png).unwrap(), b"existing png");
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"existing manifest");
+
+        let mut legacy = OutputFiles::new(false);
+        write_png(&mut legacy, &png, 1, 1, &[1, 2, 3]).unwrap();
+        write_manifest(&mut legacy, &manifest, b"new manifest").unwrap();
+        assert!(
+            std::fs::read(&png)
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n")
+        );
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"new manifest");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_exclusive_outputs_match_legacy_bytes() {
+        let root = output_test_dir();
+        let mut exclusive = OutputFiles::new(true);
+        let mut legacy = OutputFiles::new(false);
+        let exclusive_png = root.join("exclusive.png");
+        let legacy_png = root.join("legacy.png");
+        let exclusive_manifest = root.join("exclusive.json");
+        let legacy_manifest = root.join("legacy.json");
+        write_png(&mut exclusive, &exclusive_png, 1, 1, &[1, 2, 3]).unwrap();
+        write_png(&mut legacy, &legacy_png, 1, 1, &[1, 2, 3]).unwrap();
+        write_manifest(&mut exclusive, &exclusive_manifest, b"manifest").unwrap();
+        write_manifest(&mut legacy, &legacy_manifest, b"manifest").unwrap();
+        assert_eq!(
+            std::fs::read(exclusive_png).unwrap(),
+            std::fs::read(legacy_png).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(exclusive_manifest).unwrap(),
+            std::fs::read(legacy_manifest).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclusive_outputs_reject_duplicate_paths_even_after_removal() {
+        let root = output_test_dir();
+        let path = root.join("manifest.json");
+        let mut outputs = OutputFiles::new(true);
+        write_manifest(&mut outputs, &path, b"first").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let error = write_manifest(&mut outputs, &path, b"second").unwrap_err();
+        assert!(error.contains("duplicate output path"), "{error}");
+        assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_outputs_refuse_existing_and_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = output_test_dir();
+        let target = root.join("target");
+        let missing = root.join("missing");
+        let png = root.join("frame000000-SignalField.png");
+        let manifest = root.join("manifest.json");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&missing, &png).unwrap();
+        symlink(&target, &manifest).unwrap();
+        let mut outputs = OutputFiles::new(true);
+        assert!(write_png(&mut outputs, &png, 1, 1, &[1, 2, 3]).is_err());
+        assert!(write_manifest(&mut outputs, &manifest, b"new").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(!missing.exists());
+        assert!(
+            std::fs::symlink_metadata(&png)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&manifest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclusive_cli_parsing_and_legacy_parsers() {
+        let flags = ["--out", "shots", "--exclusive-output"];
+        let (command, exclusive) = parse_starfield_args(flags.map(str::to_string), true).unwrap();
+        assert!(matches!(command, StarfieldConfiguredCommand::Capture(_, _)));
+        assert!(exclusive);
+        let (_, exclusive) =
+            parse_starfield_args(["--out", "shots"].map(str::to_string), true).unwrap();
+        assert!(!exclusive);
+        assert!(parse_args(flags.map(str::to_string)).is_err());
+        assert!(parse_args_with_options(flags.map(str::to_string)).is_err());
+        assert!(parse_args_with_starfield_options(flags.map(str::to_string)).is_err());
+
+        let duplicate = ["--out", "shots", "--frames", "0,60,0", "--exclusive-output"];
+        let error = parse_starfield_args(duplicate.map(str::to_string), true).unwrap_err();
+        assert!(error.contains("duplicate output frame: 0"), "{error}");
+        assert!(parse_args(["--out", "shots", "--frames", "0,0"].map(str::to_string)).is_ok());
+    }
+
+    #[test]
+    fn exclusive_flag_cannot_be_consumed_as_a_cli_option_value() {
+        for option in [
+            "--out",
+            "--input",
+            "--catalog",
+            "--star-catalog",
+            "--profile",
+            "--scene",
+            "--frames",
+            "--size",
+            "--mic-layers",
+            "--tunnel-variant",
+            "--location",
+            "--time",
+        ] {
+            let error = parse_starfield_args(
+                ["--out", "shots", option, "--exclusive-output"].map(str::to_string),
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "{option} requires a value; --exclusive-output is a flag"
+                )),
+                "{option}: {error}"
+            );
+        }
+
+        let (command, exclusive) = parse_starfield_args(
+            [
+                "--out",
+                "./--exclusive-output",
+                "--input",
+                "./--exclusive-output",
+                "--catalog",
+                "./--exclusive-output",
+                "--location",
+                "0,0",
+                "--exclusive-output",
+            ]
+            .map(str::to_string),
+            true,
+        )
+        .unwrap();
+        let StarfieldConfiguredCommand::Capture(args, options) = command else {
+            panic!("unexpected help");
+        };
+        assert!(exclusive);
+        assert_eq!(args.out, PathBuf::from("./--exclusive-output"));
+        assert_eq!(args.input, Input::File("./--exclusive-output".into()));
+        assert_eq!(
+            options.starfield.catalog_path,
+            Some(PathBuf::from("./--exclusive-output"))
+        );
+
+        // The public legacy parsers still accept the literal as a path value.
+        let Command::Capture(args) =
+            parse_args(["--out", "--exclusive-output"].map(str::to_string)).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.out, PathBuf::from("--exclusive-output"));
+        let StarfieldConfiguredCommand::Capture(args, _) = parse_args_with_starfield_options(
+            ["--out", "shots", "--input", "--exclusive-output"].map(str::to_string),
+        )
+        .unwrap() else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.input, Input::File("--exclusive-output".into()));
+    }
 
     fn parse(args: &[&str]) -> Result<CaptureArgs, String> {
         match parse_args(args.iter().map(|arg| arg.to_string()))? {
