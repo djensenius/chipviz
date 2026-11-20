@@ -18,9 +18,17 @@ jobs:
           cc65 -t c64 -o "$RUNNER_TEMP/scene_catalog_v1_ring_default.s" shared/src/scene_catalog_v1_ring.c
           cc65 --standard c99 -t c64 -o "$RUNNER_TEMP/scene_catalog_v1_ring_c99.s" shared/src/scene_catalog_v1_ring.c
           printf '%s\n' '#include "chipviz/scene_catalog_v1_ring.h"' 'int main(void) { return 0; }' | cc65 -I shared/include -t c64 -o "$RUNNER_TEMP/scene_catalog_v1_header.s" /dev/stdin
+          cc65 -Werror -t c64 -o "$RUNNER_TEMP/catalog_pairs_unused.s" tests/scene_catalog_v1_pairs_consumer.c
+          cc65 -Werror -t c64 -DCHIPVIZ_TEST_USE_PAIR -o "$RUNNER_TEMP/catalog_pairs_used.s" tests/scene_catalog_v1_pairs_consumer.c
+          cc65 --standard c99 -Werror -t c64 -o "$RUNNER_TEMP/catalog_pairs_unused_c99.s" tests/scene_catalog_v1_pairs_consumer.c
+          cc65 --standard c99 -Werror -t c64 -DCHIPVIZ_TEST_USE_PAIR -o "$RUNNER_TEMP/catalog_pairs_used_c99.s" tests/scene_catalog_v1_pairs_consumer.c
           test -s "$RUNNER_TEMP/scene_catalog_v1_ring_default.s"
           test -s "$RUNNER_TEMP/scene_catalog_v1_ring_c99.s"
           test -s "$RUNNER_TEMP/scene_catalog_v1_header.s"
+          test -s "$RUNNER_TEMP/catalog_pairs_unused.s"
+          test -s "$RUNNER_TEMP/catalog_pairs_used.s"
+          test -s "$RUNNER_TEMP/catalog_pairs_unused_c99.s"
+          test -s "$RUNNER_TEMP/catalog_pairs_used_c99.s"
       - name: Build C64 PRG
         run: make -C cores/c64/homebrew
       - name: Verify C64 PRG

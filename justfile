@@ -120,6 +120,11 @@ scene-catalog-v1-ring-test:
     @mkdir -p build/tests
     @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_ring_tests.c shared/src/scene_catalog_v1_ring.c -o build/tests/scene_catalog_v1_ring_tests
     @build/tests/scene_catalog_v1_ring_tests
+    @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_pairs_consumer.c -o build/tests/scene_catalog_v1_pairs_unused
+    @${CC:-cc} {{ cflags }} -DCHIPVIZ_TEST_USE_PAIR tests/scene_catalog_v1_pairs_consumer.c -o build/tests/scene_catalog_v1_pairs_used
+    @build/tests/scene_catalog_v1_pairs_unused
+    @build/tests/scene_catalog_v1_pairs_used
+    @echo "scene catalog v1 pair consumer tests passed"
 
 c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test
     @mkdir -p build/tests
