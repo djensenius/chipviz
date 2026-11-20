@@ -340,12 +340,15 @@ fn differential_recordings_against_python_host_validator() {
         "{}/tests/catalog_v1_reference.py",
         env!("CARGO_MANIFEST_DIR")
     );
-    let mut child = Command::new("python3")
+    let python = std::env::var_os("PYTHON")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "python3".into());
+    let mut child = Command::new(python)
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("development differential test requires python3");
+        .expect("development differential test requires a Python interpreter");
     {
         let mut stdin = child.stdin.take().unwrap();
         for (_, bytes, _) in &vectors {
