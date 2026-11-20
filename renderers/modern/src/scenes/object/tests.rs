@@ -203,6 +203,51 @@ fn every_model_mesh_is_finite_bounded_and_within_budget() {
     }
 }
 
+/// The coarsest step `kind` is drawn at on `profile`, over every
+/// background it meets.
+fn coarsest_step(kind: Kind, profile: &RenderProfile) -> f32 {
+    let frames = (0..55).map(|index| frame_in(index, 200));
+    let frames = frames.filter(|&frame| section(frame).object == kind);
+    let steps = frames.map(|frame| {
+        let section = section(frame);
+        let stage = stage(frame, section, WIDE);
+        let (_, budget) = background(profile, section, &stage, profile.instance_count);
+        step_for(kind, (budget as f32 * OVERSAMPLE) as usize)
+    });
+    steps.fold(0.0, f32::max)
+}
+
+/// The font pixels (five columns by seven body rows per letter) that the
+/// face's sample grid at `step` never lands on.
+fn missed_pixels(label: &models::Label, step: f32) -> Vec<(usize, usize)> {
+    let count = label.line.chars().count();
+    let [nu, nv] = label.extent.map(|length| models::steps(length, step));
+    let mut hit = std::collections::HashSet::new();
+    for i in 0..nu {
+        for j in 0..nv {
+            let [u, v] = [(i, nu), (j, nv)].map(|(k, n)| (k as f32 + 0.5) / n as f32);
+            let across = (u - label.u[0]) / (label.u[1] - label.u[0]);
+            let up = (v - label.v[0]) / (label.v[1] - label.v[0]);
+            if (0.0..1.0).contains(&across) && (0.0..1.0).contains(&up) {
+                let column = (across * count as f32 * 6.0) as usize;
+                hit.insert((column, ((1.0 - up) * 7.0) as usize));
+            }
+        }
+    }
+    let pixels = (0..count * 6).filter(|column| column % 6 < 5);
+    let pixels = pixels.flat_map(|column| (0..7).map(move |row| (column, row)));
+    pixels.filter(|pixel| !hit.contains(pixel)).collect()
+}
+
+#[test]
+fn lettering_samples_every_font_row_and_column_on_m1() {
+    for (kind, label) in models::LABELS {
+        let step = coarsest_step(kind, &RenderProfile::m1());
+        let missed = missed_pixels(label, step);
+        assert!(missed.is_empty(), "{} at {step}: {missed:?}", label.line);
+    }
+}
+
 #[test]
 fn models_build_deterministically() {
     let look = Look {
@@ -434,7 +479,9 @@ fn camcorder_tearing_only_in_camcorder_sections() {
 fn fingerprint() -> u64 {
     let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
     for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
-        for frame in [0, 48, 200, 700, 1_300, 1_800, 2_250, 2_800, 6_000] {
+        for frame in [
+            0, 48, 200, 700, 1_300, 1_800, 2_250, 2_800, 3_272, 3_784, 4_296, 4_808, 5_320, 6_000,
+        ] {
             for byte in
                 bytemuck::cast_slice::<Instance, u8>(&build_frame(&profile, at(frame), WIDE))
             {
@@ -447,11 +494,13 @@ fn fingerprint() -> u64 {
 }
 
 // Gated like the registry goldens: platform libm sin/cos may differ in the
-// last ulp elsewhere. Re-recorded in phase B: frames 0 to 2_800 (sections 0
-// to 5) are unchanged, but frame 6_000 is in section 11, which the
-// eleven-object cycle now gives the television instead of the computer.
+// last ulp elsewhere. Re-recorded in phase B, which added frames 3_272 to
+// 5_320 (one per new object). Frames 0 to 2_800 (sections 0 to 5) are
+// unchanged, but frame 6_000 is in section 11, which the eleven-object
+// cycle changed from the computer, hue-cycle morph and camcorder overlay to
+// the television, beat-jump morph and infomercial overlay.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn instances_match_recorded_golden() {
-    assert_eq!(fingerprint(), 0x1284_8946_dbc4_a6fb);
+    assert_eq!(fingerprint(), 0x2d34_2a5a_47ee_e027);
 }
