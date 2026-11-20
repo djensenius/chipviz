@@ -1649,14 +1649,18 @@ mod tests {
             ..ControlFrame::procedural(0)
         };
 
-        // Independently calculated center-pixel sRGB codes, with a ±3-code
-        // tolerance for rasterization and attachment quantization.
+        // Independently calculated center-pixel sRGB codes, with a ±1-code
+        // tolerance for rasterization and attachment quantization. The first
+        // two stars' expected quantized luminances are 0.0192846 and 0.0197899
+        // (inverted), despite their pre-quantization luminances being ordered;
+        // check them independently rather than imposing a false output order.
         let samples = [
             ((80, 45), [36, 38, 42]),
             ((97, 52), [41, 38, 35]),
             ((62, 52), [34, 14, 0]),
             ((55, 60), [16, 16, 16]),
         ];
+        let mut attachment_samples = Vec::new();
         let decode_srgb = |code: u8| {
             let value = f32::from(code) / 255.0;
             if value <= 0.04045 {
@@ -1691,23 +1695,39 @@ mod tests {
                 let offset = (y * 160 + x) * 3;
                 [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
             };
+            let format_samples: Vec<_> = samples
+                .iter()
+                .map(|(position, _)| read_pixel(*position))
+                .collect();
 
-            for (position, expected) in samples {
-                let actual = read_pixel(position);
+            for ((position, expected), actual) in samples.iter().zip(&format_samples) {
                 assert!(
                     actual
                         .iter()
                         .zip(expected)
-                        .all(|(&actual, expected)| actual.abs_diff(expected) <= 3),
+                        .all(|(&actual, &expected)| actual.abs_diff(expected) <= 1),
                     "{format:?} at {position:?}: expected sRGB codes near {expected:?}, got {actual:?}"
                 );
             }
 
-            let brighter_faint = luminance(read_pixel((62, 52)));
-            let fainter_white = luminance(read_pixel((55, 60)));
+            let brighter_faint = luminance(format_samples[2]);
+            let fainter_white = luminance(format_samples[3]);
             assert!(
                 brighter_faint > fainter_white,
                 "{format:?}: distinguishable faint stars should retain readback luminance order ({brighter_faint} <= {fainter_white})"
+            );
+            attachment_samples.push(format_samples);
+        }
+
+        for (sample, (srgb, unorm)) in samples
+            .iter()
+            .zip(attachment_samples[0].iter().zip(&attachment_samples[1]))
+        {
+            assert!(
+                srgb.iter()
+                    .zip(unorm)
+                    .all(|(&srgb, &unorm)| srgb.abs_diff(unorm) <= 1),
+                "sRGB and UNORM readbacks differ by more than one code at {sample:?}: {srgb:?} vs {unorm:?}"
             );
         }
     }
