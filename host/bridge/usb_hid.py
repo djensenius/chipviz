@@ -13,6 +13,8 @@ from n64_joybus import decode_control_frame
 from chipviz_bridge import WIRE_SIZE, add_allow_flash_argument, announce_allow_flash, sanitise_flash
 
 PALETTE_KEYS = ("Q", "W", "E", "R", "T", "Y", "U", "I")
+GBA_SCENES = (0, 1, 2, 3, 7)
+STABLE_POLLS = 60
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,117 @@ class HidState:
   left_x: int
   left_y: int
   keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GamepadState:
+  buttons: int
+  left_x: int
+  left_y: int
+  dpad: tuple[str, ...]
+  keys: tuple[str, ...] = ()
+
+
+def gba_targets(wire: bytes, allow_flash: bool) -> tuple[int, int]:
+  frame = decode_control_frame(sanitise_flash(wire, "hid", allow_flash))
+  scene = frame.scene & 7
+  return (7 if scene == 7 else scene & 3, frame.palette & 7)
+
+
+class GbaGamepadMapper:
+  """Estimate receiver rings assuming every output is delivered in order."""
+
+  def __init__(self, scene: int, palette: int, allow_flash: bool = False) -> None:
+    self.allow_flash = allow_flash
+    self.resync(scene, palette)
+
+  def disconnect(self) -> None:
+    self.scene = None
+    self.palette = None
+    self.wait = 0
+
+  def resync(self, scene: int, palette: int) -> None:
+    if scene not in GBA_SCENES or palette not in range(8):
+      raise ValueError("known GBA scene must be 0..3 or 7, and palette 0..7")
+    if not self.allow_flash and scene == 7 and palette in (3, 7):
+      raise ValueError("resynchronize to a safe palette before using scene 7")
+    self.scene: int | None = scene
+    self.palette: int | None = palette
+    self.wait = 0
+
+  @staticmethod
+  def _direction(ring: tuple[int, ...], current: int, target: int,
+                 forbidden: tuple[int, ...] = ()) -> int:
+    if current == target:
+      return 0
+    choices = []
+    for direction in (1, -1):
+      index = ring.index(current)
+      for distance in range(1, len(ring)):
+        index = (index + direction) % len(ring)
+        if ring[index] in forbidden:
+          break
+        if ring[index] == target:
+          choices.append((distance, -direction, direction))
+          break
+    if not choices:
+      raise ValueError("palette cannot cross 3 or 7 while scene 7 is selected without --allow-flash")
+    return min(choices)[2]
+
+  def step(self, wire: bytes) -> GamepadState:
+    if self.scene is None or self.palette is None:
+      raise ValueError("receiver state unknown; resynchronize before conversion")
+    target_scene, target_palette = gba_targets(wire, self.allow_flash)
+    base = map_frame(wire, self.allow_flash)
+    dpad: tuple[str, ...] = ()
+    if self.wait:
+      self.wait -= 1
+    else:
+      # Leave scene 7 before changing a native palette; prepare the palette
+      # before entering it. Native-to-native routes never pass through 7.
+      palette_first = target_scene == 7 and self.scene != 7
+      scene_first = self.scene == 7 and target_scene != 7
+      if palette_first and self.palette != target_palette:
+        axis = "palette"
+      elif scene_first or self.scene != target_scene:
+        axis = "scene"
+      else:
+        axis = "palette"
+      if axis == "scene":
+        forbidden = (7,) if self.scene != 7 and target_scene != 7 else ()
+        direction = self._direction(GBA_SCENES, self.scene, target_scene, forbidden)
+        if direction:
+          self.scene = GBA_SCENES[(GBA_SCENES.index(self.scene) + direction) % len(GBA_SCENES)]
+          dpad = ("up" if direction == 1 else "down",)
+      else:
+        forbidden = (3, 7) if self.scene == 7 and not self.allow_flash else ()
+        direction = self._direction(tuple(range(8)), self.palette, target_palette, forbidden)
+        if direction:
+          self.palette = (self.palette + direction) % 8
+          dpad = ("right" if direction == 1 else "left",)
+      if dpad:
+        self.wait = STABLE_POLLS - 1
+    return GamepadState(base.buttons, base.left_x, base.left_y, dpad)
+
+
+def convert_gba_stream(stream: bytes, scene: int, palette: int,
+                       allow_flash: bool = False) -> list[GamepadState]:
+  if len(stream) % WIRE_SIZE != 0:
+    raise ValueError("control-frame stream is not aligned to 33-byte records")
+  mapper = GbaGamepadMapper(scene, palette, allow_flash)
+  states = []
+  for offset in range(0, len(stream), WIRE_SIZE):
+    wire = stream[offset:offset + WIRE_SIZE]
+    states.append(mapper.step(wire))
+  if stream:
+    # Finish the latest selection and its stability interval.
+    last_wire = stream[-WIRE_SIZE:]
+    target = gba_targets(last_wire, allow_flash)
+    while mapper.wait or (mapper.scene, mapper.palette) != target:
+      states.append(mapper.step(last_wire))
+    if states[-1].buttons:
+      states.append(GamepadState(0, states[-1].left_x, states[-1].left_y, ()))
+  return states
 
 
 def signed_bucket(value: int) -> int:
@@ -77,14 +190,26 @@ def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--input", type=Path, required=True, help="raw control-frame-v0 stream")
   parser.add_argument("--output", type=Path, help="JSON HID state stream; stdout if omitted")
+  parser.add_argument("--gba-gamepad", action="store_true", help="opt in to GBA relative D-pad output")
+  parser.add_argument("--initial-scene", type=int, choices=GBA_SCENES)
+  parser.add_argument("--initial-palette", type=int, choices=range(8))
   add_allow_flash_argument(parser)
   return parser
 
 
 def main_from_args(argv: list[str] | None = None) -> int:
   args = build_parser().parse_args(argv)
+  if args.gba_gamepad != (args.initial_scene is not None and args.initial_palette is not None):
+    raise SystemExit("--gba-gamepad requires both --initial-scene and --initial-palette")
+  if not args.gba_gamepad and (args.initial_scene is not None or args.initial_palette is not None):
+    raise SystemExit("initial selections require --gba-gamepad")
   announce_allow_flash(args.allow_flash)
-  states = [asdict(state) for state in convert_stream(args.input.read_bytes(), args.allow_flash)]
+  stream = args.input.read_bytes()
+  if args.gba_gamepad:
+    mapped = convert_gba_stream(stream, args.initial_scene, args.initial_palette, args.allow_flash)
+  else:
+    mapped = convert_stream(stream, args.allow_flash)
+  states = [asdict(state) for state in mapped]
   output = json.dumps(states, indent=2).encode("utf-8") + b"\n"
   if args.output is None or str(args.output) == "-":
     sys.stdout.buffer.write(output)

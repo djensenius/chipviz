@@ -260,6 +260,125 @@ def _scene_frame(scene: int, palette: int) -> bytes:
   ))
 
 
+class GbaGamepadTests(unittest.TestCase):
+  def _receive(self, states, scene=0, palette=0):
+    ring = usb_hid.GBA_SCENES
+    previous = ()
+    seen = []
+    for state in states:
+      self.assertEqual(state.keys, ())
+      self.assertLessEqual(len(state.dpad), 1)
+      if state.dpad:
+        self.assertEqual(previous, (), "every press needs a release")
+        direction = state.dpad[0]
+        if direction in ("up", "down"):
+          scene = ring[(ring.index(scene) + (1 if direction == "up" else -1)) % len(ring)]
+        else:
+          palette = (palette + (1 if direction == "right" else -1)) % 8
+      seen.append((scene, palette))
+      previous = state.dpad
+    self.assertEqual(previous, ())
+    return seen
+
+  def test_all_ring_destinations_wrap_and_stabilize(self):
+    for scene in usb_hid.GBA_SCENES:
+      for palette in range(8):
+        with self.subTest(scene=scene, palette=palette):
+          states = usb_hid.convert_gba_stream(_scene_frame(scene, palette), 0, 0, True)
+          seen = self._receive(states)
+          self.assertEqual(seen[-1], (scene, palette))
+          pulses = [i for i, state in enumerate(states) if state.dpad]
+          self.assertTrue(all(b - a >= 60 for a, b in zip(pulses, pulses[1:])))
+          if pulses:
+            self.assertGreaterEqual(len(states) - pulses[-1], 60)
+          self.assertEqual(usb_hid.convert_gba_stream(_scene_frame(scene, palette) * 2, scene, palette, True)[0].dpad, ())
+
+  def test_latest_target_wins_and_opposite_has_release(self):
+    stream = _scene_frame(1, 0) + _scene_frame(0, 0) * 61
+    states = usb_hid.convert_gba_stream(stream, 0, 0)
+    self.assertEqual([(i, s.dpad) for i, s in enumerate(states) if s.dpad],
+                     [(0, ("up",)), (60, ("down",))])
+    self.assertEqual(self._receive(states)[-1], (0, 0))
+
+  def test_aliases_and_native_route_avoids_seven(self):
+    states = usb_hid.convert_gba_stream(_scene_frame(6, 0), 0, 0)
+    self.assertEqual(self._receive(states)[-1], (2, 0))
+    states = usb_hid.convert_gba_stream(_scene_frame(3, 0), 0, 0)
+    self.assertNotIn(7, [scene for scene, _ in self._receive(states)])
+
+  def test_flash_guard_and_safe_paths(self):
+    for palette, safe in ((3, 2), (7, 6)):
+      with self.subTest(palette=palette):
+        states = usb_hid.convert_gba_stream(_scene_frame(15, palette), 0, 0)
+        seen = self._receive(states)
+        self.assertEqual(seen[-1], (7, safe))
+        self.assertTrue(all(p not in (3, 7) for s, p in seen if s == 7))
+        allowed = usb_hid.convert_gba_stream(_scene_frame(15, palette), 0, 0, True)
+        self.assertEqual(self._receive(allowed)[-1], (7, palette))
+    with self.assertRaisesRegex(ValueError, "cannot cross"):
+      usb_hid.convert_gba_stream(_scene_frame(7, 4), 7, 0)
+    with self.assertRaisesRegex(ValueError, "safe palette"):
+      usb_hid.GbaGamepadMapper(7, 3)
+    # Leaving scene 7 precedes a native palette change, including the debounce wait.
+    states = usb_hid.convert_gba_stream(_scene_frame(0, 3), 7, 2)
+    self.assertEqual([(i, s.dpad) for i, s in enumerate(states) if s.dpad],
+                     [(0, ("up",)), (60, ("right",))])
+
+  def test_f19_digital_buttons_and_f24_relative_only(self):
+    base = chipviz_bridge.ControlFrame(
+      frame=0, bpm=120, beat_phase=0, beat_count=0, energy=200, bass=0, mid=0, treble=0,
+      spectrum=(0,) * 8, scene=7, palette=3, flags=1, notes=(),
+    )
+    states = usb_hid.convert_gba_stream(chipviz_bridge.pack_frame(base), 7, 0, True)
+    seen = self._receive(states, 7, 0)
+    self.assertTrue(all(state.buttons & 0x11 == 0x11 for state in states[:-1]))
+    self.assertEqual(states[-1].buttons, 0)
+    self.assertEqual(seen[-30:], [(7, 3)] * 30)
+    self.assertTrue(all(state.keys == () for state in states))
+    # F24 requires a data-role receiver to treat this run as unarmed; no
+    # absolute scene/palette keys capable of arming are emitted.
+    self.assertEqual([state.dpad for state in states if state.dpad], [("right",)] * 3)
+
+  def test_initial_validation_and_stream_alignment(self):
+    for scene, palette in ((4, 0), (0, 8), (-1, 0)):
+      with self.subTest(scene=scene, palette=palette), self.assertRaises(ValueError):
+        usb_hid.GbaGamepadMapper(scene, palette)
+    with self.assertRaisesRegex(ValueError, "aligned"):
+      usb_hid.convert_gba_stream(b"x", 0, 0)
+
+  def test_disconnect_requires_known_resynchronization(self):
+    mapper = usb_hid.GbaGamepadMapper(0, 0)
+    mapper.step(_scene_frame(1, 0))
+    mapper.disconnect()
+    self.assertIsNone(mapper.scene)
+    self.assertIsNone(mapper.palette)
+    with self.assertRaisesRegex(ValueError, "unknown"):
+      mapper.step(_scene_frame(1, 0))
+    with self.assertRaises(ValueError):
+      mapper.resync(4, 0)
+    mapper.resync(1, 0)
+    self.assertEqual(mapper.step(_scene_frame(1, 0)).dpad, ())
+
+  def test_cli_requires_explicit_state_and_preserves_default(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      root = pathlib.Path(temp_dir)
+      cvz, out = root / "input.cvz", root / "output.json"
+      cvz.write_bytes(_scene_frame(1, 0))
+      with self.assertRaises(SystemExit):
+        usb_hid.main_from_args(["--input", str(cvz), "--gba-gamepad"])
+      self.assertEqual(usb_hid.main_from_args(["--input", str(cvz), "--output", str(out)]), 0)
+      default = json.loads(out.read_text())
+      self.assertEqual(len(default), 1)
+      self.assertEqual(set(default[0]), {"buttons", "left_x", "left_y", "keys"})
+      self.assertEqual(usb_hid.main_from_args(["--input", str(cvz), "--output", str(out),
+                                               "--gba-gamepad", "--initial-scene", "0",
+                                               "--initial-palette", "0"]), 0)
+      gamepad = json.loads(out.read_text())
+      self.assertEqual(gamepad[0]["dpad"], ["up"])
+      self.assertEqual(gamepad[-1]["dpad"], [])
+      self.assertTrue(all(state["keys"] == [] for state in gamepad))
+
+
 class FlashGuardTests(unittest.TestCase):
   """colour-field-v0 host flash guard (F23) and the CC1 scene debounce."""
 
