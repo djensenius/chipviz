@@ -1,7 +1,7 @@
 """Host checks for SMS spectral lookup data and normative level fixtures.
 
-The fixture model consumes the same lookup bytes as the Z80, but does not
-execute the Z80 module or validate its integration.
+The fixtures model candidate lookup data on the host; they do not execute
+or validate any SMS target implementation.
 """
 
 import importlib.util

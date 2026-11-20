@@ -27,9 +27,9 @@ homebrew artifact builder until an SMS SDK is chosen.
 `homebrew/field_assets.py` generates deterministic candidate field patterns,
 maps and lookup tables into a supplied directory. These files are not used by
 the static seed ROM. Python host-model tests are discovered by
-`just python-test`; `just sms-procedural-test` generates the assets under
-`build/tests` and compares all 65,536 procedural frames against the shared C
-control-frame implementation. It also runs as part of `just c-test`.
+`just python-test`; `just sms-procedural-test` generates the assets in a
+temporary directory and compares all 65,536 procedural frames against the
+shared C control-frame implementation. It also runs as part of `just c-test`.
 These checks do not execute SMS code or establish visualization or hardware
 coverage.
 

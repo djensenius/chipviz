@@ -12,7 +12,7 @@ SPEC.loader.exec_module(assets)
 
 
 def cuts(events, steps=600):
-  """Model the spec's unpinned cut rule using the linked SMS action table."""
+  """Model the spec's unpinned cut rule using the candidate action table."""
   actions = assets.cut_actions()
   act = layout = combo = rot = 0
   since_cut = 20
@@ -39,6 +39,18 @@ def cuts(events, steps=600):
 
 
 class SmsCutModeTests(unittest.TestCase):
+  def test_action_ring_state_after_each_cut(self):
+    states = (
+      (0, 0, 1), (0, 1, 1), (0, 1, 0), (1, 1, 0),
+      (1, 1, 1), (1, 2, 1), (1, 2, 0), (2, 2, 0),
+      (2, 2, 1), (2, 3, 1), (2, 3, 2), (3, 3, 2),
+    )
+    for count, expected in enumerate(states, 1):
+      events = set(range(0, count * 20, 20))
+      accepted, _, state = cuts(events, steps=count * 20)
+      self.assertEqual(accepted, sorted(events))
+      self.assertEqual(state, expected, count)
+
   def test_f3_drops_events_inside_cut_floor(self):
     accepted, _, _ = cuts({37, 101, 113, 250, 400, 523})
     self.assertEqual(accepted, [37, 101, 250, 400, 523])
