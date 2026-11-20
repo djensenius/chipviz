@@ -5,7 +5,7 @@
 //! stateful, so it is not a registry entry. Every other byte keeps its
 //! registry scene.
 //!
-//! Registry scenes that need memory between frames (so far only Lines)
+//! Registry scenes that need memory between frames (Lines and Static)
 //! keep it in [`SceneState`], which the renderer steps once per new frame
 //! and passes to [`SceneBuild::Stateful`] builders; other scenes ignore it.
 //!
@@ -91,6 +91,7 @@ pub struct SceneConfig {
 pub struct SceneState {
     config: SceneConfig,
     pub(crate) lines: lines::LinesState,
+    pub(crate) static_noise: static_noise::StaticState,
 }
 
 impl SceneState {
@@ -98,6 +99,7 @@ impl SceneState {
         Self {
             config,
             lines: lines::LinesState::new(config.lines_drop_cuts),
+            static_noise: static_noise::StaticState::default(),
         }
     }
 
@@ -108,6 +110,7 @@ impl SceneState {
     /// Feeds one new (not held) frame to every stateful scene.
     pub fn observe(&mut self, frame: &ControlFrame) {
         self.lines.observe(frame);
+        self.static_noise.observe(frame);
     }
 }
 
