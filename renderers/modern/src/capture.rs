@@ -454,8 +454,12 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         let file = format!("frame{index:06}-{}.png", entry.name());
         write_png(&args.out.join(&file), width, height, &rgb)?;
         println!("wrote {}", args.out.join(&file).display());
+        let frame_starfield_epoch = starfield.as_ref().map_or_else(
+            || "null".to_string(),
+            |config| config.epoch_at(elapsed(index) as f32).to_string(),
+        );
         captures.push(format!(
-            "    {{\"file\": {}, \"frame_index\": {index}, \"elapsed\": {}, \"scene\": {}, \"scene_name\": {}, \"camera\": {}}}",
+            "    {{\"file\": {}, \"frame_index\": {index}, \"elapsed\": {}, \"starfield_epoch_unix_seconds\": {frame_starfield_epoch}, \"scene\": {}, \"scene_name\": {}, \"camera\": {}}}",
             json_string(&file),
             elapsed(index),
             frame.scene,
@@ -763,6 +767,66 @@ mod tests {
         assert_eq!(starfield_metadata(None), ("null".into(), "null".into()));
     }
 
+    /// Full replay path: a fixed base epoch plus `--follow-time` must produce
+    /// the same manifest and PNGs on repeated runs, including a ten-second
+    /// Starfield snapshot change. Uses only this synthetic catalog.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn advancing_capture_manifest_and_pngs_are_replay_deterministic() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chipviz-starfield-replay-{}-{nonce}",
+            std::process::id()
+        ));
+        let catalog = root.join("synthetic-stars.csv");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&catalog, "ra,dec,mag,proper\n0,45,1,\"Synthetic star\"\n").unwrap();
+
+        let mut args = CaptureArgs {
+            profile: RenderProfile::pi5(),
+            scene: Some(6),
+            frames: vec![0, 600],
+            input: Input::Procedural,
+            size: (160, 90),
+            out: root.join("first"),
+            mic_layers: mic_layers::Mode::Off,
+            lines_drop_cuts: false,
+            catalog_path: Some(catalog),
+            location: Some((45.0, 80.0)),
+            unix_seconds: Some(946_728_000.0),
+            follow_time: true,
+        };
+        run(&args).unwrap();
+        args.out = root.join("second");
+        run(&args).unwrap();
+
+        let first_manifest = std::fs::read(root.join("first/manifest.json")).unwrap();
+        let second_manifest = std::fs::read(root.join("second/manifest.json")).unwrap();
+        assert_eq!(first_manifest, second_manifest);
+        let manifest = String::from_utf8(first_manifest).unwrap();
+        assert!(manifest.contains("\"starfield_epoch_unix_seconds\": 946728000"));
+        assert!(manifest.contains("\"starfield_epoch_advances_with_elapsed\": true"));
+        assert!(manifest.contains("\"frame_index\": 600"));
+        assert!(manifest.contains(
+            "\"frame_index\": 0, \"elapsed\": 0, \"starfield_epoch_unix_seconds\": 946728000"
+        ));
+        assert!(manifest.contains(
+            "\"frame_index\": 600, \"elapsed\": 10, \"starfield_epoch_unix_seconds\": 946728010"
+        ));
+        for frame in [0, 600] {
+            let file = format!("frame{frame:06}-Starfield.png");
+            assert_eq!(
+                std::fs::read(root.join("first").join(&file)).unwrap(),
+                std::fs::read(root.join("second").join(&file)).unwrap(),
+                "replay PNG differs at frame {frame}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn reads_cvz_fixture_frames() {
         let bytes = include_bytes!("../../../host/fixtures/musical/groove.cvz");
@@ -878,6 +942,164 @@ mod tests {
             "center pixel was not lit: {:?}",
             &rgb[pixel..pixel + 3]
         );
+    }
+
+    /// Exercises the complete scene pipeline and its final GPU output limiter,
+    /// rather than comparing Starfield instance colours alone.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn starfield_scene_crossings_limit_rendered_luminance_at_multiple_rates() {
+        let decode = |byte: u8| {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = |pixel: &[u8]| {
+            0.2126 * decode(pixel[0]) + 0.7152 * decode(pixel[1]) + 0.0722 * decode(pixel[2])
+        };
+        let blank_catalog =
+            starfield::StarCatalog::from_reader("ra,dec,mag\n0,-90,1\n".as_bytes()).unwrap();
+        let blank_starfield = starfield::StarfieldConfig {
+            catalog: std::sync::Arc::new(blank_catalog),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        for fps in [60_u64, 120, 240] {
+            let (width, height) = (160, 90);
+            let mut renderer =
+                pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                    .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(blank_starfield.clone()));
+            renderer
+                .pipeline_mut()
+                .set_mic_layers(mic_layers::allowed(mic_layers::Mode::Both));
+
+            let mut previous = Vec::new();
+            for step in 0..=fps {
+                let scene = if (step / 6).is_multiple_of(2) { 4 } else { 6 };
+                let mut frame = ControlFrame::procedural(2_048 + step);
+                frame.scene = scene;
+                frame.flags = 0;
+                frame.beat_count = 0;
+                frame.beat_phase = 0;
+                let pixels = renderer.render(frame, step as f64 / fps as f64).unwrap();
+                if step == 0 {
+                    let bright_pixels = pixels
+                        .chunks_exact(3)
+                        .filter(|pixel| luminance(pixel) > 0.5)
+                        .count();
+                    assert!(
+                        bright_pixels > 1_000,
+                        "the initial Static frame should exercise a bright full-screen transition"
+                    );
+                }
+                if !previous.is_empty() && step >= 6 {
+                    let mut max_change = 0.0_f32;
+                    let mut large_changes = 0;
+                    for (left, right) in previous.chunks_exact(3).zip(pixels.chunks_exact(3)) {
+                        let change = (luminance(left) - luminance(right)).abs();
+                        max_change = max_change.max(change);
+                        large_changes += usize::from(change > 0.1);
+                    }
+                    assert!(
+                        max_change <= 0.04,
+                        "fps={fps}, step={step}: maximum GPU luminance change {max_change}"
+                    );
+                    assert_eq!(
+                        large_changes, 0,
+                        "fps={fps}, step={step}: large changed pixels"
+                    );
+                }
+                previous = pixels;
+            }
+            let mut corrected_sky = synthetic_starfield_config();
+            corrected_sky.unix_seconds += 43_200.0;
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(corrected_sky));
+            let mut correction = ControlFrame::procedural(2_049 + fps);
+            correction.scene = 6;
+            let corrected = renderer.render(correction, 1.0 + 1.0 / fps as f64).unwrap();
+            let correction_change = previous
+                .chunks_exact(3)
+                .zip(corrected.chunks_exact(3))
+                .map(|(left, right)| (luminance(left) - luminance(right)).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                correction_change <= 0.04,
+                "fps={fps}: a Starfield epoch correction changed luminance by {correction_change}"
+            );
+        }
+    }
+
+    /// Simulates acquisition failure by previewing dispatch but deliberately
+    /// skipping encode, then retrying the same frame through the real
+    /// offscreen encoder. It also checks the colour-field debounce afterward.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn starfield_fallback_retry_keeps_output_and_scene_seven_debounce() {
+        let (width, height) = (160, 90);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        let mut frame = ControlFrame::procedural(8);
+        frame.scene = 13;
+        frame.flags = 0x05;
+        frame.energy = 120;
+        frame.beat_count = 7;
+        assert_eq!(renderer.pipeline_mut().displayed_scene(frame), 13);
+        renderer.pipeline_mut().fallback_next_missing_starfield();
+
+        // No encode here models get_current_texture() failing. The retry
+        // must still consume the fallback and produce the selected safe scene.
+        let retry = renderer.render(frame, 0.0).unwrap();
+        assert!(
+            retry.iter().any(|&value| value > 16),
+            "retry output must not be black"
+        );
+        let mut baseline =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        let mut native = frame;
+        native.scene = 0;
+        assert_eq!(retry, baseline.render(native, 0.0).unwrap());
+
+        let mut previous = retry;
+        for index in 1..=40 {
+            let mut color_field = ControlFrame::procedural(8 + index);
+            color_field.scene = colour_field::SCENE;
+            let pixels = renderer.render(color_field, index as f64 / 60.0).unwrap();
+            let largest = previous
+                .chunks_exact(3)
+                .zip(pixels.chunks_exact(3))
+                .map(|(left, right)| (luminance_srgb(left) - luminance_srgb(right)).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(largest <= 0.04, "scene-7 transition changed by {largest}");
+            previous = pixels;
+        }
+        assert!(matches!(
+            renderer.pipeline_mut().colour_field_display(),
+            colour_field::Display::ColourField(_)
+        ));
+    }
+
+    fn luminance_srgb(pixel: &[u8]) -> f32 {
+        let decode = |byte: u8| {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * decode(pixel[0]) + 0.7152 * decode(pixel[1]) + 0.0722 * decode(pixel[2])
     }
 
     /// The mic layers never touch the colour field, and `off` renders exactly

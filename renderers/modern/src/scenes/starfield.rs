@@ -21,8 +21,14 @@ const MAX_STAR_LINEAR_LUMINANCE: f32 = 0.05;
 const MAX_RENDERED_STARS: usize = 200;
 const RIGHT_ASCENSION_BINS: usize = 48;
 const DECLINATION_BINS: usize = 18;
-const STARS_PER_SKY_BIN: usize = 12;
-const SKY_CANDIDATE_BOUND: usize = RIGHT_ASCENSION_BINS * DECLINATION_BINS * STARS_PER_SKY_BIN;
+const FINE_RA_BINS_PER_SKY_BIN: usize = 4;
+const FINE_DEC_BINS_PER_SKY_BIN: usize = 4;
+const FINE_SKY_SUBCELLS: usize = FINE_RA_BINS_PER_SKY_BIN * FINE_DEC_BINS_PER_SKY_BIN;
+const STARS_PER_FINE_SUBCELL: usize = 2;
+const SKY_CANDIDATE_BOUND: usize =
+    RIGHT_ASCENSION_BINS * DECLINATION_BINS * FINE_SKY_SUBCELLS * STARS_PER_FINE_SUBCELL;
+const MIN_STAR_MAGNITUDE: f64 = -2.0;
+const BRIGHTNESS_DECADES_PER_MAGNITUDE: f64 = 0.23;
 
 #[derive(Clone, Debug)]
 pub struct StarfieldConfig {
@@ -32,6 +38,12 @@ pub struct StarfieldConfig {
     pub unix_seconds: f64,
     /// Advance from the base UTC epoch with the renderer's monotonic clock.
     pub follow_elapsed: bool,
+}
+
+fn star_brightness(magnitude: f64) -> f32 {
+    (f64::from(MAX_STAR_LINEAR_LUMINANCE)
+        * 10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (magnitude - MIN_STAR_MAGNITUDE)))
+    .clamp(0.000_55, f64::from(MAX_STAR_LINEAR_LUMINANCE)) as f32
 }
 
 impl StarfieldConfig {
@@ -46,9 +58,8 @@ impl StarfieldConfig {
     }
 }
 
-/// A wall-clock UTC estimate disciplined by a monotonic clock. Corrections
-/// slew at no more than one percent of elapsed time, so wall-clock jumps
-/// cannot teleport the displayed sky.
+/// The latest valid wall-clock UTC reading, sampled on the monotonic render
+/// clock. The app publishes it only at the Starfield snapshot cadence.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UtcClock {
     unix_seconds: f64,
@@ -67,14 +78,19 @@ impl UtcClock {
         if !wall_unix_seconds.is_finite() || !monotonic_seconds.is_finite() {
             return self.unix_seconds;
         }
-        let monotonic_seconds = monotonic_seconds.max(self.monotonic_seconds);
-        let elapsed = monotonic_seconds - self.monotonic_seconds;
-        let predicted = self.unix_seconds + elapsed;
-        let correction = (wall_unix_seconds - predicted).clamp(-elapsed * 0.01, elapsed * 0.01);
-        self.unix_seconds = predicted + correction;
+        if monotonic_seconds < self.monotonic_seconds {
+            return self.unix_seconds;
+        }
+        self.unix_seconds = wall_unix_seconds;
         self.monotonic_seconds = monotonic_seconds;
         self.unix_seconds
     }
+}
+
+pub fn snapshot_due(elapsed: f64, last_snapshot: f64) -> bool {
+    elapsed.is_finite()
+        && last_snapshot.is_finite()
+        && elapsed - last_snapshot >= STARFIELD_SNAPSHOT_PERIOD_SECONDS
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,7 +106,7 @@ pub struct Star {
 pub struct StarCatalog {
     /// Brightest-first, so the profile's instance cap retains the most visible stars.
     stars: Vec<Star>,
-    /// Brightest representatives in each J2000 sky cell; caps per-frame work.
+    /// Brightest representative of each fine J2000 sky subcell; caps per-frame work.
     candidate_bins: Vec<Vec<usize>>,
 }
 
@@ -187,6 +203,9 @@ impl StarCatalog {
 
     fn build_candidate_bins(stars: &[Star]) -> Vec<Vec<usize>> {
         let mut bins = vec![Vec::new(); RIGHT_ASCENSION_BINS * DECLINATION_BINS];
+        let mut first = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
+        let mut second_spatial = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
+        let mut coincident = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
         for (index, star) in stars.iter().enumerate() {
             let ra_bin = ((star.right_ascension_hours / 24.0 * RIGHT_ASCENSION_BINS as f64)
                 as usize)
@@ -194,9 +213,37 @@ impl StarCatalog {
             let dec_bin = (((star.declination_degrees + 90.0) / 180.0 * DECLINATION_BINS as f64)
                 as usize)
                 .min(DECLINATION_BINS - 1);
-            let bin = &mut bins[dec_bin * RIGHT_ASCENSION_BINS + ra_bin];
-            if bin.len() < STARS_PER_SKY_BIN {
-                bin.push(index);
+            let bin_index = dec_bin * RIGHT_ASCENSION_BINS + ra_bin;
+            let ra_in_bin =
+                star.right_ascension_hours / 24.0 * RIGHT_ASCENSION_BINS as f64 - ra_bin as f64;
+            let dec_in_bin = (star.declination_degrees + 90.0) / 180.0 * DECLINATION_BINS as f64
+                - dec_bin as f64;
+            let fine_ra = (ra_in_bin * FINE_RA_BINS_PER_SKY_BIN as f64) as usize;
+            let fine_dec = (dec_in_bin * FINE_DEC_BINS_PER_SKY_BIN as f64) as usize;
+            let subcell = fine_dec.min(FINE_DEC_BINS_PER_SKY_BIN - 1) * FINE_RA_BINS_PER_SKY_BIN
+                + fine_ra.min(FINE_RA_BINS_PER_SKY_BIN - 1);
+            if first[bin_index][subcell].is_none() {
+                bins[bin_index].push(index);
+                first[bin_index][subcell] = Some(index);
+            } else if second_spatial[bin_index][subcell].is_none() {
+                let first_star = &stars[first[bin_index][subcell].expect("first candidate set")];
+                if star.right_ascension_hours != first_star.right_ascension_hours
+                    || star.declination_degrees != first_star.declination_degrees
+                {
+                    bins[bin_index].push(index);
+                    second_spatial[bin_index][subcell] = Some(index);
+                } else if coincident[bin_index][subcell].is_none() {
+                    coincident[bin_index][subcell] = Some(index);
+                }
+            }
+        }
+        for bin_index in 0..bins.len() {
+            for subcell in 0..FINE_SKY_SUBCELLS {
+                if second_spatial[bin_index][subcell].is_none()
+                    && let Some(index) = coincident[bin_index][subcell]
+                {
+                    bins[bin_index].push(index);
+                }
             }
         }
         bins
@@ -396,16 +443,15 @@ fn build(
         if selected.len() >= MAX_RENDERED_STARS {
             break;
         }
-        let brightness = (10.0_f64.powf(-0.2 * (star.magnitude + 1.5)) as f32)
-            .clamp(0.0, MAX_STAR_LINEAR_LUMINANCE);
+        let brightness = star_brightness(star.magnitude);
         let tint = star
             .colour_index
             .map(color_index_rgb)
             .unwrap_or([1.0, 1.0, 1.0]);
-        let point_size = 0.0025 + brightness * 0.009;
-        // A two-pixel minimum keeps bright stars visible at small output sizes.
-        // Sizes are NDC full-width/full-height values.
-        let point_size = point_size.max(4.0 / viewport.1.max(1) as f32);
+        // The size curve preserves magnitude ordering while retaining a
+        // two-pixel minimum footprint at small output sizes.
+        let size_pixels = 2.0 + 1.25 * (brightness / MAX_STAR_LINEAR_LUMINANCE).sqrt();
+        let point_size = 2.0 * size_pixels / viewport.1.max(1) as f32;
         let size = [point_size / aspect.max(f32::MIN_POSITIVE), point_size];
         let instance = Instance {
             center: [center[0], center[1], 0.0],
@@ -637,15 +683,22 @@ mod tests {
     }
 
     #[test]
-    fn utc_clock_slews_wall_clock_corrections_without_running_backwards() {
+    fn utc_clock_resynchronizes_to_wall_clock_at_snapshot_cadence() {
         let mut clock = UtcClock::new(1_000.0);
-        assert_eq!(clock.update(1_010.0, 10.0), 1_010.0);
-        let after_backward_correction = clock.update(900.0, 20.0);
-        assert!((after_backward_correction - 1_019.9).abs() < 1.0e-9);
-        let after_forward_correction = clock.update(5_000.0, 30.0);
-        assert!((after_forward_correction - 1_030.0).abs() < 1.0e-9);
-        assert_eq!(clock.update(0.0, 25.0), after_forward_correction);
-        assert_eq!(clock.update(f64::NAN, 40.0), after_forward_correction);
+        assert_eq!(clock.update(1_000.1, 0.1), 1_000.1);
+        assert!(!snapshot_due(9.9, 0.0));
+        assert!(snapshot_due(10.0, 0.0));
+        assert!(!snapshot_due(10.1, 10.0));
+
+        assert_eq!(clock.update(3_600.0, 10.0), 3_600.0);
+        assert_eq!(clock.update(3_600.2, 10.2), 3_600.2);
+        assert_eq!(clock.update(0.0, 10.1), 3_600.2);
+        assert!(!snapshot_due(19.9, 10.0));
+        assert!(snapshot_due(20.0, 10.0));
+        assert_eq!(clock.update(0.0, 20.0), 0.0);
+        assert_eq!(clock.update(10_000.0, 30.0), 10_000.0);
+        assert_eq!(clock.update(f64::NAN, 40.0), 10_000.0);
+        assert!(!snapshot_due(f64::NAN, 40.0));
     }
 
     #[test]
@@ -861,7 +914,7 @@ mod tests {
         }
         let catalog = Arc::new(catalog(&csv).unwrap());
         let candidate_count: usize = catalog.candidate_bins.iter().map(Vec::len).sum();
-        assert_eq!(candidate_count, STARS_PER_SKY_BIN);
+        assert_eq!(candidate_count, 2);
         assert!(candidate_count <= SKY_CANDIDATE_BOUND);
 
         let mut state = SceneState::default();
@@ -883,6 +936,117 @@ mod tests {
             &mut instances,
         );
         assert!(instances.is_empty());
+    }
+
+    #[test]
+    fn visible_faint_star_is_not_hidden_by_brighter_stars_below_the_horizon() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for index in 0..12 {
+            csv.push_str(&format!(
+                "{},{},5\n",
+                12.52 + 0.015 * index as f64,
+                0.5 + 0.75 * index as f64
+            ));
+        }
+        csv.push_str("12.95,5,-6\n");
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let target_index = catalog
+            .stars
+            .iter()
+            .position(|star| star.right_ascension_hours == 12.95)
+            .unwrap();
+        assert!(
+            catalog
+                .candidate_bins
+                .iter()
+                .any(|bin| bin.contains(&target_index)),
+            "a spatially distinct candidate must survive the bounded index"
+        );
+        let target = &catalog.stars[target_index];
+        let projected = project_star(target, 0.0, 0.0, 946_728_000.0)
+            .expect("review fixture target is above the horizon");
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert!(
+            instances.iter().any(|instance| {
+                (instance.center[0] - projected[0]).abs() < 1.0e-6
+                    && (instance.center[1] - projected[1]).abs() < 1.0e-6
+            }),
+            "the visible mag -6 star must be rendered"
+        );
+    }
+
+    #[test]
+    fn magnitude_brightness_and_size_keep_order_without_exceeding_output_caps() {
+        let magnitudes = [-2.0, 0.0, 1.0, 5.0, 6.0, 6.5];
+        let brightness: Vec<_> = magnitudes
+            .iter()
+            .map(|&magnitude| star_brightness(magnitude))
+            .collect();
+        let sizes: Vec<_> = brightness
+            .iter()
+            .map(|&value| 2.0 + 1.25 * (value / MAX_STAR_LINEAR_LUMINANCE).sqrt())
+            .collect();
+        assert!(brightness[0] <= MAX_STAR_LINEAR_LUMINANCE);
+        assert!(brightness[0] > brightness[1]);
+        assert!(brightness.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(sizes.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(*brightness.last().unwrap() >= 0.000_55);
+        assert!(*sizes.last().unwrap() >= 2.0);
+
+        let csv = format!(
+            "ra,dec,mag\n{}",
+            magnitudes
+                .iter()
+                .enumerate()
+                .map(|(index, magnitude)| format!("{},60,{magnitude}\n", index as f64 + 0.1))
+                .collect::<String>()
+        );
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog(&csv).unwrap()),
+            latitude_degrees: 90.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert_eq!(instances.len(), magnitudes.len());
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].color[0] < pair[1].color[0])
+        );
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].size[1] < pair[1].size[1])
+        );
     }
 
     #[test]

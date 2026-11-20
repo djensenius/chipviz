@@ -223,9 +223,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                 let elapsed = start.elapsed().as_secs_f64();
                 if let (Some(clock), Some(config)) = (&mut utc_clock, &mut starfield) {
                     let utc_now = clock.update(system_utc_seconds(), elapsed);
-                    if elapsed - last_starfield_snapshot
-                        >= starfield::STARFIELD_SNAPSHOT_PERIOD_SECONDS
-                    {
+                    if starfield::snapshot_due(elapsed, last_starfield_snapshot) {
                         config.unix_seconds = utc_now;
                         renderer
                             .pipeline_mut()

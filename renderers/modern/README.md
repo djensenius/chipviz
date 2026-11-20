@@ -430,14 +430,23 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   IAU 1976 precession transforms J2000 coordinates to date for supported UTC
   dates from 1800 through 2200. Proper motion, parallax and atmospheric
   refraction are not modeled, so this is a useful sky view rather than a
-  precision planetarium. Magnitude and colour index control bounded point
-  brightness and approximate hue. At most 200 stars are rendered, with a
-  bounded set of bright candidates per 7.5-by-10-degree sky cell. Each
-  linear-RGB channel is capped at 0.05, bounding opaque per-pixel luminance;
-  no unmeasured flash feature is enabled or claimed as certified. The complete
-  star snapshot (positions, membership, ordering and brightness) is held
-  between ten-second updates.
-  Stars fainter than magnitude 6.5 are
+  precision planetarium. Magnitude controls compressed, monotonically ordered
+  brightness and point size; colour index controls approximate hue. At most
+  200 stars are rendered, selected from at most 27,648 brightest-per-subcell
+  candidates so below-horizon bright stars do not crowd out visible stars.
+  Each star's linear-RGB channel is capped at 0.05. A final full-frame output
+  limiter bounds each channel's change to 0.15 linear units per second while
+  Starfield is displayed and until one full linear-light range of slew has
+  been allowed after it (at least about 6.7 seconds at normal refresh rates).
+  Its initial Starfield frame starts from black with a maximum per-channel
+  change of 0.05. This includes scene 7, fallback and optional-overlay output.
+  Live wall-clock corrections are synchronized at the next ten-second
+  snapshot; the full star snapshot (positions, membership, ordering and
+  brightness) is held between updates.
+  These output limits are conservative scene behavior, not independent
+  photosensitivity certification. The limiter keeps full-frame GPU history
+  and adds a resolve pass; verify memory and frame-time costs on target
+  adapters. Stars fainter than magnitude 6.5 are
   excluded. Below-horizon stars are culled, brightest stars are considered
   first, and output respects each profile's instance budget.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
@@ -616,7 +625,8 @@ for the analyser.
 
 `chipviz-capture` renders frames through the same pipeline and shader into an
 offscreen texture, then writes PNGs plus `manifest.json` (profile, input, size, resolved Starfield epoch/clock mode,
-and per-frame file, index, elapsed time and scene). It opens no window and
+and per-frame file, index, elapsed time, resolved Starfield epoch and scene).
+It opens no window and
 needs no screen-recording permission, only a GPU adapter.
 
 ```sh
