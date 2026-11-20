@@ -20,15 +20,18 @@ fn build_frame(profile: &RenderProfile, frame: ControlFrame, aspect: f32) -> Vec
 
 #[test]
 fn timeline_reaches_every_object_background_morph_and_overlay() {
-    let sections: Vec<Section> = (0..30).map(|index| section(frame_in(index, 100))).collect();
+    let sections: Vec<Section> = (0..55).map(|index| section(frame_in(index, 100))).collect();
     let first = |count: usize| sections[..count].iter();
     for kind in Kind::ALL {
-        // Every object meets every background, and both overlays early.
+        // Every object meets every background, both overlays and every morph.
         for background in Background::ALL {
-            assert!(first(30).any(|s| (s.object, s.background) == (kind, background)));
+            assert!(first(55).any(|s| (s.object, s.background) == (kind, background)));
         }
         for overlay in [Overlay::Camcorder, Overlay::Infomercial] {
-            assert!(first(12).any(|s| (s.object, s.overlay) == (kind, overlay)));
+            assert!(first(22).any(|s| (s.object, s.overlay) == (kind, overlay)));
+        }
+        for morph in [Morph::Cycle, Morph::Sweep, Morph::BeatJump] {
+            assert!(first(33).any(|s| (s.object, s.morph) == (kind, morph)));
         }
     }
     for morph in [Morph::Cycle, Morph::Sweep, Morph::BeatJump] {
@@ -97,7 +100,7 @@ fn appended_build_respects_the_remaining_budget() {
 
 #[test]
 fn every_object_is_drawn_and_pi5_uses_fewer_splats() {
-    for index in 0..6 {
+    for index in 0..Kind::ALL.len() as u16 {
         let frame = frame_in(index, 200);
         let section = section(frame);
         let pose = pose(section, frame);
@@ -130,6 +133,139 @@ fn splat_counts_do_not_depend_on_the_look() {
         kind.build(&mut loud_mesh, &loud);
         assert_eq!(quiet_mesh.splats.len(), loud_mesh.splats.len(), "{kind:?}");
         assert!(loud_mesh.splats.len() <= 4_000);
+    }
+}
+
+#[test]
+fn new_objects_are_appended_after_the_original_six() {
+    let original = [
+        Kind::Television,
+        Kind::VideoTape,
+        Kind::CompactDisc,
+        Kind::Sun,
+        Kind::Tree,
+        Kind::Computer,
+    ];
+    for (index, kind) in original.into_iter().enumerate() {
+        assert_eq!(section(frame_in(index as u16, 200)).object, kind);
+    }
+    let appended = [
+        Kind::PhoneBooth,
+        Kind::Tricycle,
+        Kind::MilkCarton,
+        Kind::Jukebox,
+        Kind::Beans,
+    ];
+    for (offset, kind) in appended.into_iter().enumerate() {
+        assert_eq!(section(frame_in(6 + offset as u16, 200)).object, kind);
+    }
+    for (index, kind) in Kind::ALL.iter().enumerate() {
+        assert!(!Kind::ALL[..index].contains(kind), "{kind:?} twice");
+    }
+}
+
+#[test]
+fn every_model_mesh_is_finite_bounded_and_within_budget() {
+    let loud = Look {
+        t: 400.0,
+        spectrum: [1.0; 8],
+        mid: 1.0,
+        treble: 1.0,
+        energy: 1.0,
+        beat: 1.0,
+        yaw: 1.0,
+    };
+    let length = |v: Vec3| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    for kind in Kind::ALL {
+        for target in [4_000, 27_000] {
+            let step = step_for(kind, target);
+            assert!(step.is_finite() && step > 0.0, "{kind:?} {step}");
+            for look in [Look::default(), loud] {
+                let mut mesh = Mesh::new(step);
+                kind.build(&mut mesh, &look);
+                let count = mesh.splats.len();
+                assert!(count <= target && count > target / 3, "{kind:?} {count}");
+                for splat in &mesh.splats {
+                    let surface = splat.surface;
+                    let values = [splat.pos, splat.normal, splat.du, splat.dv, surface.color];
+                    assert!(values.iter().flatten().all(|v| v.is_finite()), "{kind:?}");
+                    assert!(length(splat.pos) * kind.size() < 1.5, "{kind:?} {splat:?}");
+                    assert!((length(splat.normal) - 1.0).abs() < 1e-3, "{kind:?}");
+                    for edge in [splat.du, splat.dv] {
+                        assert!(length(edge) > 0.0 && length(edge) < 4.0 * step, "{kind:?}");
+                    }
+                    assert!(surface.color.iter().all(|c| (0.0..=1.0).contains(c)));
+                    assert!((0.0..=1.0).contains(&surface.shine), "{kind:?}");
+                    assert!((0.0..=1.0).contains(&surface.glow), "{kind:?}");
+                }
+            }
+        }
+    }
+}
+
+/// The coarsest step `kind` is drawn at on `profile`, over every
+/// background it meets.
+fn coarsest_step(kind: Kind, profile: &RenderProfile) -> f32 {
+    let frames = (0..55).map(|index| frame_in(index, 200));
+    let frames = frames.filter(|&frame| section(frame).object == kind);
+    let steps = frames.map(|frame| {
+        let section = section(frame);
+        let stage = stage(frame, section, WIDE);
+        let (_, budget) = background(profile, section, &stage, profile.instance_count);
+        step_for(kind, (budget as f32 * OVERSAMPLE) as usize)
+    });
+    steps.fold(0.0, f32::max)
+}
+
+/// The font pixels (five columns by seven body rows per letter) that the
+/// face's sample grid at `step` never lands on.
+fn missed_pixels(label: &models::Label, step: f32) -> Vec<(usize, usize)> {
+    let count = label.line.chars().count();
+    let [nu, nv] = label.extent.map(|length| models::steps(length, step));
+    let mut hit = std::collections::HashSet::new();
+    for i in 0..nu {
+        for j in 0..nv {
+            let [u, v] = [(i, nu), (j, nv)].map(|(k, n)| (k as f32 + 0.5) / n as f32);
+            let across = (u - label.u[0]) / (label.u[1] - label.u[0]);
+            let up = (v - label.v[0]) / (label.v[1] - label.v[0]);
+            if (0.0..1.0).contains(&across) && (0.0..1.0).contains(&up) {
+                let column = (across * count as f32 * 6.0) as usize;
+                hit.insert((column, ((1.0 - up) * 7.0) as usize));
+            }
+        }
+    }
+    let pixels = (0..count * 6).filter(|column| column % 6 < 5);
+    let pixels = pixels.flat_map(|column| (0..7).map(move |row| (column, row)));
+    pixels.filter(|pixel| !hit.contains(pixel)).collect()
+}
+
+#[test]
+fn lettering_samples_every_font_row_and_column_on_m1() {
+    for (kind, label) in models::LABELS {
+        let step = coarsest_step(kind, &RenderProfile::m1());
+        let missed = missed_pixels(label, step);
+        assert!(missed.is_empty(), "{} at {step}: {missed:?}", label.line);
+    }
+}
+
+#[test]
+fn models_build_deterministically() {
+    let look = Look {
+        t: 123.0,
+        spectrum: [0.5; 8],
+        treble: 0.7,
+        beat: 0.4,
+        ..Look::default()
+    };
+    for kind in Kind::ALL {
+        let step = step_for(kind, 6_000);
+        let [mut a, mut b] = [Mesh::new(step), Mesh::new(step)];
+        kind.build(&mut a, &look);
+        kind.build(&mut b, &look);
+        assert_eq!(a.splats.len(), b.splats.len(), "{kind:?}");
+        for (a, b) in a.splats.iter().zip(&b.splats) {
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "{kind:?}");
+        }
     }
 }
 
@@ -283,7 +419,7 @@ fn zoom_punch_lands_on_the_beat() {
 
 #[test]
 fn intro_and_outro_shrink_the_object_to_nothing() {
-    for index in 0..6 {
+    for index in 0..Kind::ALL.len() as u16 {
         let first = frame_in(index, 0);
         assert_eq!(pose(section(first), first).scale, 0.0);
         let last = frame_in(index, SECTION_FRAMES - 1);
@@ -343,7 +479,9 @@ fn camcorder_tearing_only_in_camcorder_sections() {
 fn fingerprint() -> u64 {
     let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
     for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
-        for frame in [0, 48, 200, 700, 1_300, 1_800, 2_250, 2_800, 6_000] {
+        for frame in [
+            0, 48, 200, 700, 1_300, 1_800, 2_250, 2_800, 3_272, 3_784, 4_296, 4_808, 5_320, 6_000,
+        ] {
             for byte in
                 bytemuck::cast_slice::<Instance, u8>(&build_frame(&profile, at(frame), WIDE))
             {
@@ -356,9 +494,13 @@ fn fingerprint() -> u64 {
 }
 
 // Gated like the registry goldens: platform libm sin/cos may differ in the
-// last ulp elsewhere.
+// last ulp elsewhere. Re-recorded in phase B, which added frames 3_272 to
+// 5_320 (one per new object). Frames 0 to 2_800 (sections 0 to 5) are
+// unchanged, but frame 6_000 is in section 11, which the eleven-object
+// cycle changed from the computer, hue-cycle morph and camcorder overlay to
+// the television, beat-jump morph and infomercial overlay.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn instances_match_recorded_golden() {
-    assert_eq!(fingerprint(), 0xbfff_534e_f332_2181);
+    assert_eq!(fingerprint(), 0x2d34_2a5a_47ee_e027);
 }
