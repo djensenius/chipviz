@@ -25,27 +25,26 @@ For the v4.4 gzip, upstream LFS metadata reports 13,636,362 bytes and SHA-256
 The `CURRENT` URL can change; that hash applies to the compressed file only
 and is not verified by the utility.
 
-The launcher depends on the modern renderer changes planned in
-[#14](https://github.com/djensenius/chipviz/issues/14): scene 6 and the
-`--scene`, `--star-catalog`, `--location`, and `--time` flags. They are not yet
-part of this base; use a compatible renderer only after that work is
-integrated. The utility does not run or verify the binary.
+The launcher requires a compatible modern renderer with scene 6 and the
+`--scene`, `--star-catalog`, `--location`, and `--time` flags; see
+[#14](https://github.com/djensenius/chipviz/issues/14). The utility does not
+run or verify the binary.
 
-After that integration, build a renderer and supply your locally obtained HYG
+Build a compatible renderer and supply your locally obtained HYG
 v4.4 `.csv` or `.csv.gz` (no network access is performed by this utility).
 Before creating the destination, ensure the checkout, `build/`, and their
 ancestors are trusted and contain no symlinks:
 
 ```sh
-cargo build --release --manifest-path renderers/modern/Cargo.toml --bin chipviz-m1
-mkdir -p build
+cargo build --release --manifest-path renderers/modern/Cargo.toml --bin chipviz-m1 &&
+mkdir -p build &&
 (
-  umask 077
-  mkdir -m 700 build/personal-starfield
+  umask 077 &&
+  mkdir -m 700 build/personal-starfield &&
   python3 scripts/personal-starfield-bundle.py \
     --catalog "/path/to/local/hyg_v44.csv.gz" \
     --binary "renderers/modern/target/release/chipviz-m1"
-)
+) &&
 ./build/personal-starfield/launch-starfield --location "0,0" --time 0
 ```
 
@@ -53,8 +52,8 @@ The example explicitly selects latitude/longitude `0,0` and Unix time `0`;
 replace them with your chosen decimal-degree location (longitude east) and UTC
 Unix time. The launcher inserts only `--scene 6` and the bundled
 `--star-catalog`, forwarding every other argument unchanged. It never supplies
-a location or time. The planned renderer requires a location and, if no time
-is supplied, defaults to current UTC.
+a location or time. The compatible renderer requires a location and, if no
+time is supplied, defaults to current UTC.
 
 The default output is the ignored `build/personal-starfield/` directory, with
 the executable, uncompressed CSV, launcher, and `HYG-NOTICE.txt`. Another
