@@ -21,8 +21,34 @@ just modern-pi5
 just modern-m1 -- --udp 127.0.0.1:6464
 ```
 
-Without `--udp` or `--mic`, the renderer uses deterministic procedural frames. With UDP,
-it consumes `control-frame-v0` packets from the host bridge:
+Explicitly selecting scene 6 (`Starfield`) reads a user-supplied
+HYG-compatible CSV; no catalog is bundled. It requires both an observer
+location and the catalog path. The observation time defaults to current UTC:
+
+```sh
+just modern-m1 -- --udp 127.0.0.1:6464 --scene 6 \
+  --star-catalog /path/to/stars.csv --location 45.5,-73.25
+just modern-m1 -- --scene 6 --star-catalog /path/to/stars.csv \
+  --location 45.5,-73.25
+just modern-pi5 -- --scene 6 --star-catalog /path/to/stars.csv \
+  --location 45.5,-73.25 --time 946728000
+```
+
+The CSV must have `ra` (hours), `dec` (degrees) and `mag` columns; `ci` and
+`proper` are optional. Standard CSV quoting is supported. Explicit `--scene 6`
+without both setup options exits with an actionable error before opening the
+window. `--catalog` is an alias for `--star-catalog`; both load the file at
+runtime and never embed it in the executable. Supplying a catalog alone does
+not opt into Starfield. Scene 7 stays the ColourField. `--scene 6` opts into
+Starfield for procedural or microphone
+frames without a UDP sender and overrides UDP scene bytes when explicitly set.
+Without that explicit option, every wire byte keeps its original modulo-six
+mapping (byte 7 remains the ColourField); in particular, bytes 6 and 13 do not
+silently become Starfield. Scene 6 requires its catalog and location at startup
+when selected with `--scene`; unrelated scenes do not require a catalog.
+
+Without `--udp` or `--mic`, the renderer uses deterministic procedural frames.
+With UDP, it consumes `control-frame-v0` packets from the host bridge:
 
 ```sh
 python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
@@ -38,7 +64,11 @@ The renderer starts windowed by default.
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
-| `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
+| `--star-catalog PATH` | Read a user-supplied HYG-compatible CSV for scene 6; catalogs are not bundled or embedded. `--catalog` is an alias. |
+| `--location LAT,LON` | Observer latitude and longitude in decimal degrees, longitude east positive. Required with `--star-catalog`. |
+| `--time UNIX_SECONDS` | Observation time in UTC seconds since the Unix epoch (1800–2200); defaults to current UTC, advances while live, and requires `--star-catalog` plus `--location`. Capture manifests record the resolved epoch and whether it advances. |
+| `--scene N` | Override the input scene byte (0-255), including UDP frames; absent by default. Byte 7 is ColourField, byte 6 selects Starfield when its catalog and location are configured, and other bytes keep the original modulo-six mapping. |
+| `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over eligible native scenes (not ColourField or Starfield). Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
 | `--tunnel-variant original\|hallway\|abstract` | Choose the PulseTunnel look at startup, for every scene byte selecting it. Default `original` preserves the orbiting tunnel. Also supported by `chipviz-capture`. |
@@ -172,10 +202,11 @@ library `libasound2` (e.g. `sudo apt install libasound2`).
 
 ## Mic layers
 
-Two overlay layers can be drawn on top of any native scene (never over the
-colour field, scene 7, whose colours depend only on its trace). They are off by
-default; choose them with `--mic-layers` or cycle them with `M`. They do not
-change the control-frame wire format. Their red flashes are not yet bounded
+Two overlay layers can be drawn on eligible native scenes. They are suppressed
+over the colour field (scene 7), whose colours depend only on its trace, and
+over Starfield to preserve its luminance bound. They are off by default; choose
+them with `--mic-layers` or cycle them with `M`. They do not change the
+control-frame wire format. Their red flashes are not yet bounded
 (see below), so like flash/gate they are drawn only in builds with the
 `unmeasured-flash` Cargo feature, for measurement and development. Default
 builds (including release packages) accept `--mic-layers` and `M`, print a
@@ -347,18 +378,22 @@ cargo run --manifest-path renderers/modern/Cargo.toml \
 
 Scenes live in `src/scenes/`, one module per scene, behind the `REGISTRY`
 table in `src/scenes/mod.rs`. Scene byte 7 is checked first and always selects
-the colour field, whatever the registry length; every other byte selects
-`REGISTRY[scene % REGISTRY.len()]`:
+the colour field. To preserve all existing wire behavior, bytes other than 7
+keep the original modulo-six mapping. For the live app, Starfield is selected
+with `--scene 6` and both catalog and location options. Capture can also use
+`--starfield` with those options to enable Starfield only on recorded scene-6
+frames. Bare or wrapped wire bytes and catalog options alone do not select it.
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
 | 7 | `ColourField` | `ScreenSpace` |
-| 0, 6, 12, ... | `SignalField` | `Orbit3D` |
-| 1, 13, 19, ... | `SpectrumVolume` | `Orbit3D` |
+| 0, 6, 12, ... (unless explicit scene-6 opt-in) | `SignalField` | `Orbit3D` |
+| 1, 7, 13, 19, ... (except byte 7) | `SpectrumVolume` | `Orbit3D` |
 | 2, 8, 14, ... | `PulseTunnel` | `Orbit3D` |
 | 3, 9, 15, ... | `Lines` | `ScreenSpace` |
 | 4, 10, 16, ... | `Static` | `ScreenSpace` |
 | 5, 11, 17, ... | `Object` | `ScreenSpace` |
+| Live `--scene 6` with catalog/location, or capture `--starfield` | `Starfield` | `ScreenSpace` |
 
 - `ColourField` (scene 7, `src/scenes/colour_field/`): two or three large
   regions of flat colour, meant to be projected onto performers in the dark.
@@ -384,6 +419,75 @@ the colour field, whatever the registry length; every other byte selects
   steps with incoming scene 7 throughout) arms it, since hosts send those
   only when started with `--allow-flash`. Relative palette inputs, procedural
   and mic frames never arm, and unarmed 3 and 7 run as hard cuts (2 and 6).
+- `Starfield` (scene 6, `src/scenes/starfield.rs`): reads a user-supplied CSV
+  with HYG-compatible `ra` hours, `dec` degrees, and `mag` columns (optional
+  `ci` and quoted `proper` name). Select it with `--scene 6` plus both catalog
+  and location options, or with `--starfield` plus those options to preserve
+  recorded scene transitions. No catalog is distributed while the data
+  licensing research is unresolved. The coordinates are treated as HYG-style
+  J2000; a UTC timestamp and east-positive longitude feed an approximate GMST
+  rotation and local horizon conversion. Visible stars are mapped to a
+  rectangular azimuth/altitude panorama (north wraps at both horizontal
+  edges; east, south and west map across the middle; horizon at the bottom).
+  IAU 1976 precession transforms J2000 coordinates to date for supported UTC
+  dates from 1800 through 2200. Proper motion, parallax and atmospheric
+  refraction are not modeled, so this is a useful sky view rather than a
+  precision planetarium. Magnitude controls compressed, monotonically ordered
+  brightness and point size; colour index controls approximate hue. The
+  existing square-root linear-light magnitude scalar `B` preserves the
+  point-size response; emitted luminance is `L = 0.02 * tanh(B / 0.02)`.
+  A neutral magnitude-6.5 star stays near 0.00514 linear luminance (about 16
+  sRGB codes), while very bright white stars top out near 0.01974 (about 38
+  codes). Each approximate black-body tint is scaled by `L / Y`, where `Y` is
+  its Rec.709 linear luminance, keeping different hues in the same magnitude
+  order. Over the complete 1000–40000 K range, `Y` is at least 0.403096 at the
+  warm endpoint (the cool endpoint is about 0.719); thus the worst channel is
+  below `0.01974 / 0.403 < 0.049`, leaving margin under the 0.05 linear
+  per-channel cap even with rounding. The tint values are linear RGB, not
+  sRGB-encoded inputs. This is deliberate tone shaping, not an sRGB correction;
+  the renderer's output encoding is unchanged. Magnitude ordering holds for
+  the pre-quantization luminance, but output encoding and 8-bit quantization
+  can tie or slightly invert displayed luminance across hues for close
+  magnitudes, particularly in the compressed bright range.
+  Point footprints retain the
+  existing approximately 2.8–3.5 output-pixel curve over the rendered
+  magnitude range. At most
+  200 stars are rendered from a spatial index that retains every in-limit
+  star, so brighter below-horizon records cannot hide a fainter visible one.
+  At most 131,072 CSV rows, 64 MiB total input, and 1 MiB per CSV record are
+  accepted; larger inputs fail with an actionable error instead of silently
+  dropping stars. Projection and ordering are cached for each effective
+  ten-second sky snapshot, observer, viewport and profile budget. Catalog
+  scanning remains bounded by the row limit, with wholly below-horizon bins
+  skipped; benchmark the largest catalogs on target hardware.
+  Each star's linear-RGB channel is capped at
+  0.05; stars are opaque and drawn in ascending brightness (faintest first,
+  brightest last), so a
+  coincident faint star cannot overwrite a brighter one. Changing membership
+  or overlap changes a Starfield pixel by at most 0.05 linear luminance.
+  Transitions into or out of Starfield are separately gated to at most two
+  crossings per rolling second, using monotonic timestamps after the window
+  surface's `present()` call returns. Acquisition, rendering and present-call
+  stalls therefore count against the gate; wgpu does not expose physical
+  scanout timestamps, so this is not a physical presentation-time guarantee.
+  While the gate is full, it continues showing the last committed scene and
+  retries the latest request; native-to-native changes are immediate.
+  Mic-layer overlays are suppressed while Starfield is displayed, then resume
+  on other eligible scenes. The gate survives resize and capture replay uses
+  deterministic frame time.
+  This bounds Starfield crossings, not native-to-native or ColourField-internal
+  flashing, which remain separate safety work (#119/#124); it is not
+  independent photosensitivity certification.
+  Live wall-clock corrections are synchronized at the next ten-second
+  snapshot; the full star snapshot (positions, membership, ordering and
+  brightness) is held between updates.
+  The renderer writes sRGB-encoded star colors explicitly on non-sRGB targets
+  so faint linear-light stars survive attachment quantization. Stars fainter
+  than magnitude 6.5 are excluded. Below-horizon stars are culled; the
+  visible candidates are selected by brightness with a screen-quarter coverage
+  reserve, and output respects each profile's instance budget. Seam-crossing
+  stars use two instance slots atomically; with only one slot remaining, that
+  star is skipped rather than drawn at just one edge.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
@@ -524,15 +628,9 @@ the colour field, whatever the registry length; every other byte selects
   buffer, so splats are sorted far to near on the CPU.
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
-mode, and append that entry to `REGISTRY`. Appending keeps every byte below the
-old registry length on the same scene; wrapped bytes follow the new length,
-because selection is `scene % REGISTRY.len()`. Appending `Lines` as the fourth
-scene shifted them: bytes 3, 4 and 5 (formerly `SignalField`, `SpectrumVolume`
-and `PulseTunnel`) now select `Lines`, `SignalField` and `SpectrumVolume`.
-Appending `Static` as the fifth scene shifted bytes 4 to 7 the same way: they
-now select `Static`, `SignalField`, `SpectrumVolume` and `PulseTunnel`.
-Appending `Object` as the sixth scene shifted bytes 5 to 9: they now select
-`Object`, `SignalField`, `SpectrumVolume`, `PulseTunnel` and `Lines`.
+mode, and append that entry to `REGISTRY`. Do not change the legacy modulo-six
+mapping for control-frame bytes: Starfield is selected only by explicit local
+opt-in to scene 6, and byte 7 remains the ColourField.
 `Orbit3D` scenes use world coordinates and the smoothed orbit camera.
 `ScreenSpace` scenes draw flat: `center.xy` is NDC (`-1..1` spans the viewport,
 `+y` up), depth is ignored, and instances draw in order with their colour
@@ -576,8 +674,10 @@ for the analyser.
 ## Capture
 
 `chipviz-capture` renders frames through the same pipeline and shader into an
-offscreen texture, then writes PNGs plus `manifest.json` (profile, input, size,
-and per-frame file, index, elapsed time and scene). It opens no window and
+offscreen texture, then writes PNGs plus `manifest.json` (profile, input, size, resolved Starfield epoch/clock mode,
+and per-frame file, index, elapsed time, resolved Starfield epoch, requested
+scene byte and debounced `displayed_scene`).
+It opens no window and
 needs no screen-recording permission, only a GPU adapter.
 
 ```sh
@@ -587,6 +687,26 @@ just modern-capture --input host/fixtures/musical/groove.cvz --frames 0,30 --out
 
 Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
 frame 0, so very large frame indices take longer to capture.
+Starfield captures without `--time` advance from the resolved current UTC epoch
+in ten-second snapshot steps. That epoch and advancing mode are recorded in the
+manifest. To reproduce a moving-sky set, pass the recorded
+`starfield_epoch_unix_seconds` as `--time` together with `--follow-time`.
+An explicit `--time` remains fixed unless `--follow-time` is supplied.
+The capture CLI preserves legacy mapping by default: bare `--scene 6` remains
+`SignalField`, and raw/wrapped scene bytes keep their existing mappings. To
+force Starfield in every captured frame, use the paired form
+`--scene 6 --catalog PATH --location LAT,LON`; this preserves the original
+personal-bundle invocation. Catalog/location options without either `--scene
+6` or `--starfield` do not enable Starfield. Alternatively, `--starfield --catalog PATH
+--location LAT,LON` opts in to Starfield for recorded scene-6 frames without
+forcing the scene, and is useful for replaying recordings with scene
+transitions. `--starfield` requires both catalog and location before output or
+GPU setup.
+The stable programmatic `capture::run` and `capture::run_with_options` APIs
+also keep legacy scene-byte mapping (byte 6 is `SignalField`); opt into
+Starfield through `capture::run_with_starfield_options`. That explicit API
+replays recorded scene-6 frames with Starfield even when `CaptureArgs.scene` is
+`None`.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed
