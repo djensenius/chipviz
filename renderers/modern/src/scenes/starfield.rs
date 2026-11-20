@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn projection_cache_hits_and_invalidates_every_projection_input() {
-        let catalog_arc = Arc::new(catalog("ra,dec,mag\n0,45,1\n6,45,2\n").unwrap());
+        let catalog_arc = Arc::new(catalog("ra,dec,mag\n18.7,45,1\n6,45,2\n").unwrap());
         let mut state = SceneState::default();
         let mut config = StarfieldConfig {
             catalog: Arc::clone(&catalog_arc),
@@ -1062,6 +1062,79 @@ mod tests {
             ProjectionKey::new(&catalog_changed, &profile, (160, 90), 16.0 / 9.0, 0, 0.0),
             baseline,
             "catalog identity is part of cache key"
+        );
+
+        let project =
+            |state: &SceneState, profile: &RenderProfile, existing: &mut Vec<Instance>| {
+                build(
+                    profile,
+                    ControlFrame::procedural(3),
+                    0.0,
+                    16.0 / 9.0,
+                    (160, 90),
+                    state,
+                    existing,
+                );
+            };
+        let mut longitude_state = SceneState::default();
+        longitude_state.configure_starfield(Some(longitude_changed));
+        let mut longitude_output = Vec::new();
+        project(&longitude_state, &profile, &mut longitude_output);
+        assert_ne!(
+            bytemuck::cast_slice::<Instance, u8>(&longitude_output),
+            bytemuck::cast_slice::<Instance, u8>(&first_instances),
+            "changing longitude rebuilds actual projected output"
+        );
+        assert_eq!(
+            longitude_state
+                .starfield_projection()
+                .as_ref()
+                .unwrap()
+                .rebuilds,
+            1
+        );
+
+        let mut catalog_state = SceneState::default();
+        catalog_state.configure_starfield(Some(catalog_changed));
+        let mut catalog_output = Vec::new();
+        project(&catalog_state, &profile, &mut catalog_output);
+        assert_ne!(
+            bytemuck::cast_slice::<Instance, u8>(&catalog_output),
+            bytemuck::cast_slice::<Instance, u8>(&first_instances),
+            "changing catalog rebuilds actual projected output"
+        );
+        assert_eq!(
+            catalog_state
+                .starfield_projection()
+                .as_ref()
+                .unwrap()
+                .rebuilds,
+            1
+        );
+
+        let mut existing_state = SceneState::default();
+        existing_state.configure_starfield(Some(config.clone()));
+        let mut baseline_output = Vec::new();
+        project(&existing_state, &profile, &mut baseline_output);
+        let mut prefixed_output = vec![Instance {
+            center: [0.25, 0.5, 0.0],
+            size: [1.0, 1.0],
+            color: [0.1, 0.2, 0.3, 1.0],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern: [0.0, 0.0],
+        }];
+        project(&existing_state, &profile, &mut prefixed_output);
+        assert_eq!(prefixed_output[0].center, [0.25, 0.5, 0.0]);
+        assert_eq!(prefixed_output.len(), baseline_output.len() + 1);
+        assert_eq!(
+            existing_state
+                .starfield_projection()
+                .as_ref()
+                .unwrap()
+                .rebuilds,
+            2,
+            "existing instances invalidate the previous projection cache hit"
         );
 
         config.latitude_degrees = 44.0;

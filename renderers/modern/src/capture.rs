@@ -476,7 +476,16 @@ pub fn run_with_starfield_options(
     args: &CaptureArgs,
     options: &StarfieldCaptureOptions,
 ) -> Result<(), String> {
-    run_internal(args, options.capture, &options.starfield, true)
+    run_internal(
+        args,
+        options.capture,
+        &options.starfield,
+        starfield_opt_in(args),
+    )
+}
+
+fn starfield_opt_in(args: &CaptureArgs) -> bool {
+    args.scene == Some(starfield::SCENE)
 }
 
 fn run_internal(
@@ -632,16 +641,16 @@ fn run_internal(
             || "null".to_string(),
             |config| config.epoch_at(elapsed(index) as f32).to_string(),
         );
-        captures.push(manifest_capture_entry(
-            &file,
-            index,
-            elapsed(index),
-            frame_starfield_epoch,
-            frame.scene,
+        captures.push(manifest_capture_entry(ManifestCaptureEntry {
+            file: &file,
+            frame_index: index,
+            elapsed: elapsed(index),
+            starfield_epoch: frame_starfield_epoch,
+            requested_scene: frame.scene,
             displayed_scene,
-            name,
+            scene_name: name,
             camera,
-        ));
+        }));
     }
 
     let input = match &args.input {
@@ -671,21 +680,28 @@ fn starfield_metadata(config: Option<&starfield::StarfieldConfig>) -> (String, S
     }
 }
 
-fn manifest_capture_entry(
-    file: &str,
+struct ManifestCaptureEntry<'a> {
+    file: &'a str,
     frame_index: u64,
-    frame_elapsed: f64,
+    elapsed: f64,
     starfield_epoch: String,
     requested_scene: u8,
     displayed_scene: u8,
-    scene_name: &str,
+    scene_name: &'a str,
     camera: CameraMode,
-) -> String {
+}
+
+fn manifest_capture_entry(entry: ManifestCaptureEntry<'_>) -> String {
     format!(
-        "    {{\"file\": {}, \"frame_index\": {frame_index}, \"elapsed\": {frame_elapsed}, \"starfield_epoch_unix_seconds\": {starfield_epoch}, \"scene\": {requested_scene}, \"displayed_scene\": {displayed_scene}, \"scene_name\": {}, \"camera\": {}}}",
-        json_string(file),
-        json_string(scene_name),
-        json_string(match camera {
+        "    {{\"file\": {}, \"frame_index\": {}, \"elapsed\": {}, \"starfield_epoch_unix_seconds\": {}, \"scene\": {}, \"displayed_scene\": {}, \"scene_name\": {}, \"camera\": {}}}",
+        json_string(entry.file),
+        entry.frame_index,
+        entry.elapsed,
+        entry.starfield_epoch,
+        entry.requested_scene,
+        entry.displayed_scene,
+        json_string(entry.scene_name),
+        json_string(match entry.camera {
             CameraMode::Orbit3D => "orbit3d",
             CameraMode::ScreenSpace => "screen_space",
         }),
@@ -965,6 +981,7 @@ mod tests {
             scenes::dispatch_configured(args.scene.unwrap(), false).name(),
             "SignalField"
         );
+        assert!(starfield_opt_in(&args));
         assert!(matches!(
             parse_args([
                 "--out".into(),
@@ -978,6 +995,31 @@ mod tests {
             tunnel_variant: TunnelVariant::Hallway,
         };
         assert_eq!(configured.tunnel_variant, TunnelVariant::Hallway);
+    }
+
+    #[test]
+    fn capture_starfield_opt_in_requires_exact_scene_override() {
+        let mut args = CaptureArgs {
+            profile: RenderProfile::pi5(),
+            scene: None,
+            frames: vec![0],
+            input: Input::File(PathBuf::from("fixture.cvz")),
+            size: (160, 90),
+            out: PathBuf::from("unused"),
+            mic_layers: mic_layers::Mode::Off,
+            lines_drop_cuts: false,
+        };
+        assert!(
+            !starfield_opt_in(&args),
+            "catalogs alone do not enable scene 6"
+        );
+        args.scene = Some(13);
+        assert!(
+            !starfield_opt_in(&args),
+            "wrapped bytes keep legacy dispatch"
+        );
+        args.scene = Some(6);
+        assert!(starfield_opt_in(&args), "exact --scene 6 is the opt-in");
     }
 
     #[test]
@@ -1082,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_preflight_checks_debounced_displayed_scene() {
+    fn capture_preflight_respects_colour_field_debounce_and_legacy_scene_six() {
         let source = FrameSource {
             fixture: Some(vec![
                 ControlFrame {
@@ -1096,6 +1138,8 @@ mod tests {
             ]),
             scene: None,
         };
+        // The raw requested frame stays scene 7. Debounce keeps displayed
+        // output on scene 0 at frame 1 in both legacy and Starfield modes.
         assert_eq!(source.frame(1).unwrap().scene, 7);
         assert_eq!(displayed_scene_at(&source, 1, false).unwrap(), 0);
         assert_eq!(displayed_scene_at(&source, 1, true).unwrap(), 0);
@@ -1225,16 +1269,16 @@ mod tests {
 
     #[test]
     fn manifest_separates_requested_wrapped_byte_from_displayed_scene() {
-        let wrapped = manifest_capture_entry(
-            "frame000000-SpectrumVolume.png",
-            0,
-            0.0,
-            "null".into(),
-            13,
-            1,
-            "SpectrumVolume",
-            CameraMode::Orbit3D,
-        );
+        let wrapped = manifest_capture_entry(ManifestCaptureEntry {
+            file: "frame000000-SpectrumVolume.png",
+            frame_index: 0,
+            elapsed: 0.0,
+            starfield_epoch: "null".into(),
+            requested_scene: 13,
+            displayed_scene: 1,
+            scene_name: "SpectrumVolume",
+            camera: CameraMode::Orbit3D,
+        });
         assert!(wrapped.contains("\"scene\": 13, \"displayed_scene\": 1"));
 
         let source = FrameSource {
@@ -1251,16 +1295,16 @@ mod tests {
             scene: None,
         };
         let displayed = displayed_scene_at(&source, 1, false).unwrap();
-        let debounced = manifest_capture_entry(
-            "frame000001-SignalField.png",
-            1,
-            elapsed(1),
-            "null".into(),
-            7,
-            displayed,
-            "SignalField",
-            CameraMode::Orbit3D,
-        );
+        let debounced = manifest_capture_entry(ManifestCaptureEntry {
+            file: "frame000001-SignalField.png",
+            frame_index: 1,
+            elapsed: elapsed(1),
+            starfield_epoch: "null".into(),
+            requested_scene: 7,
+            displayed_scene: displayed,
+            scene_name: "SignalField",
+            camera: CameraMode::Orbit3D,
+        });
         assert!(debounced.contains("\"scene\": 7, \"displayed_scene\": 0"));
     }
 

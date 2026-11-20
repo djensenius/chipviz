@@ -88,6 +88,15 @@ pub struct OffscreenRenderer {
     readback: wgpu::Buffer,
 }
 
+#[derive(Clone, Copy)]
+struct EncodeFrameOptions {
+    elapsed: f64,
+    gate_elapsed: f64,
+    size: (u32, u32),
+    mic_layers: bool,
+    commit_gate: bool,
+}
+
 #[derive(Debug)]
 pub enum RendererError {
     CreateSurface(wgpu::CreateSurfaceError),
@@ -474,9 +483,11 @@ impl ScenePipeline {
         let aspect = size_aspect(size);
         let camera = match display {
             colour_field::Display::ColourField(_) => CameraMode::ScreenSpace,
-            colour_field::Display::Native(_) => {
-                scenes::select_configured(frame.scene, self.starfield_dispatch_enabled).camera
-            }
+            colour_field::Display::Native(_) => scenes::selected_camera_configured(
+                frame.scene,
+                self.starfield_dispatch_enabled,
+                self.scene_state.config(),
+            ),
         };
         let _ = scene_uniforms(
             camera,
@@ -667,7 +678,18 @@ impl ScenePipeline {
         elapsed: f64,
         size: (u32, u32),
     ) {
-        let _ = self.encode_frame(encoder, view, frame, elapsed, elapsed, size, true, true);
+        let _ = self.encode_frame(
+            encoder,
+            view,
+            frame,
+            EncodeFrameOptions {
+                elapsed,
+                gate_elapsed: elapsed,
+                size,
+                mic_layers: true,
+                commit_gate: true,
+            },
+        );
     }
 
     /// Encodes a window frame using acquisition time only for the gate.
@@ -685,11 +707,13 @@ impl ScenePipeline {
             encoder,
             view,
             frame,
-            elapsed,
-            acquired_elapsed,
-            size,
-            true,
-            false,
+            EncodeFrameOptions {
+                elapsed,
+                gate_elapsed: acquired_elapsed,
+                size,
+                mic_layers: true,
+                commit_gate: false,
+            },
         )
     }
 
@@ -704,7 +728,18 @@ impl ScenePipeline {
         elapsed: f64,
         size: (u32, u32),
     ) {
-        let _ = self.encode_frame(encoder, view, frame, elapsed, elapsed, size, false, true);
+        let _ = self.encode_frame(
+            encoder,
+            view,
+            frame,
+            EncodeFrameOptions {
+                elapsed,
+                gate_elapsed: elapsed,
+                size,
+                mic_layers: false,
+                commit_gate: true,
+            },
+        );
     }
 
     fn encode_frame(
@@ -712,12 +747,15 @@ impl ScenePipeline {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         frame: ControlFrame,
-        elapsed: f64,
-        gate_elapsed: f64,
-        size: (u32, u32),
-        mic_layers: bool,
-        commit_gate: bool,
+        options: EncodeFrameOptions,
     ) -> (colour_field::Display, bool) {
+        let EncodeFrameOptions {
+            elapsed,
+            gate_elapsed,
+            size,
+            mic_layers,
+            commit_gate,
+        } = options;
         self.scene_state.advance_tunnel(&frame, elapsed);
         let overlay_elapsed = elapsed;
         let elapsed = elapsed as f32;
@@ -739,7 +777,11 @@ impl ScenePipeline {
                     size,
                     &self.scene_state,
                 ),
-                scenes::selected_camera(frame.scene, self.scene_state.config()),
+                scenes::selected_camera_configured(
+                    frame.scene,
+                    self.starfield_dispatch_enabled,
+                    self.scene_state.config(),
+                ),
             ),
         };
         prepare_starfield_attachment_colors(

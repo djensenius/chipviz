@@ -110,6 +110,20 @@ fn public_app_error_still_supports_an_external_exhaustive_match() {
 }
 
 #[test]
+fn capture_cli_rejects_explicit_starfield_without_catalog_or_location() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .args(["--scene", "6", "--out", "unused-starfield-output"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--star-catalog PATH and --location LAT,LON"),
+        "{stderr}"
+    );
+}
+
+#[test]
 #[ignore = "requires a GPU adapter"]
 fn capture_api_and_cli_select_variants_without_changing_the_default() {
     let root = std::env::temp_dir().join(format!(
@@ -176,6 +190,70 @@ fn capture_api_and_cli_select_variants_without_changing_the_default() {
     let manifest = std::fs::read_to_string(root.join("cli/manifest.json")).unwrap();
     assert!(manifest.contains("\"scene_name\": \"PulseTunnel-Abstract\""));
     assert!(manifest.contains("\"camera\": \"screen_space\""));
+
+    // The CLI's raw .cvz scene 6 retains the legacy SignalField mapping;
+    // only the explicit --scene 6 override enables the synthetic Starfield.
+    let mut scene_six_fixture =
+        include_bytes!("../../../host/fixtures/musical/groove.cvz").to_vec();
+    scene_six_fixture[20] = 6;
+    let checksum = scene_six_fixture[..32]
+        .iter()
+        .fold(0, |checksum, byte| checksum ^ byte);
+    scene_six_fixture[32] = checksum;
+    let fixture_path = root.join("scene-six.cvz");
+    std::fs::write(&fixture_path, scene_six_fixture).unwrap();
+    let legacy_cli = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .args(["--profile", "pi5", "--input"])
+        .arg(&fixture_path)
+        .args(["--frames", "0", "--size", "160x90", "--out"])
+        .arg(root.join("legacy-cli-scene-six"))
+        .output()
+        .unwrap();
+    assert!(
+        legacy_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy_cli.stderr)
+    );
+    assert!(
+        root.join("legacy-cli-scene-six/frame000000-SignalField.png")
+            .exists()
+    );
+    let manifest =
+        std::fs::read_to_string(root.join("legacy-cli-scene-six/manifest.json")).unwrap();
+    assert!(manifest.contains("\"scene\": 6, \"displayed_scene\": 0"));
+
+    let synthetic_catalog = root.join("synthetic-stars.csv");
+    std::fs::write(&synthetic_catalog, "ra,dec,mag\n0,90,1\n").unwrap();
+    let starfield_cli = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .args([
+            "--profile",
+            "pi5",
+            "--scene",
+            "6",
+            "--input",
+            "procedural",
+            "--frames",
+            "0",
+            "--size",
+            "160x90",
+            "--star-catalog",
+        ])
+        .arg(&synthetic_catalog)
+        .args(["--location", "90,0", "--time", "946728000", "--out"])
+        .arg(root.join("opt-in-starfield"))
+        .output()
+        .unwrap();
+    assert!(
+        starfield_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&starfield_cli.stderr)
+    );
+    assert!(
+        root.join("opt-in-starfield/frame000000-Starfield.png")
+            .exists()
+    );
+    let manifest = std::fs::read_to_string(root.join("opt-in-starfield/manifest.json")).unwrap();
+    assert!(manifest.contains("\"scene\": 6, \"displayed_scene\": 6"));
 
     // The pre-Starfield API must retain scene-byte-6's legacy SignalField
     // mapping; only the separate Starfield API opts in to Starfield.

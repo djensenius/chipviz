@@ -231,6 +231,21 @@ pub fn selected_camera(scene: u8, config: SceneConfig) -> CameraMode {
     }
 }
 
+pub(crate) fn selected_camera_configured(
+    scene: u8,
+    starfield_enabled: bool,
+    config: SceneConfig,
+) -> CameraMode {
+    let selected = dispatch_configured(scene, starfield_enabled);
+    if selected.name() == pulse_tunnel::ENTRY.name
+        && config.tunnel_variant != TunnelVariant::Original
+    {
+        CameraMode::ScreenSpace
+    } else {
+        selected.camera()
+    }
+}
+
 pub(crate) fn build_tunnel_variant(
     profile: &RenderProfile,
     frame: ControlFrame,
@@ -544,6 +559,25 @@ mod tests {
         assert!(REGISTRY.iter().all(|entry| entry.name != "ColourField"));
         assert_eq!(dispatch(6).name(), "SignalField");
         assert_eq!(select_configured(6, true).name, "Starfield");
+        assert_eq!(
+            selected_camera_configured(6, true, SceneConfig::default()),
+            CameraMode::ScreenSpace
+        );
+        assert_eq!(
+            selected_camera_configured(6, false, SceneConfig::default()),
+            CameraMode::Orbit3D
+        );
+        assert_eq!(
+            selected_camera_configured(
+                9,
+                true,
+                SceneConfig {
+                    tunnel_variant: TunnelVariant::Hallway,
+                    ..SceneConfig::default()
+                }
+            ),
+            CameraMode::ScreenSpace
+        );
     }
 
     #[test]
