@@ -71,17 +71,25 @@ these are not atomic changes.
 
 Input records are sampled once per output poll; selection changes arriving
 during a wait replace the pending destination (latest wins), not a FIFO of
-every selection. Other buttons and axes follow each input record. After the
-last record, the converter appends states until the last destination and its
-60-poll interval are complete, repeating the last record's non-D-pad values.
-If any buttons remain held, it appends one final state releasing them (axes
-stay at their last values). The streaming mapper's caller must arrange its own
-final release.
+every selection. A source change across the scene-7 boundary must hold the
+same decoded scene for 30 consecutive **input records** before it becomes the
+destination. Native-to-native changes are immediate. A new source scene
+restarts this count, even while a ring move is pending. Synthetic tail states
+do not count as input: a recording ending with an unconfirmed change does not
+cause it. Once a crossing has been accepted, the target's 30-step debounce
+still applies, so a later reversal can arrive after that crossing is visible.
+Other buttons and axes follow each input record. After the last record, the
+converter appends states until the last *accepted* destination and its 60-poll
+interval are complete. Padding clears beat, bar and drop onsets, but retains
+fill, manual and shoulder levels and the last axes. West remains held if fill
+is held, even if the last record also had drop. If any buttons remain held,
+one final state releases them (axes stay at their last values). A streaming
+mapper caller must mark synthetic states with `padding=True` and arrange its
+own final release.
 Playback must deliver every JSON state in order, exactly one per receiver
 step, at no more than 60 polls/s; neither the JSON nor this converter provides
-timing or enforces the rate. Tail repetition can hold other buttons until the
-final release. Transient input selections may
-never be reached, and reaching a destination can take multiple seconds.
+timing or enforces the rate. Transient input selections may never be reached,
+and reaching a destination can take multiple seconds.
 
 The `--initial-*` values are the actual receiver ring values, not the desired
 input values. Before starting or explicitly resynchronizing, independently
@@ -96,10 +104,14 @@ There is no receiver feedback and no alignment guarantee.
 
 Without `--allow-flash`, the usual HID scene-7 guard maps palette 3/7 to 2/6.
 The mapper also refuses to pass through 3/7 while its scene ring is 7, and
-requires a safe initial scene-7 palette. Since these forbidden ring positions
-separate the palette ring, some changes (for example 0 to 4 while in scene
-7) fail explicitly rather than violating the guard. Move out of scene 7,
-select the desired palette, then return, or independently resynchronize.
+requires a safe initial scene-7 palette. These forbidden positions separate
+the palette ring. For a safe destination on the other side (for example 0 to
+4), it temporarily moves the scene ring to native scene 0, waits for the
+scene-7 exit, moves the palette there, and returns to 7. The exit and re-entry
+are **visible**, and the intermediate native scene and palettes are not
+atomic; both scene crossings still go through the receiver's debounce and
+change budget. Latest source selections may redirect this detour. The guard
+also applies to the accepted scene while a source exit is still debouncing.
 With `--allow-flash` the guard is disabled and the warning is printed. Even
 then gamepad-only relative inputs cannot arm flash in a conforming `data`
 receiver (F24); they must never be fed to an `operator` build. The target's

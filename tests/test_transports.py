@@ -1,9 +1,12 @@
 import contextlib
+import ctypes
 import io
 import itertools
 import json
 import math
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -284,7 +287,7 @@ class GbaGamepadTests(unittest.TestCase):
     for scene in usb_hid.GBA_SCENES:
       for palette in range(8):
         with self.subTest(scene=scene, palette=palette):
-          states = usb_hid.convert_gba_stream(_scene_frame(scene, palette), 0, 0, True)
+          states = usb_hid.convert_gba_stream(_scene_frame(scene, palette) * 30, 0, 0, True)
           seen = self._receive(states)
           self.assertEqual(seen[-1], (scene, palette))
           pulses = [i for i, state in enumerate(states) if state.dpad]
@@ -309,20 +312,18 @@ class GbaGamepadTests(unittest.TestCase):
   def test_flash_guard_and_safe_paths(self):
     for palette, safe in ((3, 2), (7, 6)):
       with self.subTest(palette=palette):
-        states = usb_hid.convert_gba_stream(_scene_frame(15, palette), 0, 0)
+        states = usb_hid.convert_gba_stream(_scene_frame(15, palette) * 30, 0, 0)
         seen = self._receive(states)
         self.assertEqual(seen[-1], (7, safe))
         self.assertTrue(all(p not in (3, 7) for s, p in seen if s == 7))
-        allowed = usb_hid.convert_gba_stream(_scene_frame(15, palette), 0, 0, True)
+        allowed = usb_hid.convert_gba_stream(_scene_frame(15, palette) * 30, 0, 0, True)
         self.assertEqual(self._receive(allowed)[-1], (7, palette))
-    with self.assertRaisesRegex(ValueError, "cannot cross"):
-      usb_hid.convert_gba_stream(_scene_frame(7, 4), 7, 0)
     with self.assertRaisesRegex(ValueError, "safe palette"):
       usb_hid.GbaGamepadMapper(7, 3)
     # Leaving scene 7 precedes a native palette change, including the debounce wait.
-    states = usb_hid.convert_gba_stream(_scene_frame(0, 3), 7, 2)
+    states = usb_hid.convert_gba_stream(_scene_frame(0, 3) * 30, 7, 2)
     self.assertEqual([(i, s.dpad) for i, s in enumerate(states) if s.dpad],
-                     [(0, ("up",)), (60, ("right",))])
+                     [(29, ("up",)), (89, ("right",))])
 
   def test_f19_digital_buttons_and_f24_relative_only(self):
     base = chipviz_bridge.ControlFrame(
@@ -331,7 +332,8 @@ class GbaGamepadTests(unittest.TestCase):
     )
     states = usb_hid.convert_gba_stream(chipviz_bridge.pack_frame(base), 7, 0, True)
     seen = self._receive(states, 7, 0)
-    self.assertTrue(all(state.buttons & 0x11 == 0x11 for state in states[:-1]))
+    self.assertEqual(states[0].buttons & 0x11, 0x11)
+    self.assertTrue(all(state.buttons & 0x11 == 0x10 for state in states[1:-1]))
     self.assertEqual(states[-1].buttons, 0)
     self.assertEqual(seen[-30:], [(7, 3)] * 30)
     self.assertTrue(all(state.keys == () for state in states))
@@ -377,6 +379,176 @@ class GbaGamepadTests(unittest.TestCase):
       self.assertEqual(gamepad[0]["dpad"], ["up"])
       self.assertEqual(gamepad[-1]["dpad"], [])
       self.assertTrue(all(state["keys"] == [] for state in gamepad))
+
+
+def _digital_frame(scene=7, palette=0, flags=0, energy=64):
+  return chipviz_bridge.pack_frame(chipviz_bridge.ControlFrame(
+    frame=0, bpm=120, beat_phase=0, beat_count=0, energy=energy,
+    bass=energy, mid=energy, treble=energy, spectrum=(0,) * 8,
+    scene=scene, palette=palette, flags=flags, notes=(),
+  ))
+
+
+class HidReceiverTests(unittest.TestCase):
+  """Exercise polls with the C64 detector and, if supplied, the GBA core.
+
+  CHIPVIZ_GBA_RECEIVER_DIR names the directory containing the GBA
+  colour_field.c, colour_field.h and input.h from #125.
+  """
+
+  @classmethod
+  def setUpClass(cls):
+    cls.temp = tempfile.TemporaryDirectory()
+    cls.receivers = []
+    sources = [("reference", ROOT / "cores/c64/homebrew/src", False)]
+    gba_source = os.environ.get("CHIPVIZ_GBA_RECEIVER_DIR")
+    if gba_source:
+      sources.append(("gba", pathlib.Path(gba_source), True))
+    for name, source, gba in sources:
+      library = pathlib.Path(cls.temp.name) / f"{name}.so"
+      command = [os.environ.get("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror",
+                 "-pedantic", "-shared", "-fPIC", "-I", str(source),
+                 "-DGBA_RECEIVER" if gba else "-DCF_UNMEASURED_FLASH",
+                 str(ROOT / "tests/hid_colour_field_receiver.c"),
+                 str(source / "colour_field.c"), "-o", str(library)]
+      subprocess.run(command, check=True, capture_output=True)
+      receiver = ctypes.CDLL(str(library))
+      receiver.receiver_init.argtypes = [ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8]
+      receiver.receiver_step.argtypes = [ctypes.c_uint16]
+      receiver.receiver_value.argtypes = [ctypes.c_uint]
+      receiver.receiver_value.restype = ctypes.c_uint8
+      cls.receivers.append((name, receiver))
+
+  @classmethod
+  def tearDownClass(cls):
+    cls.temp.cleanup()
+
+  def _trace(self, receiver, states, scene=0, palette=0, settle=False, options=0):
+    receiver.receiver_init(scene, palette, options)
+    if settle:
+      for _ in range(60):
+        receiver.receiver_step(0)
+    trace = []
+    for state in states:
+      keys = (state.buttons & 3) | (0x0200 if state.buttons & 0x10 else 0)
+      keys |= (0x0100 if state.buttons & 0x20 else 0)
+      for direction in state.dpad:
+        keys |= {"up": 0x40, "down": 0x80, "left": 0x20, "right": 0x10}[direction]
+      receiver.receiver_step(keys)
+      trace.append(tuple(receiver.receiver_value(i) for i in range(15)))
+    return trace
+
+  def test_source_scene_debounce_and_queued_changes(self):
+    short = _scene_frame(7, 0) + _scene_frame(0, 0) * 90
+    self.assertEqual(len(usb_hid.convert_gba_stream(_scene_frame(7, 0), 0, 0)), 1)
+    sequence = (_scene_frame(0, 0) * 50 + _scene_frame(7, 0) * 29 +
+                _scene_frame(0, 0) * 30 + _scene_frame(7, 0) * 30 +
+                _scene_frame(0, 0) * 29 + _scene_frame(7, 0) * 100)
+    queued = _scene_frame(7, 0) * 30 + _scene_frame(0, 0) * 150
+    for name, receiver in self.receivers:
+      with self.subTest(receiver=name):
+        self.assertFalse(any(row[0] for row in self._trace(receiver, usb_hid.convert_gba_stream(short, 0, 0))))
+        trace = self._trace(receiver, usb_hid.convert_gba_stream(sequence, 0, 0))
+        entries = [i for i in range(1, len(trace)) if trace[i][0] and not trace[i - 1][0]]
+        exits = [i for i in range(1, len(trace)) if not trace[i][0] and trace[i - 1][0]]
+        self.assertEqual(entries, [168])
+        self.assertEqual(exits, [])
+        trace = self._trace(receiver, usb_hid.convert_gba_stream(queued, 2, 0), 2, 0)
+        self.assertFalse(any(row[0] for row in trace))
+        self.assertEqual(trace[-1][8:10], (0, 0))
+
+  def test_safe_palette_detour_and_latest_destination(self):
+    for name, receiver in self.receivers:
+      with self.subTest(receiver=name):
+        states = usb_hid.convert_gba_stream(_scene_frame(7, 4) * 400, 7, 0)
+        trace = self._trace(receiver, states, 7, 0, settle=True)
+        self.assertEqual([(i, row[0]) for i, row in enumerate(trace[1:], 1)
+                          if row[0] != trace[i - 1][0]], [(30, 0), (330, 1)])
+        self.assertEqual(trace[-1][1:3], (0, 1))
+        self.assertEqual(trace[-1][8:10], (7, 4))
+        self.assertTrue(all(not row[11] and row[1] != 3 for row in trace))
+        self.assertTrue(all(row[9] not in (3, 7) for row in trace if row[8] == 7))
+        changed = _scene_frame(7, 4) + _scene_frame(7, 2) * 300
+        trace = self._trace(receiver, usb_hid.convert_gba_stream(changed, 7, 0), 7, 0, settle=True)
+        self.assertEqual(trace[-1][8:10], (7, 2))
+        self.assertTrue(all(not row[11] and row[1] != 3 for row in trace))
+
+  def test_all_safe_scene_seven_palette_pairs(self):
+    safe = (0, 1, 2, 4, 5, 6)
+    for source in safe:
+      for target in safe:
+        states = usb_hid.convert_gba_stream(_scene_frame(7, target), 7, source)
+        for name, receiver in self.receivers:
+          with self.subTest(source=source, target=target, receiver=name):
+            trace = self._trace(receiver, states, 7, source, settle=True)
+            self.assertEqual(trace[-1][8:10], (7, target))
+            self.assertEqual(trace[-1][1:3], (target & 3, target >> 2))
+            self.assertTrue(all(not row[11] and row[1] != 3 for row in trace))
+            self.assertTrue(all(row[9] not in (3, 7) for row in trace if row[8] == 7))
+            exited = any(not row[0] for row in trace)
+            self.assertEqual(exited, (source <= 2) != (target <= 2))
+
+  def test_padding_releases_onsets_but_preserves_levels(self):
+    wire = _digital_frame(7, 3, flags=0x1f, energy=200)
+    states = usb_hid.convert_gba_stream(wire, 7, 0, True)
+    self.assertEqual(states[0].buttons & 0x1f, 0x1f)
+    self.assertTrue(all(state.buttons & 0x1f == 0x1c for state in states[1:-1]))
+    self.assertEqual(states[-1].buttons, 0)
+    for name, receiver in self.receivers:
+      with self.subTest(receiver=name):
+        trace = self._trace(receiver, states, 7, 0)
+        self.assertEqual([i for i, row in enumerate(trace) if row[10]], [0])
+        self.assertTrue(all(row[1] != 3 and not row[11] for row in trace))
+        self.assertEqual(trace[-1][1], 2)
+    drop_only = usb_hid.convert_gba_stream(_digital_frame(7, 3, flags=7, energy=200), 7, 0, True)
+    self.assertEqual(drop_only[0].buttons & 7, 7)
+    self.assertTrue(all(not state.buttons & 7 for state in drop_only[1:]))
+
+  def test_f19_digital_trace(self):
+    stream = b"".join(_digital_frame(palette=1, energy=200 if 320 <= t < 380 else 64,
+                                      flags=1 if t >= 50 and (t - 50) % 60 == 0 else 0)
+                      for t in range(600))
+    states = usb_hid.convert_gba_stream(stream, 7, 1)
+    self.assertEqual(len(states), 600)
+    for name, receiver in self.receivers:
+      with self.subTest(receiver=name):
+        trace = self._trace(receiver, states, 7, 1)
+        self.assertTrue(all(row[0] and row[1:3] == (1, 0) for row in trace))
+        self.assertTrue(all(not row[13] for row in trace))
+        self.assertEqual([i for i, row in enumerate(trace) if row[10]], list(range(50, 600, 60)))
+        self.assertEqual([trace[i][6:8] for i in (0, 319, 320, 330, 379, 380, 390)],
+                         [(1, 1), (1, 1), (2, 2), (3, 3), (3, 3), (2, 2), (1, 1)])
+        if name == "reference":
+          self.assertEqual([i for i, row in enumerate(trace) if row[12]], [320])
+        cut_states = usb_hid.convert_gba_stream(b"".join(
+          _digital_frame(palette=2, energy=200 if 320 <= t < 380 else 64,
+                         flags=1 if t >= 50 and (t - 50) % 60 == 0 else 0)
+          for t in range(600)), 7, 2)
+        cuts = self._trace(receiver, cut_states, 7, 2)
+        self.assertEqual([i for i in range(1, 600) if cuts[i][3:6] != cuts[i - 1][3:6]],
+                         [50, 110, 170, 230, 290, 320, 350, 410, 470, 530, 590])
+        held = self._trace(receiver, states, 7, 0, options=1)
+        self.assertTrue(all(row[1:8] == held[0][1:8] for row in held))
+        if name == "reference":
+          flash = self._trace(receiver, states, 7, 3, options=1)
+          self.assertEqual([i for i, row in enumerate(flash) if row[14]],
+                           [50, 110, 170, 230, 290, 320, 350, 410, 470, 530, 590])
+          self.assertTrue(all(row[6:8] == (1, 1) for row in flash if row[6] != 3))
+
+  def test_f24_exact_relative_fixture(self):
+    states = [usb_hid.GamepadState(0, -64, 0,
+              ("right",) if t in (10, 20, 30) else ("left",) if t == 130 else ())
+              for t in range(600)]
+    for name, receiver in self.receivers:
+      with self.subTest(receiver=name):
+        trace = self._trace(receiver, states, 7, 0)
+        self.assertTrue(all(row[0] and not row[11] for row in trace))
+        self.assertEqual([row[9] for row in trace],
+                         [0] * 10 + [1] * 10 + [2] * 10 + [3] * 100 + [2] * 470)
+        self.assertEqual([row[1] for row in trace], [0] * 60 + [2] * 540)
+        if name == "reference":
+          absolute = self._trace(receiver, states, 7, 0, options=2)
+          self.assertEqual([row[1] for row in absolute], [0] * 60 + [3] * 100 + [2] * 440)
 
 
 class FlashGuardTests(unittest.TestCase):

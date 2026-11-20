@@ -15,6 +15,7 @@ from chipviz_bridge import WIRE_SIZE, add_allow_flash_argument, announce_allow_f
 PALETTE_KEYS = ("Q", "W", "E", "R", "T", "Y", "U", "I")
 GBA_SCENES = (0, 1, 2, 3, 7)
 STABLE_POLLS = 60
+SOURCE_STABLE = 30
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class GbaGamepadMapper:
     self.scene = None
     self.palette = None
     self.wait = 0
+    self.target_scene = None
+    self.target_palette = None
 
   def resync(self, scene: int, palette: int) -> None:
     if scene not in GBA_SCENES or palette not in range(8):
@@ -60,6 +63,10 @@ class GbaGamepadMapper:
     self.scene: int | None = scene
     self.palette: int | None = palette
     self.wait = 0
+    self.target_scene: int | None = scene
+    self.target_palette: int | None = palette
+    self.source_candidate = scene
+    self.source_count = 0
 
   @staticmethod
   def _direction(ring: tuple[int, ...], current: int, target: int,
@@ -80,15 +87,35 @@ class GbaGamepadMapper:
       raise ValueError("palette cannot cross 3 or 7 while scene 7 is selected without --allow-flash")
     return min(choices)[2]
 
-  def step(self, wire: bytes) -> GamepadState:
+  def step(self, wire: bytes, *, padding: bool = False) -> GamepadState:
     if self.scene is None or self.palette is None:
       raise ValueError("receiver state unknown; resynchronize before conversion")
-    target_scene, target_palette = gba_targets(wire, self.allow_flash)
     base = map_frame(wire, self.allow_flash)
+    if not padding:
+      source_scene, palette = gba_targets(wire, self.allow_flash)
+      if source_scene != self.source_candidate:
+        self.source_candidate = source_scene
+        self.source_count = 1
+      else:
+        self.source_count = min(SOURCE_STABLE, self.source_count + 1)
+      if ((source_scene == 7) == (self.target_scene == 7)
+          or self.source_count >= SOURCE_STABLE):
+        self.target_scene = source_scene
+      if not self.allow_flash and self.target_scene == 7 and palette in (3, 7):
+        palette &= ~1
+      self.target_palette = palette
+    target_scene = self.target_scene
+    target_palette = self.target_palette
+    assert target_scene is not None and target_palette is not None
     dpad: tuple[str, ...] = ()
     if self.wait:
       self.wait -= 1
     else:
+      # The safe palette components are disconnected while scene 7 is
+      # selected. Exit to native scene 0, move the palette, then re-enter.
+      if (not self.allow_flash and self.scene == target_scene == 7
+          and (self.palette <= 2) != (target_palette <= 2)):
+        target_scene = 0
       # Leave scene 7 before changing a native palette; prepare the palette
       # before entering it. Native-to-native routes never pass through 7.
       palette_first = target_scene == 7 and self.scene != 7
@@ -113,7 +140,14 @@ class GbaGamepadMapper:
           dpad = ("right" if direction == 1 else "left",)
       if dpad:
         self.wait = STABLE_POLLS - 1
-    return GamepadState(base.buttons, base.left_x, base.left_y, dpad)
+    buttons = base.buttons
+    if padding:
+      # Beat, bar and drop are onsets; fill, manual and energy are levels.
+      flags = decode_control_frame(wire).flags
+      buttons &= ~0x07
+      if flags & 0x08:
+        buttons |= 0x04
+    return GamepadState(buttons, base.left_x, base.left_y, dpad)
 
 
 def convert_gba_stream(stream: bytes, scene: int, palette: int,
@@ -128,9 +162,8 @@ def convert_gba_stream(stream: bytes, scene: int, palette: int,
   if stream:
     # Finish the latest selection and its stability interval.
     last_wire = stream[-WIRE_SIZE:]
-    target = gba_targets(last_wire, allow_flash)
-    while mapper.wait or (mapper.scene, mapper.palette) != target:
-      states.append(mapper.step(last_wire))
+    while mapper.wait or (mapper.scene, mapper.palette) != (mapper.target_scene, mapper.target_palette):
+      states.append(mapper.step(last_wire, padding=True))
     if states[-1].buttons:
       states.append(GamepadState(0, states[-1].left_x, states[-1].left_y, ()))
   return states
