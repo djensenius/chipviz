@@ -94,7 +94,10 @@ and reaching a destination can take multiple seconds.
 The `--initial-*` values are the actual receiver ring values, not the desired
 input values. Before starting or explicitly resynchronizing, independently
 establish those values, release all D-pad directions, and let the receiver
-settle for at least 60 steps. The stateful Python mapper's `disconnect()`
+settle for at least 60 steps. Also establish that flash is not already armed;
+this gamepad-only data path cannot verify an unknown latch from an earlier
+absolute or operator input on a mixed-input receiver. The stateful Python
+mapper's `disconnect()`
 invalidates both estimates and refuses further conversion until `resync()`
 is called with newly established values. A JSON file cannot detect a
 disconnect or perform this resynchronization itself. Estimates assume every
@@ -103,18 +106,18 @@ from the wrong point, or external button presses invalidate that assumption.
 There is no receiver feedback and no alignment guarantee.
 
 Without `--allow-flash`, the usual HID scene-7 guard maps palette 3/7 to 2/6.
-The mapper also refuses to pass through 3/7 while its scene ring is 7, and
-requires a safe initial scene-7 palette. These forbidden positions separate
-the palette ring. For a safe destination on the other side (for example 0 to
-4), it temporarily moves the scene ring to native scene 0, waits for the
-scene-7 exit, moves the palette there, and returns to 7. The exit and re-entry
-are **visible**, and the intermediate native scene and palettes are not
-atomic; both scene crossings still go through the receiver's debounce and
-change budget. Latest source selections may redirect this detour. The guard
-also applies to the accepted scene while a source exit is still debouncing.
-With `--allow-flash` the guard is disabled and the warning is printed. Even
-then gamepad-only relative inputs cannot arm flash in a conforming `data`
-receiver (F24); they must never be fed to an `operator` build. The target's
-own stability, change budget and safety rules still apply. The GBA receiver
+Every absolute input is sanitized before conversion, and the guard also
+applies to the accepted scene while a source exit is still debouncing. The
+mapper requires a safe initial scene-7 palette. When moving a palette, it
+emits only relative D-pad pulses, never absolute scene or palette keys. Its
+ring may pass through 3/7 while scene 7 stays shown; this is not an absolute
+3/7 report. A conforming `data` receiver treats those positions as unarmed
+requests, effective as 2/6, and cannot arm flash through them (F24). The
+receiver's stability gate and change budget apply; intermediate safe mode or
+family changes may be visible before the destination is reached. The output
+must never be fed to an `operator` build or a receiver without these safety
+rules. `--allow-flash` disables the host guard and prints the warning, but
+does not make relative inputs capable of arming a conforming `data` receiver.
+The GBA receiver
 implementation and actual USB/Pocket Dock operation require separate
 validation; hardware validation is tracked in #31.

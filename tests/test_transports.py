@@ -380,6 +380,15 @@ class GbaGamepadTests(unittest.TestCase):
       self.assertEqual(gamepad[-1]["dpad"], [])
       self.assertTrue(all(state["keys"] == [] for state in gamepad))
 
+  def test_default_keyboard_exact_contract_and_flash_guard(self):
+    for scene in (7, 15):
+      for palette, key in ((3, "E"), (7, "U")):
+        with self.subTest(scene=scene, palette=palette):
+          wire = _digital_frame(scene, palette, flags=0x1f, energy=200)
+          expected = usb_hid.HidState(31, 72, -127, ("8", key, "Space", "Return", "F", "M"))
+          self.assertEqual(usb_hid.map_frame(wire), expected)
+          self.assertEqual(usb_hid.convert_stream(wire * 2), [expected, expected])
+
 
 def _digital_frame(scene=7, palette=0, flags=0, energy=64):
   return chipviz_bridge.pack_frame(chipviz_bridge.ControlFrame(
@@ -435,7 +444,7 @@ class HidReceiverTests(unittest.TestCase):
       for direction in state.dpad:
         keys |= {"up": 0x40, "down": 0x80, "left": 0x20, "right": 0x10}[direction]
       receiver.receiver_step(keys)
-      trace.append(tuple(receiver.receiver_value(i) for i in range(15)))
+      trace.append(tuple(receiver.receiver_value(i) for i in range(16)))
     return trace
 
   def test_source_scene_debounce_and_queued_changes(self):
@@ -457,21 +466,76 @@ class HidReceiverTests(unittest.TestCase):
         self.assertFalse(any(row[0] for row in trace))
         self.assertEqual(trace[-1][8:10], (0, 0))
 
-  def test_safe_palette_detour_and_latest_destination(self):
-    for name, receiver in self.receivers:
-      with self.subTest(receiver=name):
-        states = usb_hid.convert_gba_stream(_scene_frame(7, 4) * 400, 7, 0)
-        trace = self._trace(receiver, states, 7, 0, settle=True)
-        self.assertEqual([(i, row[0]) for i, row in enumerate(trace[1:], 1)
-                          if row[0] != trace[i - 1][0]], [(30, 0), (330, 1)])
-        self.assertEqual(trace[-1][1:3], (0, 1))
-        self.assertEqual(trace[-1][8:10], (7, 4))
-        self.assertTrue(all(not row[11] and row[1] != 3 for row in trace))
-        self.assertTrue(all(row[9] not in (3, 7) for row in trace if row[8] == 7))
-        changed = _scene_frame(7, 4) + _scene_frame(7, 2) * 300
-        trace = self._trace(receiver, usb_hid.convert_gba_stream(changed, 7, 0), 7, 0, settle=True)
-        self.assertEqual(trace[-1][8:10], (7, 2))
-        self.assertTrue(all(not row[11] and row[1] != 3 for row in trace))
+  def test_relative_crossings_and_unarmed_effective_palette(self):
+    for start, target, ring, effective in (
+        (0, 4, (1, 2, 3, 4), (0, 1, 2, 4)),
+        (4, 0, (5, 6, 7, 0), (4, 5, 6, 0))):
+      states = usb_hid.convert_gba_stream(_scene_frame(7, target) * 400, 7, start)
+      self.assertEqual([(i, s.dpad) for i, s in enumerate(states) if s.dpad],
+                       [(0, ("right",)), (60, ("right",)), (120, ("right",)), (180, ("right",))])
+      self.assertTrue(all(not s.keys for s in states))
+      for name, receiver in self.receivers:
+        with self.subTest(start=start, target=target, receiver=name):
+          trace = self._trace(receiver, states, 7, start, settle=True)
+          self.assertTrue(all(row[0] and row[8] == 7 and not row[11] for row in trace))
+          self.assertEqual([row[9] for row in trace],
+                           [ring[0]] * 60 + [ring[1]] * 60 + [ring[2]] * 60 + [ring[3]] * 220)
+          self.assertEqual([row[15] for row in trace],
+                           [effective[0]] * 29 + [effective[1]] * 60 +
+                           [effective[2]] * 120 + [effective[3]] * 191)
+          self.assertTrue(all(row[15] == effective[2] for row in trace if row[9] == ring[2]))
+          self.assertEqual(trace[-1][1:3], (target & 3, target >> 2))
+
+  def test_transient_palette_requests_keep_scene_visible(self):
+    for start, transient in ((0, 4), (4, 0)):
+      stream = b"".join(_scene_frame(7, transient if t % 120 == 0 else start) for t in range(600))
+      states = usb_hid.convert_gba_stream(stream, 7, start)
+      self.assertTrue(all(s.dpad in ((), ("left",), ("right",)) and not s.keys for s in states))
+      for name, receiver in self.receivers:
+        with self.subTest(start=start, receiver=name):
+          trace = self._trace(receiver, states, 7, start, settle=True)
+          self.assertTrue(all(row[0] and row[8] == 7 and not row[11] for row in trace))
+          self.assertEqual(trace[-1][9], start)
+          self.assertEqual([i for i in range(1, len(trace)) if trace[i][15] != trace[i - 1][15]],
+                           list(range(29, 600, 60)))
+
+  def test_scene_seven_absolute_source_guard_with_relative_only_output(self):
+    for scene in (7, 15):
+      for raw, target in ((3, 2), (7, 6)):
+        wire = _digital_frame(scene, raw)
+        self.assertEqual(usb_hid.gba_targets(wire, False), (7, target))
+        states = usb_hid.convert_gba_stream(wire * 400, 7, 0)
+        self.assertTrue(all(not s.keys and s.dpad not in (("up",), ("down",)) for s in states))
+        for name, receiver in self.receivers:
+          with self.subTest(scene=scene, raw=raw, receiver=name):
+            trace = self._trace(receiver, states, 7, 0, settle=True)
+            self.assertTrue(all(row[0] and not row[11] and row[1] != 3 for row in trace))
+            self.assertEqual(trace[-1][9], target)
+            self.assertEqual(trace[-1][15], target)
+    # A transient native source does not defeat the still-accepted scene-7 guard.
+    mapper = usb_hid.GbaGamepadMapper(7, 0)
+    mapper.step(_digital_frame(0, 3))
+    self.assertEqual((mapper.target_scene, mapper.target_palette), (7, 2))
+
+  def test_relative_crossing_with_beats_respects_change_budget(self):
+    for start, target in ((0, 4), (4, 0)):
+      stream = b"".join(_digital_frame(palette=target, flags=1 if t % 10 == 9 else 0)
+                        for t in range(400))
+      states = usb_hid.convert_gba_stream(stream, 7, start)
+      for name, receiver in self.receivers:
+        with self.subTest(start=start, receiver=name):
+          trace = self._trace(receiver, states, 7, start, settle=True)
+          self.assertTrue(all(row[0] and not row[11] and row[1] != 3 for row in trace))
+          self.assertEqual([i for i, row in enumerate(trace) if row[10]], list(range(9, 400, 10)))
+          self.assertEqual(trace[-1][15], target)
+          changes = [i for i in range(1, len(trace)) if trace[i][1:6] != trace[i - 1][1:6]]
+          cuts = [i for i in changes if trace[i][1] == trace[i - 1][1] == 2
+                  and trace[i][3:6] != trace[i - 1][3:6]]
+          self.assertGreater(len(changes), 3)
+          self.assertGreater(len(cuts), 3)
+          self.assertTrue(all(b - a >= 20 for a, b in zip(changes, changes[1:])), changes)
+          self.assertIn(3 if start == 0 else 7, [row[9] for row in trace])
+          self.assertTrue(all(row[15] in (0, 1, 2, 4, 5, 6) for row in trace))
 
   def test_all_safe_scene_seven_palette_pairs(self):
     safe = (0, 1, 2, 4, 5, 6)
@@ -483,10 +547,8 @@ class HidReceiverTests(unittest.TestCase):
             trace = self._trace(receiver, states, 7, source, settle=True)
             self.assertEqual(trace[-1][8:10], (7, target))
             self.assertEqual(trace[-1][1:3], (target & 3, target >> 2))
-            self.assertTrue(all(not row[11] and row[1] != 3 for row in trace))
-            self.assertTrue(all(row[9] not in (3, 7) for row in trace if row[8] == 7))
-            exited = any(not row[0] for row in trace)
-            self.assertEqual(exited, (source <= 2) != (target <= 2))
+            self.assertTrue(all(row[0] and row[8] == 7 and not row[11] and row[1] != 3 for row in trace))
+            self.assertTrue(all(not state.keys for state in states))
 
   def test_padding_releases_onsets_but_preserves_levels(self):
     wire = _digital_frame(7, 3, flags=0x1f, energy=200)
@@ -500,6 +562,7 @@ class HidReceiverTests(unittest.TestCase):
         self.assertEqual([i for i, row in enumerate(trace) if row[10]], [0])
         self.assertTrue(all(row[1] != 3 and not row[11] for row in trace))
         self.assertEqual(trace[-1][1], 2)
+        self.assertEqual(trace[-1][15], 2)
     drop_only = usb_hid.convert_gba_stream(_digital_frame(7, 3, flags=7, energy=200), 7, 0, True)
     self.assertEqual(drop_only[0].buttons & 7, 7)
     self.assertTrue(all(not state.buttons & 7 for state in drop_only[1:]))

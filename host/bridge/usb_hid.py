@@ -84,7 +84,7 @@ class GbaGamepadMapper:
           choices.append((distance, -direction, direction))
           break
     if not choices:
-      raise ValueError("palette cannot cross 3 or 7 while scene 7 is selected without --allow-flash")
+      raise ValueError("no permitted ring route")
     return min(choices)[2]
 
   def step(self, wire: bytes, *, padding: bool = False) -> GamepadState:
@@ -111,11 +111,6 @@ class GbaGamepadMapper:
     if self.wait:
       self.wait -= 1
     else:
-      # The safe palette components are disconnected while scene 7 is
-      # selected. Exit to native scene 0, move the palette, then re-enter.
-      if (not self.allow_flash and self.scene == target_scene == 7
-          and (self.palette <= 2) != (target_palette <= 2)):
-        target_scene = 0
       # Leave scene 7 before changing a native palette; prepare the palette
       # before entering it. Native-to-native routes never pass through 7.
       palette_first = target_scene == 7 and self.scene != 7
@@ -133,8 +128,8 @@ class GbaGamepadMapper:
           self.scene = GBA_SCENES[(GBA_SCENES.index(self.scene) + direction) % len(GBA_SCENES)]
           dpad = ("up" if direction == 1 else "down",)
       else:
-        forbidden = (3, 7) if self.scene == 7 and not self.allow_flash else ()
-        direction = self._direction(tuple(range(8)), self.palette, target_palette, forbidden)
+        # Relative positions 3/7 do not arm a conforming data receiver (F24).
+        direction = self._direction(tuple(range(8)), self.palette, target_palette)
         if direction:
           self.palette = (self.palette + direction) % 8
           dpad = ("right" if direction == 1 else "left",)

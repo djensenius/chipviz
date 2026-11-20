@@ -69,7 +69,8 @@ void receiver_step(uint16_t keys) {
 }
 
 /* shown, mode, family, layout, combo, rotation, levels, ring values, beat,
- * flash latch, transient, silence and pulse. On the GBA build flash is
+ * flash latch, transient, silence, pulse and post-step effective palette.
+ * On the GBA build flash is
  * disabled; reference-only detector diagnostics are unavailable. */
 uint8_t receiver_value(unsigned index) {
 #ifdef GBA_RECEIVER
@@ -99,11 +100,13 @@ uint8_t receiver_value(unsigned index) {
     case 12: return 0;
     case 13: return 0; /* Digital HID energy is never silent. */
     case 14: return 0;
+    case 15: return receiver.palette;
 #else
     case 11: return cf.flash;
     case 12: return (uint8_t)((cf.fx & CF_FX_T) != 0u);
     case 13: return cf.silent;
     case 14: return (uint8_t)((cf.fx & CF_FX_PULSE) != 0u);
+    case 15: return cf.p_eff;
 #endif
     default: return 0;
   }
