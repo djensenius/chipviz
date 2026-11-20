@@ -17,6 +17,8 @@ are read or verified here. CRC and hashes do not authenticate input.
 
 from __future__ import annotations
 
+import os
+import stat
 import struct
 import tempfile
 import zlib
@@ -134,14 +136,36 @@ class Catalog:
     self.close()
 
 
+def _open_regular(path: str | Path) -> BinaryIO:
+  # Reject special files before opening them, then verify the opened object:
+  # the path could have been replaced between stat and open.
+  before = os.stat(path)
+  if not stat.S_ISREG(before.st_mode):
+    raise ValueError("input must be a regular file")
+  if not hasattr(os, "O_NONBLOCK"):
+    raise OSError("safe nonblocking input open is unavailable on this platform")
+  fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+  try:
+    opened = os.fstat(fd)
+    if (not stat.S_ISREG(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+      raise ValueError("input changed or is not a regular file")
+    return os.fdopen(fd, "rb")
+  except BaseException:
+    os.close(fd)
+    raise
+
+
 def open_catalog(path: str | Path) -> Catalog:
   """Validate one .cvxe path atomically and return its bounded snapshot.
 
-  Raises ValueError for invalid structure, or OSError for I/O failures. No
-  record is exposed on failure, including errors in later records or at EOF.
-  The caller must independently establish all renderer and safety conditions.
+  Only regular files are accepted; platforms without nonblocking open fail
+  closed. Raises ValueError for invalid structure or non-regular input, or
+  OSError for I/O failures. No record is exposed on failure, including errors
+  in later records, at EOF, or while flushing the snapshot. The caller must
+  independently establish all renderer and safety conditions.
   """
-  with open(path, "rb") as source:
+  with _open_regular(path) as source:
     header = source.read(HEADER_SIZE)
     if len(header) != HEADER_SIZE:
       raise ValueError("truncated header")
@@ -166,7 +190,11 @@ def open_catalog(path: str | Path) -> Catalog:
         snapshot.write(wire)
       if source.read(1):
         raise ValueError("trailing bytes")
+      snapshot.flush()
       return Catalog(snapshot, header, count)
     except BaseException:
-      snapshot.close()
+      try:
+        snapshot.close()
+      except OSError:
+        pass
       raise

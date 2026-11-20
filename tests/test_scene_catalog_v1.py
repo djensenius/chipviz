@@ -1,6 +1,9 @@
+import errno
 import io
+import os
 import pathlib
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -255,10 +258,86 @@ class CatalogTests(unittest.TestCase):
         return super().read(size)
 
     source = GuardedInput(header(2) + record() + record(1))
-    with mock.patch("builtins.open", return_value=source):
+    with mock.patch.object(catalog, "_open_regular", return_value=source):
       with catalog.open_catalog("ignored") as result:
         self.assertEqual(result.count, 2)
     self.assertEqual(catalog.MAX_FILE_SIZE, 145_000_020)
+
+  @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+                       "nonblocking FIFO test requires POSIX")
+  def test_fifo_and_path_race_rejected_without_blocking(self) -> None:
+    # A subprocess timeout makes a regression to blocking open/read fail
+    # instead of hanging the test runner.
+    program = """
+import os
+import sys
+from unittest import mock
+import scene_catalog_v1 as catalog
+path, mode = sys.argv[1:]
+if mode in ("race", "regular-race"):
+  real_open = os.open
+  def replace_then_open(name, flags, *args, **kwargs):
+    if mode == "race":
+      os.unlink(path)
+      os.mkfifo(path)
+    else:
+      os.replace(path + ".replacement", path)
+    return real_open(name, flags, *args, **kwargs)
+  patch = mock.patch.object(catalog.os, "open", side_effect=replace_then_open)
+else:
+  patch = mock.patch.object(catalog.os, "open", wraps=os.open)
+with patch as opened:
+  try:
+    catalog.open_catalog(path)
+  except ValueError:
+    pass
+  else:
+    raise AssertionError("non-regular or replaced input accepted")
+  assert opened.call_count == (0 if mode == "fifo" else 1)
+"""
+    for mode in ("fifo", "race", "regular-race"):
+      with self.subTest(mode=mode):
+        if self.path.exists():
+          self.path.unlink()
+        if mode == "fifo":
+          os.mkfifo(self.path)
+        else:
+          self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+          if mode == "regular-race":
+            pathlib.Path(str(self.path) + ".replacement").write_bytes(
+              GOLDEN_HEADER + GOLDEN_RECORD
+            )
+        completed = subprocess.run(
+          [sys.executable, "-c", program, str(self.path), mode],
+          env={**os.environ, "PYTHONPATH": str(ROOT / "host" / "bridge")},
+          capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+  def test_regular_symlink(self) -> None:
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    link = self.path.with_name("link.cvxe")
+    link.symlink_to(self.path)
+    with catalog.open_catalog(link) as result:
+      self.assertEqual(result.record(0).envelope, GOLDEN_RECORD)
+
+  def test_deferred_snapshot_write_failure_is_atomic_and_closed(self) -> None:
+    class FullDisk(io.RawIOBase):
+      def writable(self) -> bool:
+        return True
+
+      def write(self, data: bytes) -> int:
+        raise OSError(errno.ENOSPC, "injected disk full")
+
+    raw = FullDisk()
+    snapshot = io.BufferedWriter(raw)
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    with mock.patch.object(catalog.tempfile, "TemporaryFile", return_value=snapshot):
+      with self.assertRaises(OSError) as error:
+        catalog.open_catalog(self.path)
+    self.assertEqual(error.exception.errno, errno.ENOSPC)
+    self.assertTrue(snapshot.closed)
+    self.assertTrue(raw.closed)
 
   def test_foreign_aligned_files_and_legacy_fixtures(self) -> None:
     file = GOLDEN_HEADER + GOLDEN_RECORD
