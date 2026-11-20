@@ -2,6 +2,12 @@
 
 #include <string.h>
 
+#ifdef __arm__
+#define GBA_FAST_CODE __attribute__((section(".iwram"), long_call))
+#else
+#define GBA_FAST_CODE
+#endif
+
 #define CF_SCENE 7u
 #define CF_STABLE 30u
 #define CF_CUT_MIN 20u
@@ -210,7 +216,7 @@ uint8_t gba_cf_pixel_index(unsigned x, unsigned y) {
   return (uint8_t)(row * 4u + column);
 }
 
-void gba_cf_render_bitmap(volatile uint16_t *target) {
+GBA_FAST_CODE void gba_cf_render_bitmap(volatile uint16_t *target) {
   static const uint8_t pairs[4] = {40u, 20u, 20u, 40u};
   unsigned y;
   for (y = 0u; y < 160u; ++y) {

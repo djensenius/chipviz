@@ -91,7 +91,7 @@ static void make_palette(uint16_t *palette, uint16_t frame, const demo_state_t *
   palette[color_index(31, 31, 31)] = rgb15(31, 31, 31);
 }
 
-static void fill_rect(volatile uint16_t *target, int x, int y, int width, int height, uint8_t color) {
+static GBA_FAST_CODE void fill_rect(volatile uint16_t *target, int x, int y, int width, int height, uint8_t color) {
   uint16_t pair;
   int pairs;
   int row;
@@ -185,8 +185,8 @@ static GBA_FAST_CODE uint8_t block_color(int bx, int by, uint16_t frame, const d
   return color_index(r, g, b);
 }
 
-static void render_background_rows(volatile uint16_t *target, uint16_t frame, const demo_state_t *state,
-                                   int first, int end) {
+static GBA_FAST_CODE void render_background_rows(volatile uint16_t *target, uint16_t frame,
+                                                const demo_state_t *state, int first, int end) {
   int by;
   int bx;
 
@@ -197,7 +197,8 @@ static void render_background_rows(volatile uint16_t *target, uint16_t frame, co
   }
 }
 
-static void render_overlay(volatile uint16_t *target, uint16_t frame, const demo_state_t *state, uint16_t keys) {
+static GBA_FAST_CODE void render_overlay(volatile uint16_t *target, uint16_t frame,
+                                         const demo_state_t *state, uint16_t keys) {
   int x;
   int y;
 
