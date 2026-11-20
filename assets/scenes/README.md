@@ -45,15 +45,21 @@ mkdir -p build &&
     --catalog "/path/to/local/hyg_v44.csv.gz" \
     --binary "renderers/modern/target/release/chipviz-m1"
 ) &&
-./build/personal-starfield/launch-starfield --location "0,0" --time 0
+./build/personal-starfield/launch-starfield --location "0,0" --time 946728000
 ```
 
-The example explicitly selects latitude/longitude `0,0` and Unix time `0`;
-replace them with your chosen decimal-degree location (longitude east) and UTC
+The example explicitly selects latitude/longitude `0,0` and
+`2000-01-01 12:00:00 UTC` (`946728000` Unix seconds), not the current sky.
+Replace them with your chosen decimal-degree location (longitude east) and UTC
 Unix time. The launcher inserts only `--scene 6` and the bundled
 `--star-catalog`, forwarding every other argument unchanged. It never supplies
 a location or time. The compatible renderer requires a location and, if no
 time is supplied, defaults to current UTC.
+
+This native launch is not a [catalog-v1](../../shared/specs/scene-catalog-v1.md)
+session or recording. That future format uses Unix milliseconds, requires a
+2000–2099 UTC epoch and separately validated provenance; an in-range timestamp
+alone does not enable it.
 
 The default output is the ignored `build/personal-starfield/` directory, with
 the executable, uncompressed CSV, launcher, and `HYG-NOTICE.txt`. Another
