@@ -198,10 +198,16 @@ impl StarCatalog {
 
         let mut stars = Vec::new();
         for (record_index, result) in reader.records().enumerate() {
-            let line = record_index + 2;
+            let fallback_line = record_index as u64 + 2;
             let record = result.map_err(|error| {
+                let line = error
+                    .position()
+                    .map_or(fallback_line, |position| position.line());
                 CatalogError(format!("malformed CSV record on line {line}: {error}"))
             })?;
+            let line = record
+                .position()
+                .map_or(fallback_line, |position| position.line());
             if record_index >= MAX_CATALOG_ROWS {
                 return Err(CatalogError(format!(
                     "catalog exceeds the supported limit of {MAX_CATALOG_ROWS} CSV data rows; reduce the catalog and retry"
@@ -780,6 +786,18 @@ mod tests {
                 .expect("escaped quotes and multiline quoted names are valid");
         assert_eq!(valid.stars()[0].name.as_deref(), Some("A \"bright\" star"));
         assert_eq!(valid.stars()[1].name.as_deref(), Some("Two\nlines"));
+    }
+
+    #[test]
+    fn reports_physical_source_line_after_a_multiline_quoted_record() {
+        let error = catalog(
+            "ra,dec,mag,proper\n0,0,1,\"Synthetic\nmultiline name\"\nnot-a-number,0,2,Bad\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.0.contains("line 4"),
+            "expected physical source line 4, got {error}"
+        );
     }
 
     #[test]

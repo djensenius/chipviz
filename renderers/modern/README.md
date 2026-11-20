@@ -439,8 +439,9 @@ wrapped bytes or by a catalog option alone.
   scanning remains bounded by the row limit, with wholly below-horizon bins
   skipped; benchmark the largest catalogs on target hardware.
   Each star's linear-RGB channel is capped at
-  0.05; stars are opaque and brightest-first, so changing star membership or
-  overlap changes a Starfield pixel by at most 0.05 linear luminance.
+  0.05; stars are opaque and drawn faintest-first, brightest-last, so a
+  coincident faint star cannot overwrite a brighter one. Changing membership
+  or overlap changes a Starfield pixel by at most 0.05 linear luminance.
   Transitions into or out of Starfield are separately gated to at most two
   crossings per rolling second, using monotonic timestamps after the window
   surface's `present()` call returns. Acquisition, rendering and present-call
@@ -667,11 +668,20 @@ in ten-second snapshot steps. That epoch and advancing mode are recorded in the
 manifest. To reproduce a moving-sky set, pass the recorded
 `starfield_epoch_unix_seconds` as `--time` together with `--follow-time`.
 An explicit `--time` remains fixed unless `--follow-time` is supplied.
-A Starfield capture must explicitly use `--scene 6` with both `--catalog` and
-`--location`; raw/wrapped scene bytes keep legacy dispatch.
+The capture CLI preserves legacy mapping by default: bare `--scene 6` remains
+`SignalField`, and raw/wrapped scene bytes keep their existing mappings. To
+force Starfield in every captured frame, use the paired form
+`--scene 6 --catalog PATH --location LAT,LON`; this preserves the original
+personal-bundle invocation. Alternatively, `--starfield --catalog PATH
+--location LAT,LON` opts in to Starfield for recorded scene-6 frames without
+forcing the scene, and is useful for replaying recordings with scene
+transitions. `--starfield` requires both catalog and location before output or
+GPU setup.
 The stable programmatic `capture::run` and `capture::run_with_options` APIs
 also keep legacy scene-byte mapping (byte 6 is `SignalField`); opt into
-Starfield through `capture::run_with_starfield_options`.
+Starfield through `capture::run_with_starfield_options`. That explicit API
+replays recorded scene-6 frames with Starfield even when `CaptureArgs.scene` is
+`None`.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed

@@ -111,15 +111,28 @@ fn public_app_error_still_supports_an_external_exhaustive_match() {
 
 #[test]
 fn capture_cli_rejects_explicit_starfield_without_catalog_or_location() {
+    let output_dir = std::env::temp_dir().join(format!(
+        "chipviz-starfield-missing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
-        .args(["--scene", "6", "--out", "unused-starfield-output"])
+        .args(["--starfield", "--out"])
+        .arg(&output_dir)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--star-catalog PATH and --location LAT,LON"),
+        stderr.contains("--starfield requires --star-catalog PATH and --location LAT,LON"),
         "{stderr}"
+    );
+    assert!(
+        !output_dir.exists(),
+        "invalid opt-in must fail before output setup"
     );
 }
 
@@ -191,8 +204,7 @@ fn capture_api_and_cli_select_variants_without_changing_the_default() {
     assert!(manifest.contains("\"scene_name\": \"PulseTunnel-Abstract\""));
     assert!(manifest.contains("\"camera\": \"screen_space\""));
 
-    // The CLI's raw .cvz scene 6 retains the legacy SignalField mapping;
-    // only the explicit --scene 6 override enables the synthetic Starfield.
+    // Raw .cvz scene 6 and bare --scene 6 keep legacy SignalField dispatch.
     let mut scene_six_fixture =
         include_bytes!("../../../host/fixtures/musical/groove.cvz").to_vec();
     scene_six_fixture[20] = 6;
@@ -221,6 +233,63 @@ fn capture_api_and_cli_select_variants_without_changing_the_default() {
     let manifest =
         std::fs::read_to_string(root.join("legacy-cli-scene-six/manifest.json")).unwrap();
     assert!(manifest.contains("\"scene\": 6, \"displayed_scene\": 0"));
+
+    let bare_scene_six = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .args([
+            "--profile",
+            "pi5",
+            "--scene",
+            "6",
+            "--input",
+            "procedural",
+            "--frames",
+            "0",
+            "--size",
+            "160x90",
+            "--out",
+        ])
+        .arg(root.join("bare-scene-six"))
+        .output()
+        .unwrap();
+    assert!(
+        bare_scene_six.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bare_scene_six.stderr)
+    );
+    assert!(
+        root.join("bare-scene-six/frame000000-SignalField.png")
+            .exists()
+    );
+    let manifest = std::fs::read_to_string(root.join("bare-scene-six/manifest.json")).unwrap();
+    assert!(manifest.contains("\"scene\": 6, \"displayed_scene\": 0"));
+
+    let mut wrapped_fixture = std::fs::read(&fixture_path).unwrap();
+    wrapped_fixture[20] = 13;
+    let checksum = wrapped_fixture[..32]
+        .iter()
+        .fold(0, |checksum, byte| checksum ^ byte);
+    wrapped_fixture[32] = checksum;
+    let wrapped_fixture_path = root.join("scene-thirteen.cvz");
+    std::fs::write(&wrapped_fixture_path, wrapped_fixture).unwrap();
+    let unrelated_scene = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .args(["--profile", "pi5", "--input"])
+        .arg(&wrapped_fixture_path)
+        .args(["--frames", "0", "--size", "160x90", "--out"])
+        .arg(root.join("legacy-scene-thirteen"))
+        .output()
+        .unwrap();
+    assert!(
+        unrelated_scene.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unrelated_scene.stderr)
+    );
+    assert!(
+        root.join("legacy-scene-thirteen/frame000000-SpectrumVolume.png")
+            .exists()
+    );
+    let manifest =
+        std::fs::read_to_string(root.join("legacy-scene-thirteen/manifest.json")).unwrap();
+    assert!(manifest.contains("\"scene\": 13, \"displayed_scene\": 1"));
 
     let synthetic_catalog = root.join("synthetic-stars.csv");
     std::fs::write(&synthetic_catalog, "ra,dec,mag\n0,90,1\n").unwrap();
@@ -253,6 +322,36 @@ fn capture_api_and_cli_select_variants_without_changing_the_default() {
             .exists()
     );
     let manifest = std::fs::read_to_string(root.join("opt-in-starfield/manifest.json")).unwrap();
+    assert!(manifest.contains("\"scene\": 6, \"displayed_scene\": 6"));
+
+    // --starfield opts into recorded scene-6 frames without forcing every
+    // frame to 6; the raw fixture byte selects Starfield only in this mode.
+    let recorded_cli = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .args(["--profile", "pi5", "--input"])
+        .arg(&fixture_path)
+        .args([
+            "--frames",
+            "0",
+            "--size",
+            "160x90",
+            "--starfield",
+            "--star-catalog",
+        ])
+        .arg(&synthetic_catalog)
+        .args(["--location", "90,0", "--time", "946728000", "--out"])
+        .arg(root.join("recorded-starfield"))
+        .output()
+        .unwrap();
+    assert!(
+        recorded_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recorded_cli.stderr)
+    );
+    assert!(
+        root.join("recorded-starfield/frame000000-Starfield.png")
+            .exists()
+    );
+    let manifest = std::fs::read_to_string(root.join("recorded-starfield/manifest.json")).unwrap();
     assert!(manifest.contains("\"scene\": 6, \"displayed_scene\": 6"));
 
     // The pre-Starfield API must retain scene-byte-6's legacy SignalField
