@@ -129,10 +129,16 @@ remote, virtual or faulty filesystems.
 
 The entire header, all records and exact EOF are checked before a snapshot
 is returned. Invalid structure or a non-regular descriptor raises
-`ValueError`; an invalid argument type raises `TypeError`; I/O errors raise
+`ValueError`; a structurally valid file containing unavailable Starfield
+raises `UnavailableSceneError`, a `ValueError` subclass, instead of returning
+a snapshot. An invalid argument type raises `TypeError`; I/O errors raise
 `OSError`. Use the snapshot as a context manager or close it explicitly;
 access is not thread-safe. It retains the header and returns individual
-complete envelopes and metadata, not stripped legacy frames.
+complete envelopes and metadata, not stripped legacy frames. Obtain catalogs
+only through `open_catalog` and `Record` instances through `catalog.record()`;
+direct construction and `dataclasses.replace(record)` are unsupported (even
+without changes). These Python API guards prevent accidental bypasses, not
+deliberate introspection or manipulation by untrusted code.
 
 The limit is 1,000,000 records, or 145,000,020 input bytes. Input read
 requests are at most 145 bytes; the temporary snapshot uses at most
@@ -141,8 +147,9 @@ caller. Temporary storage can be RAM-backed.
 
 Structural validity does not establish renderer availability, safe playback
 or authorization. Starfield is unavailable: the validator neither reads nor
-verifies private assets or provenance documents. Other renderer availability
-is unassessed. CRC and hashes are not authentication. Never route envelopes or
+verifies private assets or provenance documents, and rejects files containing
+Starfield after structural validation. Other renderer availability is
+unassessed. CRC and hashes are not authentication. Never route envelopes or
 stripped payloads to legacy readers; this library does not implement routing,
 UDP, flash sanitization or playback.
 
