@@ -440,6 +440,43 @@ os.close(slave)
     self.assertTrue(snapshot.closed)
     self.assertTrue(raw.closed)
 
+  def test_input_close_failure_closes_snapshot_and_propagates(self) -> None:
+    failure = OSError(errno.EIO, "injected input close failure")
+    sources = []
+
+    class CloseFailingInput(io.BufferedReader):
+      def close(self) -> None:
+        if not self.closed:
+          super().close()
+          raise failure
+
+    snapshot = tempfile.TemporaryFile(mode="w+b")
+    self.addCleanup(snapshot.close)
+    real_fdopen = os.fdopen
+
+    def failing_fdopen(fd: int, mode: str) -> CloseFailingInput:
+      source = CloseFailingInput(real_fdopen(fd, mode, buffering=0))
+      sources.append(source)
+      return source
+
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    with self.path.open("rb", buffering=0) as source:
+      with mock.patch.object(catalog.os, "fdopen", side_effect=failing_fdopen):
+        with mock.patch.object(snapshot, "flush", wraps=snapshot.flush) as flush:
+          with mock.patch.object(catalog.tempfile, "TemporaryFile", return_value=snapshot):
+            try:
+              catalog.open_catalog(source.fileno())
+            except OSError as error:
+              self.assertIs(error, failure)
+              traceback = error.__traceback__
+            else:
+              self.fail("input close failure did not propagate")
+          flush.assert_called()
+      self.assertEqual(source.seek(0), 0)
+    self.assertIsNotNone(traceback)
+    self.assertTrue(sources[0].closed)
+    self.assertTrue(snapshot.closed)
+
   def test_foreign_aligned_files_and_legacy_fixtures(self) -> None:
     file = GOLDEN_HEADER + GOLDEN_RECORD
     # The legacy converter is alignment-only; neither aligned foreign input

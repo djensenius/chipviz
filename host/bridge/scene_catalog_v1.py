@@ -168,25 +168,26 @@ def open_catalog(fd: int) -> Catalog:
   snapshot. The caller must independently establish renderer and safety
   conditions.
   """
-  with _open_regular(fd) as source:
-    source.seek(0)
-    header = source.read(HEADER_SIZE)
-    if len(header) != HEADER_SIZE:
-      raise ValueError("truncated header")
-    if header[:8] != b"CVXE\x01\x01\x00\x00":
-      raise ValueError("invalid header magic, version, catalog or reserved bytes")
-    if _crc(header[:16]) != int.from_bytes(header[16:20], "little"):
-      raise ValueError("invalid header CRC")
-    count = int.from_bytes(header[8:16], "little")
-    if not 1 <= count <= MAX_RECORDS:
-      raise ValueError("invalid record count")
-    # Python integers do not overflow; the bound also limits temporary storage.
-    size = HEADER_SIZE + RECORD_SIZE * count
-    if size > MAX_FILE_SIZE:
-      raise ValueError("file too large")
+  snapshot = None
+  try:
+    with _open_regular(fd) as source:
+      source.seek(0)
+      header = source.read(HEADER_SIZE)
+      if len(header) != HEADER_SIZE:
+        raise ValueError("truncated header")
+      if header[:8] != b"CVXE\x01\x01\x00\x00":
+        raise ValueError("invalid header magic, version, catalog or reserved bytes")
+      if _crc(header[:16]) != int.from_bytes(header[16:20], "little"):
+        raise ValueError("invalid header CRC")
+      count = int.from_bytes(header[8:16], "little")
+      if not 1 <= count <= MAX_RECORDS:
+        raise ValueError("invalid record count")
+      # Python integers do not overflow; the bound also limits temporary storage.
+      size = HEADER_SIZE + RECORD_SIZE * count
+      if size > MAX_FILE_SIZE:
+        raise ValueError("file too large")
 
-    snapshot = tempfile.TemporaryFile(mode="w+b")
-    try:
+      snapshot = tempfile.TemporaryFile(mode="w+b")
       star_metadata = None
       for index in range(count):
         wire = source.read(RECORD_SIZE)
@@ -195,10 +196,11 @@ def open_catalog(fd: int) -> Catalog:
       if source.read(1):
         raise ValueError("trailing bytes")
       snapshot.flush()
-      return Catalog(snapshot, header, count)
-    except BaseException:
+    return Catalog(snapshot, header, count)
+  except BaseException:
+    if snapshot is not None:
       try:
         snapshot.close()
       except OSError:
         pass
-      raise
+    raise
