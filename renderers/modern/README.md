@@ -111,9 +111,14 @@ Deliveries that run late for a while and then catch up, at once or
 gradually, are not counted as lost: any silence added for them is taken back.
 A device clock running slightly slow or fast (up to about 0.5%) is followed as
 a steady drift once it has been measured confidently, not mistaken for lost
-audio or delivery jitter, and small losses during it still add up. Heavy
-delivery jitter, or frequent delays or losses, can keep the drift from being
-measured; the capture then behaves as if the clock kept time.
+audio or delivery jitter, and small losses during it still add up (most of
+them, if the drift is large). Heavy delivery jitter, or frequent delays or
+losses, can keep the drift from being measured; the capture then behaves as if
+the clock kept time. If the drift changes (a clock that starts or stops
+drifting, or whose rate wanders), the measured drift is dropped once it no
+longer fits, without filling or taking back anything for the change, and the
+capture behaves as if the clock kept time until the new drift is measured.
+While it does, a clock that has started running slow is filled as before.
 
 The stream is not reopened if the device is unplugged or fails: the renderer
 prints a stream error (at most once every five seconds) and the levels fade to
