@@ -12,7 +12,7 @@
 //! splats. Models sit within about one unit of the origin, front facing +z.
 
 use super::super::static_noise::font::glyph;
-use super::super::{hash, sin_cos};
+use super::super::{cos, hash, sin_cos};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 pub(super) type Vec3 = [f32; 3];
@@ -107,12 +107,41 @@ impl Place {
     }
 }
 
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// A place midway between `from` and `to` whose local y runs along the
+/// segment, with the segment's half length (for a cylinder between them).
+fn between(from: Vec3, to: Vec3) -> (Place, f32) {
+    let d: Vec3 = std::array::from_fn(|k| to[k] - from[k]);
+    let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+    let y = d.map(|v| v / length);
+    let helper = if y[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let x = cross(y, helper);
+    let x_length = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
+    let x = x.map(|v| v / x_length);
+    let place = Place {
+        origin: std::array::from_fn(|k| (from[k] + to[k]) * 0.5),
+        axes: [x, y, cross(x, y)],
+    };
+    (place, length * 0.5)
+}
+
 pub(super) struct Mesh {
     step: f32,
     pub(super) splats: Vec<Splat>,
 }
 
-fn steps(length: f32, step: f32) -> usize {
+pub(super) fn steps(length: f32, step: f32) -> usize {
     (length / step).ceil().max(1.0) as usize
 }
 
@@ -209,6 +238,21 @@ impl Mesh {
         }
     }
 
+    /// Drops the splats added since `start` that `keep` rejects (hidden
+    /// parts of a primitive). Positions must not depend on the `Look`, so
+    /// splat counts stay fixed.
+    fn trim(&mut self, start: usize, keep: impl Fn(&Splat) -> bool) {
+        let added = self.splats.split_off(start);
+        self.splats
+            .extend(added.into_iter().filter(|splat| keep(splat)));
+    }
+
+    /// A solid rod of `radius` from `from` to `to`.
+    fn tube(&mut self, from: Vec3, to: Vec3, radius: f32, paint: impl Fn(&Hit) -> Surface) {
+        let (place, half) = between(from, to);
+        self.cylinder(place, [radius, 0.0, half], paint);
+    }
+
     fn sphere(&mut self, place: Place, radius: f32, paint: impl Fn(&Hit) -> Surface) {
         let rows = steps(PI * radius, self.step).max(4);
         let dv = PI * radius / rows as f32;
@@ -259,16 +303,29 @@ pub(super) enum Kind {
     Sun,
     Tree,
     Computer,
+    PhoneBooth,
+    Tricycle,
+    MilkCarton,
+    Jukebox,
+    Beans,
 }
 
 impl Kind {
-    pub(super) const ALL: [Self; 6] = [
+    /// The rotation order. Phase B appended its models, so the first six
+    /// sections are unchanged; eleven objects (coprime with the five
+    /// backgrounds) still meet every background.
+    pub(super) const ALL: [Self; 11] = [
         Self::Television,
         Self::VideoTape,
         Self::CompactDisc,
         Self::Sun,
         Self::Tree,
         Self::Computer,
+        Self::PhoneBooth,
+        Self::Tricycle,
+        Self::MilkCarton,
+        Self::Jukebox,
+        Self::Beans,
     ];
 
     /// Banner caption in the infomercial overlay.
@@ -280,6 +337,11 @@ impl Kind {
             Self::Sun => "THE SUN",
             Self::Tree => "A TREE",
             Self::Computer => "HOME COMPUTER",
+            Self::PhoneBooth => "PHONE BOOTH",
+            Self::Tricycle => "TRICYCLE",
+            Self::MilkCarton => "FRESH MILK",
+            Self::Jukebox => "JUKEBOX",
+            Self::Beans => "BAKED BEANS",
         }
     }
 
@@ -288,6 +350,7 @@ impl Kind {
         match self {
             Self::Television => 0.82,
             Self::Computer => 0.92,
+            Self::PhoneBooth => 0.86,
             _ => 1.0,
         }
     }
@@ -305,6 +368,11 @@ impl Kind {
             Self::Sun => sun(mesh, look),
             Self::Tree => tree(mesh, look),
             Self::Computer => computer(mesh, look),
+            Self::PhoneBooth => phone_booth(mesh, look),
+            Self::Tricycle => tricycle(mesh, look),
+            Self::MilkCarton => milk_carton(mesh, look),
+            Self::Jukebox => jukebox(mesh, look),
+            Self::Beans => beans(mesh, look),
         }
     }
 }
@@ -337,15 +405,88 @@ fn speckle(p: Vec3, cell: f32, salt: u32) -> f32 {
 /// Whether text `line` covers (`u`, `v`) of its box (0..1, v up), drawn
 /// with the Static scene's 5x8 font and a one-pixel gap after each letter.
 fn text_lit(line: &str, u: f32, v: f32) -> bool {
+    lettered(line, u, v, 8)
+}
+
+/// As [`text_lit`], but spreads the box over the seven body rows (skipping
+/// the accent row, blank in capitals), so capitals fill it and small faces
+/// sample every row.
+fn body_lit(line: &str, u: f32, v: f32) -> bool {
+    lettered(line, u, v, 7)
+}
+
+/// Lettering over the bottom `rows` font rows.
+fn lettered(line: &str, u: f32, v: f32, rows: usize) -> bool {
     let count = line.chars().count();
     if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) || count == 0 {
         return false;
     }
     let x = u * count as f32 * 6.0;
-    let (column, row) = (x as usize % 6, ((1.0 - v) * 8.0) as usize);
+    let row = 8 - rows + ((1.0 - v) * rows as f32) as usize;
+    let column = x as usize % 6;
     let character = line.chars().nth(x as usize / 6).unwrap_or(' ');
     column < 5 && glyph(character).is_some_and(|bits| bits >> (row.min(7) * 5 + column) & 1 == 1)
 }
+
+/// Lettering on a box face or round a cylinder, placed in the face's uv.
+pub(super) struct Label {
+    pub(super) line: &'static str,
+    /// The text box's left and right edges in u (right below left reads
+    /// along falling u), then its bottom and top in v.
+    pub(super) u: [f32; 2],
+    pub(super) v: [f32; 2],
+    /// The face's length along u and v, which sets its sample grid.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) extent: [f32; 2],
+}
+
+impl Label {
+    fn lit(&self, u: f32, v: f32) -> bool {
+        let across = (u - self.u[0]) / (self.u[1] - self.u[0]);
+        body_lit(self.line, across, (v - self.v[0]) / (self.v[1] - self.v[0]))
+    }
+}
+
+/// The phone box sign's half size; its four sides are lettered.
+const SIGN: Vec3 = [0.41, 0.12, 0.41];
+const PHONE_SIGN: Label = Label {
+    line: "PHONE",
+    u: [0.04, 0.96],
+    v: [0.06, 0.94],
+    extent: [2.0 * SIGN[0], 2.0 * SIGN[1]],
+};
+const CARTON: Vec3 = [0.4, 0.6, 0.4];
+const MILK_FRONT: Label = Label {
+    line: "MILK",
+    u: [0.04, 0.96],
+    v: [0.5, 0.76],
+    extent: [2.0 * CARTON[0], 2.0 * CARTON[1]],
+};
+const MILK_SIDE: Label = Label {
+    line: "FRESH",
+    u: [0.04, 0.96],
+    v: [0.52, 0.72],
+    extent: [2.0 * CARTON[2], 2.0 * CARTON[1]],
+};
+/// The tin's radius and half height.
+const TIN: [f32; 2] = [0.48, 0.62];
+/// Round the front of the tin: uv 0.25 faces +z, and the angle grows right
+/// to left as seen from there.
+const TIN_LABEL: Label = Label {
+    line: "BEANS",
+    u: [0.39, 0.11],
+    v: [0.55, 0.77],
+    extent: [TAU * TIN[0], 2.0 * TIN[1]],
+};
+
+/// Every lettered face of the phase B models, for the sampling test.
+#[cfg(test)]
+pub(super) const LABELS: [(Kind, &Label); 4] = [
+    (Kind::PhoneBooth, &PHONE_SIGN),
+    (Kind::MilkCarton, &MILK_FRONT),
+    (Kind::MilkCarton, &MILK_SIDE),
+    (Kind::Beans, &TIN_LABEL),
+];
 
 const CHROME: Surface = gloss([0.75, 0.76, 0.8], 1.0);
 const BLACK_PLASTIC: Surface = gloss([0.05, 0.05, 0.06], 0.45);
@@ -485,8 +626,8 @@ fn compact_disc(mesh: &mut Mesh, look: &Look) {
                 return gloss(if ring { [0.45; 3] } else { [0.7, 0.74, 0.78] }, 1.0);
             }
             let angle = z.atan2(x);
-            let streak = (angle - light).cos().powi(2);
-            let rainbow = hue(r * 1.3 + 0.35 * (2.0 * (angle - light)).cos() + look.treble * 0.3);
+            let streak = cos(angle - light).powi(2);
+            let rainbow = hue(r * 1.3 + 0.35 * cos(2.0 * (angle - light)) + look.treble * 0.3);
             return Surface {
                 color: mix3([0.72, 0.74, 0.78], rainbow, 0.25 + 0.7 * streak),
                 shine: 1.0,
@@ -644,4 +785,393 @@ fn computer(mesh: &mut Mesh, look: &Look) {
         let dark = (v * 5.0) as usize == 0 || (u * 17.0) as usize >= 15;
         matte([[0.88, 0.84, 0.74], [0.55, 0.5, 0.42]][usize::from(dark)])
     });
+}
+
+/// `hit.uv[0]` on a box's side face, flipped where needed so it runs left
+/// to right as seen from outside that face (for lettering).
+fn reading_u(hit: &Hit) -> f32 {
+    if hit.normal[0] > 0.5 || hit.normal[2] < -0.5 {
+        1.0 - hit.uv[0]
+    } else {
+        hit.uv[0]
+    }
+}
+
+/// A red cast-iron phone box: glazing bars on all four sides over a warm
+/// interior lamp that brightens on the beat, and a lit "PHONE" sign.
+fn phone_booth(mesh: &mut Mesh, look: &Look) {
+    let red = gloss([0.78, 0.06, 0.05], 0.5);
+    let lamp = 0.65 + 0.35 * look.beat;
+    mesh.cuboid(at([0.0, -0.14, 0.0]), [0.4, 0.74, 0.4], |hit| {
+        let [u, v] = hit.uv;
+        if hit.normal[1].abs() > 0.5 {
+            return red;
+        }
+        // Three columns of eight panes inside the door frame.
+        let (gx, gy) = ((u - 0.14) / 0.72, (v - 0.1) / 0.82);
+        if !(0.0..1.0).contains(&gx) || !(0.0..1.0).contains(&gy) {
+            return red;
+        }
+        let (cx, cy) = ((gx * 3.0).fract(), (gy * 8.0).fract());
+        if !(0.14..0.86).contains(&cx) || !(0.12..0.88).contains(&cy) {
+            return red;
+        }
+        Surface {
+            color: mix3([0.08, 0.1, 0.16], [1.0, 0.86, 0.5], gy * lamp * 0.8),
+            shine: 1.0,
+            glow: 0.4,
+        }
+    });
+    let handle = at([0.27, -0.12, 0.41]);
+    mesh.cuboid(handle, [0.015, 0.07, 0.015], |_| CHROME);
+    mesh.cuboid(at([0.0, 0.6 + SIGN[1], 0.0]), SIGN, |hit| {
+        if hit.normal[1].abs() > 0.5 {
+            return red;
+        }
+        let on = PHONE_SIGN.lit(reading_u(hit), hit.uv[1]);
+        Surface {
+            color: [[0.96, 0.94, 0.86], [0.05; 3]][usize::from(on)],
+            shine: 0.4,
+            glow: 0.9,
+        }
+    });
+    mesh.cuboid(at([0.0, 0.88, 0.0]), [0.44, 0.04, 0.44], |_| red);
+    mesh.cuboid(at([0.0, 0.95, 0.0]), [0.34, 0.035, 0.34], |_| red);
+    mesh.sphere(at([0.0, 1.04, 0.0]), 0.07, |_| {
+        gloss([0.85, 0.65, 0.15], 0.9)
+    });
+    mesh.cuboid(at([0.0, -0.92, 0.0]), [0.45, 0.04, 0.45], |_| {
+        gloss([0.55, 0.05, 0.04], 0.3)
+    });
+}
+
+/// A child's tricycle side-on: the wheels and pedals turn and the
+/// handlebar streamers flutter with the treble.
+fn tricycle(mesh: &mut Mesh, look: &Look) {
+    let shift = |p: Vec3| [p[0] - 0.12, p[1], p[2]];
+    // Clockwise seen from +z, so it rolls forwards (towards +x).
+    let spin = -look.t * 0.05 * (1.0 + look.energy);
+    let frame = gloss([0.85, 0.08, 0.1], 0.7);
+    let rubber = gloss([0.06; 3], 0.2);
+    let wheel = |mesh: &mut Mesh, hub: Vec3, radius: f32, width: f32| {
+        let rim = radius * 0.8;
+        mesh.cylinder(at(hub).turned(0, FRAC_PI_2), [radius, rim, width], |hit| {
+            if hit.normal[1].abs() > 0.5 && hit.uv[1] < 0.88 {
+                return gloss([0.95; 3], 0.6);
+            }
+            rubber
+        });
+        mesh.cylinder(
+            at(hub).turned(0, FRAC_PI_2),
+            [0.06, 0.0, width + 0.02],
+            |_| CHROME,
+        );
+        for k in 0..3 {
+            let spoke = at(hub).turned(2, spin * 0.43 / radius + k as f32 * PI / 3.0);
+            mesh.cuboid(spoke, [rim, 0.01, 0.01], |_| CHROME);
+        }
+    };
+    let front = shift([0.55, -0.47, 0.0]);
+    wheel(mesh, front, 0.43, 0.05);
+    for z in [-0.36, 0.36] {
+        wheel(mesh, shift([-0.5, -0.66, z]), 0.24, 0.04);
+    }
+    let rod = |mesh: &mut Mesh, from: Vec3, to: Vec3, radius: f32, surface: Surface| {
+        mesh.tube(shift(from), shift(to), radius, |_| surface);
+    };
+    rod(
+        mesh,
+        [-0.5, -0.66, -0.36],
+        [-0.5, -0.66, 0.36],
+        0.025,
+        CHROME,
+    );
+    rod(mesh, [-0.5, -0.64, 0.0], [0.42, 0.1, 0.0], 0.045, frame);
+    for z in [-0.08, 0.08] {
+        rod(mesh, [0.55, -0.47, z], [0.43, 0.12, z * 0.6], 0.025, frame);
+    }
+    rod(mesh, [0.43, 0.06, 0.0], [0.38, 0.34, 0.0], 0.04, frame);
+    rod(mesh, [0.36, 0.36, -0.34], [0.36, 0.36, 0.34], 0.022, CHROME);
+    rod(
+        mesh,
+        [-0.18, -0.37, 0.0],
+        [-0.21, -0.06, 0.0],
+        0.025,
+        CHROME,
+    );
+    let step = at(shift([-0.64, -0.6, 0.0]));
+    mesh.cuboid(step, [0.1, 0.015, 0.3], |hit| {
+        let ribbed = hit.normal[1] > 0.5 && (hit.uv[1] * 9.0).fract() < 0.3;
+        [CHROME, gloss([0.3; 3], 0.6)][usize::from(ribbed)]
+    });
+    mesh.cuboid(at(shift([-0.22, -0.03, 0.0])), [0.17, 0.035, 0.13], |_| {
+        gloss([0.08, 0.08, 0.1], 0.5)
+    });
+    let flutter = 0.3 + 0.9 * look.treble;
+    for side in [-1.0f32, 1.0] {
+        rod(
+            mesh,
+            [0.36, 0.36, side * 0.25],
+            [0.36, 0.36, side * 0.38],
+            0.035,
+            matte([0.95; 3]),
+        );
+        for k in 0..3 {
+            let wave = (look.t * 0.2 + k as f32 * 1.7 + side).sin();
+            let lean = 0.35 + 0.25 * k as f32 + flutter * 0.3 * wave;
+            let (s, c) = sin_cos(lean);
+            let from = [0.36, 0.36, side * 0.39];
+            let to = [
+                from[0] - 0.26 * s,
+                from[1] - 0.26 * c,
+                side * (0.41 + 0.03 * k as f32),
+            ];
+            rod(mesh, from, to, 0.012, matte(hue(k as f32 / 3.0 + 0.1)));
+        }
+        // Pedal cranks on the front axle, half a turn apart.
+        let (s, c) = sin_cos(spin + (side + 1.0) * FRAC_PI_2);
+        let foot = [0.55 + 0.13 * c, -0.47 + 0.13 * s, side * 0.13];
+        rod(mesh, [0.55, -0.47, side * 0.13], foot, 0.018, CHROME);
+        let pedal = at(shift([foot[0], foot[1], side * 0.19]));
+        mesh.cuboid(pedal, [0.05, 0.02, 0.05], |_| BLACK_PLASTIC);
+    }
+}
+
+/// A gable-top milk carton: "MILK" on the front and back, "FRESH" on the
+/// sides, over a blue wave of milk that ripples round the base.
+fn milk_carton(mesh: &mut Mesh, look: &Look) {
+    let white = matte([0.95, 0.95, 0.92]);
+    let blue = matte([0.12, 0.3, 0.82]);
+    let ripple = look.t * 0.05;
+    let body = mesh.splats.len();
+    mesh.cuboid(at([0.0, -0.28, 0.0]), CARTON, |hit| {
+        if hit.normal[1].abs() > 0.5 {
+            return white;
+        }
+        let (u, v) = (reading_u(hit), hit.uv[1]);
+        let crest = 0.26 + 0.04 * (u * TAU * 2.0 + ripple).sin();
+        let front = hit.normal[2].abs() > 0.5;
+        let on = [&MILK_SIDE, &MILK_FRONT][usize::from(front)].lit(u, v);
+        if v < crest || on {
+            return blue;
+        }
+        white
+    });
+    // The gable covers the top.
+    mesh.trim(body, |splat| splat.normal[1] < 0.5);
+    // A square prism turned on its edge; its upper half is the gable roof.
+    // The lower half (inside the carton) is trimmed, keeping a little below
+    // the eaves so the stepped cut along the gable ends leaves no gaps.
+    let (gable, eaves) = (mesh.splats.len(), 0.32 - 0.75 * mesh.step);
+    let prism = at([0.0, 0.32, 0.0]).turned(0, PI / 4.0);
+    mesh.cuboid(prism, [0.39, 0.283, 0.283], |hit| {
+        if hit.normal[0].abs() > 0.5 {
+            white
+        } else {
+            blue
+        }
+    });
+    mesh.trim(gable, |splat| splat.pos[1] > eaves);
+    mesh.cuboid(at([0.0, 0.75, 0.0]), [0.39, 0.05, 0.015], |_| white);
+}
+
+/// A 1950s-style jukebox: a wooden cabinet under a neon arch, bubble-tube
+/// pillars, a spinning record behind the glass and a grille whose lights
+/// follow the spectrum.
+fn jukebox(mesh: &mut Mesh, look: &Look) {
+    let wood = |p: Vec3| {
+        let grain = 0.85 + 0.15 * (p[1] * 30.0 + p[0] * 3.0).sin();
+        gloss(scale3([0.5, 0.22, 0.08], grain), 0.4)
+    };
+    let cycle = look.t / 240.0;
+    let cabinet = mesh.splats.len();
+    mesh.cuboid(at([0.0, -0.32, 0.0]), [0.58, 0.52, 0.3], |hit| {
+        let [x, y, _] = hit.local;
+        if hit.normal[2] < 0.5 || x.abs() > 0.44 {
+            return wood(hit.local);
+        }
+        if y > 0.14 {
+            // Title strips over a row of selector buttons.
+            let row = ((y - 0.14) / 0.34 * 4.0).fract();
+            let column = ((x + 0.44) / 0.88 * 4.0).fract();
+            let card = (0.12..0.88).contains(&row) && (0.08..0.92).contains(&column);
+            let line = card && (0.45..0.55).contains(&row) && column < 0.7;
+            return match (card, line) {
+                (_, true) => matte([0.7, 0.1, 0.1]),
+                (true, false) => lit([0.95, 0.92, 0.8], 0.6),
+                _ => gloss([0.75, 0.6, 0.25], 0.9),
+            };
+        }
+        if y > -0.44 {
+            let across = (x + 0.44) / 0.88 * 8.0;
+            let band = (across as usize).min(7);
+            let height = (y + 0.44) / 0.58;
+            let level = 0.1 + 0.85 * look.spectrum[band];
+            if (0.18..0.82).contains(&across.fract()) && height < level {
+                return lit(hue(band as f32 / 8.0 + cycle), 0.9);
+            }
+            let slot = (y * 30.0).rem_euclid(1.0) < 0.4;
+            return gloss(if slot { [0.1; 3] } else { [0.8, 0.62, 0.25] }, 0.9);
+        }
+        wood(hit.local)
+    });
+    // The arch sits on the middle of the cabinet's top.
+    mesh.trim(cabinet, |splat| {
+        let [x, _, z] = splat.pos;
+        splat.normal[1] < 0.5 || x.abs() > 0.55 || z.abs() > 0.27
+    });
+    for side in [-1.0f32, 1.0] {
+        mesh.tube(
+            [side * 0.51, -0.78, 0.3],
+            [side * 0.51, 0.2, 0.3],
+            0.06,
+            |hit| {
+                let y = hit.local[1];
+                let bubble = (y * 7.0 - look.t * 0.04 + side).rem_euclid(1.0) < 0.18;
+                let color = if bubble {
+                    [1.0; 3]
+                } else {
+                    hue(cycle + y * 0.3)
+                };
+                lit(color, 0.9)
+            },
+        );
+    }
+    let spin = look.t * 0.06;
+    // A cylinder whose lower half, inside the cabinet, is trimmed (keeping
+    // a little below the top so the stepped cut leaves no gaps); a hair
+    // narrower than the cabinet so their sides never coincide.
+    let (arch, top) = (mesh.splats.len(), 0.2 - 0.75 * mesh.step);
+    let place = at([0.0, 0.2, 0.0]).turned(0, FRAC_PI_2);
+    mesh.cylinder(place, [0.57, 0.0, 0.28], |hit| {
+        let [x, y, z] = hit.local;
+        if hit.normal[1].abs() < 0.5 {
+            if y.abs() < 0.08 {
+                return lit(hue(cycle + hit.uv[0]), 0.9);
+            }
+            return wood(hit.local);
+        }
+        if hit.normal[1] < 0.0 {
+            return wood(hit.local);
+        }
+        // Front: local -z is world up from the arch's centre.
+        let r = x.hypot(z);
+        if r > 0.49 {
+            return lit(hue(cycle + 0.5 + x * 0.4), 0.9);
+        }
+        if r > 0.43 {
+            return CHROME;
+        }
+        let (dx, dy) = (x, -z - 0.2);
+        let record = dx.hypot(dy);
+        if record < 0.17 {
+            if record < 0.05 {
+                return matte([0.85, 0.1, 0.1]);
+            }
+            let sheen = cos(dy.atan2(dx) - spin).powi(8);
+            return gloss(mix3([0.04; 3], [0.5; 3], sheen * 0.6), 1.0);
+        }
+        gloss([0.05, 0.08, 0.2], 1.0)
+    });
+    mesh.trim(arch, |splat| splat.pos[1] > top);
+    mesh.cuboid(at([0.0, -0.87, 0.0]), [0.6, 0.03, 0.32], |_| {
+        gloss([0.2, 0.18, 0.16], 0.6)
+    });
+}
+
+/// A tin of baked beans in a puddle of sauce, a few loose beans hopping on
+/// the beat.
+fn beans(mesh: &mut Mesh, look: &Look) {
+    mesh.cylinder(at([0.0, -0.12, 0.0]), [TIN[0], 0.0, TIN[1]], |hit| {
+        if hit.normal[1].abs() > 0.5 {
+            let ridge = (hit.uv[1] * 6.0).fract() < 0.5;
+            return gloss(
+                if ridge {
+                    [0.82, 0.82, 0.85]
+                } else {
+                    [0.6, 0.6, 0.64]
+                },
+                1.0,
+            );
+        }
+        let y = hit.local[1];
+        if y.abs() > 0.52 {
+            let rib = (y * 40.0).rem_euclid(1.0) < 0.5;
+            return gloss(
+                if rib {
+                    [0.8, 0.8, 0.83]
+                } else {
+                    [0.55, 0.55, 0.6]
+                },
+                1.0,
+            );
+        }
+        if TIN_LABEL.lit(hit.uv[0], hit.uv[1]) {
+            return matte([0.98, 0.94, 0.8]);
+        }
+        let u = (TIN_LABEL.u[0] - hit.uv[0]) / (TIN_LABEL.u[0] - TIN_LABEL.u[1]);
+        let v = (y + 0.52) / 1.04;
+        if !(0.1..0.9).contains(&v) {
+            return matte([0.95, 0.75, 0.2]);
+        }
+        if (0.0..1.0).contains(&u) && (0.14..0.5).contains(&v) {
+            let (bx, by) = (u * 9.0, v * 14.0);
+            let shift = hash((bx as u32).wrapping_mul(977) ^ (by as u32)) * 0.3;
+            let bean = ((bx.fract() - 0.5 - shift + 0.15) * 1.3).hypot(by.fract() - 0.5) < 0.36;
+            let color = if bean {
+                [0.85, 0.45, 0.14]
+            } else {
+                [0.6, 0.12, 0.05]
+            };
+            return gloss(color, 0.6);
+        }
+        matte([0.12, 0.25, 0.65])
+    });
+    let sauce = gloss([0.65, 0.14, 0.04], 0.9);
+    mesh.cylinder(at([0.08, -0.76, 0.2]), [0.72, 0.0, 0.015], |_| sauce);
+    let loose: [Vec3; 5] = [
+        [-0.55, -0.69, 0.45],
+        [0.45, -0.69, 0.55],
+        [0.62, -0.69, 0.22],
+        [-0.2, -0.69, 0.7],
+        [0.22, -0.69, 0.75],
+    ];
+    for (index, centre) in loose.into_iter().enumerate() {
+        let hop = look.beat * 0.08 * (1.0 + index as f32 % 2.0);
+        let bean = at([centre[0], centre[1] + hop, centre[2]]);
+        mesh.sphere(bean, 0.065, |_| gloss([0.82, 0.42, 0.12], 0.9));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primitive_normals_point_outward() {
+        let place = at([0.3, -0.2, 0.1]).turned(0, 0.7).turned(2, -1.1);
+        let mut mesh = Mesh::new(0.05);
+        let mut checks = 0;
+        let mut check = |mesh: &mut Mesh, centre: Vec3| {
+            for splat in mesh.splats.drain(..) {
+                let out: Vec3 = std::array::from_fn(|k| splat.pos[k] - centre[k]);
+                let along: f32 = (0..3).map(|k| out[k] * splat.normal[k]).sum();
+                assert!(along > 0.0, "{splat:?}");
+                checks += 1;
+            }
+        };
+        let paint = |_: &Hit| CHROME;
+        mesh.cuboid(place, [0.4, 0.2, 0.3], paint);
+        check(&mut mesh, place.origin);
+        mesh.cylinder(place, [0.5, 0.2, 0.3], paint);
+        check(&mut mesh, place.origin);
+        mesh.cylinder(place, [0.3, 0.0, 0.1], paint);
+        check(&mut mesh, place.origin);
+        mesh.sphere(place, 0.35, paint);
+        check(&mut mesh, place.origin);
+        let (from, to) = ([-0.4, 0.1, 0.2], [0.5, 0.6, -0.3]);
+        mesh.tube(from, to, 0.08, paint);
+        check(&mut mesh, between(from, to).0.origin);
+        assert!(checks > 1_000, "{checks}");
+    }
 }

@@ -1,31 +1,36 @@
 //! Object: an object in space, sold like a late-night 1980s/90s infomercial
-//! and taped on an early VHS camcorder (issue #17, phase A).
+//! and taped on an early VHS camcorder (issue #17, phases A and B).
 //!
 //! One procedural object at a time swings on a turntable (or rocks, for the
-//! flat CD and the sun's face) in front of a cheesy background. The six
+//! flat CD and the sun's face) in front of a cheesy background. The eleven
 //! objects are original code-built models (`models.rs`): a CRT television,
-//! a VHS tape, a CD, the sun, a tree and a 1980s home computer. No assets
-//! are downloaded. Each model is a cloud of surface splats that the scene
-//! rotates, lights (diffuse, specular and a colour-cycling rim light),
+//! a VHS tape, a CD, the sun, a tree and a 1980s home computer, then (added
+//! in phase B, appended so the first six sections are unchanged) a red
+//! phone box, a tricycle, a milk carton, a jukebox and a tin of beans. No
+//! assets are downloaded. Each model is a cloud of surface splats that the
+//! scene rotates, lights (diffuse, specular and a colour-cycling rim light),
 //! projects on the CPU and draws far to near as flat `ScreenSpace` quads,
 //! as Lines and Static do. The splat spacing follows the instance budget,
 //! so the Pi 5 draws the same models with fewer, larger splats.
 //!
 //! Timing follows the monotonic `frame` counter, so the scene is stateless
 //! and captures are reproducible. Every 512 frames (about 8.5 s at 60 fps)
-//! a section starts: section `n` shows object `n % 6` on background `n % 5`
+//! a section starts: section `n` shows object `n % 11` on background `n % 5`
 //! (starfield, lava goop, vaporwave grid, rainbow sweep, chroma-key colour
-//! cycle), so all 30 pairs appear every 30 sections. The colour morph
-//! (hue cycle, rainbow sweep, hue jump per beat) and the overlay (camcorder
-//! or infomercial) follow `n + n / 6`, so each object meets each of them.
+//! cycle), so all 55 pairs appear every 55 sections. The colour morph
+//! (hue cycle, rainbow sweep, hue jump per beat) follows `n % 3` and the
+//! overlay (camcorder or infomercial) `n % 2`; 11 is coprime with both, so
+//! each object meets each of them.
 //! The object spins in over the first 48 frames with a gleam, and spins out
 //! over the last 32.
 //!
 //! Audio: each beat punches the object's zoom (decaying over `beat_phase`);
-//! the spectrum drives the TV's colour bars and the computer's bar chart,
-//! mids sway the tree, bass stretches the sun's rays and the goop, treble
-//! slides the CD's sheen and twinkles the stars, and energy adds sparkles
-//! and speeds the tape reels. The drop flag (and every eighth beat) fires a
+//! the spectrum drives the TV's colour bars, the computer's bar chart and
+//! the jukebox grille, mids sway the tree, bass stretches the sun's rays
+//! and the goop, treble slides the CD's sheen, flutters the tricycle's
+//! streamers and twinkles the stars, beats light the phone box and hop the
+//! beans, and energy adds sparkles and speeds the tape reels and the
+//! tricycle's wheels. The drop flag (and every eighth beat) fires a
 //! lens flare and extra sparkles; the drop is a one-frame trigger, so on
 //! its own the flare lasts one frame.
 //!
@@ -143,14 +148,13 @@ struct Section {
 
 fn section(frame: ControlFrame) -> Section {
     let index = frame.frame / SECTION_FRAMES;
-    let round = index + index / 6;
     Section {
         index,
         local: frame.frame % SECTION_FRAMES,
-        object: Kind::ALL[usize::from(index % 6)],
+        object: Kind::ALL[usize::from(index) % Kind::ALL.len()],
         background: Background::ALL[usize::from(index % 5)],
-        morph: [Morph::Cycle, Morph::Sweep, Morph::BeatJump][usize::from(round % 3)],
-        overlay: [Overlay::Camcorder, Overlay::Infomercial][usize::from(round % 2)],
+        morph: [Morph::Cycle, Morph::Sweep, Morph::BeatJump][usize::from(index % 3)],
+        overlay: [Overlay::Camcorder, Overlay::Infomercial][usize::from(index % 2)],
     }
 }
 
