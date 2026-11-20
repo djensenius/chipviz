@@ -26,6 +26,7 @@ const RIGHT_ASCENSION_BINS: usize = 48;
 const DECLINATION_BINS: usize = 18;
 const MIN_STAR_MAGNITUDE: f64 = -2.0;
 const BRIGHTNESS_DECADES_PER_MAGNITUDE: f64 = 0.23;
+const LINEAR_LIGHT_TONE_EXPONENT: f64 = 0.5;
 
 #[derive(Clone, Debug)]
 pub struct StarfieldConfig {
@@ -80,9 +81,17 @@ impl ProjectionKey {
 }
 
 fn star_brightness(magnitude: f64) -> f32 {
-    (f64::from(MAX_STAR_LINEAR_LUMINANCE)
-        * 10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (magnitude - MIN_STAR_MAGNITUDE)))
-    .clamp(0.000_55, f64::from(MAX_STAR_LINEAR_LUMINANCE)) as f32
+    // This square-root tone lift is applied in linear light, not as an sRGB
+    // correction. It improves faint-star visibility while retaining the
+    // same per-channel output cap.
+    let relative_brightness =
+        10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (magnitude - MIN_STAR_MAGNITUDE));
+    (f64::from(MAX_STAR_LINEAR_LUMINANCE) * relative_brightness.powf(LINEAR_LIGHT_TONE_EXPONENT))
+        .clamp(0.0, f64::from(MAX_STAR_LINEAR_LUMINANCE)) as f32
+}
+
+fn star_size_pixels(brightness: f32) -> f32 {
+    2.5 + (brightness / MAX_STAR_LINEAR_LUMINANCE).sqrt()
 }
 
 impl StarfieldConfig {
@@ -684,9 +693,9 @@ fn build_uncached(
             .colour_index
             .map(color_index_rgb)
             .unwrap_or([1.0, 1.0, 1.0]);
-        // The size curve preserves magnitude ordering while retaining a
-        // two-pixel minimum footprint at small output sizes.
-        let size_pixels = 2.0 + 1.25 * (brightness / MAX_STAR_LINEAR_LUMINANCE).sqrt();
+        // The size curve preserves magnitude ordering while keeping points
+        // discernible at small output sizes.
+        let size_pixels = star_size_pixels(brightness);
         let point_size = 2.0 * size_pixels / viewport.1.max(1) as f32;
         let size = [point_size / aspect.max(f32::MIN_POSITIVE), point_size];
         let instance = Instance {
@@ -1676,14 +1685,30 @@ mod tests {
             .collect();
         let sizes: Vec<_> = brightness
             .iter()
-            .map(|&value| 2.0 + 1.25 * (value / MAX_STAR_LINEAR_LUMINANCE).sqrt())
+            .map(|&value| star_size_pixels(value))
             .collect();
         assert!(brightness[0] <= MAX_STAR_LINEAR_LUMINANCE);
         assert!(brightness[0] > brightness[1]);
         assert!(brightness.windows(2).all(|pair| pair[0] > pair[1]));
         assert!(sizes.windows(2).all(|pair| pair[0] > pair[1]));
-        assert!(*brightness.last().unwrap() >= 0.000_55);
-        assert!(*sizes.last().unwrap() >= 2.0);
+        assert!((0.0052..=0.0054).contains(brightness.last().unwrap()));
+        assert!((2.8..=2.9).contains(sizes.last().unwrap()));
+
+        let encode_srgb = |linear: f32| {
+            let encoded = if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (encoded * 255.0).round() as u8
+        };
+        let old_faint = (f64::from(MAX_STAR_LINEAR_LUMINANCE)
+            * 10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (6.5 - MIN_STAR_MAGNITUDE)))
+        .clamp(0.000_55, f64::from(MAX_STAR_LINEAR_LUMINANCE)) as f32;
+        assert!(brightness[5] > old_faint * 9.0);
+        assert!(encode_srgb(brightness[5]) >= encode_srgb(old_faint) * 8);
+        assert!(encode_srgb(brightness[5]) >= 16);
+        assert!(encode_srgb(brightness[0]) <= 63);
 
         let csv = format!(
             "ra,dec,mag\n{}",
@@ -1712,6 +1737,12 @@ mod tests {
             &mut instances,
         );
         assert_eq!(instances.len(), magnitudes.len());
+        assert!(instances.iter().all(|instance| {
+            instance.color[..3]
+                .iter()
+                .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+                && instance.color[3] == 1.0
+        }));
         assert!(
             instances
                 .windows(2)
@@ -1721,6 +1752,46 @@ mod tests {
             instances
                 .windows(2)
                 .all(|pair| pair[0].size[1] < pair[1].size[1])
+        );
+    }
+
+    #[test]
+    fn coincident_stars_remain_opaque_and_draw_faint_before_bright() {
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog("ra,dec,mag\n18.7,45,6.5\n18.7,45,0\n18.7,45,2\n").unwrap()),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (960, 540),
+            &state,
+            &mut instances,
+        );
+
+        assert_eq!(instances.len(), 3);
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].center == pair[1].center)
+        );
+        assert!(instances.iter().all(|instance| {
+            instance.color[3] == 1.0
+                && instance.color[..3]
+                    .iter()
+                    .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+        }));
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].color[0] < pair[1].color[0])
         );
     }
 

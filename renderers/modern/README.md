@@ -433,7 +433,11 @@ frames. Bare or wrapped wire bytes and catalog options alone do not select it.
   dates from 1800 through 2200. Proper motion, parallax and atmospheric
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
-  brightness and point size; colour index controls approximate hue. At most
+  brightness and point size; colour index controls approximate hue. A
+  square-root tone lift in linear light raises faint stars for 8-bit
+  legibility; this is deliberate tone compression, not an sRGB correction,
+  and the renderer's sRGB output encoding is unchanged. Point footprints are
+  approximately 2.8–3.5 output pixels over the rendered magnitude range. At most
   200 stars are rendered from a spatial index that retains every in-limit
   star, so brighter below-horizon records cannot hide a fainter visible one.
   At most 131,072 CSV rows, 64 MiB total input, and 1 MiB per CSV record are
