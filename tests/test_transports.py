@@ -263,6 +263,11 @@ def _scene_frame(scene: int, palette: int) -> bytes:
   ))
 
 
+def _gba_convert(stream, scene, palette, allow_flash=False):
+  return usb_hid.convert_gba_stream(stream, scene, palette, allow_flash,
+                                    release_polled=True, relative_unarmed=True)
+
+
 class GbaGamepadTests(unittest.TestCase):
   def _receive(self, states, scene=0, palette=0):
     ring = usb_hid.GBA_SCENES
@@ -287,41 +292,41 @@ class GbaGamepadTests(unittest.TestCase):
     for scene in usb_hid.GBA_SCENES:
       for palette in range(8):
         with self.subTest(scene=scene, palette=palette):
-          states = usb_hid.convert_gba_stream(_scene_frame(scene, palette) * 30, 0, 0, True)
+          states = _gba_convert(_scene_frame(scene, palette) * 30, 0, 0, True)
           seen = self._receive(states)
           self.assertEqual(seen[-1], (scene, palette))
           pulses = [i for i, state in enumerate(states) if state.dpad]
           self.assertTrue(all(b - a >= 60 for a, b in zip(pulses, pulses[1:])))
           if pulses:
             self.assertGreaterEqual(len(states) - pulses[-1], 60)
-          self.assertEqual(usb_hid.convert_gba_stream(_scene_frame(scene, palette) * 2, scene, palette, True)[0].dpad, ())
+          self.assertEqual(_gba_convert(_scene_frame(scene, palette) * 2, scene, palette, True)[0].dpad, ())
 
   def test_latest_target_wins_and_opposite_has_release(self):
     stream = _scene_frame(1, 0) + _scene_frame(0, 0) * 61
-    states = usb_hid.convert_gba_stream(stream, 0, 0)
+    states = _gba_convert(stream, 0, 0)
     self.assertEqual([(i, s.dpad) for i, s in enumerate(states) if s.dpad],
                      [(0, ("up",)), (60, ("down",))])
     self.assertEqual(self._receive(states)[-1], (0, 0))
 
   def test_aliases_and_native_route_avoids_seven(self):
-    states = usb_hid.convert_gba_stream(_scene_frame(6, 0), 0, 0)
+    states = _gba_convert(_scene_frame(6, 0), 0, 0)
     self.assertEqual(self._receive(states)[-1], (2, 0))
-    states = usb_hid.convert_gba_stream(_scene_frame(3, 0), 0, 0)
+    states = _gba_convert(_scene_frame(3, 0), 0, 0)
     self.assertNotIn(7, [scene for scene, _ in self._receive(states)])
 
   def test_flash_guard_and_safe_paths(self):
     for palette, safe in ((3, 2), (7, 6)):
       with self.subTest(palette=palette):
-        states = usb_hid.convert_gba_stream(_scene_frame(15, palette) * 30, 0, 0)
+        states = _gba_convert(_scene_frame(15, palette) * 30, 0, 0)
         seen = self._receive(states)
         self.assertEqual(seen[-1], (7, safe))
         self.assertTrue(all(p not in (3, 7) for s, p in seen if s == 7))
-        allowed = usb_hid.convert_gba_stream(_scene_frame(15, palette) * 30, 0, 0, True)
+        allowed = _gba_convert(_scene_frame(15, palette) * 30, 0, 0, True)
         self.assertEqual(self._receive(allowed)[-1], (7, palette))
-    with self.assertRaisesRegex(ValueError, "safe palette"):
-      usb_hid.GbaGamepadMapper(7, 3)
+    with self.assertRaisesRegex(ValueError, "known unarmed"):
+      usb_hid.GbaGamepadMapper(7, 3, release_polled=True)
     # Leaving scene 7 precedes a native palette change, including the debounce wait.
-    states = usb_hid.convert_gba_stream(_scene_frame(0, 3) * 30, 7, 2)
+    states = _gba_convert(_scene_frame(0, 3) * 30, 7, 2)
     self.assertEqual([(i, s.dpad) for i, s in enumerate(states) if s.dpad],
                      [(29, ("up",)), (89, ("right",))])
 
@@ -330,7 +335,7 @@ class GbaGamepadTests(unittest.TestCase):
       frame=0, bpm=120, beat_phase=0, beat_count=0, energy=200, bass=0, mid=0, treble=0,
       spectrum=(0,) * 8, scene=7, palette=3, flags=1, notes=(),
     )
-    states = usb_hid.convert_gba_stream(chipviz_bridge.pack_frame(base), 7, 0, True)
+    states = _gba_convert(chipviz_bridge.pack_frame(base), 7, 0, True)
     seen = self._receive(states, 7, 0)
     self.assertEqual(states[0].buttons & 0x11, 0x11)
     self.assertTrue(all(state.buttons & 0x11 == 0x10 for state in states[1:-1]))
@@ -344,12 +349,43 @@ class GbaGamepadTests(unittest.TestCase):
   def test_initial_validation_and_stream_alignment(self):
     for scene, palette in ((4, 0), (0, 8), (-1, 0)):
       with self.subTest(scene=scene, palette=palette), self.assertRaises(ValueError):
-        usb_hid.GbaGamepadMapper(scene, palette)
+        usb_hid.GbaGamepadMapper(scene, palette, release_polled=True)
     with self.assertRaisesRegex(ValueError, "aligned"):
       usb_hid.convert_gba_stream(b"x", 0, 0)
 
+  def test_release_and_unarmed_assertions_are_required(self):
+    with self.assertRaisesRegex(ValueError, "released for 60"):
+      usb_hid.GbaGamepadMapper(0, 0)
+    mapper = usb_hid.GbaGamepadMapper(0, 0, release_polled=True)
+    with self.assertRaisesRegex(ValueError, "released for 60"):
+      mapper.resync(0, 0)
+    self.assertIsNone(mapper.scene)
+    self.assertIsNone(mapper.palette)
+    with self.assertRaisesRegex(ValueError, "unknown"):
+      mapper.step(_scene_frame(0, 0))
+    for palette in (3, 7):
+      for allow_flash in (False, True):
+        with self.subTest(palette=palette, allow_flash=allow_flash):
+          with self.assertRaisesRegex(ValueError, "known unarmed"):
+            usb_hid.GbaGamepadMapper(7, palette, allow_flash, release_polled=True)
+          mapper = usb_hid.GbaGamepadMapper(
+            7, palette, allow_flash, release_polled=True, relative_unarmed=True)
+          mapper.disconnect()
+          with self.assertRaisesRegex(ValueError, "known unarmed"):
+            mapper.resync(7, palette, release_polled=True)
+          self.assertIsNone(mapper.scene)
+          self.assertIsNone(mapper.palette)
+          with self.assertRaisesRegex(ValueError, "unknown"):
+            mapper.step(_scene_frame(7, palette))
+          mapper.resync(7, palette, release_polled=True, relative_unarmed=True)
+          if not allow_flash:
+            state = mapper.step(_scene_frame(7, palette))
+            self.assertEqual(state.dpad, ("left",))
+            self.assertEqual(state.keys, ())
+            self.assertEqual(mapper.palette, palette - 1)
+
   def test_disconnect_requires_known_resynchronization(self):
-    mapper = usb_hid.GbaGamepadMapper(0, 0)
+    mapper = usb_hid.GbaGamepadMapper(0, 0, release_polled=True)
     mapper.step(_scene_frame(1, 0))
     mapper.disconnect()
     self.assertIsNone(mapper.scene)
@@ -357,8 +393,8 @@ class GbaGamepadTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "unknown"):
       mapper.step(_scene_frame(1, 0))
     with self.assertRaises(ValueError):
-      mapper.resync(4, 0)
-    mapper.resync(1, 0)
+      mapper.resync(4, 0, release_polled=True)
+    mapper.resync(1, 0, release_polled=True)
     self.assertEqual(mapper.step(_scene_frame(1, 0)).dpad, ())
 
   def test_cli_requires_explicit_state_and_preserves_default(self):
@@ -368,17 +404,31 @@ class GbaGamepadTests(unittest.TestCase):
       cvz.write_bytes(_scene_frame(1, 0))
       with self.assertRaises(SystemExit):
         usb_hid.main_from_args(["--input", str(cvz), "--gba-gamepad"])
+      with self.assertRaisesRegex(SystemExit, "initial-release-polled"):
+        usb_hid.main_from_args(["--input", str(cvz), "--gba-gamepad", "--initial-scene", "0",
+                                "--initial-palette", "0"])
       self.assertEqual(usb_hid.main_from_args(["--input", str(cvz), "--output", str(out)]), 0)
       default = json.loads(out.read_text())
       self.assertEqual(len(default), 1)
       self.assertEqual(set(default[0]), {"buttons", "left_x", "left_y", "keys"})
       self.assertEqual(usb_hid.main_from_args(["--input", str(cvz), "--output", str(out),
                                                "--gba-gamepad", "--initial-scene", "0",
-                                               "--initial-palette", "0"]), 0)
+                                               "--initial-palette", "0", "--initial-release-polled"]), 0)
       gamepad = json.loads(out.read_text())
       self.assertEqual(gamepad[0]["dpad"], ["up"])
       self.assertEqual(gamepad[-1]["dpad"], [])
       self.assertTrue(all(state["keys"] == [] for state in gamepad))
+      cvz.write_bytes(_scene_frame(7, 3))
+      unsafe_args = ["--input", str(cvz), "--output", str(out), "--gba-gamepad",
+                     "--initial-scene", "7", "--initial-palette", "3", "--initial-release-polled"]
+      with self.assertRaisesRegex(ValueError, "known unarmed"):
+        usb_hid.main_from_args(unsafe_args)
+      self.assertEqual(usb_hid.main_from_args([*unsafe_args, "--assert-relative-unarmed"]), 0)
+      gamepad = json.loads(out.read_text())
+      self.assertEqual(gamepad[0]["dpad"], ["left"])
+      self.assertTrue(all(not state["keys"] for state in gamepad))
+      with self.assertRaisesRegex(SystemExit, "require --gba-gamepad"):
+        usb_hid.main_from_args(["--input", str(cvz), "--initial-release-polled"])
 
   def test_default_keyboard_exact_contract_and_flash_guard(self):
     for scene in (7, 15):
@@ -447,22 +497,78 @@ class HidReceiverTests(unittest.TestCase):
       trace.append(tuple(receiver.receiver_value(i) for i in range(16)))
     return trace
 
+  def test_release_preamble_restores_first_beat_on_start_and_resync(self):
+    for name, receiver in self.receivers:
+      with self.subTest(receiver=name):
+        receiver.receiver_init(7, 2, 0)
+        # A South button already held across initialization is not a new beat.
+        for _ in range(60):
+          receiver.receiver_step(1)
+        self.assertEqual(receiver.receiver_value(10), 0)
+        with self.assertRaisesRegex(ValueError, "released for 60"):
+          usb_hid.GbaGamepadMapper(7, 2)
+        for _ in range(60):
+          receiver.receiver_step(0)
+        mapper = usb_hid.GbaGamepadMapper(7, 2, release_polled=True)
+        before = tuple(receiver.receiver_value(i) for i in (3, 4, 5))
+        first = mapper.step(_digital_frame(7, 2, flags=1))
+        receiver.receiver_step(first.buttons & 3)
+        self.assertEqual(receiver.receiver_value(10), 1)
+        self.assertNotEqual(tuple(receiver.receiver_value(i) for i in (3, 4, 5)), before)
+        # Disconnect with South still held, and require a new receiver-polled release.
+        for _ in range(60):
+          receiver.receiver_step(1)
+        mapper.disconnect()
+        with self.assertRaisesRegex(ValueError, "released for 60"):
+          mapper.resync(7, 2)
+        self.assertIsNone(mapper.scene)
+        for _ in range(60):
+          receiver.receiver_step(0)
+        mapper.resync(7, 2, release_polled=True)
+        before = tuple(receiver.receiver_value(i) for i in (3, 4, 5))
+        receiver.receiver_step(mapper.step(_digital_frame(7, 2, flags=1)).buttons & 3)
+        self.assertEqual(receiver.receiver_value(10), 1)
+        self.assertNotEqual(tuple(receiver.receiver_value(i) for i in (3, 4, 5)), before)
+
+  def test_known_unarmed_interrupted_relative_transit(self):
+    for palette in (3, 7):
+      states = usb_hid.convert_gba_stream(_digital_frame(7, palette, flags=1), 7, palette,
+                                           release_polled=True, relative_unarmed=True)
+      self.assertEqual(states[0].dpad, ("left",))
+      self.assertEqual(states[-1].dpad, ())
+      self.assertTrue(all(not state.keys for state in states))
+      for name, receiver in self.receivers:
+        with self.subTest(palette=palette, receiver=name):
+          trace = self._trace(receiver, states, 7, palette, settle=True)
+          self.assertTrue(all(row[0] and not row[11] and row[1] == 2 for row in trace))
+          self.assertTrue(all(row[9] == palette - 1 and row[15] == palette - 1 for row in trace))
+          self.assertEqual([i for i, row in enumerate(trace) if row[10]], [0])
+          self.assertEqual(trace[0][5], 1)
+          if name == "reference":
+            # A different, pre-armed receiver proves its state cannot be inferred
+            # from the same scene/ring numbers; missing assertion still fails.
+            receiver.receiver_init(7, palette, 1)
+            receiver.receiver_step(0)
+            self.assertEqual(receiver.receiver_value(11), 1)
+            with self.assertRaisesRegex(ValueError, "known unarmed"):
+              usb_hid.GbaGamepadMapper(7, palette, release_polled=True)
+
   def test_source_scene_debounce_and_queued_changes(self):
     short = _scene_frame(7, 0) + _scene_frame(0, 0) * 90
-    self.assertEqual(len(usb_hid.convert_gba_stream(_scene_frame(7, 0), 0, 0)), 1)
+    self.assertEqual(len(_gba_convert(_scene_frame(7, 0), 0, 0)), 1)
     sequence = (_scene_frame(0, 0) * 50 + _scene_frame(7, 0) * 29 +
                 _scene_frame(0, 0) * 30 + _scene_frame(7, 0) * 30 +
                 _scene_frame(0, 0) * 29 + _scene_frame(7, 0) * 100)
     queued = _scene_frame(7, 0) * 30 + _scene_frame(0, 0) * 150
     for name, receiver in self.receivers:
       with self.subTest(receiver=name):
-        self.assertFalse(any(row[0] for row in self._trace(receiver, usb_hid.convert_gba_stream(short, 0, 0))))
-        trace = self._trace(receiver, usb_hid.convert_gba_stream(sequence, 0, 0))
+        self.assertFalse(any(row[0] for row in self._trace(receiver, _gba_convert(short, 0, 0))))
+        trace = self._trace(receiver, _gba_convert(sequence, 0, 0))
         entries = [i for i in range(1, len(trace)) if trace[i][0] and not trace[i - 1][0]]
         exits = [i for i in range(1, len(trace)) if not trace[i][0] and trace[i - 1][0]]
         self.assertEqual(entries, [168])
         self.assertEqual(exits, [])
-        trace = self._trace(receiver, usb_hid.convert_gba_stream(queued, 2, 0), 2, 0)
+        trace = self._trace(receiver, _gba_convert(queued, 2, 0), 2, 0)
         self.assertFalse(any(row[0] for row in trace))
         self.assertEqual(trace[-1][8:10], (0, 0))
 
@@ -470,7 +576,7 @@ class HidReceiverTests(unittest.TestCase):
     for start, target, ring, effective in (
         (0, 4, (1, 2, 3, 4), (0, 1, 2, 4)),
         (4, 0, (5, 6, 7, 0), (4, 5, 6, 0))):
-      states = usb_hid.convert_gba_stream(_scene_frame(7, target) * 400, 7, start)
+      states = _gba_convert(_scene_frame(7, target) * 400, 7, start)
       self.assertEqual([(i, s.dpad) for i, s in enumerate(states) if s.dpad],
                        [(0, ("right",)), (60, ("right",)), (120, ("right",)), (180, ("right",))])
       self.assertTrue(all(not s.keys for s in states))
@@ -489,7 +595,7 @@ class HidReceiverTests(unittest.TestCase):
   def test_transient_palette_requests_keep_scene_visible(self):
     for start, transient in ((0, 4), (4, 0)):
       stream = b"".join(_scene_frame(7, transient if t % 120 == 0 else start) for t in range(600))
-      states = usb_hid.convert_gba_stream(stream, 7, start)
+      states = _gba_convert(stream, 7, start)
       self.assertTrue(all(s.dpad in ((), ("left",), ("right",)) and not s.keys for s in states))
       for name, receiver in self.receivers:
         with self.subTest(start=start, receiver=name):
@@ -504,7 +610,7 @@ class HidReceiverTests(unittest.TestCase):
       for raw, target in ((3, 2), (7, 6)):
         wire = _digital_frame(scene, raw)
         self.assertEqual(usb_hid.gba_targets(wire, False), (7, target))
-        states = usb_hid.convert_gba_stream(wire * 400, 7, 0)
+        states = _gba_convert(wire * 400, 7, 0)
         self.assertTrue(all(not s.keys and s.dpad not in (("up",), ("down",)) for s in states))
         for name, receiver in self.receivers:
           with self.subTest(scene=scene, raw=raw, receiver=name):
@@ -513,7 +619,7 @@ class HidReceiverTests(unittest.TestCase):
             self.assertEqual(trace[-1][9], target)
             self.assertEqual(trace[-1][15], target)
     # A transient native source does not defeat the still-accepted scene-7 guard.
-    mapper = usb_hid.GbaGamepadMapper(7, 0)
+    mapper = usb_hid.GbaGamepadMapper(7, 0, release_polled=True)
     mapper.step(_digital_frame(0, 3))
     self.assertEqual((mapper.target_scene, mapper.target_palette), (7, 2))
 
@@ -521,7 +627,7 @@ class HidReceiverTests(unittest.TestCase):
     for start, target in ((0, 4), (4, 0)):
       stream = b"".join(_digital_frame(palette=target, flags=1 if t % 10 == 9 else 0)
                         for t in range(400))
-      states = usb_hid.convert_gba_stream(stream, 7, start)
+      states = _gba_convert(stream, 7, start)
       for name, receiver in self.receivers:
         with self.subTest(start=start, receiver=name):
           trace = self._trace(receiver, states, 7, start, settle=True)
@@ -541,7 +647,7 @@ class HidReceiverTests(unittest.TestCase):
     safe = (0, 1, 2, 4, 5, 6)
     for source in safe:
       for target in safe:
-        states = usb_hid.convert_gba_stream(_scene_frame(7, target), 7, source)
+        states = _gba_convert(_scene_frame(7, target), 7, source)
         for name, receiver in self.receivers:
           with self.subTest(source=source, target=target, receiver=name):
             trace = self._trace(receiver, states, 7, source, settle=True)
@@ -552,7 +658,7 @@ class HidReceiverTests(unittest.TestCase):
 
   def test_padding_releases_onsets_but_preserves_levels(self):
     wire = _digital_frame(7, 3, flags=0x1f, energy=200)
-    states = usb_hid.convert_gba_stream(wire, 7, 0, True)
+    states = _gba_convert(wire, 7, 0, True)
     self.assertEqual(states[0].buttons & 0x1f, 0x1f)
     self.assertTrue(all(state.buttons & 0x1f == 0x1c for state in states[1:-1]))
     self.assertEqual(states[-1].buttons, 0)
@@ -563,7 +669,7 @@ class HidReceiverTests(unittest.TestCase):
         self.assertTrue(all(row[1] != 3 and not row[11] for row in trace))
         self.assertEqual(trace[-1][1], 2)
         self.assertEqual(trace[-1][15], 2)
-    drop_only = usb_hid.convert_gba_stream(_digital_frame(7, 3, flags=7, energy=200), 7, 0, True)
+    drop_only = _gba_convert(_digital_frame(7, 3, flags=7, energy=200), 7, 0, True)
     self.assertEqual(drop_only[0].buttons & 7, 7)
     self.assertTrue(all(not state.buttons & 7 for state in drop_only[1:]))
 
@@ -571,7 +677,7 @@ class HidReceiverTests(unittest.TestCase):
     stream = b"".join(_digital_frame(palette=1, energy=200 if 320 <= t < 380 else 64,
                                       flags=1 if t >= 50 and (t - 50) % 60 == 0 else 0)
                       for t in range(600))
-    states = usb_hid.convert_gba_stream(stream, 7, 1)
+    states = _gba_convert(stream, 7, 1)
     self.assertEqual(len(states), 600)
     for name, receiver in self.receivers:
       with self.subTest(receiver=name):
@@ -583,7 +689,7 @@ class HidReceiverTests(unittest.TestCase):
                          [(1, 1), (1, 1), (2, 2), (3, 3), (3, 3), (2, 2), (1, 1)])
         if name == "reference":
           self.assertEqual([i for i, row in enumerate(trace) if row[12]], [320])
-        cut_states = usb_hid.convert_gba_stream(b"".join(
+        cut_states = _gba_convert(b"".join(
           _digital_frame(palette=2, energy=200 if 320 <= t < 380 else 64,
                          flags=1 if t >= 50 and (t - 50) % 60 == 0 else 0)
           for t in range(600)), 7, 2)

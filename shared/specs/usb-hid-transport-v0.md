@@ -53,8 +53,9 @@ button/key pulses.
 
 `host/bridge/usb_hid.py` defaults to the existing keyboard mapping and emits
 one JSON state per input record. `--gba-gamepad --initial-scene N
---initial-palette N` instead emits gamepad-only states: `buttons`, `left_x`,
-and `left_y` retain their existing meanings, `keys` is empty, and `dpad` is
+--initial-palette N --initial-release-polled` instead emits gamepad-only
+states: `buttons`, `left_x`, and `left_y` retain their existing meanings,
+`keys` is empty, and `dpad` is
 an array containing at most one of `up`, `down`, `left`, `right` (empty means
 release). These are abstract JSON states, not a HID report descriptor or USB
 gadget driver.
@@ -93,24 +94,43 @@ and reaching a destination can take multiple seconds.
 
 The `--initial-*` values are the actual receiver ring values, not the desired
 input values. Before starting or explicitly resynchronizing, independently
-establish those values, release all D-pad directions, and let the receiver
-settle for at least 60 steps. Also establish that flash is not already armed;
-this gamepad-only data path cannot verify an unknown latch from an earlier
-absolute or operator input on a mixed-input receiver. The stateful Python
-mapper's `disconnect()`
-invalidates both estimates and refuses further conversion until `resync()`
-is called with newly established values. A JSON file cannot detect a
-disconnect or perform this resynchronization itself. Estimates assume every
-state is delivered and no other input changes the rings; loss, reset, replay
-from the wrong point, or external button presses invalidate that assumption.
-There is no receiver feedback and no alignment guarantee.
+establish those values and the unarmed state. The receiver must have actually
+polled a release preamble for at least 60 consecutive steps: all D-pad
+directions, face buttons, shoulders, Select, Start and any keyboard keys
+released. This both settles the receiver and resets its
+edge history, so a first beat is not mistaken for an already-held button.
+It does not override scene-entry event suppression or the change budget.
+`--initial-release-polled` (Python `release_polled=True` on construction or
+`resync`) is the caller's assertion that this occurred; the converter neither
+sends nor verifies the preamble. A release only on the host without receiver
+polls does not satisfy it.
+
+The stateful Python mapper's `disconnect()` invalidates both estimates and
+refuses further conversion until `resync()` is called with newly established
+values and a new release assertion. A failed `resync()` also leaves the state
+unknown. A JSON file cannot detect a disconnect or perform resynchronization
+itself. Estimates assume every state is delivered and no other input changes
+the rings; loss, reset, replay from the wrong point, or external button presses
+invalidate that assumption. There is no receiver feedback and no alignment
+guarantee.
 
 Without `--allow-flash`, the usual HID scene-7 guard maps palette 3/7 to 2/6.
 Every absolute input is sanitized before conversion, and the guard also
-applies to the accepted scene while a source exit is still debouncing. The
-mapper requires a safe initial scene-7 palette. When moving a palette, it
-emits only relative D-pad pulses, never absolute scene or palette keys. Its
-ring may pass through 3/7 while scene 7 stays shown; this is not an absolute
+applies to the accepted scene while a source exit is still debouncing. Scene
+7 with ring 3 or 7 may be an interrupted relative transit. To start or
+resynchronize there, even with `--allow-flash`, the caller must explicitly
+assert `--assert-relative-unarmed` (Python `relative_unarmed=True`): the
+receiver is known unarmed, is a conforming `data` receiver, and receives no
+absolute scene/palette keys or operator input. The bridge cannot verify this
+assertion or a latch from an earlier absolute or operator input. If any of
+these facts are unknown, do not assert them: independently reset or manually
+establish an unarmed safe palette and repeat the release preamble. Once a
+source frame arrives, its sanitized destination drives the relative ring;
+an empty input produces no movement.
+
+When moving a palette, the mapper emits only relative D-pad pulses, never
+absolute scene or palette keys. Its ring may pass through 3/7 while scene 7
+stays shown; this is not an absolute
 3/7 report. A conforming `data` receiver treats those positions as unarmed
 requests, effective as 2/6, and cannot arm flash through them (F24). The
 receiver's stability gate and change budget apply; intermediate safe mode or

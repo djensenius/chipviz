@@ -103,8 +103,9 @@ intentional encoder change with `--write-fixtures`.
 
 `usb_hid.py --input build/scale.cvz --output build/scale-hid.json` produces
 the default keyboard/gamepad JSON states. For a gamepad-only GBA data-role
-receiver, opt in with `--gba-gamepad --initial-scene 0 --initial-palette 0`
-only after independently establishing and settling those receiver ring values.
+receiver, opt in with `--gba-gamepad --initial-scene 0 --initial-palette 0
+--initial-release-polled` only after independently establishing those receiver
+ring values and completing the release preamble.
 See the [HID transport spec](../../shared/specs/usb-hid-transport-v0.md#gba-gamepad-only-json-conversion)
 for aliases, pulse timing, latest-wins behavior, safe palette restrictions,
 and resynchronization. This file converter does not send USB reports or verify

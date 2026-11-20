@@ -44,9 +44,10 @@ def gba_targets(wire: bytes, allow_flash: bool) -> tuple[int, int]:
 class GbaGamepadMapper:
   """Estimate receiver rings assuming every output is delivered in order."""
 
-  def __init__(self, scene: int, palette: int, allow_flash: bool = False) -> None:
+  def __init__(self, scene: int, palette: int, allow_flash: bool = False, *,
+               release_polled: bool = False, relative_unarmed: bool = False) -> None:
     self.allow_flash = allow_flash
-    self.resync(scene, palette)
+    self.resync(scene, palette, release_polled=release_polled, relative_unarmed=relative_unarmed)
 
   def disconnect(self) -> None:
     self.scene = None
@@ -55,11 +56,16 @@ class GbaGamepadMapper:
     self.target_scene = None
     self.target_palette = None
 
-  def resync(self, scene: int, palette: int) -> None:
+  def resync(self, scene: int, palette: int, *, release_polled: bool = False,
+             relative_unarmed: bool = False) -> None:
+    """Assert a 60-poll release; ring 3/7 also requires known unarmed relative-only DATA."""
+    self.disconnect()
     if scene not in GBA_SCENES or palette not in range(8):
       raise ValueError("known GBA scene must be 0..3 or 7, and palette 0..7")
-    if not self.allow_flash and scene == 7 and palette in (3, 7):
-      raise ValueError("resynchronize to a safe palette before using scene 7")
+    if release_polled is not True:
+      raise ValueError("receiver must have polled all relevant buttons released for 60 steps")
+    if scene == 7 and palette in (3, 7) and relative_unarmed is not True:
+      raise ValueError("scene 7 palette 3/7 requires known unarmed relative-only DATA receiver")
     self.scene: int | None = scene
     self.palette: int | None = palette
     self.wait = 0
@@ -146,10 +152,12 @@ class GbaGamepadMapper:
 
 
 def convert_gba_stream(stream: bytes, scene: int, palette: int,
-                       allow_flash: bool = False) -> list[GamepadState]:
+                       allow_flash: bool = False, *, release_polled: bool = False,
+                       relative_unarmed: bool = False) -> list[GamepadState]:
   if len(stream) % WIRE_SIZE != 0:
     raise ValueError("control-frame stream is not aligned to 33-byte records")
-  mapper = GbaGamepadMapper(scene, palette, allow_flash)
+  mapper = GbaGamepadMapper(scene, palette, allow_flash, release_polled=release_polled,
+                            relative_unarmed=relative_unarmed)
   states = []
   for offset in range(0, len(stream), WIRE_SIZE):
     wire = stream[offset:offset + WIRE_SIZE]
@@ -221,6 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--gba-gamepad", action="store_true", help="opt in to GBA relative D-pad output")
   parser.add_argument("--initial-scene", type=int, choices=GBA_SCENES)
   parser.add_argument("--initial-palette", type=int, choices=range(8))
+  parser.add_argument("--initial-release-polled", action="store_true",
+                      help="assert 60 receiver polls with all relevant buttons released before playback")
+  parser.add_argument("--assert-relative-unarmed", action="store_true",
+                      help="assert known unarmed DATA receiver using no absolute scene/palette keys")
   add_allow_flash_argument(parser)
   return parser
 
@@ -231,10 +243,16 @@ def main_from_args(argv: list[str] | None = None) -> int:
     raise SystemExit("--gba-gamepad requires both --initial-scene and --initial-palette")
   if not args.gba_gamepad and (args.initial_scene is not None or args.initial_palette is not None):
     raise SystemExit("initial selections require --gba-gamepad")
+  if args.gba_gamepad and not args.initial_release_polled:
+    raise SystemExit("--gba-gamepad requires --initial-release-polled")
+  if not args.gba_gamepad and (args.initial_release_polled or args.assert_relative_unarmed):
+    raise SystemExit("initial receiver assertions require --gba-gamepad")
   announce_allow_flash(args.allow_flash)
   stream = args.input.read_bytes()
   if args.gba_gamepad:
-    mapped = convert_gba_stream(stream, args.initial_scene, args.initial_palette, args.allow_flash)
+    mapped = convert_gba_stream(stream, args.initial_scene, args.initial_palette, args.allow_flash,
+                                release_polled=args.initial_release_polled,
+                                relative_unarmed=args.assert_relative_unarmed)
   else:
     mapped = convert_stream(stream, args.allow_flash)
   states = [asdict(state) for state in mapped]
