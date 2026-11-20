@@ -903,8 +903,9 @@ fn most_flashes(frames: &[usize], values: &[f32]) -> usize {
 }
 
 /// Largest change of any tile's mean luminance between consecutive samples
-/// and across any span of up to one second, skipping samples where a
-/// section starts (`sections` changes), and the most WCAG flashes in any
+/// and between any two samples at most one second apart (a rise and fall
+/// within the second counts, not just its endpoints), never across a
+/// section start (`sections` changes), and the most WCAG flashes in any
 /// tile.
 fn luminance_report(series: &Series) -> (f32, f32, usize) {
     let Series {
@@ -917,22 +918,47 @@ fn luminance_report(series: &Series) -> (f32, f32, usize) {
         .collect();
     let mut per_sample = 0.0f32;
     let mut per_second = 0.0f32;
-    let most = |most: f32, now: &[f32], then: &[f32]| {
-        now.iter()
-            .zip(then)
-            .fold(most, |most, (now, then)| most.max((now - then).abs()))
-    };
-    // The earliest sample within one second of `sample`.
+    // The window: samples `earliest..=sample`, at most one second apart and
+    // in one section. Per tile, the window's samples in increasing (`lows`)
+    // and decreasing (`highs`) order of value, so each front is the
+    // window's minimum or maximum.
     let mut earliest = 0;
-    for sample in 1..tiles.len() {
-        if !starts[sample] {
-            per_sample = most(per_sample, &tiles[sample], &tiles[sample - 1]);
+    let mut lows = vec![std::collections::VecDeque::new(); TILES_X * TILES_Y];
+    let mut highs = lows.clone();
+    for sample in 0..tiles.len() {
+        if starts[sample] {
+            earliest = sample;
+        } else if sample > 0 {
+            for (now, then) in tiles[sample].iter().zip(&tiles[sample - 1]) {
+                per_sample = per_sample.max((now - then).abs());
+            }
         }
         while frames[earliest] + SECOND < frames[sample] {
             earliest += 1;
         }
-        if frames[sample] >= frames[0] + SECOND && !starts[earliest + 1..=sample].contains(&true) {
-            per_second = most(per_second, &tiles[sample], &tiles[earliest]);
+        for (tile, (lows, highs)) in lows.iter_mut().zip(&mut highs).enumerate() {
+            let value = tiles[sample][tile];
+            while lows
+                .back()
+                .is_some_and(|&low: &usize| tiles[low][tile] >= value)
+            {
+                lows.pop_back();
+            }
+            while highs
+                .back()
+                .is_some_and(|&high: &usize| tiles[high][tile] <= value)
+            {
+                highs.pop_back();
+            }
+            lows.push_back(sample);
+            highs.push_back(sample);
+            while lows.front().is_some_and(|&low| low < earliest) {
+                lows.pop_front();
+            }
+            while highs.front().is_some_and(|&high| high < earliest) {
+                highs.pop_front();
+            }
+            per_second = per_second.max(tiles[highs[0]][tile] - tiles[lows[0]][tile]);
         }
     }
     let flashes = (0..TILES_X * TILES_Y)
@@ -959,6 +985,40 @@ fn steady(frame: ControlFrame) -> ControlFrame {
     }
 }
 
+/// A tile that rises to 0.4 and falls back within every second has a 1 s
+/// change of 0.4, over the flash test's 0.35, though samples exactly one
+/// second apart never differ; across a section start it does not count.
+#[test]
+fn one_second_change_counts_a_rise_and_fall_within_the_second() {
+    let pulse = |frame: usize| 0.4 * (1.0 - (frame as f32 % 60.0 - 30.0).abs() / 30.0);
+    let frames: Vec<usize> = (0..=180).collect();
+    let series = Series {
+        tiles: frames
+            .iter()
+            .map(|&frame| {
+                let mut tiles = [0.0; TILES_X * TILES_Y];
+                tiles[5] = pulse(frame);
+                tiles
+            })
+            .collect(),
+        sections: vec![0; frames.len()],
+        frames: frames.clone(),
+    };
+    let endpoints = (SECOND..frames.len())
+        .map(|frame| (pulse(frame) - pulse(frame - SECOND)).abs())
+        .fold(0.0f32, f32::max);
+    assert_eq!(endpoints, 0.0);
+    let (_, second, _) = luminance_report(&series);
+    assert!((second - 0.4).abs() < 1e-6 && second >= 0.35, "{second}");
+    // A new section every 20 frames: each holds only a third of a pulse.
+    let cut = Series {
+        sections: frames.iter().map(|&frame| (frame / 20) as u16).collect(),
+        ..series
+    };
+    let (_, second, _) = luminance_report(&cut);
+    assert!(second < 0.3, "{second}");
+}
+
 /// Flash policy for the beat-synced changes, measured with `tile_estimate`
 /// (`pi5` profile, 4x4 tiles of mean luminance, steady energy; sampled
 /// every frame in pixel sections and every `GLYPH_STRIDE` frames in glyph
@@ -968,14 +1028,14 @@ fn steady(frame: ControlFrame) -> ControlFrame {
 /// pixel sections, with the frame-timed schedule on the same frames in
 /// brackets:
 ///
-/// | input | sections | worst tile step per sample | worst change over 1 s | flashes in 1 s |
+/// | input | sections | worst tile step per sample | worst swing within 1 s | flashes in 1 s |
 /// | --- | --- | --- | --- | --- |
-/// | procedural (beat every 16) | glyphs | 0.050 (timed 0.041) | 0.138 (0.140) | 1 (0) |
-/// | procedural | pixels | 0.026 (0.013) | 0.288 (0.288) | 1 (1) |
+/// | procedural (beat every 16) | glyphs | 0.050 (timed 0.041) | 0.140 (0.140) | 1 (0) |
+/// | procedural | pixels | 0.026 (0.013) | 0.288 (0.295) | 1 (1) |
 /// | live (beat every 30) | glyphs | 0.046 (0.042) | 0.136 (0.143) | 1 (0) |
-/// | live | pixels | 0.026 (0.013) | 0.288 (0.288) | 1 (1) |
+/// | live | pixels | 0.026 (0.013) | 0.296 (0.295) | 1 (1) |
 /// | racing (beat every frame, 255 bpm) | glyphs | 0.064 (0.052) | 0.141 (0.140) | 1 (0) |
-/// | racing | pixels | 0.055 (0.013) | 0.288 (0.288) | 1 (1) |
+/// | racing | pixels | 0.055 (0.013) | 0.295 (0.295) | 1 (1) |
 ///
 /// A step is over two frames in glyph sections and one in pixel sections.
 /// Steps skip the samples where a section starts (the white background
