@@ -55,7 +55,7 @@ fn build(
     }
 }
 
-/// Slow audio envelopes; only fresh frames update them, using the renderer clock.
+/// Slow audio envelopes advanced once per draw or capture replay step.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TunnelState {
     levels: [f32; 3],
@@ -63,9 +63,11 @@ pub(crate) struct TunnelState {
 }
 
 impl TunnelState {
-    pub(crate) fn observe_at(&mut self, frame: &ControlFrame, elapsed: f64) {
+    pub(crate) fn advance(&mut self, frame: &ControlFrame, elapsed: f64) {
         let previous = self.last_elapsed.unwrap_or(elapsed);
-        let delta = (elapsed - previous).max(0.0);
+        // Discard excess time after a stall: applying it in one draw could
+        // otherwise jump the geometry straight to a new audio level.
+        let delta = (elapsed - previous).clamp(0.0, 1.0 / 30.0);
         let blend = (1.0 - (-delta / 0.8).exp()) as f32;
         for (level, input) in self
             .levels
@@ -75,11 +77,6 @@ impl TunnelState {
             *level += (f32::from(input) / 255.0 - *level) * blend;
         }
         self.last_elapsed = Some(previous.max(elapsed));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn next_test_time(&self) -> f64 {
-        self.last_elapsed.map_or(0.0, |time| time + 1.0 / 60.0)
     }
 }
 
@@ -180,6 +177,109 @@ pub(crate) fn build_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::build_instances;
+    use crate::scenes::SceneConfig;
+
+    fn audio(level: u8) -> ControlFrame {
+        ControlFrame {
+            scene: 2,
+            energy: level,
+            bass: level,
+            treble: level,
+            ..ControlFrame::procedural(0)
+        }
+    }
+
+    fn state() -> SceneState {
+        SceneState::new(SceneConfig {
+            tunnel_variant: TunnelVariant::Hallway,
+            ..SceneConfig::default()
+        })
+    }
+
+    #[test]
+    fn single_packet_converges_on_held_redraws() {
+        let frame = audio(255);
+        let mut state = state();
+        state.observe_at(&frame, 0.0);
+        state.advance_tunnel(&frame, 0.0);
+        assert_eq!(state.tunnel.levels, [0.0; 3]);
+        let mut previous = 0.0;
+        // No more observations: a UDP packet is held on each redraw.
+        for i in 1..=240 {
+            state.advance_tunnel(&frame, f64::from(i) / 60.0);
+            let level = state.tunnel.levels[0];
+            assert!(level > previous && level <= 1.0);
+            assert!(level - previous < 0.021);
+            previous = level;
+        }
+        assert!(previous > 0.99);
+    }
+
+    #[test]
+    fn batched_packets_use_displayed_newest_input_once() {
+        let quiet = audio(0);
+        let loud = audio(255);
+        let mut state = state();
+        state.observe_at(&quiet, 0.0);
+        state.advance_tunnel(&quiet, 0.0);
+
+        // Both packet observations share a timestamp; neither may consume
+        // the interval before the newest displayed frame is known.
+        state.observe_at(&quiet, 1.0 / 60.0);
+        state.observe_at(&loud, 1.0 / 60.0);
+        assert_eq!(state.tunnel.levels, [0.0; 3]);
+        state.advance_tunnel(&loud, 1.0 / 60.0);
+        let expected = (1.0 - (-1.0_f64 / 60.0 / 0.8).exp()) as f32;
+        assert!((state.tunnel.levels[0] - expected).abs() < 0.000001);
+        let before = state.tunnel.levels;
+        // An identical timestamp cannot double-smooth, even if the frame
+        // changes. The next redraw uses the newest held input.
+        state.advance_tunnel(&quiet, 1.0 / 60.0);
+        assert_eq!(state.tunnel.levels, before);
+        state.advance_tunnel(&quiet, 2.0 / 60.0);
+        assert!(state.tunnel.levels[0] < before[0]);
+    }
+
+    #[test]
+    fn long_gap_is_bounded_and_capture_replay_matches_redraw() {
+        let loud = audio(255);
+        let mut stalled = state();
+        stalled.advance_tunnel(&loud, 0.0);
+        stalled.advance_tunnel(&loud, 60.0);
+        let maximum = (1.0 - (-1.0_f64 / 30.0 / 0.8).exp()) as f32;
+        assert!((stalled.tunnel.levels[0] - maximum).abs() < 0.000001);
+        let before = stalled.tunnel.levels;
+        stalled.advance_tunnel(&audio(0), 59.0);
+        stalled.advance_tunnel(&audio(0), 60.0);
+        assert_eq!(stalled.tunnel.levels, before);
+        stalled.advance_tunnel(&loud, 60.0 + 1.0 / 60.0);
+        assert!(stalled.tunnel.levels[0] > before[0]);
+
+        let mut replay = state();
+        let mut live = state();
+        for i in 0..180 {
+            let frame = if i < 80 { loud } else { audio(0) };
+            let time = f64::from(i) / 60.0;
+            // Capture observes every frame; a live held packet observes only
+            // once per change. Both advance once per displayed/replayed step.
+            replay.observe_at(&frame, time);
+            if i == 0 || i == 80 {
+                live.observe_at(&frame, time);
+            }
+            replay.advance_tunnel(&frame, time);
+            live.advance_tunnel(&frame, time);
+            assert_eq!(replay.tunnel.levels, live.tunnel.levels);
+        }
+        let profile = RenderProfile::pi5();
+        let frame = audio(0);
+        let a = build_instances(&profile, frame, 3.0, 16.0 / 9.0, &replay);
+        let b = build_instances(&profile, frame, 3.0, 16.0 / 9.0, &live);
+        assert_eq!(
+            bytemuck::cast_slice::<Instance, u8>(&a),
+            bytemuck::cast_slice::<Instance, u8>(&b)
+        );
+    }
 
     #[test]
     fn audio_envelope_is_time_based_and_ignores_backward_timestamps() {
@@ -192,14 +292,14 @@ mod tests {
         let mut sixty = TunnelState::default();
         let mut thirty = TunnelState::default();
         for i in 0..=60 {
-            sixty.observe_at(&frame, f64::from(i) / 60.0);
+            sixty.advance(&frame, f64::from(i) / 60.0);
         }
         for i in 0..=30 {
-            thirty.observe_at(&frame, f64::from(i) / 30.0);
+            thirty.advance(&frame, f64::from(i) / 30.0);
         }
         assert!((sixty.levels[0] - thirty.levels[0]).abs() < 0.00001);
         let before = sixty.levels;
-        sixty.observe_at(
+        sixty.advance(
             &ControlFrame {
                 energy: 0,
                 bass: 0,
@@ -209,7 +309,7 @@ mod tests {
             0.5,
         );
         assert_eq!(sixty.levels, before);
-        sixty.observe_at(
+        sixty.advance(
             &ControlFrame {
                 energy: 0,
                 bass: 0,

@@ -393,6 +393,11 @@ the colour field, whatever the registry length; every other byte selects
   PulseTunnel looks, not the separate Lines scene. Both use a screen-space
   projection, slowly moving depth and time-smoothed energy, bass and treble
   (hallway uses energy and bass); palette still chooses the line colour.
+  The envelope starts at zero and follows the newest displayed audio once per
+  redraw, including a held UDP packet, with a 0.8 s response. A redraw after
+  a stall advances it by at most 1/30 s and discards the excess, avoiding a
+  large one-frame audio jump; equal or backward timestamps do not advance it.
+  Capture replay advances it once per replayed frame on the same clock.
   Selection does not consume any wire, palette or layout bits. It applies
   whenever scene 2, 8, 14, ... is selected; live procedural input cycles
   scenes 0 to 2, or a host can send scene 2. Capture can force `--scene 2`.
@@ -613,10 +618,9 @@ cargo test --manifest-path renderers/modern/Cargo.toml --lib tunnel_variants_bou
 ```
 
 The second check samples 120 frames with energy and palette alternating on
-every frame. At 320x180 and 180x320 on the m1 GPU, both profile budgets had
-at most 6.89% of pixels changing luminance by 0.1 or more in one frame,
-and at most 0.0183 change in whole-frame mean linear luminance. This is
-supporting evidence, not a WCAG viewing-area test or real-display assessment.
+every frame, at 320x180 and 180x320 for both profile budgets. It reports
+whole-frame luminance changes; this is supporting evidence, not a WCAG
+viewing-area test or real-display assessment.
 
 For reproducible stills, run the following in this worktree. It covers both
 profile budgets, landscape and portrait, all three looks and two synthetic

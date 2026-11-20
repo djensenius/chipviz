@@ -7,7 +7,8 @@
 //!
 //! Registry scenes that need memory between frames (Lines and Static)
 //! keep it in [`SceneState`], which the renderer steps once per new frame
-//! and passes to [`SceneBuild::Stateful`] builders; other scenes ignore it.
+//! and passes to [`SceneBuild::Stateful`] builders. PulseTunnel variants also
+//! smooth audio on each redraw or replay step, including held frames.
 //!
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
 //! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
@@ -104,9 +105,10 @@ impl TunnelVariant {
 }
 
 /// State registry scenes keep between frames. [`observe`](Self::observe)
-/// steps every stateful scene once per new frame, whichever scene is shown,
-/// so a scene resumes in time when it is selected again; builders only read
-/// it, so a held redraw repeats the last step. Stateless scenes ignore it.
+/// steps Lines and Static once per new frame, whichever scene is shown.
+/// PulseTunnel's audio envelope is advanced separately per redraw or replay
+/// step using the displayed frame, including on held redraws. Builders read
+/// the resulting state without advancing it.
 #[derive(Clone, Debug, Default)]
 pub struct SceneState {
     config: SceneConfig,
@@ -135,7 +137,6 @@ impl SceneState {
     pub fn observe(&mut self, frame: &ControlFrame) {
         self.lines.observe(frame);
         self.static_noise.observe(frame);
-        self.tunnel.observe_at(frame, self.tunnel.next_test_time());
     }
 
     /// As [`observe`](Self::observe) at `elapsed` seconds on the renderer's
@@ -144,7 +145,12 @@ impl SceneState {
     pub fn observe_at(&mut self, frame: &ControlFrame, elapsed: f64) {
         self.lines.observe(frame);
         self.static_noise.observe_at(frame, elapsed);
-        self.tunnel.observe_at(frame, elapsed);
+    }
+
+    /// Smooth the displayed frame once per redraw or capture replay step.
+    /// Fresh packet observations do not advance this envelope.
+    pub(crate) fn advance_tunnel(&mut self, frame: &ControlFrame, elapsed: f64) {
+        self.tunnel.advance(frame, elapsed);
     }
 }
 
@@ -341,8 +347,8 @@ mod tests {
                     ..frame
                 };
                 for i in 0..120 {
-                    quiet.observe_at(&silent, f64::from(i) / 60.0);
-                    loud.observe_at(&strong, f64::from(i) / 60.0);
+                    quiet.advance_tunnel(&silent, f64::from(i) / 60.0);
+                    loud.advance_tunnel(&strong, f64::from(i) / 60.0);
                 }
                 for aspect in [16.0 / 9.0, 4.0 / 3.0] {
                     let a = build_instances(&profile, frame, 2.0, aspect, &quiet);

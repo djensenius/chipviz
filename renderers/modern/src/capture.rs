@@ -1030,6 +1030,66 @@ mod tests {
         assert!(replayed == live, "replayed still differs from the live run");
     }
 
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn tunnel_held_redraw_and_batched_packets_match_replayed_still() {
+        let size = (320, 180);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), size.0, size.1))
+                .unwrap();
+        let quiet = ControlFrame {
+            scene: 2,
+            palette: 1,
+            energy: 0,
+            bass: 0,
+            treble: 0,
+            ..ControlFrame::procedural(0)
+        };
+        let old = ControlFrame { frame: 1, ..quiet };
+        let loud = ControlFrame {
+            frame: 2,
+            energy: 255,
+            bass: 255,
+            treble: 255,
+            ..quiet
+        };
+        for variant in [TunnelVariant::Hallway, TunnelVariant::Abstract] {
+            renderer.pipeline_mut().configure_scenes(SceneConfig {
+                tunnel_variant: variant,
+                ..SceneConfig::default()
+            });
+            renderer.pipeline_mut().reset_state();
+            let mut live = Vec::new();
+            for index in 0..=120 {
+                let time = elapsed(index);
+                let frame = if index == 0 { quiet } else { loud };
+                if index == 0 {
+                    renderer.pipeline_mut().observe(&quiet, time);
+                } else if index == 1 {
+                    renderer.pipeline_mut().observe(&old, time);
+                    renderer.pipeline_mut().observe(&loud, time);
+                }
+                live = renderer
+                    .render_with(|pipeline, encoder, view| {
+                        pipeline.encode(encoder, view, frame, time, size)
+                    })
+                    .unwrap();
+            }
+            renderer.pipeline_mut().reset_state();
+            for index in 0..120 {
+                let frame = if index == 0 { quiet } else { loud };
+                renderer
+                    .pipeline_mut()
+                    .advance_state(frame, elapsed(index), size);
+            }
+            let replayed = renderer.render(loud, elapsed(120)).unwrap();
+            assert_eq!(
+                live, replayed,
+                "{variant:?}: replay differs from held redraws"
+            );
+        }
+    }
+
     /// Scene 7 enters the colour field at power-on and draws flat regions
     /// whose sRGB pixels and boundaries match the CPU model exactly.
     #[test]
