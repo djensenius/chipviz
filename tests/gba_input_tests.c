@@ -18,13 +18,14 @@ static void sample(uint16_t keys, uint16_t *prev_keys, uint8_t *scene, uint8_t *
                    uint8_t expected_scene, uint8_t expected_palette, const char *message) {
   update_input(keys, prev_keys, scene, palette);
   require(*scene == expected_scene && *palette == expected_palette, message);
-  require(*scene < 4u && *palette < 8u, "selection stays in range without underflow");
+  require((*scene < 4u || *scene == 7u) && *palette < 8u, "selection stays in range without underflow");
   require(*prev_keys == keys, "records every key sample");
 }
 
 static void directions_and_wrapping(void) {
-  static const uint8_t next_scene[] = {1, 2, 3, 0};
-  static const uint8_t prev_scene[] = {3, 0, 1, 2};
+  static const uint8_t scenes[] = {0, 1, 2, 3, 7};
+  static const uint8_t next_scene[] = {1, 2, 3, 7, 0};
+  static const uint8_t prev_scene[] = {7, 0, 1, 2, 3};
   static const uint8_t next_palette[] = {1, 2, 3, 4, 5, 6, 7, 0};
   static const uint8_t prev_palette[] = {7, 0, 1, 2, 3, 4, 5, 6};
   uint8_t s;
@@ -32,26 +33,26 @@ static void directions_and_wrapping(void) {
 
   require(KEY_UP == 0x0040 && KEY_DOWN == 0x0080, "scene directions match GBA key bits");
   require(KEY_RIGHT == 0x0010 && KEY_LEFT == 0x0020, "palette directions match GBA key bits");
-  require(GBA_SCENE_COUNT == 4u, "renderer has four scenes");
+  require(GBA_SCENE_COUNT == 5u, "ring has four native scenes and scene 7");
   require(GBA_PALETTE_COUNT == 8u, "renderer has eight palettes");
-  for (s = 0; s < 4; s++) {
+  for (s = 0; s < 5; s++) {
     for (p = 0; p < 8; p++) {
-      uint8_t scene = s;
+      uint8_t scene = scenes[s];
       uint8_t palette = p;
       uint16_t prev_keys = 0;
       sample(KEY_UP, &prev_keys, &scene, &palette, next_scene[s], p, "Up increments only scene");
-      scene = s;
+      scene = scenes[s];
       palette = p;
       prev_keys = 0;
       sample(KEY_DOWN, &prev_keys, &scene, &palette, prev_scene[s], p, "Down decrements only scene");
-      scene = s;
+      scene = scenes[s];
       palette = p;
       prev_keys = 0;
-      sample(KEY_RIGHT, &prev_keys, &scene, &palette, s, next_palette[p], "Right increments only palette");
-      scene = s;
+      sample(KEY_RIGHT, &prev_keys, &scene, &palette, scenes[s], next_palette[p], "Right increments only palette");
+      scene = scenes[s];
       palette = p;
       prev_keys = 0;
-      sample(KEY_LEFT, &prev_keys, &scene, &palette, s, prev_palette[p], "Left decrements only palette");
+      sample(KEY_LEFT, &prev_keys, &scene, &palette, scenes[s], prev_palette[p], "Left decrements only palette");
     }
   }
 }
@@ -107,15 +108,15 @@ static void chords(void) {
   } cases[] = {
     {KEY_UP | KEY_RIGHT, 1, 1},
     {KEY_UP | KEY_LEFT, 1, 7},
-    {KEY_DOWN | KEY_RIGHT, 3, 1},
-    {KEY_DOWN | KEY_LEFT, 3, 7},
+    {KEY_DOWN | KEY_RIGHT, 7, 1},
+    {KEY_DOWN | KEY_LEFT, 7, 7},
     {KEY_UP | KEY_DOWN, 0, 0},
     {KEY_LEFT | KEY_RIGHT, 0, 0},
     {KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT, 0, 0},
     {KEY_UP | KEY_DOWN | KEY_RIGHT, 0, 1},
     {KEY_UP | KEY_DOWN | KEY_LEFT, 0, 7},
     {KEY_LEFT | KEY_RIGHT | KEY_UP, 1, 0},
-    {KEY_LEFT | KEY_RIGHT | KEY_DOWN, 3, 0},
+    {KEY_LEFT | KEY_RIGHT | KEY_DOWN, 7, 0},
   };
   unsigned i;
 

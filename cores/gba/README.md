@@ -32,6 +32,27 @@ control path. The Pi maps `control-frame-v0` state down to scene, palette,
 intensity, and trigger buttons. See
 [`../../shared/specs/usb-hid-transport-v0.md`](../../shared/specs/usb-hid-transport-v0.md).
 
+The homebrew scene ring is 0, 1, 2, 3, 7: D-pad up/down selects the next or
+previous scene and left/right selects the palette. Scene 7 is the colour field.
+The default data role debounces scene 7 and palette changes; palettes 3 and 7
+run as hard cuts, never flash. South and East produce beat/bar edges and the
+left shoulder selects the high energy bucket. The digital-only path has no
+separate bands, notes, drop or silence input.
+
+The default host HID encoder emits absolute scene and palette as keyboard keys,
+which this ROM does not read. Its opt-in `--gba-gamepad` conversion emits
+relative D-pad JSON states for this scene ring, subject to the known-ring and
+release-preamble requirements in the
+[HID transport spec](../../shared/specs/usb-hid-transport-v0.md#gba-gamepad-only-json-conversion).
+It is not a USB sender, and actual Dock/hardware operation is not yet verified.
+No keyboard or richer control-frame input is implemented by this ROM.
+
+Native overlays use the A/B/Select/Start state sampled at the beginning of each
+page; short presses between snapshots can be missed. Scene and palette D-pad
+edges are polled separately. While a field exit debounces, the candidate
+native page is prepared in the hidden buffer using a page-start input and
+palette snapshot. A changed candidate discards that preparation.
+
 ## Constraints
 
 GBA is ideal for fast 2D motion and palette work. Keep scenes stylized and data-light so they can be shared with Pocket and cartridge/flashcart workflows.

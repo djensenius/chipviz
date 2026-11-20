@@ -7,7 +7,7 @@
 #define KEY_LEFT 0x0020
 #define KEY_UP 0x0040
 #define KEY_DOWN 0x0080
-#define GBA_SCENE_COUNT 4u
+#define GBA_SCENE_COUNT 5u
 #define GBA_PALETTE_COUNT 8u
 
 /* HID v0: Up/Down select scenes, Right/Left select palettes.
@@ -21,9 +21,9 @@ static void update_input(uint16_t keys, uint16_t *prev_keys, uint8_t *scene, uin
 
   if ((keys & (KEY_UP | KEY_DOWN)) != (KEY_UP | KEY_DOWN)) {
     if (pressed & KEY_UP) {
-      *scene = (uint8_t)((*scene + 1u) % GBA_SCENE_COUNT);
+      *scene = *scene == 7u ? 0u : (*scene == 3u ? 7u : (uint8_t)(*scene + 1u));
     } else if (pressed & KEY_DOWN) {
-      *scene = (uint8_t)((*scene + GBA_SCENE_COUNT - 1u) % GBA_SCENE_COUNT);
+      *scene = *scene == 0u ? 7u : (*scene == 7u ? 3u : (uint8_t)(*scene - 1u));
     }
   }
   if ((keys & (KEY_RIGHT | KEY_LEFT)) != (KEY_RIGHT | KEY_LEFT)) {
