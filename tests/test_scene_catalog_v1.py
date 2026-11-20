@@ -80,7 +80,11 @@ class CatalogTests(unittest.TestCase):
 
   def open_bytes(self, data: bytes) -> catalog.Catalog:
     self.path.write_bytes(data)
-    return catalog.open_catalog(self.path)
+    return self.open_path(self.path)
+
+  def open_path(self, path: pathlib.Path) -> catalog.Catalog:
+    with path.open("rb", buffering=0) as source:
+      return catalog.open_catalog(source.fileno())
 
   def assert_invalid(self, data: bytes, message: str = "") -> None:
     with self.assertRaises(ValueError, msg=message):
@@ -220,7 +224,7 @@ class CatalogTests(unittest.TestCase):
       stream.write(header(65_537))
       for index in range(65_537):
         stream.write(record(index))
-    with catalog.open_catalog(self.path) as result:
+    with self.open_path(self.path) as result:
       self.assertEqual(result.record(65_536).envelope[26:28], b"\x00\x00")
       self.assertEqual(result.record(65_536).tick, 65_536)
 
@@ -259,41 +263,50 @@ class CatalogTests(unittest.TestCase):
 
     source = GuardedInput(header(2) + record() + record(1))
     with mock.patch.object(catalog, "_open_regular", return_value=source):
-      with catalog.open_catalog("ignored") as result:
+      with catalog.open_catalog(0) as result:
         self.assertEqual(result.count, 2)
     self.assertEqual(catalog.MAX_FILE_SIZE, 145_000_020)
 
   @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
                        "nonblocking FIFO test requires POSIX")
-  def test_fifo_and_path_race_rejected_without_blocking(self) -> None:
+  def test_fifo_rejected_and_path_swaps_ignored_without_blocking(self) -> None:
     # A subprocess timeout makes a regression to blocking open/read fail
     # instead of hanging the test runner.
     program = """
 import os
 import sys
-from unittest import mock
 import scene_catalog_v1 as catalog
 path, mode = sys.argv[1:]
-if mode in ("race", "regular-race"):
-  real_open = os.open
-  def replace_then_open(name, flags, *args, **kwargs):
+if mode == "fifo":
+  fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+  try:
+    try:
+      catalog.open_catalog(fd)
+    except ValueError:
+      pass
+    else:
+      raise AssertionError("FIFO accepted")
+  finally:
+    os.close(fd)
+else:
+  fd = os.open(path, os.O_RDONLY)
+  try:
     if mode == "race":
       os.unlink(path)
       os.mkfifo(path)
     else:
       os.replace(path + ".replacement", path)
-    return real_open(name, flags, *args, **kwargs)
-  patch = mock.patch.object(catalog.os, "open", side_effect=replace_then_open)
+    with catalog.open_catalog(fd) as result:
+      assert result.count == 1
+      assert result.record(0).family == 7
+  finally:
+    os.close(fd)
+try:
+  catalog.open_catalog(path)
+except TypeError:
+  pass
 else:
-  patch = mock.patch.object(catalog.os, "open", wraps=os.open)
-with patch as opened:
-  try:
-    catalog.open_catalog(path)
-  except ValueError:
-    pass
-  else:
-    raise AssertionError("non-regular or replaced input accepted")
-  assert opened.call_count == (0 if mode == "fifo" else 1)
+  raise AssertionError("path accepted")
 """
     for mode in ("fifo", "race", "regular-race"):
       with self.subTest(mode=mode):
@@ -318,8 +331,96 @@ with patch as opened:
     self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
     link = self.path.with_name("link.cvxe")
     link.symlink_to(self.path)
-    with catalog.open_catalog(link) as result:
+    with self.open_path(link) as result:
       self.assertEqual(result.record(0).envelope, GOLDEN_RECORD)
+
+  def test_descriptor_position_and_ownership(self) -> None:
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    with self.path.open("rb", buffering=0) as source:
+      source.seek(10)
+      with catalog.open_catalog(source.fileno()) as result:
+        self.assertEqual(result.record(0).envelope, GOLDEN_RECORD)
+      self.assertEqual(source.tell(), len(GOLDEN_HEADER + GOLDEN_RECORD))
+      source.seek(0)
+      self.assertEqual(source.read(4), b"CVXE")
+
+  def test_descriptor_replacement_after_dup_does_not_change_input(self) -> None:
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    with self.path.open("rb", buffering=0) as source:
+      pipe_read, pipe_write = os.pipe()
+      self.addCleanup(os.close, pipe_read)
+      self.addCleanup(os.close, pipe_write)
+      real_fstat = os.fstat
+      replaced = False
+
+      def swap_then_stat(fd: int) -> os.stat_result:
+        nonlocal replaced
+        if not replaced:
+          replaced = True
+          os.dup2(pipe_read, source.fileno())
+        return real_fstat(fd)
+
+      with mock.patch.object(catalog.os, "fstat", side_effect=swap_then_stat):
+        with catalog.open_catalog(source.fileno()) as result:
+          self.assertEqual(result.record(0).envelope, GOLDEN_RECORD)
+      self.assertTrue(replaced)
+
+  @unittest.skipUnless(all(hasattr(os, name) for name in
+                           ("openpty", "setsid", "O_NOCTTY", "O_NONBLOCK")),
+                       "PTY test requires POSIX")
+  def test_pty_path_swap_does_not_open_device_or_acquire_terminal(self) -> None:
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    program = """
+import os
+import sys
+from unittest import mock
+import scene_catalog_v1 as catalog
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY)
+master, slave = os.openpty()
+os.setsid()
+device = os.ttyname(slave)
+os.unlink(path)
+os.symlink(device, path)
+def no_controlling_terminal():
+  try:
+    tty = os.open("/dev/tty", os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
+  except OSError:
+    return
+  os.close(tty)
+  raise AssertionError("unexpected controlling terminal")
+no_controlling_terminal()
+real_open = os.open
+def guarded_open(name, flags, *args, **kwargs):
+  if os.fspath(name) in (path, device):
+    raise AssertionError("validator opened the swapped input or PTY")
+  return real_open(name, flags, *args, **kwargs)
+with mock.patch.object(catalog.os, "open", side_effect=guarded_open):
+  try:
+    catalog.open_catalog(path)
+  except TypeError:
+    pass
+  else:
+    raise AssertionError("path accepted")
+  with catalog.open_catalog(fd) as result:
+    assert result.record(0).family == 7
+  try:
+    catalog.open_catalog(slave)
+  except ValueError:
+    pass
+  else:
+    raise AssertionError("PTY accepted")
+no_controlling_terminal()
+os.close(fd)
+os.close(master)
+os.close(slave)
+"""
+    completed = subprocess.run(
+      [sys.executable, "-c", program, str(self.path)],
+      env={**os.environ, "PYTHONPATH": str(ROOT / "host" / "bridge")},
+      capture_output=True, text=True, timeout=5,
+    )
+    self.assertEqual(completed.returncode, 0, completed.stderr)
 
   def test_deferred_snapshot_write_failure_is_atomic_and_closed(self) -> None:
     class FullDisk(io.RawIOBase):
@@ -334,7 +435,7 @@ with patch as opened:
     self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
     with mock.patch.object(catalog.tempfile, "TemporaryFile", return_value=snapshot):
       with self.assertRaises(OSError) as error:
-        catalog.open_catalog(self.path)
+        self.open_path(self.path)
     self.assertEqual(error.exception.errno, errno.ENOSPC)
     self.assertTrue(snapshot.closed)
     self.assertTrue(raw.closed)

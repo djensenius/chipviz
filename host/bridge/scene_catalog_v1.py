@@ -23,7 +23,6 @@ import struct
 import tempfile
 import zlib
 from dataclasses import dataclass
-from pathlib import Path
 from typing import BinaryIO
 
 
@@ -136,36 +135,41 @@ class Catalog:
     self.close()
 
 
-def _open_regular(path: str | Path) -> BinaryIO:
-  # Reject special files before opening them, then verify the opened object:
-  # the path could have been replaced between stat and open.
-  before = os.stat(path)
-  if not stat.S_ISREG(before.st_mode):
-    raise ValueError("input must be a regular file")
-  if not hasattr(os, "O_NONBLOCK"):
-    raise OSError("safe nonblocking input open is unavailable on this platform")
-  fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+def _open_regular(fd: int) -> BinaryIO:
+  if isinstance(fd, bool) or not isinstance(fd, int):
+    raise TypeError("input must be an already-open file descriptor")
+  duplicate = os.dup(fd)
   try:
-    opened = os.fstat(fd)
-    if (not stat.S_ISREG(opened.st_mode)
-        or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
-      raise ValueError("input changed or is not a regular file")
-    return os.fdopen(fd, "rb")
+    if not stat.S_ISREG(os.fstat(duplicate).st_mode):
+      raise ValueError("input must be a regular file")
+    return os.fdopen(duplicate, "rb")
   except BaseException:
-    os.close(fd)
+    os.close(duplicate)
     raise
 
 
-def open_catalog(path: str | Path) -> Catalog:
-  """Validate one .cvxe path atomically and return its bounded snapshot.
+def open_catalog(fd: int) -> Catalog:
+  """Validate a .cvxe from an already-open readable regular-file descriptor.
 
-  Only regular files are accepted; platforms without nonblocking open fail
-  closed. Raises ValueError for invalid structure or non-regular input, or
-  OSError for I/O failures. No record is exposed on failure, including errors
-  in later records, at EOF, or while flushing the snapshot. The caller must
-  independently establish all renderer and safety conditions.
+  No input path is opened: the caller is responsible for acquiring the
+  descriptor safely, without opening an untrusted device or FIFO. O_NONBLOCK
+  and O_NOCTTY alone cannot make arbitrary device opens safe. The descriptor
+  is duplicated before checking its type, so later path or descriptor
+  replacement cannot change the checked input. Validation starts at offset
+  zero; the duplicate shares and changes the caller's file position. Do not
+  use buffered or concurrent access to that open file description during
+  validation, or mutate the input while it is being read. The caller retains
+  ownership of its descriptor. Regular-file checks do not bound I/O latency
+  on remote, virtual, or faulty filesystems.
+
+  Raises TypeError for path arguments, ValueError for invalid structure or
+  non-regular input, or OSError for I/O failures. No record is exposed on
+  failure, including errors in later records, at EOF, or while flushing the
+  snapshot. The caller must independently establish renderer and safety
+  conditions.
   """
-  with _open_regular(path) as source:
+  with _open_regular(fd) as source:
+    source.seek(0)
     header = source.read(HEADER_SIZE)
     if len(header) != HEADER_SIZE:
       raise ValueError("truncated header")
