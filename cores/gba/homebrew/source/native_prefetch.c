@@ -5,12 +5,12 @@ void gba_native_prefetch_init(gba_native_prefetch_t *prefetch) {
   prefetch->scene = 0u;
   prefetch->palette = 0u;
   prefetch->keys = 0u;
-  prefetch->rows = prefetch->overlays = prefetch->ready = 0u;
+  prefetch->rows = prefetch->ready = 0u;
 }
 
 uint8_t gba_native_prefetch_observe(gba_native_prefetch_t *prefetch, uint8_t scene,
-                                    uint8_t palette, uint16_t keys) {
-  if (scene == 7u) {
+                                    uint8_t palette, uint16_t keys, uint16_t stable) {
+  if (scene == 7u || stable < GBA_PREFETCH_START_POLL) {
     gba_native_prefetch_init(prefetch);
     return 0u;
   }
@@ -21,25 +21,22 @@ uint8_t gba_native_prefetch_observe(gba_native_prefetch_t *prefetch, uint8_t sce
   prefetch->scene = scene;
   prefetch->palette = palette;
   prefetch->keys = keys;
-  prefetch->rows = prefetch->overlays = prefetch->ready = 0u;
+  prefetch->rows = prefetch->ready = 0u;
   return 1u;
 }
 
 uint8_t gba_native_prefetch_next(gba_native_prefetch_t *prefetch, uint8_t *first, uint8_t *end) {
-  if (!prefetch->active || prefetch->ready) {
+  if (!prefetch->active || prefetch->ready || prefetch->rows >= GBA_PREFETCH_ROWS) {
     return GBA_PREFETCH_NONE;
   }
-  if (prefetch->rows < GBA_PREFETCH_ROWS) {
-    *first = prefetch->rows;
-    prefetch->rows = (uint8_t)(prefetch->rows + GBA_PREFETCH_ROWS_PER_POLL);
-    *end = prefetch->rows;
-    return GBA_PREFETCH_BACKGROUND;
-  }
-  *first = prefetch->overlays;
-  prefetch->overlays = (uint8_t)(prefetch->overlays + GBA_PREFETCH_OVERLAYS_PER_POLL);
-  *end = prefetch->overlays;
-  if (prefetch->overlays == GBA_PREFETCH_OVERLAYS) {
+  *first = prefetch->rows;
+  prefetch->rows = (uint8_t)(prefetch->rows + GBA_PREFETCH_ROWS_PER_POLL);
+  *end = prefetch->rows;
+  return GBA_PREFETCH_BACKGROUND;
+}
+
+void gba_native_prefetch_complete(gba_native_prefetch_t *prefetch) {
+  if (prefetch->active && prefetch->rows == GBA_PREFETCH_ROWS) {
     prefetch->ready = 1u;
   }
-  return GBA_PREFETCH_OVERLAY;
 }

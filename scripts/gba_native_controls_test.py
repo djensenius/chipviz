@@ -252,15 +252,30 @@ def main():
   if exit_field != field:
     raise AssertionError("field-exit setup is not deterministic")
   assert_exit_timing(exit_index(exit_frames))
-  assert_overlay_sequence(exit_frames[exit_index(exit_frames):], [1, 2, 0],
-                          "page-start A snapshot, later B and release")
+  assert_overlay_sequence(exit_frames[exit_index(exit_frames):], [2, 0],
+                          "released early A is not replayed; page-start B and release")
 
   def exit_chord(step):
-    return ("down", "a", "b") if step < 8 else ()
+    return ("down",) if step < 8 else ("a", "b") if 20 <= step < 40 else ()
 
   _, chord_frames = field_exit_sample(args.rom, args.core, exit_chord)
   assert_exit_timing(exit_index(chord_frames))
   assert_overlay_sequence(chord_frames[exit_index(chord_frames):], [3, 0], "real exit chord")
+
+  def palette_at(start):
+    return lambda step: (("down",) if step < 8 else ()) + (("right",) if start <= step < start + 3 else ())
+
+  _, early_palette = field_exit_sample(args.rom, args.core, palette_at(10))
+  _, late_palette = field_exit_sample(args.rom, args.core, palette_at(22))
+  for frames in (early_palette, late_palette):
+    assert_exit_timing(exit_index(frames))
+  if early_palette[exit_index(early_palette)] != late_palette[exit_index(late_palette)]:
+    raise AssertionError("palette changes before page start did not produce the same first native page")
+
+  _, post_snapshot_palette = field_exit_sample(args.rom, args.core, palette_at(29))
+  assert_exit_timing(exit_index(post_snapshot_palette))
+  if exit_baseline[departure] != post_snapshot_palette[exit_index(post_snapshot_palette)]:
+    raise AssertionError("palette change after page start altered the already sampled page")
 
   def cancelled(step):
     return ("down",) if step < 8 or 30 <= step < 33 else ("up",) if 25 <= step < 28 else ()
