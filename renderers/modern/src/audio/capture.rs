@@ -86,6 +86,9 @@ const DRIFT_RECOVERY: f64 = 10.0;
 /// older fill was for audio the device lost, and the lag falling below the
 /// latency for good is the drift changing.
 const FRESH_FILL: Duration = Duration::from_secs(30);
+/// At most this many recent fills are kept for `FRESH_FILL`; older ones are
+/// dropped first.
+const FRESH_FILLS: usize = 32;
 /// While a drift is trusted, lag above the margin is filled only if at
 /// least `STEP_SHARE` of the margin arrived at once, compared with the lowest
 /// lag of the `STEP_LOOKBACK` before: a rise that built up gradually is the
@@ -591,9 +594,10 @@ struct LossDetector {
     stepped: f64,
     /// The lags of the last `STALL_RESET`, to tell steps from gradual rises.
     lags: VecDeque<(Instant, f64)>,
-    /// When the last fill was, and the seconds filled since `FRESH_FILL`
-    /// before it and not taken back.
-    fresh: Option<(Instant, f64)>,
+    /// When each fill of the last `FRESH_FILL` was, and the seconds of it
+    /// not taken back (each expires on its own, so recurring fills do not
+    /// keep older ones fresh).
+    fresh: VecDeque<(Instant, f64)>,
     /// How far the latency fell without take-back since the drift was
     /// trusted.
     sunk: f64,
@@ -620,7 +624,7 @@ impl LossDetector {
             owed: 0.0,
             stepped: 0.0,
             lags: VecDeque::new(),
-            fresh: None,
+            fresh: VecDeque::new(),
             sunk: 0.0,
             absorbed: None,
             residual: false,
@@ -694,6 +698,7 @@ impl LossDetector {
     fn overlapped(&mut self, overlap: f64) {
         self.filled = (self.filled - overlap).max(0.0);
         self.stepped -= overlap;
+        self.unfill(overlap);
     }
 
     fn margin(&self) -> f64 {
@@ -711,14 +716,39 @@ impl LossDetector {
 
     /// Fill from the last `FRESH_FILL` not yet taken back.
     fn fresh(&self, now: Instant) -> f64 {
-        match self.fresh {
-            Some((at, fresh)) if now.duration_since(at) < FRESH_FILL => fresh.min(self.filled),
-            _ => 0.0,
-        }
+        self.fresh
+            .iter()
+            .filter(|&&(at, _)| now.duration_since(at) < FRESH_FILL)
+            .map(|&(_, fill)| fill)
+            .sum::<f64>()
+            .min(self.filled)
     }
 
     fn note_fill(&mut self, now: Instant, fill: f64) {
-        self.fresh = Some((now, self.fresh(now) + fill));
+        while self
+            .fresh
+            .front()
+            .is_some_and(|&(at, _)| now.duration_since(at) >= FRESH_FILL)
+            || self.fresh.len() >= FRESH_FILLS
+        {
+            self.fresh.pop_front();
+        }
+        self.fresh.push_back((now, fill));
+    }
+
+    /// `amount` seconds of fill were taken back or cancelled: the newest
+    /// fills go first.
+    fn unfill(&mut self, mut amount: f64) {
+        while amount > 0.0
+            && let Some((_, fill)) = self.fresh.back_mut()
+        {
+            let back = amount.min(*fill);
+            *fill -= back;
+            amount -= back;
+            if *fill <= 0.0 {
+                self.fresh.pop_back();
+            }
+        }
     }
 
     /// The lowest lag in the `STEP_LOOKBACK` before `since`.
@@ -783,9 +813,7 @@ impl LossDetector {
         if lag < latency && takeable > 0.0 {
             let back = (latency - lag).min(takeable).min(spare);
             self.filled -= back;
-            if let Some((_, fresh)) = &mut self.fresh {
-                *fresh = (*fresh - back).max(0.0);
-            }
+            self.unfill(back);
             // Fill taken back was a delay, not a loss: learn the whole
             // reversal as jitter so the same delay is not filled again. It
             // accumulates over an episode, so a delay that recovers in steps
@@ -1996,6 +2024,26 @@ mod tests {
         assert!(loss.check(at(150), -0.01, 1.0, false) < 0.0);
         assert_eq!(loss.check(at(160), 0.09, 1.0, false), 0.0);
         assert_eq!(loss.check(at(210), 0.09, 1.0, false), 0.09);
+    }
+
+    #[test]
+    fn each_trusted_fill_expires_on_its_own() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut loss = LossDetector::new(start);
+        // While a drift is trusted, 40 ms is lost and filled every 20 s.
+        for k in 0..4 {
+            let t = 1_000 + k * 20_000;
+            assert_eq!(loss.check(at(t - 10), 0.0, 1.0, true), 0.0);
+            assert_eq!(loss.check(at(t), 0.04, 1.0, true), 0.0);
+            assert_eq!(loss.check(at(t + 50), 0.04, 1.0, true), 0.04);
+            assert_eq!(loss.check(at(t + 60), 0.0, 1.0, true), 0.0);
+        }
+        // The lag then falls by 200 ms: only the fills of the last
+        // `FRESH_FILL` (at 41 s and 61 s) may be taken back, not the older
+        // ones that the later fills followed within 30 s.
+        let back = loss.check(at(70_000), -0.2, 1.0, true);
+        assert!((back + 0.08).abs() < 1e-9, "{back}");
     }
 
     /// Callbacks of `ms` milliseconds of device time for `seconds` of device
