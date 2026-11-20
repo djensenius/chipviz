@@ -407,20 +407,24 @@ the colour field, whatever the registry length; every other byte selects
   each cell, so glyph density is limited by the instance budget (about 208x78
   cells on `m1`, 104x39 on `pi5`). Sections are frame-timed, not beat-synced.
 - `Object`: an object in space, presented like a 1980s/90s infomercial or
-  camcorder tape. Six original procedural models (a CRT television, a VHS
-  tape, a CD with a rainbow sheen, a sunglasses-wearing sun, a tree and a
-  beige desktop computer) are built in code from boxes, cylinders and spheres
+  camcorder tape. Eleven original procedural models (a CRT television, a VHS
+  tape, a CD with a rainbow sheen, a sunglasses-wearing sun, a tree, a beige
+  desktop computer, a red phone box with a lit sign, a tricycle with turning
+  wheels and streamers, a gable-top milk carton, a neon jukebox whose grille
+  follows the spectrum, and a tin of beans with loose beans that hop on the
+  beat) are built in code from boxes, cylinders and spheres
   sampled into lit, back-face-culled splats; no downloaded assets are used.
   Every 512 control frames the object spins in, swings back and forth on a
   turntable around a three-quarter front view (the CD and sun rock instead),
-  and spins out. Sections cycle the object (6),
+  and spins out. Sections cycle the object (11, the newer five appended
+  after the first six),
   the background (5: procedural starfield, lava goop, a vaporwave sunset over
   a grid floor, a rainbow sweep, and a chroma-key colour field), the palette
   morph (3: a hue swing, a rainbow sweep, or a hue jump every beat; glowing
   screens and the sun keep their colours) and the overlay (2: camcorder
   scanlines, rolling tracking noise, tearing, "REC" and a date stamp, or an
   infomercial caption banner, taglines and a spinning "NEW!" burst), so all
-  30 object/background pairs appear within 30 sections. Beats punch the zoom
+  55 object/background pairs appear within 55 sections. Beats punch the zoom
   and drive the screens and spectrum; the drop flag, every eighth beat and
   each reveal fire a lens flare and sparkles. Flash safety: beat effects only
   touch the object, the flare and small sparkles; the chroma-key field cuts
@@ -429,8 +433,8 @@ the colour field, whatever the registry length; every other byte selects
   (at most about 15,000 object splats on `m1` and 3,500 on `pi5`), and the object is projected on
   the CPU, so the scene uses `ScreenSpace`. Text reuses Static's 5x8 font.
   Procedural input never selects it; use `--scene 5` (frames 200, 712, 1224,
-  1736, 2248 and 2760 show each object; 48 past a section start is the
-  reveal flare).
+  1736, 2248, 2760, 3272, 3784, 4296, 4808 and 5320 show each object; 48
+  past a section start is the reveal flare).
   Limitations: sections are frame-timed, not beat-synced; there is no depth
   buffer, so splats are sorted far to near on the CPU.
 
