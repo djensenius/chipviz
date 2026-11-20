@@ -398,7 +398,9 @@ the colour field, whatever the registry length; every other byte selects
   scene uses `ScreenSpace`. Sections follow the beat: the scene keeps its
   schedule between frames, and once a section's 512 frames have run the next
   starts on the first bar line (`beat_count` crossing a multiple of 4), so
-  sections stay at least 512 frames apart (every 600 at 120 bpm live). Every
+  sections stay at least 512 frames apart (every 600 at 120 bpm live; at
+  slow tempos, about 30 bpm, a section can run up to about 480 extra frames
+  while it waits for a bar). Every
   bar line at least 60 frames after the last one reframes the camera, easing
   over one beat (15 to 30 frames) to the next of six framings (head on every
   other bar, either side, closer, from above, pulled back). In a text
@@ -411,7 +413,10 @@ the colour field, whatever the registry length; every other byte selects
   input sections start on the same frames as before. Flash safety: beats
   change only geometry and characters, never the background or brightness,
   and each change eases or staggers over at least 15 frames; a CPU luminance
-  test under racing beats finds at most one flash in any second.
+  test over all eight section types, up to racing beats, finds at most one
+  flash in any second. Recorded golden fingerprints cover both the
+  frame-timed path (frames built before any is observed) and the
+  beat-synced replay from frame 0 that the renderer and captures use.
   Procedural input never selects it; use
   `--scene 4` (frames 100, 200 and 300 show glyph noise, a mid-transition and
   resolved text; 3604 shows pixel noise, 4908 a constant on white, 3422 the

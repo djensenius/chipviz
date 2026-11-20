@@ -26,7 +26,9 @@
 //!   multiple of 4. Sections are therefore at least 512 frames apart, so the
 //!   white background still cuts in or out at most once per 8.5 s. With
 //!   procedural input (a beat every 16 frames) that is exactly every 512
-//!   frames, as before; at 120 bpm live it is every 600.
+//!   frames, as before; at 120 bpm live it is every 600. At slow tempos a
+//!   section waits longer for its bar: at 30 bpm (a bar every 480 frames)
+//!   it can run up to about 480 frames past its 512.
 //! - Every bar line at least 60 frames (1 s) after the last one also
 //!   reframes the camera: it eases over one beat (15 to 30 frames) to the
 //!   next of six framings (head on, either side, closer, from above and
@@ -42,14 +44,22 @@
 //!   every 512 frames and the camera holds its framing.
 //! - Before the state has seen a frame, the schedule is the frame counter's
 //!   (`frame / 512`, head on), and a state joins that schedule on its first
-//!   frame. The recorded golden fingerprint is built this way, so it is
-//!   unchanged.
+//!   frame.
+//!
+//! Two sets of recorded golden fingerprints in `tests.rs` cover the two
+//! paths: `instances_match_recorded_golden` builds each frame before any
+//! frame is observed (the frame-timed path, unchanged from before beat
+//! sync), and `observed_instances_match_recorded_golden` replays from frame
+//! 0 through an observed state, as the renderer and `chipviz-capture` do,
+//! with procedural and live-like beats (the beat-synced path, including a
+//! reframe and a flip under way).
 //!
 //! Flash safety: the beat changes only geometry and characters, never the
 //! background or brightness, and every change eases or staggers over at
 //! least 15 frames. `beat_changes_keep_luminance_flashes_bounded` in
-//! `tests.rs` measures large-area luminance under racing beats: at most one
-//! flash in any second, under WCAG 2.3.1's three (see its table).
+//! `tests.rs` measures large-area luminance over all eight section types
+//! under procedural, live and racing beats: at most one flash in any
+//! second, under WCAG 2.3.1's three (see its table).
 //!
 //! Audio drives the noise: energy shortens each cell's change period (1 to
 //! 12 frames) and lowers the chance of a blank cell (80% when silent, 20% at
