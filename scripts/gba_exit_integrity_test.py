@@ -175,6 +175,17 @@ def main():
       return ("up",)
     return ()
 
+  def alternate_scene(count):
+    last = (count - 1) * 10
+    def buttons(step):
+      result = ("down",) if any(start <= step < start + 3 for start in range(0, last + 1, 10)) else ()
+      if last + 3 <= step < last + 6:
+        result += ("left",)
+      if last + 20 <= step < last + 40:
+        result += ("a", "b", "start", "select")
+      return result
+    return buttons
+
   scenario(args.rom, args.core, oracle, "plain", plain, 0, (3, 0, 0), (3, 0, 0))
   scenario(args.rom, args.core, oracle, "released A", early_a, 0, (3, 0, 0), (3, 0, 0))
   scenario(args.rom, args.core, oracle, "snapshotted A", snapshot_a, 0, (3, 0, KEYS["a"]), (3, 0, 0))
@@ -184,8 +195,11 @@ def main():
   scenario(args.rom, args.core, oracle, "scene on display poll", scene_on_display, 0, (3, 0, 0), (2, 0, 0))
   scenario(args.rom, args.core, oracle, "scene change on 30th poll", cancel_at_30, 29, (2, 0, 0), (2, 0, 0))
   scenario(args.rom, args.core, oracle, "three reversals", reversals, 120, (3, 0, 0), (3, 0, 0), 180)
+  for count, scene in ((2, 2), (3, 1), (4, 0)):
+    scenario(args.rom, args.core, oracle, f"scene {scene} palette 7 full chord", alternate_scene(count),
+             (count - 1) * 10, (scene, 7, 15), (scene, 7, 15))
   repeated_entries(args.rom, args.core, oracle)
-  print("gba mGBA entry/exit integrity: 10 scenarios passed")
+  print("gba mGBA entry/exit integrity: 13 scenarios passed")
 
 
 if __name__ == "__main__":
