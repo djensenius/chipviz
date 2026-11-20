@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#include "scene_catalog_v1_pairs.h"
+#include "scene_catalog_v1_ids.h"
 
 typedef enum {
   CHIPVIZ_RING_OK,

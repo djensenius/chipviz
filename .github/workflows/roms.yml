@@ -13,6 +13,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install cc65
         run: sudo apt-get update && sudo apt-get install -y cc65
+      - name: Compile catalog ring with cc65
+        run: |
+          cc65 -t c64 -o "$RUNNER_TEMP/scene_catalog_v1_ring_default.s" shared/src/scene_catalog_v1_ring.c
+          cc65 --standard c99 -t c64 -o "$RUNNER_TEMP/scene_catalog_v1_ring_c99.s" shared/src/scene_catalog_v1_ring.c
+          printf '%s\n' '#include "chipviz/scene_catalog_v1_ring.h"' 'int main(void) { return 0; }' | cc65 -I shared/include -t c64 -o "$RUNNER_TEMP/scene_catalog_v1_header.s" /dev/stdin
+          test -s "$RUNNER_TEMP/scene_catalog_v1_ring_default.s"
+          test -s "$RUNNER_TEMP/scene_catalog_v1_ring_c99.s"
+          test -s "$RUNNER_TEMP/scene_catalog_v1_header.s"
       - name: Build C64 PRG
         run: make -C cores/c64/homebrew
       - name: Verify C64 PRG

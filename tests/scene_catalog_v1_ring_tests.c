@@ -1,4 +1,5 @@
 #include "../shared/include/chipviz/scene_catalog_v1_ring.h"
+#include "../shared/include/chipviz/scene_catalog_v1_pairs.h"
 
 #include <limits.h>
 #include <stdio.h>
