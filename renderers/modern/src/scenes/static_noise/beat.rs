@@ -8,6 +8,9 @@
 //! state starts: it joins that schedule on its first frame. With procedural
 //! input (a beat every 16 frames) sections then start on exactly the frames
 //! the frame-timed schedule used.
+//!
+//! The state also slew-limits the energy the noise follows (see
+//! `ENERGY_SLEW`), so no energy signal can strobe the noise density.
 
 use super::{Content, DISSOLVE_START, HOLD_START, SECTION_FRAMES, section_at};
 use crate::control_frame::ControlFrame;
@@ -36,6 +39,10 @@ pub(super) const FLIP_SPREAD: u16 = 24;
 pub(super) const FLIP_CYCLE: u16 = 12;
 /// A flip must finish before the section's dissolve starts.
 pub(super) const LAST_FLIP: u16 = DISSOLVE_START - FLIP_SPREAD - FLIP_CYCLE;
+/// Most the energy the noise follows (0 to 1) moves per frame, so silence
+/// to full energy takes `1 / ENERGY_SLEW` frames (see the module docs'
+/// flash safety).
+pub(super) const ENERGY_SLEW: f32 = 1.0 / 48.0;
 
 /// A camera framing applied on top of the section's move: yaw and pitch
 /// (radians) are added, `zoom` scales the distance.
@@ -103,10 +110,18 @@ pub(super) struct Clock {
     /// `local` when the last flip started.
     pub flip_at: u16,
     pub framing: Framing,
+    /// The energy (0 to 1) the noise follows, slew-limited.
+    pub energy: f32,
+}
+
+/// `frame`'s energy, 0 to 1.
+fn raw_energy(frame: ControlFrame) -> f32 {
+    f32::from(frame.energy) / 255.0
 }
 
 impl Clock {
-    /// The frame-timed schedule: a section every 512 frames, head on.
+    /// The frame-timed schedule: a section every 512 frames, head on, at
+    /// the frame's own energy.
     pub(super) fn frame_timed(frame: ControlFrame) -> Self {
         Self {
             index: frame.frame / SECTION_FRAMES,
@@ -114,6 +129,7 @@ impl Clock {
             flips: 0,
             flip_at: 0,
             framing: REST,
+            energy: raw_energy(frame),
         }
     }
 }
@@ -143,6 +159,8 @@ pub struct StaticState {
     ease: f32,
     flips: u16,
     flip_at: u16,
+    /// The slew-limited energy (see `ENERGY_SLEW`).
+    energy: f32,
 }
 
 impl Default for StaticState {
@@ -159,6 +177,7 @@ impl Default for StaticState {
             ease: MIN_EASE_FRAMES,
             flips: 0,
             flip_at: 0,
+            energy: 0.0,
         }
     }
 }
@@ -175,6 +194,7 @@ impl StaticState {
             // Join the frame-timed schedule.
             let clock = Clock::frame_timed(*frame);
             (self.index, self.local) = (clock.index, clock.local);
+            self.energy = clock.energy;
             self.last = Some(seen);
             return;
         };
@@ -186,6 +206,8 @@ impl StaticState {
         let frames = if step <= MAX_FRAME_STEP { step } else { 1 };
         self.local = self.local.saturating_add(frames);
         self.since_bar = self.since_bar.saturating_add(frames);
+        let reach = ENERGY_SLEW * f32::from(frames);
+        self.energy += (raw_energy(*frame) - self.energy).clamp(-reach, reach);
         let beats = frame.beat_count.wrapping_sub(last.beat_count);
         let advanced = (1..=MAX_BEAT_STEP).contains(&beats);
         self.stalled = if advanced {
@@ -228,6 +250,7 @@ impl StaticState {
             flips: self.flips,
             flip_at: self.flip_at,
             framing: REST,
+            energy: self.energy,
         }
     }
 
@@ -477,5 +500,53 @@ mod tests {
     fn states_are_deterministic() {
         let frames: Vec<_> = (0..3000).map(live).collect();
         assert_eq!(run(frames.iter().copied()), run(frames.iter().copied()));
+    }
+
+    #[test]
+    fn energy_follows_any_input_within_the_slew() {
+        // Square waves from every frame to every 60, a hold, then dropped
+        // frames (up to `MAX_FRAME_STEP` count) and a frame jump (one).
+        let mut frames: Vec<_> = (2..=60u64)
+            .flat_map(|period| {
+                (0..120).map(move |index| ControlFrame {
+                    energy: if index * 2 / period % 2 == 1 { 255 } else { 0 },
+                    ..ControlFrame::procedural(0)
+                })
+            })
+            .chain((0..60).map(|_| ControlFrame {
+                energy: 255,
+                ..ControlFrame::procedural(0)
+            }))
+            .collect();
+        for (index, frame) in frames.iter_mut().enumerate() {
+            frame.frame = index as u16;
+        }
+        let skips = [3, MAX_FRAME_STEP, 900];
+        for (offset, skip) in skips.into_iter().enumerate() {
+            let last = frames[frames.len() - 1];
+            frames.push(ControlFrame {
+                frame: last.frame.wrapping_add(skip),
+                energy: if offset % 2 == 0 { 0 } else { 255 },
+                ..last
+            });
+        }
+        let clocks = run(frames.iter().copied());
+        for (index, pair) in clocks.windows(2).enumerate() {
+            let step = frames[index + 1].frame.wrapping_sub(frames[index].frame);
+            let frames = if step <= MAX_FRAME_STEP { step } else { 1 };
+            let moved = (pair[1].energy - pair[0].energy).abs();
+            assert!(
+                moved <= ENERGY_SLEW * f32::from(frames) + 1e-6,
+                "frame {index}: {moved}"
+            );
+            assert!((0.0..=1.0).contains(&pair[1].energy));
+        }
+        // The hold reaches full energy within `1 / ENERGY_SLEW` frames.
+        let held = clocks.len() - skips.len() - 1;
+        assert_eq!(clocks[held].energy, 1.0);
+        // A state starts at the first frame's energy, as the frame-timed
+        // clock does.
+        assert_eq!(clocks[0].energy, 0.0);
+        assert_eq!(run([ControlFrame::procedural(7)])[0].energy, 139.0 / 255.0);
     }
 }

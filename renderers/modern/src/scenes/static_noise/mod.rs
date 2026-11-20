@@ -66,6 +66,19 @@
 //! full energy); every beat reshuffles the field. `palette % 4` picks the
 //! colour (0..2 tint the field like the other scenes, 3 is random hues).
 //!
+//! The noise follows a slew-limited energy, which the state moves towards
+//! each frame's energy by at most 1/48 a frame (`ENERGY_SLEW` in
+//! `beat.rs`), so silence to full energy takes 48 frames (0.8 s at 60 fps).
+//! Unlimited, energy strobed the noise density: procedural energy (a
+//! 15-frame sawtooth) made 4 flashes in 1 s in a screen tile, and a square
+//! wave between silence and full energy up to 30 (#116). Limited, any
+//! energy signal ramps a pixel tile's luminance by at most about 0.008 a
+//! frame, so a 0.1 reversal takes at least 13 frames: at most 2 flashes in
+//! 1 s. `procedural_energy_keeps_noise_flashes_bounded` and the
+//! `square_wave_energy_keeps_*_noise_flashes_bounded` tests measure 1 and 2.
+//! Frames built before any frame is observed (the frame-timed path) use the
+//! frame's own energy, so a state's first frame matches them.
+//!
 //! The camera mostly faces the plane head on, reframed on bars as above.
 //! Some sections zoom out or orbit a full turn (passing behind the plane,
 //! where text reads mirrored); the scene projects cell centres on the CPU as
@@ -400,8 +413,9 @@ struct Noise {
 }
 
 impl Noise {
-    fn new(frame: ControlFrame) -> Self {
-        let quiet = 1.0 - f32::from(frame.energy) / 255.0;
+    /// Noise for `frame` at `energy` (0 to 1; the clock's slew-limited one).
+    fn new(frame: ControlFrame, energy: f32) -> Self {
+        let quiet = 1.0 - energy.clamp(0.0, 1.0);
         Self {
             blank: MIN_BLANK + (MAX_BLANK - MIN_BLANK) * quiet,
             longest: 1 + (quiet * (SLOWEST - 1) as f32).round() as u32,
@@ -644,8 +658,8 @@ fn build_with(
     let section = section_at(clock);
     let grid = Grid::new(profile, aspect);
     let view = View::new(framed(camera_pose(section), clock.framing), aspect);
-    let noise = Noise::new(frame);
-    let energy = f32::from(frame.energy) / 255.0;
+    let noise = Noise::new(frame, clock.energy);
+    let energy = clock.energy;
     let rainbow = frame.palette % 4 == 3;
     let ink = |brightness: f32, tone: Option<u32>| {
         let mut color = match tone {

@@ -414,9 +414,16 @@ the colour field, whatever the registry length; every other byte selects
   change only geometry and characters, never the background or brightness,
   and each change eases or staggers over at least 15 frames; a CPU luminance
   test over all eight section types, up to racing beats, finds at most one
-  flash in any second. Recorded golden fingerprints cover both the
-  frame-timed path (frames built before any is observed) and the
-  beat-synced replay from frame 0 that the renderer and captures use.
+  flash in any second. The noise follows energy through a slew limit: it
+  moves at most 1/48 of the range a frame, so silence to full energy takes
+  0.8 s. Without it, energy strobed the noise density (4 flashes in 1 s in a
+  screen tile with procedural input, up to 30 with a square wave). With it,
+  CPU tests find at most 1 flash in 1 s with procedural input and 2 for a
+  square wave between silence and full energy at any period from 2 to 60
+  frames, under WCAG 2.3.1's three. Recorded golden fingerprints cover both
+  the frame-timed path (frames built before any is observed) and the
+  beat-synced replay from frame 0 that the renderer and captures use (the
+  replay's were re-recorded for the slew limit).
   Procedural input never selects it; use
   `--scene 4` (frames 100, 200 and 300 show glyph noise, a mid-transition and
   resolved text; 3604 shows pixel noise, 4908 a constant on white, 3422 the
