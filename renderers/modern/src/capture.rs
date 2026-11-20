@@ -12,20 +12,23 @@ use crate::profile::RenderProfile;
 use crate::renderer::{OffscreenRenderer, ScenePipeline};
 use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers, starfield};
 
+pub use crate::scenes::TunnelVariant;
+
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
 
 const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scene N]
                        [--frames 0,60,120] [--input procedural|synth-mic|PATH.cvz]
                        [--size WxH] [--mic-layers off|scope|bursts|both]
-                       [--lines-drop-cuts] [--catalog FILE --location LAT,LON]
+                       [--catalog FILE --location LAT,LON]
                        [--time UNIX_SECONDS] [--follow-time]
+                       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
   --scene    force the control-frame scene byte: 7 is the colour field,
-             scene 6 explicitly opts into Starfield; other bytes keep the
-             original modulo-six mapping
+             scene 6 opts into Starfield only with --star-catalog and
+             --location; other bytes keep the original modulo-six mapping
   --frames   comma-separated frame indices (default 0); elapsed = index / 60 s
   --input    procedural frames (default), synth-mic (a deterministic synthetic
              microphone: tones plus a click every 0.5 s, silent from 6 s, run
@@ -43,7 +46,9 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --catalog  alias for --star-catalog
   --location observer latitude,longitude in decimal degrees; longitude east
   --time     observation UTC as Unix seconds (1800..2200); defaults to current UTC
-  --follow-time advance from --time (or current UTC), for reproducible moving-sky captures";
+  --follow-time advance from --time (or current UTC), for reproducible moving-sky captures
+  --tunnel-variant
+             PulseTunnel look: original (default), hallway or abstract";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -64,8 +69,14 @@ pub struct CaptureArgs {
     pub lines_drop_cuts: bool,
 }
 
-/// Programmatic Starfield setup is kept separate so the long-standing
-/// [`CaptureArgs`] struct-literal API remains source compatible.
+/// Additional capture options, kept separate to preserve `CaptureArgs` literals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureOptions {
+    pub tunnel_variant: TunnelVariant,
+}
+
+/// Programmatic Starfield setup is separate from the stable public capture
+/// argument and option structs.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StarfieldOptions {
     pub catalog_path: Option<PathBuf>,
@@ -74,39 +85,72 @@ pub struct StarfieldOptions {
     pub follow_time: bool,
 }
 
+/// Combined opt-in settings for captures that explicitly enable Starfield.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StarfieldCaptureOptions {
+    pub capture: CaptureOptions,
+    pub starfield: StarfieldOptions,
+}
+
 #[derive(Debug)]
 pub enum Command {
     Help,
     Capture(CaptureArgs),
 }
 
+/// Parsed capture command with the optional extended configuration.
 #[derive(Debug)]
 pub enum ConfiguredCommand {
     Help,
-    Capture {
-        args: CaptureArgs,
-        starfield: StarfieldOptions,
-    },
+    Capture(CaptureArgs, CaptureOptions),
 }
 
+/// Parsed capture command with explicit Starfield setup.
+#[derive(Debug)]
+pub enum StarfieldConfiguredCommand {
+    Help,
+    Capture(CaptureArgs, StarfieldCaptureOptions),
+}
+
+/// Parse the original capture arguments. Extended flags are rejected rather
+/// than silently dropped; use one of the configured APIs for those flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
-    match parse_args_with_options(args)? {
+    match parse_args_internal(args, false, false)?.0 {
         ConfiguredCommand::Help => Ok(Command::Help),
-        ConfiguredCommand::Capture { args, starfield }
-            if starfield == StarfieldOptions::default() =>
-        {
-            Ok(Command::Capture(args))
-        }
-        ConfiguredCommand::Capture { .. } => Err(
-            "Starfield options require parse_args_with_options; use the configured capture API"
-                .to_string(),
-        ),
+        ConfiguredCommand::Capture(args, _) => Ok(Command::Capture(args)),
     }
 }
 
+/// Parse capture arguments including `--tunnel-variant`, preserving the
+/// #139 public command enum arity and parser signature.
 pub fn parse_args_with_options(
     args: impl IntoIterator<Item = String>,
 ) -> Result<ConfiguredCommand, String> {
+    parse_args_internal(args, true, false).map(|(command, _)| command)
+}
+
+/// Parse capture arguments with both tunnel and Starfield options.
+pub fn parse_args_with_starfield_options(
+    args: impl IntoIterator<Item = String>,
+) -> Result<StarfieldConfiguredCommand, String> {
+    let (parsed, starfield) = parse_args_internal(args, true, true)?;
+    Ok(match parsed {
+        ConfiguredCommand::Help => StarfieldConfiguredCommand::Help,
+        ConfiguredCommand::Capture(args, capture_options) => StarfieldConfiguredCommand::Capture(
+            args,
+            StarfieldCaptureOptions {
+                capture: capture_options,
+                starfield,
+            },
+        ),
+    })
+}
+
+fn parse_args_internal(
+    args: impl IntoIterator<Item = String>,
+    allow_capture_options: bool,
+    allow_starfield_options: bool,
+) -> Result<(ConfiguredCommand, StarfieldOptions), String> {
     let mut profile = RenderProfile::m1();
     let mut scene = None;
     let mut frames = vec![0];
@@ -119,11 +163,12 @@ pub fn parse_args_with_options(
     let mut location = None;
     let mut unix_seconds = None;
     let mut follow_time = false;
+    let mut tunnel_variant = TunnelVariant::Original;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            return Ok(ConfiguredCommand::Help);
+            return Ok((ConfiguredCommand::Help, StarfieldOptions::default()));
         }
         let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
         match arg.as_str() {
@@ -176,9 +221,31 @@ pub fn parse_args_with_options(
                 })?;
             }
             "--lines-drop-cuts" => lines_drop_cuts = true,
-            "--catalog" | "--star-catalog" => catalog_path = Some(PathBuf::from(value()?)),
-            "--location" => location = Some(parse_location(&value()?)?),
+            "--tunnel-variant" => {
+                if !allow_capture_options {
+                    return Err("--tunnel-variant requires parse_args_with_options".into());
+                }
+                let text = value()?;
+                tunnel_variant = TunnelVariant::parse(&text).ok_or_else(|| {
+                    format!("--tunnel-variant expects original|hallway|abstract, got {text}")
+                })?;
+            }
+            "--catalog" | "--star-catalog" => {
+                if !allow_starfield_options {
+                    return Err("--star-catalog requires parse_args_with_starfield_options".into());
+                }
+                catalog_path = Some(PathBuf::from(value()?));
+            }
+            "--location" => {
+                if !allow_starfield_options {
+                    return Err("--location requires parse_args_with_starfield_options".into());
+                }
+                location = Some(parse_location(&value()?)?);
+            }
             "--time" => {
+                if !allow_starfield_options {
+                    return Err("--time requires parse_args_with_starfield_options".into());
+                }
                 let text = value()?;
                 let seconds = text
                     .parse::<f64>()
@@ -190,45 +257,53 @@ pub fn parse_args_with_options(
                 }
                 unix_seconds = Some(seconds);
             }
-            "--follow-time" => follow_time = true,
+            "--follow-time" => {
+                if !allow_starfield_options {
+                    return Err("--follow-time requires parse_args_with_starfield_options".into());
+                }
+                follow_time = true;
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
 
     let out = out.ok_or("--out DIR is required")?;
-    if catalog_path.is_some() != location.is_some() {
+    if allow_starfield_options && catalog_path.is_some() != location.is_some() {
         return Err("--star-catalog and --location must be supplied together for scene 6".into());
     }
-    if unix_seconds.is_some() && catalog_path.is_none() {
+    if allow_starfield_options && unix_seconds.is_some() && catalog_path.is_none() {
         return Err("--time requires --star-catalog and --location".into());
     }
-    if follow_time && catalog_path.is_none() {
+    if allow_starfield_options && follow_time && catalog_path.is_none() {
         return Err("--follow-time requires --star-catalog and --location".into());
     }
-    if scene == Some(starfield::SCENE) && catalog_path.is_none() {
+    if allow_starfield_options && scene == Some(starfield::SCENE) && catalog_path.is_none() {
         return Err(
             "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON".to_string(),
         );
     }
     let size = size.unwrap_or((profile.target_width, profile.target_height));
-    Ok(ConfiguredCommand::Capture {
-        args: CaptureArgs {
-            profile,
-            scene,
-            frames,
-            input,
-            size,
-            out,
-            mic_layers: layers,
-            lines_drop_cuts,
-        },
-        starfield: StarfieldOptions {
+    Ok((
+        ConfiguredCommand::Capture(
+            CaptureArgs {
+                profile,
+                scene,
+                frames,
+                input,
+                size,
+                out,
+                mic_layers: layers,
+                lines_drop_cuts,
+            },
+            CaptureOptions { tunnel_variant },
+        ),
+        StarfieldOptions {
             catalog_path,
             location,
             unix_seconds,
             follow_time,
         },
-    })
+    ))
 }
 
 fn parse_location(value: &str) -> Result<(f64, f64), String> {
@@ -387,12 +462,28 @@ fn feed(
 }
 
 pub fn run(args: &CaptureArgs) -> Result<(), String> {
-    run_with_options(args, &StarfieldOptions::default())
+    run_with_options(args, CaptureOptions::default())
 }
 
-pub fn run_with_options(
+/// Capture using #139's tunnel options. Legacy scene bytes, including scene 6,
+/// keep their original native mapping in this API.
+pub fn run_with_options(args: &CaptureArgs, options: CaptureOptions) -> Result<(), String> {
+    run_internal(args, options, &StarfieldOptions::default(), false)
+}
+
+/// Capture with an explicit Starfield opt-in and its separate configuration.
+pub fn run_with_starfield_options(
     args: &CaptureArgs,
+    options: &StarfieldCaptureOptions,
+) -> Result<(), String> {
+    run_internal(args, options.capture, &options.starfield, true)
+}
+
+fn run_internal(
+    args: &CaptureArgs,
+    options: CaptureOptions,
     starfield_options: &StarfieldOptions,
+    starfield_enabled: bool,
 ) -> Result<(), String> {
     if starfield_options.catalog_path.is_some() != starfield_options.location.is_some() {
         return Err("--star-catalog and --location must be supplied together for scene 6".into());
@@ -416,7 +507,10 @@ pub fn run_with_options(
     {
         return Err("--time must be finite UNIX seconds in the UTC year 1800..2200 range".into());
     }
-    if args.scene == Some(starfield::SCENE) && starfield_options.catalog_path.is_none() {
+    if starfield_enabled
+        && args.scene == Some(starfield::SCENE)
+        && starfield_options.catalog_path.is_none()
+    {
         return Err("scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON".into());
     }
     let source = FrameSource {
@@ -430,16 +524,15 @@ pub fn run_with_options(
         },
         scene: args.scene,
     };
-    // Validate the entire replay leading to each requested frame before
-    // touching the GPU or the output directory, including skipped frames.
-    if let Some(&last_index) = args.frames.iter().max() {
-        validate_replay_catalog(
-            &source,
-            last_index,
-            starfield_options.catalog_path.is_some(),
-            args.scene == Some(starfield::SCENE),
-        )?;
-    }
+    // Always retain direct fixture bounds checks. Only scan the full replay
+    // when an enabled Starfield lacks a catalog and missing-input validation
+    // is actually needed.
+    preflight_replay(
+        &source,
+        args.frames.iter().copied().max(),
+        starfield_enabled,
+        starfield_options.catalog_path.is_some(),
+    )?;
     let starfield = match (&starfield_options.catalog_path, starfield_options.location) {
         (Some(path), Some((latitude_degrees, longitude_degrees))) => {
             let catalog = starfield::StarCatalog::load(path).map_err(|error| error.to_string())?;
@@ -489,13 +582,14 @@ pub fn run_with_options(
     renderer.pipeline_mut().set_mic_layers(layers);
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
+        tunnel_variant: options.tunnel_variant,
     });
     renderer
         .pipeline_mut()
         .configure_starfield(starfield.clone());
     renderer
         .pipeline_mut()
-        .enable_starfield_dispatch(args.scene == Some(starfield::SCENE));
+        .enable_starfield_dispatch(starfield_enabled);
     let mut captures = Vec::new();
 
     for &index in &args.frames {
@@ -509,7 +603,7 @@ pub fn run_with_options(
         let pipeline = renderer.pipeline_mut();
         pipeline.reset_state();
         pipeline.configure_starfield(starfield.clone());
-        pipeline.enable_starfield_dispatch(args.scene == Some(starfield::SCENE));
+        pipeline.enable_starfield_dispatch(starfield_enabled);
         for previous in 0..index {
             let frame = feed(pipeline, synth.as_mut(), source.frame(previous)?, previous);
             pipeline.advance_state(frame, elapsed(previous), size);
@@ -518,27 +612,35 @@ pub fn run_with_options(
         let rgb = renderer
             .render(frame, elapsed(index))
             .map_err(|error| error.to_string())?;
-        // The crossing gate can hold a requested scene while preserving the
-        // most recently encoded display, so record the actual committed one.
         let displayed_scene = renderer.pipeline_mut().committed_displayed_scene();
-        let entry =
-            scenes::dispatch_configured(displayed_scene, args.scene == Some(starfield::SCENE));
-        let file = format!("frame{index:06}-{}.png", entry.name());
+        let entry = scenes::dispatch_configured(displayed_scene, starfield_enabled);
+        let name = match (entry.name(), options.tunnel_variant) {
+            ("PulseTunnel", TunnelVariant::Hallway) => "PulseTunnel-Hallway",
+            ("PulseTunnel", TunnelVariant::Abstract) => "PulseTunnel-Abstract",
+            _ => entry.name(),
+        };
+        let camera =
+            if entry.name() == "PulseTunnel" && options.tunnel_variant != TunnelVariant::Original {
+                CameraMode::ScreenSpace
+            } else {
+                entry.camera()
+            };
+        let file = format!("frame{index:06}-{name}.png");
         write_png(&args.out.join(&file), width, height, &rgb)?;
         println!("wrote {}", args.out.join(&file).display());
         let frame_starfield_epoch = starfield.as_ref().map_or_else(
             || "null".to_string(),
             |config| config.epoch_at(elapsed(index) as f32).to_string(),
         );
-        captures.push(format!(
-            "    {{\"file\": {}, \"frame_index\": {index}, \"elapsed\": {}, \"starfield_epoch_unix_seconds\": {frame_starfield_epoch}, \"scene\": {displayed_scene}, \"scene_name\": {}, \"camera\": {}}}",
-            json_string(&file),
+        captures.push(manifest_capture_entry(
+            &file,
+            index,
             elapsed(index),
-            json_string(entry.name()),
-            json_string(match entry.camera() {
-                CameraMode::Orbit3D => "orbit3d",
-                CameraMode::ScreenSpace => "screen_space",
-            }),
+            frame_starfield_epoch,
+            frame.scene,
+            displayed_scene,
+            name,
+            camera,
         ));
     }
 
@@ -569,8 +671,33 @@ fn starfield_metadata(config: Option<&starfield::StarfieldConfig>) -> (String, S
     }
 }
 
+fn manifest_capture_entry(
+    file: &str,
+    frame_index: u64,
+    frame_elapsed: f64,
+    starfield_epoch: String,
+    requested_scene: u8,
+    displayed_scene: u8,
+    scene_name: &str,
+    camera: CameraMode,
+) -> String {
+    format!(
+        "    {{\"file\": {}, \"frame_index\": {frame_index}, \"elapsed\": {frame_elapsed}, \"starfield_epoch_unix_seconds\": {starfield_epoch}, \"scene\": {requested_scene}, \"displayed_scene\": {displayed_scene}, \"scene_name\": {}, \"camera\": {}}}",
+        json_string(file),
+        json_string(scene_name),
+        json_string(match camera {
+            CameraMode::Orbit3D => "orbit3d",
+            CameraMode::ScreenSpace => "screen_space",
+        }),
+    )
+}
+
 #[cfg(test)]
-fn displayed_scene_at(source: &FrameSource, index: u64) -> Result<u8, String> {
+fn displayed_scene_at(
+    source: &FrameSource,
+    index: u64,
+    starfield_enabled: bool,
+) -> Result<u8, String> {
     let mut field = colour_field::ColourField::new(colour_field::Config::default());
     let mut display = colour_field::Display::Native(0);
     for frame_index in 0..=index {
@@ -581,7 +708,9 @@ fn displayed_scene_at(source: &FrameSource, index: u64) -> Result<u8, String> {
         display = field.display();
     }
     Ok(match display {
-        colour_field::Display::Native(scene) => scene % 6,
+        colour_field::Display::Native(scene) => {
+            scenes::normalize_scene_byte(scene, starfield_enabled)
+        }
         colour_field::Display::ColourField(_) => colour_field::SCENE,
     })
 }
@@ -599,7 +728,9 @@ fn validate_replay_catalog(
             field.step(colour_field::Controls::default());
         }
         let displayed = match field.display() {
-            colour_field::Display::Native(scene) => scene % 6,
+            colour_field::Display::Native(scene) => {
+                scenes::normalize_scene_byte(scene, starfield_enabled)
+            }
             colour_field::Display::ColourField(_) => colour_field::SCENE,
         };
         if starfield_enabled && displayed == starfield::SCENE && !catalog_available {
@@ -609,6 +740,25 @@ fn validate_replay_catalog(
         }
     }
     Ok(())
+}
+
+fn preflight_replay(
+    source: &FrameSource,
+    last_index: Option<u64>,
+    starfield_enabled: bool,
+    catalog_available: bool,
+) -> Result<(), String> {
+    let Some(last_index) = last_index else {
+        return Ok(());
+    };
+    if starfield_enabled && !catalog_available {
+        validate_replay_catalog(source, last_index, false, true)
+    } else {
+        // A single direct bound check is sufficient; do not replay the
+        // ColourField solely for validation when Starfield is unavailable or
+        // already configured.
+        source.frame(last_index).map(|_| ())
+    }
 }
 
 fn write_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<(), String> {
@@ -640,13 +790,13 @@ fn json_string(text: &str) -> String {
 }
 
 pub fn main() -> ExitCode {
-    match parse_args_with_options(std::env::args().skip(1)) {
-        Ok(ConfiguredCommand::Help) => {
+    match parse_args_with_starfield_options(std::env::args().skip(1)) {
+        Ok(StarfieldConfiguredCommand::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Ok(ConfiguredCommand::Capture { args, starfield }) => {
-            match run_with_options(&args, &starfield) {
+        Ok(StarfieldConfiguredCommand::Capture(args, options)) => {
+            match run_with_starfield_options(&args, &options) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("chipviz-capture: {error}");
@@ -673,10 +823,10 @@ mod tests {
         }
     }
 
-    fn parse_configured(args: &[&str]) -> Result<(CaptureArgs, StarfieldOptions), String> {
-        match parse_args_with_options(args.iter().map(|arg| arg.to_string()))? {
-            ConfiguredCommand::Capture { args, starfield } => Ok((args, starfield)),
-            ConfiguredCommand::Help => Err("help".into()),
+    fn parse_configured(args: &[&str]) -> Result<(CaptureArgs, StarfieldCaptureOptions), String> {
+        match parse_args_with_starfield_options(args.iter().map(|arg| arg.to_string()))? {
+            StarfieldConfiguredCommand::Capture(args, options) => Ok((args, options)),
+            StarfieldConfiguredCommand::Help => Err("help".into()),
         }
     }
 
@@ -712,12 +862,15 @@ mod tests {
 
     #[test]
     fn parses_starfield_options_and_requires_them_for_scene_six() {
-        let error = parse(&["--out", "shots", "--scene", "6"]).unwrap_err();
+        let error = parse_configured(&["--out", "shots", "--scene", "6"]).unwrap_err();
         assert!(error.contains("--star-catalog PATH and --location LAT,LON"));
         let legacy_wrapped = parse(&["--out", "shots", "--scene", "13"]).unwrap();
         assert_eq!(legacy_wrapped.scene, Some(13));
+        let legacy_six = parse(&["--out", "shots", "--scene", "6"]).unwrap();
+        assert_eq!(legacy_six.scene, Some(6));
+        assert_eq!(scenes::dispatch_configured(6, false).name(), "SignalField");
 
-        let (args, starfield) = parse_configured(&[
+        let (_args, starfield) = parse_configured(&[
             "--out",
             "shots",
             "--scene",
@@ -731,12 +884,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            starfield.catalog_path.as_deref(),
+            starfield.starfield.catalog_path.as_deref(),
             Some(Path::new("stars.csv"))
         );
-        assert_eq!(starfield.location, Some((45.0, -73.0)));
-        assert_eq!(starfield.unix_seconds, Some(946_728_000.0));
-        assert!(!starfield.follow_time);
+        assert_eq!(starfield.starfield.location, Some((45.0, -73.0)));
+        assert_eq!(starfield.starfield.unix_seconds, Some(946_728_000.0));
+        assert!(!starfield.starfield.follow_time);
         let (_, advancing) = parse_configured(&[
             "--out",
             "shots",
@@ -751,9 +904,9 @@ mod tests {
             "--follow-time",
         ])
         .unwrap();
-        assert!(advancing.follow_time);
+        assert!(advancing.starfield.follow_time);
         assert!(
-            parse(&["--out", "shots", "--follow-time"]).is_err(),
+            parse_configured(&["--out", "shots", "--follow-time"]).is_err(),
             "follow-time needs a starfield catalog and location"
         );
 
@@ -765,12 +918,39 @@ mod tests {
         ] {
             let mut args = vec!["--out", "shots"];
             args.extend_from_slice(options);
-            assert!(parse(&args).is_err(), "{args:?}");
+            assert!(parse_configured(&args).is_err(), "{args:?}");
+        }
+
+        match parse_args_with_starfield_options(
+            [
+                "--out",
+                "shots",
+                "--tunnel-variant",
+                "hallway",
+                "--scene",
+                "6",
+                "--star-catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+            ]
+            .map(str::to_string),
+        )
+        .unwrap()
+        {
+            StarfieldConfiguredCommand::Capture(_, options) => {
+                assert_eq!(options.capture.tunnel_variant, TunnelVariant::Hallway);
+                assert_eq!(
+                    options.starfield.catalog_path,
+                    Some(PathBuf::from("stars.csv"))
+                );
+            }
+            StarfieldConfiguredCommand::Help => panic!("unexpected help"),
         }
     }
 
     #[test]
-    fn legacy_capture_args_and_run_api_fail_clearly_for_missing_starfield_inputs() {
+    fn legacy_capture_args_and_command_preserve_scene_six_as_signalfield() {
         let args = CaptureArgs {
             profile: RenderProfile::pi5(),
             scene: Some(starfield::SCENE),
@@ -781,8 +961,23 @@ mod tests {
             mic_layers: mic_layers::Mode::Off,
             lines_drop_cuts: false,
         };
-        let error = run(&args).unwrap_err();
-        assert!(error.contains("--star-catalog PATH and --location LAT,LON"));
+        assert_eq!(
+            scenes::dispatch_configured(args.scene.unwrap(), false).name(),
+            "SignalField"
+        );
+        assert!(matches!(
+            parse_args([
+                "--out".into(),
+                "unused".into(),
+                "--scene".into(),
+                "6".into()
+            ]),
+            Ok(Command::Capture(_))
+        ));
+        let configured = CaptureOptions {
+            tunnel_variant: TunnelVariant::Hallway,
+        };
+        assert_eq!(configured.tunnel_variant, TunnelVariant::Hallway);
     }
 
     #[test]
@@ -797,6 +992,38 @@ mod tests {
         let synth = parse(&["--out", "o", "--input", "synth-mic"]).unwrap();
         assert_eq!(synth.input, Input::SynthMic);
         assert!(!args.lines_drop_cuts);
+        assert_eq!(
+            CaptureOptions::default().tunnel_variant,
+            TunnelVariant::Original
+        );
+    }
+
+    #[test]
+    fn parses_tunnel_variants() {
+        for (text, expected) in [
+            ("original", TunnelVariant::Original),
+            ("hallway", TunnelVariant::Hallway),
+            ("abstract", TunnelVariant::Abstract),
+        ] {
+            let args = ["--out", "o", "--tunnel-variant", text].map(str::to_string);
+            match parse_args_with_options(args).unwrap() {
+                ConfiguredCommand::Capture(_, options) => {
+                    assert_eq!(options.tunnel_variant, expected)
+                }
+                ConfiguredCommand::Help => panic!("unexpected help"),
+            }
+        }
+        assert!(
+            parse_args_with_options(
+                ["--out", "o", "--tunnel-variant", "lines"].map(str::to_string)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_args_with_options(["--out", "o", "--tunnel-variant"].map(str::to_string))
+                .is_err()
+        );
+        assert!(parse(&["--out", "o", "--tunnel-variant", "hallway"]).is_err());
     }
 
     #[test]
@@ -828,6 +1055,8 @@ mod tests {
             .is_err()
         );
         assert!(matches!(parse_args(["-h".to_string()]), Ok(Command::Help)));
+        assert!(USAGE.contains("--star-catalog PATH"));
+        assert!(USAGE.contains("--tunnel-variant"));
     }
 
     #[test]
@@ -868,8 +1097,20 @@ mod tests {
             scene: None,
         };
         assert_eq!(source.frame(1).unwrap().scene, 7);
-        assert_eq!(displayed_scene_at(&source, 1).unwrap(), 0);
+        assert_eq!(displayed_scene_at(&source, 1, false).unwrap(), 0);
+        assert_eq!(displayed_scene_at(&source, 1, true).unwrap(), 0);
         assert_eq!(scenes::dispatch(6).name(), scenes::REGISTRY[0].name);
+        let scene_six = FrameSource {
+            fixture: Some(vec![ControlFrame {
+                scene: 6,
+                ..ControlFrame::procedural(0)
+            }]),
+            scene: None,
+        };
+        assert_eq!(displayed_scene_at(&scene_six, 0, false).unwrap(), 0);
+        assert_eq!(displayed_scene_at(&scene_six, 0, true).unwrap(), 6);
+        assert_eq!(scenes::dispatch_configured(6, false).name(), "SignalField");
+        assert_eq!(scenes::dispatch_configured(6, true).name(), "Starfield");
     }
 
     #[test]
@@ -891,12 +1132,41 @@ mod tests {
             ]),
             scene: None,
         };
-        assert_eq!(displayed_scene_at(&source, 2).unwrap(), 0);
+        assert_eq!(displayed_scene_at(&source, 2, true).unwrap(), 0);
         assert!(validate_replay_catalog(&source, 2, false, false).is_ok());
         let error = validate_replay_catalog(&source, 2, false, true).unwrap_err();
         assert!(error.contains("replay frame 1"), "{error}");
         assert!(error.contains("--star-catalog PATH"), "{error}");
         assert!(validate_replay_catalog(&source, 2, true, true).is_ok());
+
+        let wrapped = FrameSource {
+            fixture: Some(vec![ControlFrame {
+                scene: 13,
+                ..ControlFrame::procedural(0)
+            }]),
+            scene: None,
+        };
+        assert!(validate_replay_catalog(&wrapped, 0, false, true).is_ok());
+    }
+
+    #[test]
+    fn replay_preflight_scans_only_for_missing_enabled_starfield_and_checks_bounds() {
+        let source = FrameSource {
+            fixture: Some(vec![ControlFrame {
+                scene: 6,
+                ..ControlFrame::procedural(0)
+            }]),
+            scene: None,
+        };
+        assert!(preflight_replay(&source, Some(0), false, false).is_ok());
+        assert!(preflight_replay(&source, Some(0), true, true).is_ok());
+        let missing = preflight_replay(&source, Some(0), true, false).unwrap_err();
+        assert!(missing.contains("replay frame 0"), "{missing}");
+        for (enabled, catalog_available) in [(false, false), (true, true), (true, false)] {
+            let error = preflight_replay(&source, Some(1), enabled, catalog_available)
+                .expect_err("requested frame must be bounds-checked");
+            assert!(error.contains("past the input's 1 frames"), "{error}");
+        }
     }
 
     /// State-only replay with layers enabled must produce the same next image
@@ -953,6 +1223,47 @@ mod tests {
         assert_eq!(starfield_metadata(None), ("null".into(), "null".into()));
     }
 
+    #[test]
+    fn manifest_separates_requested_wrapped_byte_from_displayed_scene() {
+        let wrapped = manifest_capture_entry(
+            "frame000000-SpectrumVolume.png",
+            0,
+            0.0,
+            "null".into(),
+            13,
+            1,
+            "SpectrumVolume",
+            CameraMode::Orbit3D,
+        );
+        assert!(wrapped.contains("\"scene\": 13, \"displayed_scene\": 1"));
+
+        let source = FrameSource {
+            fixture: Some(vec![
+                ControlFrame {
+                    scene: 6,
+                    ..ControlFrame::procedural(0)
+                },
+                ControlFrame {
+                    scene: 7,
+                    ..ControlFrame::procedural(1)
+                },
+            ]),
+            scene: None,
+        };
+        let displayed = displayed_scene_at(&source, 1, false).unwrap();
+        let debounced = manifest_capture_entry(
+            "frame000001-SignalField.png",
+            1,
+            elapsed(1),
+            "null".into(),
+            7,
+            displayed,
+            "SignalField",
+            CameraMode::Orbit3D,
+        );
+        assert!(debounced.contains("\"scene\": 7, \"displayed_scene\": 0"));
+    }
+
     /// Full replay path: a fixed base epoch plus `--follow-time` must produce
     /// the same manifest and PNGs on repeated runs, including a ten-second
     /// Starfield snapshot change. Uses only this synthetic catalog.
@@ -981,18 +1292,21 @@ mod tests {
             mic_layers: mic_layers::Mode::Off,
             lines_drop_cuts: false,
         };
-        let options = StarfieldOptions {
-            catalog_path: Some(catalog),
-            location: Some((45.0, 80.0)),
-            unix_seconds: Some(946_728_000.0),
-            follow_time: true,
+        let options = StarfieldCaptureOptions {
+            capture: CaptureOptions::default(),
+            starfield: StarfieldOptions {
+                catalog_path: Some(catalog),
+                location: Some((45.0, 80.0)),
+                unix_seconds: Some(946_728_000.0),
+                follow_time: true,
+            },
         };
-        run_with_options(&args, &options).unwrap();
+        run_with_starfield_options(&args, &options).unwrap();
         let args = CaptureArgs {
             out: root.join("second"),
             ..args
         };
-        run_with_options(&args, &options).unwrap();
+        run_with_starfield_options(&args, &options).unwrap();
 
         let first_manifest = std::fs::read(root.join("first/manifest.json")).unwrap();
         let second_manifest = std::fs::read(root.join("second/manifest.json")).unwrap();
@@ -1230,12 +1544,13 @@ mod tests {
             pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
                 .unwrap();
         let mut frame = ControlFrame::procedural(8);
-        frame.scene = 13;
+        frame.scene = 6;
         frame.flags = 0x05;
         frame.energy = 120;
         frame.beat_count = 7;
+        renderer.pipeline_mut().enable_starfield_dispatch(true);
         renderer.pipeline_mut().observe(&frame, 0.0);
-        assert_eq!(renderer.pipeline_mut().displayed_scene(frame, 0.0), 1);
+        assert_eq!(renderer.pipeline_mut().displayed_scene(frame, 0.0), 6);
         renderer.pipeline_mut().fallback_next_missing_starfield();
         assert_eq!(renderer.pipeline_mut().displayed_scene(frame, 0.0), 0);
 
@@ -1262,6 +1577,48 @@ mod tests {
         assert_eq!(renderer.pipeline_mut().committed_displayed_scene(), 7);
     }
 
+    /// Repeated pre-acquisition previews must leave ColourField debounce
+    /// unchanged; a later successful encode consumes the frame once.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn failed_surface_acquisition_preview_does_not_advance_colour_field_debounce() {
+        let (width, height) = (160, 90);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        let mut baseline =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                .unwrap();
+        let mut last = ControlFrame::procedural(0);
+        for index in 0..40 {
+            last = ControlFrame {
+                scene: colour_field::SCENE,
+                ..ControlFrame::procedural(index)
+            };
+            renderer
+                .pipeline_mut()
+                .observe(&last, f64::from(index) / 60.0);
+            baseline
+                .pipeline_mut()
+                .observe(&last, f64::from(index) / 60.0);
+            for _ in 0..3 {
+                let _ = renderer.pipeline_mut().requested_scene(last);
+            }
+        }
+        assert_eq!(
+            renderer.pipeline_mut().colour_field_display(),
+            colour_field::Display::Native(0),
+            "preview must not consume any scene-7 debounce steps"
+        );
+        let retried = renderer.render(last, 39.0 / 60.0).unwrap();
+        let expected = baseline.render(last, 39.0 / 60.0).unwrap();
+        assert_eq!(retried, expected);
+        assert_eq!(
+            renderer.pipeline_mut().committed_displayed_scene(),
+            baseline.pipeline_mut().committed_displayed_scene()
+        );
+    }
+
     fn luminance_srgb(pixel: &[u8]) -> f32 {
         let decode = |byte: u8| {
             let value = f32::from(byte) / 255.0;
@@ -1272,6 +1629,134 @@ mod tests {
             }
         };
         0.2126 * decode(pixel[0]) + 0.7152 * decode(pixel[1]) + 0.0722 * decode(pixel[2])
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn tunnel_variants_render_synthetic_input_at_representative_aspects() {
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for (width, height) in [(320, 180), (320, 240), (180, 320)] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                let mut images = Vec::new();
+                for variant in [
+                    TunnelVariant::Original,
+                    TunnelVariant::Hallway,
+                    TunnelVariant::Abstract,
+                ] {
+                    renderer.pipeline_mut().configure_scenes(SceneConfig {
+                        tunnel_variant: variant,
+                        ..SceneConfig::default()
+                    });
+                    renderer.pipeline_mut().reset_state();
+                    let mut synth = SynthMic::new().unwrap();
+                    for index in 0..120 {
+                        let base = ControlFrame {
+                            scene: 2,
+                            palette: 1,
+                            ..ControlFrame::procedural(index)
+                        };
+                        let frame = feed(renderer.pipeline_mut(), Some(&mut synth), base, index);
+                        renderer.pipeline_mut().advance_state(
+                            frame,
+                            elapsed(index),
+                            (width, height),
+                        );
+                    }
+                    let base = ControlFrame {
+                        scene: 2,
+                        palette: 1,
+                        ..ControlFrame::procedural(120)
+                    };
+                    let frame = feed(renderer.pipeline_mut(), Some(&mut synth), base, 120);
+                    let rgb = renderer.render(frame, elapsed(120)).unwrap();
+                    assert!(
+                        rgb.iter().any(|&value| value > 16),
+                        "{} {width}x{height} {variant:?} blank",
+                        profile.name
+                    );
+                    assert!(
+                        images.iter().all(|other| other != &rgb),
+                        "{} {width}x{height} {variant:?} identical",
+                        profile.name
+                    );
+                    images.push(rgb);
+                }
+            }
+        }
+    }
+
+    /// Supporting evidence only: this tests sampled whole-frame changes, not
+    /// the WCAG viewing-area calculation or physical display behaviour.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn tunnel_variants_bound_gpu_luminance_changes() {
+        fn linear(byte: u8) -> f32 {
+            let value = f32::from(byte) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(rgb: &[u8]) -> Vec<f32> {
+            rgb.chunks_exact(3)
+                .map(|p| 0.2126 * linear(p[0]) + 0.7152 * linear(p[1]) + 0.0722 * linear(p[2]))
+                .collect()
+        }
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for (width, height) in [(320, 180), (180, 320)] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                for variant in [TunnelVariant::Hallway, TunnelVariant::Abstract] {
+                    renderer.pipeline_mut().configure_scenes(SceneConfig {
+                        tunnel_variant: variant,
+                        ..SceneConfig::default()
+                    });
+                    renderer.pipeline_mut().reset_state();
+                    let mut previous: Option<Vec<f32>> = None;
+                    let mut max_changed = 0.0_f32;
+                    let mut max_mean_delta = 0.0_f32;
+                    for index in 0..120 {
+                        // Deliberately hostile input: jump audio and palette every
+                        // frame, including a warm palette.
+                        let high = index % 2 == 0;
+                        let frame = ControlFrame {
+                            scene: 2,
+                            palette: if high { 0 } else { 2 },
+                            energy: if high { 255 } else { 0 },
+                            bass: if high { 255 } else { 0 },
+                            treble: if high { 255 } else { 0 },
+                            ..ControlFrame::procedural(index)
+                        };
+                        let current = luminance(&renderer.render(frame, elapsed(index)).unwrap());
+                        if let Some(before) = &previous {
+                            let count = current.len() as f32;
+                            let changed = before
+                                .iter()
+                                .zip(&current)
+                                .filter(|(a, b)| (*a - *b).abs() >= 0.1)
+                                .count() as f32
+                                / count;
+                            let mean_delta =
+                                (before.iter().sum::<f32>() - current.iter().sum::<f32>()).abs()
+                                    / count;
+                            max_changed = max_changed.max(changed);
+                            max_mean_delta = max_mean_delta.max(mean_delta);
+                        }
+                        previous = Some(current);
+                    }
+                    println!(
+                        "{} {width}x{height} {variant:?}: max changed={max_changed:.4}, max mean delta={max_mean_delta:.4}",
+                        profile.name
+                    );
+                    assert!(max_changed < 0.12);
+                    assert!(max_mean_delta < 0.08);
+                }
+            }
+        }
     }
 
     /// The mic layers never touch the colour field, and `off` renders exactly
@@ -1533,6 +2018,66 @@ mod tests {
         }
         let replayed = renderer.render(frame(still), elapsed(still)).unwrap();
         assert!(replayed == live, "replayed still differs from the live run");
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn tunnel_held_redraw_and_batched_packets_match_replayed_still() {
+        let size = (320, 180);
+        let mut renderer =
+            pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), size.0, size.1))
+                .unwrap();
+        let quiet = ControlFrame {
+            scene: 2,
+            palette: 1,
+            energy: 0,
+            bass: 0,
+            treble: 0,
+            ..ControlFrame::procedural(0)
+        };
+        let old = ControlFrame { frame: 1, ..quiet };
+        let loud = ControlFrame {
+            frame: 2,
+            energy: 255,
+            bass: 255,
+            treble: 255,
+            ..quiet
+        };
+        for variant in [TunnelVariant::Hallway, TunnelVariant::Abstract] {
+            renderer.pipeline_mut().configure_scenes(SceneConfig {
+                tunnel_variant: variant,
+                ..SceneConfig::default()
+            });
+            renderer.pipeline_mut().reset_state();
+            let mut live = Vec::new();
+            for index in 0..=120 {
+                let time = elapsed(index);
+                let frame = if index == 0 { quiet } else { loud };
+                if index == 0 {
+                    renderer.pipeline_mut().observe(&quiet, time);
+                } else if index == 1 {
+                    renderer.pipeline_mut().observe(&old, time);
+                    renderer.pipeline_mut().observe(&loud, time);
+                }
+                live = renderer
+                    .render_with(|pipeline, encoder, view| {
+                        pipeline.encode(encoder, view, frame, time, size)
+                    })
+                    .unwrap();
+            }
+            renderer.pipeline_mut().reset_state();
+            for index in 0..120 {
+                let frame = if index == 0 { quiet } else { loud };
+                renderer
+                    .pipeline_mut()
+                    .advance_state(frame, elapsed(index), size);
+            }
+            let replayed = renderer.render(loud, elapsed(120)).unwrap();
+            assert_eq!(
+                live, replayed,
+                "{variant:?}: replay differs from held redraws"
+            );
+        }
     }
 
     /// Scene 7 enters the colour field at power-on and draws flat regions

@@ -2,6 +2,9 @@
 
 This is the first shared live-control shape for chipviz. It is intentionally tiny so it can map onto very limited transports, including controller ports, serial links, USB debug channels, MIDI-derived streams, and precomputed playback files.
 
+For the proposed opt-in extended catalog, see
+[scene catalog v1](scene-catalog-v1.md). Unmarked v0 remains legacy.
+
 ## Goals
 
 - Fit the same musical intent across N64, GBA, and C64.

@@ -53,6 +53,8 @@ struct ProjectionKey {
 pub(crate) struct ProjectionCache {
     key: ProjectionKey,
     instances: Vec<Instance>,
+    /// Monotonic rebuild count used to verify cache hits in unit tests.
+    rebuilds: u64,
 }
 
 impl ProjectionKey {
@@ -158,6 +160,11 @@ impl StarCatalog {
             return Err(CatalogError(format!(
                 "catalog CSV exceeds the supported size of {MAX_CATALOG_BYTES} bytes; reduce the file and retry"
             )));
+        }
+        if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            let input_len = input.len();
+            input.copy_within(3.., 0);
+            input.truncate(input_len - 3);
         }
         validate_csv_quotes(&input)?;
         let mut reader = csv::ReaderBuilder::new()
@@ -497,11 +504,16 @@ fn build(
     }
 
     let mut projected = Vec::new();
+    let rebuilds = state
+        .starfield_projection()
+        .as_ref()
+        .map_or(1, |snapshot| snapshot.rebuilds.saturating_add(1));
     let available_budget = profile.instance_count.saturating_sub(instances.len());
     if available_budget == 0 {
         *state.starfield_projection_mut() = Some(ProjectionCache {
             key,
             instances: projected,
+            rebuilds,
         });
         return;
     }
@@ -516,6 +528,7 @@ fn build(
     *state.starfield_projection_mut() = Some(ProjectionCache {
         key,
         instances: projected.clone(),
+        rebuilds,
     });
     instances.extend(projected);
 }
@@ -769,6 +782,14 @@ mod tests {
     }
 
     #[test]
+    fn strips_utf8_bom_before_parsing_a_quoted_first_header() {
+        let csv = b"\xef\xbb\xbf\"ra\",dec,mag\n0,45,1\n";
+        let catalog = StarCatalog::from_reader(csv.as_slice()).unwrap();
+        assert_eq!(catalog.stars().len(), 1);
+        assert_eq!(catalog.stars()[0].right_ascension_hours, 0.0);
+    }
+
+    #[test]
     fn bounds_csv_record_and_total_input_bytes() {
         let large_record = format!(
             "ra,dec,mag,proper\n0,0,1,\"{}\"\n",
@@ -909,10 +930,10 @@ mod tests {
 
     #[test]
     fn projection_cache_hits_and_invalidates_every_projection_input() {
-        let catalog = Arc::new(catalog("ra,dec,mag\n0,45,1\n6,45,2\n").unwrap());
+        let catalog_arc = Arc::new(catalog("ra,dec,mag\n0,45,1\n6,45,2\n").unwrap());
         let mut state = SceneState::default();
         let mut config = StarfieldConfig {
-            catalog: Arc::clone(&catalog),
+            catalog: Arc::clone(&catalog_arc),
             latitude_degrees: 45.0,
             longitude_degrees: 0.0,
             unix_seconds: 946_728_000.0,
@@ -936,6 +957,14 @@ mod tests {
             .expect("snapshot cached")
             .key
             .clone();
+        assert_eq!(
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("first projection cached")
+                .rebuilds,
+            1
+        );
         let first_instances = instances.clone();
         instances.clear();
         build(
@@ -958,6 +987,15 @@ mod tests {
                 .expect("snapshot retained")
                 .key,
             first
+        );
+        assert_eq!(
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("cache hit retained snapshot")
+                .rebuilds,
+            1,
+            "a cache hit must not rerun projection"
         );
 
         let key_after = |state: &SceneState,
@@ -1000,6 +1038,30 @@ mod tests {
         assert_ne!(
             key_after(&state, &tight_profile, 10.0, 16.0 / 9.0, (160, 90)),
             epoch_key
+        );
+
+        let baseline = ProjectionKey::new(&config, &profile, (160, 90), 16.0 / 9.0, 0, 0.0);
+        assert_ne!(
+            ProjectionKey::new(&config, &profile, (160, 90), 16.0 / 9.0, 1, 0.0),
+            baseline,
+            "existing instances are part of cache identity"
+        );
+        let mut longitude_changed = config.clone();
+        longitude_changed.longitude_degrees = 1.0;
+        assert_ne!(
+            ProjectionKey::new(&longitude_changed, &profile, (160, 90), 16.0 / 9.0, 0, 0.0),
+            baseline,
+            "longitude is part of cache identity"
+        );
+        let other_catalog = Arc::new(catalog("ra,dec,mag\n1,45,1\n").unwrap());
+        let catalog_changed = StarfieldConfig {
+            catalog: other_catalog,
+            ..config.clone()
+        };
+        assert_ne!(
+            ProjectionKey::new(&catalog_changed, &profile, (160, 90), 16.0 / 9.0, 0, 0.0),
+            baseline,
+            "catalog identity is part of cache key"
         );
 
         config.latitude_degrees = 44.0;

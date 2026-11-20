@@ -469,6 +469,7 @@ impl ScenePipeline {
     /// however long the renderer runs; scenes take it as f32.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame, elapsed);
+        self.scene_state.advance_tunnel(&frame, elapsed);
         let (frame, display, _) = self.dispatch(frame, true, elapsed);
         let aspect = size_aspect(size);
         let camera = match display {
@@ -561,7 +562,8 @@ impl ScenePipeline {
     /// Starfield crossing. Surface acquisition can fail after this query.
     #[cfg(test)]
     pub fn displayed_scene(&mut self, frame: ControlFrame, elapsed: f64) -> u8 {
-        let (_, display, _) = self.dispatch(frame, false, elapsed);
+        let (_, requested, _) = self.preview_requested_display(frame);
+        let display = self.crossing_gate.resolve(requested, elapsed, false);
         displayed_scene_byte(display)
     }
 
@@ -569,7 +571,7 @@ impl ScenePipeline {
     /// gate. Used to validate required scene inputs without a stale clock
     /// sample affecting the decision.
     pub fn requested_scene(&mut self, frame: ControlFrame) -> u8 {
-        let (_, display, _) = self.resolve_requested_display(frame);
+        let (_, display, _) = self.preview_requested_display(frame);
         displayed_scene_byte(display)
     }
 
@@ -620,6 +622,33 @@ impl ScenePipeline {
             clock,
             now,
             &mut self.colour_controls,
+        );
+        resolve_dispatch_frame(
+            frame,
+            display,
+            self.next_native_fallback,
+            self.starfield_dispatch_enabled,
+        )
+    }
+
+    /// Predicts dispatch without consuming debounce or colour-field step
+    /// budget. This is safe before surface acquisition, which may fail.
+    fn preview_requested_display(
+        &self,
+        frame: ControlFrame,
+    ) -> (ControlFrame, colour_field::Display, bool) {
+        let mut colour_field = self.colour_field.clone();
+        let mut colour_controls = self.colour_controls;
+        let mut clock = self
+            .step_clock
+            .as_ref()
+            .map(|(clock, start)| (clock.clone(), start.elapsed()));
+        let now = clock.as_ref().map_or(Duration::ZERO, |(_, now)| *now);
+        let display = colour_field::step_capped(
+            &mut colour_field,
+            clock.as_mut().map(|(clock, _)| clock),
+            now,
+            &mut colour_controls,
         );
         resolve_dispatch_frame(
             frame,
@@ -689,6 +718,7 @@ impl ScenePipeline {
         mic_layers: bool,
         commit_gate: bool,
     ) -> (colour_field::Display, bool) {
+        self.scene_state.advance_tunnel(&frame, elapsed);
         let overlay_elapsed = elapsed;
         let elapsed = elapsed as f32;
         let (width, height) = size;
@@ -709,7 +739,7 @@ impl ScenePipeline {
                     size,
                     &self.scene_state,
                 ),
-                scenes::select_configured(frame.scene, self.starfield_dispatch_enabled).camera,
+                scenes::selected_camera(frame.scene, self.scene_state.config()),
             ),
         };
         prepare_starfield_attachment_colors(

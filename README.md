@@ -88,10 +88,20 @@ Merges to `main` run release-please. Published releases build individual assets:
 modern renderer binaries, `.cvz` demos, N64 Joybus and USB HID mapped streams,
 generated C arrays, and current homebrew artifacts. The release asset workflow
 builds `chipviz-gba.gba` with devkitPro, `chipviz-n64.z64` with libdragon,
-`chipviz-c64.prg` with cc65, `chipviz-snes.sfc` with PVSnesLib,
-`chipviz-gb.gb` with RGBDS, and `chipviz-nes.nes` with ca65. Generated
-C64/SNES/Genesis/NES/SMS assets remain SDK-free fallbacks for local packaging
-when those toolchains are not installed.
+`chipviz-c64.prg` with cc65, `chipviz-gb.gb` with RGBDS, and
+`chipviz-nes.nes` with ca65. Generated C64/Genesis/NES/SMS assets remain
+SDK-free fallbacks for local packaging when those toolchains are not installed.
+
+All SNES ROMs, including the generated diagnostic seed and SDK build, are
+temporarily omitted from future individual release assets and combined zips;
+past releases are unchanged.
+The SDK build links an allocator whose redistribution permission is unresolved;
+this is a precaution, not a legal determination. Restoring releases awaits a
+clean-source or permission resolution and symbol-scan safeguard in
+[#109](https://github.com/djensenius/chipviz/issues/109). Local builds and
+emulator use remain available; the generated seed is not a visualizer.
+The release guard allows only known asset names; adding a new release asset
+requires updating `scripts/check-release-assets.py` after policy review.
 
 ## Current scaffold
 

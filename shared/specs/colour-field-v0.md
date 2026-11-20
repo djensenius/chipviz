@@ -123,6 +123,14 @@ same trace on every target. Reduced transports have their own oracle (see
     - Without the flag, the host clears palette bit 0 before transmission, so
       `p` 3 or 7 goes out as 2 or 6 (F23). When one frame goes to several
       transports, the rule applies to each transport's encoding separately.
+    - For a gamepad-only HID converter, this guard applies to every absolute
+      source frame and target before conversion. Its output contains no
+      absolute scene or palette keys: D-pad pulses may carry the receiver's
+      relative palette ring through 3 or 7 while scene 7 is shown. These are
+      not absolute palette reports and cannot arm a conforming `data` receiver
+      ([relative palette inputs](#relative-palette-inputs), F24). Such output
+      must not feed an `operator` build. This distinction does not permit an
+      unsanitized absolute frame or HID key.
     - Host paths include live audio, MIDI, chipsynth, the procedural bridge,
       and file playback of `.cvz` streams from `chipviz_encode`. This covers
       recorded files as well as live sources.
@@ -757,7 +765,7 @@ Flash is armed only by a deliberate source.
   becomes an armed request. This includes a 3
   or 7 present at scene entry: it runs as 2 or 6, and after 30 stable steps its
   armed request differs in effective mode, so it is applied under the budget.
-  - Hosts emit 3 or 7 only when that host process was started with
+  - Hosts emit an absolute 3 or 7 with scene 7 only when started with
     `--allow-flash` (see [Requirements for scene sources](#scene-index-7-is-the-colour-field)).
     A host with that flag prints the full warning when it starts.
   - Auto mode on the host may arm flash this way.

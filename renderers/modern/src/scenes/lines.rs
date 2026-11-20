@@ -834,6 +834,7 @@ mod tests {
         let profile = RenderProfile::m1();
         let mut state = SceneState::new(super::super::SceneConfig {
             lines_drop_cuts: true,
+            ..Default::default()
         });
         let frames = with_drops(drops, 0..index + 1);
         let mut images = Vec::new();

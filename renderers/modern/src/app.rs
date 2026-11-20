@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::{self, SceneConfig, colour_field, mic_layers, starfield};
+use crate::scenes::{self, SceneConfig, TunnelVariant, colour_field, mic_layers, starfield};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -23,7 +23,6 @@ pub enum AppError {
     Renderer(RendererError),
     Monitor(String),
     Audio(String),
-    Starfield(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -35,7 +34,6 @@ impl std::fmt::Display for AppError {
             Self::Renderer(error) => write!(formatter, "renderer error: {error}"),
             Self::Monitor(message) => write!(formatter, "monitor error: {message}"),
             Self::Audio(message) => write!(formatter, "audio error: {message}"),
-            Self::Starfield(message) => write!(formatter, "starfield error: {message}"),
         }
     }
 }
@@ -155,6 +153,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         .configure_colour_field(colour_field_config(&args));
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
+        tunnel_variant: args.tunnel_variant,
     });
     renderer
         .pipeline_mut()
@@ -320,7 +319,8 @@ fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
-       [--lines-drop-cuts] [--scene N]
+       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
+       [--scene N]
        {program} --list-monitors | --list-audio-devices
 
 Options:
@@ -355,6 +355,7 @@ Options:
                           default builds print a notice and draw nothing
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
+  --tunnel-variant MODE   PulseTunnel look: original (default), hallway or abstract
   Scene 6 requires both --star-catalog and --location; scene 7 remains ColourField
   -h, --help              print this help
 
@@ -556,6 +557,7 @@ struct AppArgs {
     catalog_path: Option<std::path::PathBuf>,
     location: Option<(f64, f64)>,
     unix_seconds: Option<f64>,
+    tunnel_variant: TunnelVariant,
 }
 
 /// Wire palettes go through the stability gate, and a stable absolute 3 or 7
@@ -593,8 +595,8 @@ impl AppArgs {
         else {
             return Ok(None);
         };
-        let catalog = starfield::StarCatalog::load(path)
-            .map_err(|error| AppError::Starfield(error.to_string()))?;
+        let catalog =
+            starfield::StarCatalog::load(path).map_err(|error| invalid_input(error.to_string()))?;
         let unix_seconds = match self.unix_seconds {
             Some(seconds) => seconds,
             None => std::time::SystemTime::now()
@@ -679,6 +681,15 @@ impl AppArgs {
                         )));
                     }
                     parsed.unix_seconds = Some(seconds);
+                }
+                "--tunnel-variant" => {
+                    let value =
+                        required_value(&mut args, "--tunnel-variant", "original|hallway|abstract")?;
+                    parsed.tunnel_variant = TunnelVariant::parse(&value).ok_or_else(|| {
+                        invalid_input(format!(
+                            "--tunnel-variant expects original|hallway|abstract, got {value}"
+                        ))
+                    })?;
                 }
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
@@ -998,6 +1009,27 @@ mod tests {
     }
 
     #[test]
+    fn public_app_error_remains_exhaustively_matchable() {
+        // Mirrors a downstream exhaustive match: adding a public enum variant
+        // would make this compile-time compatibility check fail.
+        fn downstream_match(error: AppError) -> &'static str {
+            match error {
+                AppError::Window(_) => "window",
+                AppError::EventLoop(_) => "event loop",
+                AppError::Io(_) => "io",
+                AppError::Renderer(_) => "renderer",
+                AppError::Monitor(_) => "monitor",
+                AppError::Audio(_) => "audio",
+            }
+        }
+
+        assert_eq!(
+            downstream_match(invalid_input("invalid Starfield catalog".into())),
+            "io"
+        );
+    }
+
+    #[test]
     fn scene_override_changes_only_the_displayed_scene() {
         let frame = ControlFrame {
             scene: 13,
@@ -1041,7 +1073,7 @@ mod tests {
                 },
                 true,
             )
-            .name(),
+            .name,
             "Starfield"
         );
         assert!(initial_scene_override(None).is_none());
@@ -1058,6 +1090,14 @@ mod tests {
     }
 
     #[test]
+    fn help_documents_starfield_and_tunnel_options() {
+        let help = usage("chipviz");
+        assert!(help.contains("--star-catalog PATH"));
+        assert!(help.contains("--scene 6"));
+        assert!(help.contains("--tunnel-variant MODE"));
+    }
+
+    #[test]
     fn missing_starfield_fallback_does_not_skip_earlier_udp_batch_events() {
         let frames = [
             ControlFrame {
@@ -1065,18 +1105,18 @@ mod tests {
                 ..ControlFrame::procedural(1)
             },
             ControlFrame {
-                scene: 13,
+                scene: 6,
                 ..ControlFrame::procedural(2)
             },
         ];
         let mut observed = Vec::new();
-        observe_fresh_frames(&frames, None, 1.5, |frame, elapsed| {
+        observe_fresh_frames(&frames, Some(6), 1.5, |frame, elapsed| {
             observed.push((frame.scene, frame.flags, elapsed));
         });
         assert_eq!(observed.len(), 2);
-        assert_eq!(observed[0], (0, audio::BEAT_FLAG | audio::DROP_FLAG, 1.5));
-        assert_eq!(observed[1], (13, 0, 1.5));
-        assert!(!needs_starfield_catalog(observed[1].0));
+        assert_eq!(observed[0], (6, audio::BEAT_FLAG | audio::DROP_FLAG, 1.5));
+        assert_eq!(observed[1], (6, 0, 1.5));
+        assert!(needs_starfield_catalog(observed[1].0));
     }
 
     #[test]
@@ -1729,6 +1769,21 @@ mod tests {
     fn lines_drop_cuts_are_opt_in() {
         assert!(!AppArgs::default().lines_drop_cuts);
         assert!(parse_run(&["--lines-drop-cuts"]).lines_drop_cuts);
+    }
+
+    #[test]
+    fn tunnel_variant_is_explicit_and_validated() {
+        assert_eq!(AppArgs::default().tunnel_variant, TunnelVariant::Original);
+        assert_eq!(
+            parse_run(&["--tunnel-variant", "hallway"]).tunnel_variant,
+            TunnelVariant::Hallway
+        );
+        assert_eq!(
+            parse_run(&["--tunnel-variant", "abstract"]).tunnel_variant,
+            TunnelVariant::Abstract
+        );
+        assert!(parse(&["--tunnel-variant", "lines"]).is_err());
+        assert!(parse(&["--tunnel-variant"]).is_err());
     }
 
     #[test]
