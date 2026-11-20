@@ -21,12 +21,12 @@ just modern-pi5
 just modern-m1 -- --udp 127.0.0.1:6464
 ```
 
-Scene 6 (`Starfield`) reads a user-supplied HYG-compatible CSV; no catalog is
-bundled. It requires both an observer location and the catalog path. The
-observation time defaults to current UTC:
+Explicitly selecting scene 6 (`Starfield`) reads a user-supplied
+HYG-compatible CSV; no catalog is bundled. It requires both an observer
+location and the catalog path. The observation time defaults to current UTC:
 
 ```sh
-just modern-m1 -- --udp 127.0.0.1:6464 \
+just modern-m1 -- --udp 127.0.0.1:6464 --scene 6 \
   --star-catalog /path/to/stars.csv --location 45.5,-73.25
 just modern-m1 -- --scene 6 --star-catalog /path/to/stars.csv \
   --location 45.5,-73.25
@@ -35,19 +35,20 @@ just modern-pi5 -- --scene 6 --star-catalog /path/to/stars.csv \
 ```
 
 The CSV must have `ra` (hours), `dec` (degrees) and `mag` columns; `ci` and
-`proper` are optional. Standard CSV quoting is supported. Scene 6 without both
-setup options prints an actionable message and temporarily displays scene 0,
-while continuing to observe all incoming frames. `--catalog` is an alias for `--star-catalog`; both load
-the file at runtime and never embed it in the executable. Scene 7 stays the
-colour field. `--scene 6` forces Starfield for procedural or microphone frames
-without a UDP sender; it also overrides UDP scene bytes when explicitly set.
-Without `--scene`, UDP, microphone and procedural scene selection is unchanged.
-Scene 6 requires its catalog and location at startup when selected with
-`--scene`; a scene-6 UDP frame without setup displays scene 0 with a clear
-message, and subsequent non-star scenes continue normally.
+`proper` are optional. Standard CSV quoting is supported. Explicit `--scene 6`
+without both setup options exits with an actionable error before opening the
+window. `--catalog` is an alias for `--star-catalog`; both load the file at
+runtime and never embed it in the executable. Supplying a catalog alone does
+not opt into Starfield. Scene 7 stays the ColourField. `--scene 6` opts into
+Starfield for procedural or microphone
+frames without a UDP sender and overrides UDP scene bytes when explicitly set.
+Without that explicit option, every wire byte keeps its original modulo-six
+mapping (byte 7 remains the ColourField); in particular, bytes 6 and 13 do not
+silently become Starfield. Scene 6 requires its catalog and location at startup
+when selected with `--scene`; unrelated scenes do not require a catalog.
 
-Without `--udp` or `--mic`, the renderer uses deterministic procedural frames. With UDP,
-it consumes `control-frame-v0` packets from the host bridge:
+Without `--udp` or `--mic`, the renderer uses deterministic procedural frames.
+With UDP, it consumes `control-frame-v0` packets from the host bridge:
 
 ```sh
 python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
@@ -66,7 +67,7 @@ The renderer starts windowed by default.
 | `--star-catalog PATH` | Read a user-supplied HYG-compatible CSV for scene 6; catalogs are not bundled or embedded. `--catalog` is an alias. |
 | `--location LAT,LON` | Observer latitude and longitude in decimal degrees, longitude east positive. Required with `--star-catalog`. |
 | `--time UNIX_SECONDS` | Observation time in UTC seconds since the Unix epoch (1800–2200); defaults to current UTC, advances while live, and requires `--star-catalog` plus `--location`. Capture manifests record the resolved epoch and whether it advances. |
-| `--scene N` | Force the displayed scene byte (0-255), including UDP frames; absent by default, preserving the selected input's scene. Scene 6 requires `--star-catalog` and `--location`. |
+| `--scene N` | Override the input scene byte (0-255), including UDP frames; absent by default. Byte 7 is ColourField, byte 6 opts into Starfield, and other bytes keep the original modulo-six mapping. Scene 6 requires `--star-catalog` and `--location`. |
 | `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
@@ -375,25 +376,21 @@ cargo run --manifest-path renderers/modern/Cargo.toml \
 
 Scenes live in `src/scenes/`, one module per scene, behind the `REGISTRY`
 table in `src/scenes/mod.rs`. Scene byte 7 is checked first and always selects
-the colour field, whatever the registry length; every other byte selects
-`REGISTRY[scene % REGISTRY.len()]`:
-
-Starfield is appended at registry index 6: bytes 0-5 keep their original
-registry scenes, byte 6 becomes Starfield, and the registry modulus changes
-from six to seven for other wrapped byte values. Thus some bytes >=6 that
-previously wrapped to a different scene now select a different registry
-entry. The explicit scene-7 ColourField dispatch is unchanged.
+the colour field. To preserve all existing wire behavior, bytes other than 7
+keep the original modulo-six mapping. Starfield is selected only when the
+local caller explicitly opts in with `--scene 6`; it is not selected by
+wrapped bytes or by a catalog option alone.
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
 | 7 | `ColourField` | `ScreenSpace` |
-| 0, 14, 21, ... | `SignalField` | `Orbit3D` |
-| 1, 8, 15, ... | `SpectrumVolume` | `Orbit3D` |
-| 2, 9, 16, ... | `PulseTunnel` | `Orbit3D` |
-| 3, 10, 17, ... | `Lines` | `ScreenSpace` |
-| 4, 11, 18, ... | `Static` | `ScreenSpace` |
-| 5, 12, 19, ... | `Object` | `ScreenSpace` |
-| 6, 13, 20, ... | `Starfield` | `ScreenSpace` |
+| 0, 6, 12, ... (unless explicit scene-6 opt-in) | `SignalField` | `Orbit3D` |
+| 1, 7, 13, 19, ... (except byte 7) | `SpectrumVolume` | `Orbit3D` |
+| 2, 8, 14, ... | `PulseTunnel` | `Orbit3D` |
+| 3, 9, 15, ... | `Lines` | `ScreenSpace` |
+| 4, 10, 16, ... | `Static` | `ScreenSpace` |
+| 5, 11, 17, ... | `Object` | `ScreenSpace` |
+| explicit `--scene 6` only | `Starfield` | `ScreenSpace` |
 
 - `ColourField` (scene 7, `src/scenes/colour_field/`): two or three large
   regions of flat colour, meant to be projected onto performers in the dark.
@@ -434,10 +431,12 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   brightness and point size; colour index controls approximate hue. At most
   200 stars are rendered from a spatial index that retains every in-limit
   star, so brighter below-horizon records cannot hide a fainter visible one.
-  At most 131,072 CSV rows are accepted; larger catalogs fail with an
-  actionable error instead of silently dropping stars. Per-frame catalog
-  scanning is therefore bounded, with wholly below-horizon bins skipped;
-  benchmark the largest catalogs on target hardware.
+  At most 131,072 CSV rows, 64 MiB total input, and 1 MiB per CSV record are
+  accepted; larger inputs fail with an actionable error instead of silently
+  dropping stars. Projection and ordering are cached for each effective
+  ten-second sky snapshot, observer, viewport and profile budget. Catalog
+  scanning remains bounded by the row limit, with wholly below-horizon bins
+  skipped; benchmark the largest catalogs on target hardware.
   Each star's linear-RGB channel is capped at
   0.05; stars are opaque and brightest-first, so changing star membership or
   overlap changes a Starfield pixel by at most 0.05 linear luminance.
@@ -586,15 +585,9 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   buffer, so splats are sorted far to near on the CPU.
 
 To add a scene, copy one scene module, give it a unique `ENTRY` name and camera
-mode, and append that entry to `REGISTRY`. Appending keeps every byte below the
-old registry length on the same scene; wrapped bytes follow the new length,
-because selection is `scene % REGISTRY.len()`. Appending `Lines` as the fourth
-scene shifted them: bytes 3, 4 and 5 (formerly `SignalField`, `SpectrumVolume`
-and `PulseTunnel`) now select `Lines`, `SignalField` and `SpectrumVolume`.
-Appending `Static` as the fifth scene shifted bytes 4 to 7 the same way: they
-now select `Static`, `SignalField`, `SpectrumVolume` and `PulseTunnel`.
-Appending `Object` as the sixth scene shifted bytes 5 to 9: they now select
-`Object`, `SignalField`, `SpectrumVolume`, `PulseTunnel` and `Lines`.
+mode, and append that entry to `REGISTRY`. Do not change the legacy modulo-six
+mapping for control-frame bytes: Starfield is selected only by explicit local
+opt-in to scene 6, and byte 7 remains the ColourField.
 `Orbit3D` scenes use world coordinates and the smoothed orbit camera.
 `ScreenSpace` scenes draw flat: `center.xy` is NDC (`-1..1` spans the viewport,
 `+y` up), depth is ignored, and instances draw in order with their colour
@@ -655,6 +648,8 @@ in ten-second snapshot steps. That epoch and advancing mode are recorded in the
 manifest. To reproduce a moving-sky set, pass the recorded
 `starfield_epoch_unix_seconds` as `--time` together with `--follow-time`.
 An explicit `--time` remains fixed unless `--follow-time` is supplied.
+A Starfield capture must explicitly use `--scene 6` with both `--catalog` and
+`--location`; raw/wrapped scene bytes keep legacy dispatch.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed

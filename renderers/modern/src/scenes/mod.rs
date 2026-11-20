@@ -10,15 +10,10 @@
 //! and passes to [`SceneBuild::Stateful`] builders; other scenes ignore it.
 //!
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
-//! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
-//! with the current seven entries scene 0/14/21... is SignalField, 1/8/15... is
-//! SpectrumVolume, 2/9/16... is PulseTunnel, 3/10/17... is Lines, 4/11/18...
-//! is Static, 5/12/19... is Object and 6/13/20... is Starfield. Byte 7 is
-//! separately reserved for ColourField. Adding a scene is one new module plus
-//! one `REGISTRY` entry. Appending keeps every index below the old length on
-//! the same scene; wrapped indices (>= length) move with the new length.
-//! Starfield is appended at byte 6, leaving the ColourField override at byte
-//! 7 untouched.
+//! first six entries preserve the original wire-byte mapping for every byte:
+//! `scene % 6`. Byte 7 is checked first and remains reserved for ColourField.
+//! Starfield is opt-in and is selected only for explicit scene byte 6; all
+//! other bytes retain their original mapping.
 
 pub mod colour_field;
 mod lines;
@@ -37,6 +32,7 @@ pub(crate) use static_noise::gpu_reference as static_gpu_reference;
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
+use std::cell::{Ref, RefCell};
 
 /// How a scene's instance positions are transformed to the viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +92,8 @@ pub struct SceneState {
     pub(crate) lines: lines::LinesState,
     pub(crate) static_noise: static_noise::StaticState,
     starfield: Option<starfield::StarfieldConfig>,
+    starfield_dispatch_enabled: bool,
+    starfield_projection: RefCell<Option<starfield::ProjectionCache>>,
 }
 
 impl SceneState {
@@ -105,6 +103,8 @@ impl SceneState {
             lines: lines::LinesState::new(config.lines_drop_cuts),
             static_noise: static_noise::StaticState::default(),
             starfield: None,
+            starfield_dispatch_enabled: false,
+            starfield_projection: RefCell::new(None),
         }
     }
 
@@ -114,10 +114,29 @@ impl SceneState {
 
     pub fn configure_starfield(&mut self, config: Option<starfield::StarfieldConfig>) {
         self.starfield = config;
+        *self.starfield_projection.get_mut() = None;
+    }
+
+    pub(crate) fn configure_starfield_dispatch(&mut self, enabled: bool) {
+        self.starfield_dispatch_enabled = enabled;
+    }
+
+    pub(crate) fn starfield_dispatch_enabled(&self) -> bool {
+        self.starfield_dispatch_enabled
     }
 
     pub(crate) fn starfield(&self) -> Option<&starfield::StarfieldConfig> {
         self.starfield.as_ref()
+    }
+
+    pub(crate) fn starfield_projection(&self) -> Ref<'_, Option<starfield::ProjectionCache>> {
+        self.starfield_projection.borrow()
+    }
+
+    pub(crate) fn starfield_projection_mut(
+        &self,
+    ) -> std::cell::RefMut<'_, Option<starfield::ProjectionCache>> {
+        self.starfield_projection.borrow_mut()
     }
 
     /// Feeds one new (not held) frame to every stateful scene, counted as
@@ -146,15 +165,33 @@ pub const REGISTRY: &[SceneEntry] = &[
     object::ENTRY,
     starfield::ENTRY,
 ];
+const LEGACY_SCENE_COUNT: usize = 6;
 
-/// The registry mapping for native scenes. Callers check
-/// [`colour_field::SCENE`] first (see [`dispatch`]).
+/// The legacy mapping for native scenes. Callers check
+/// [`colour_field::SCENE`] first (see [`dispatch`]); Starfield is deliberately
+/// not selected by this mapping.
 pub fn select(scene: u8) -> &'static SceneEntry {
-    &REGISTRY[usize::from(scene) % REGISTRY.len()]
+    &REGISTRY[usize::from(scene) % LEGACY_SCENE_COUNT]
 }
 
-/// What a scene byte selects: 7 is the colour field on every target,
-/// whatever the registry length; anything else is `REGISTRY[scene % len]`.
+/// Resolves an input byte to the actual native registry index. The explicit
+/// Starfield opt-in applies only to exact scene byte 6.
+pub fn normalize_scene_byte(scene: u8, starfield_enabled: bool) -> u8 {
+    if starfield_enabled && scene == starfield::SCENE {
+        starfield::SCENE
+    } else {
+        (usize::from(scene) % LEGACY_SCENE_COUNT) as u8
+    }
+}
+
+/// Selects Starfield only when the caller explicitly enabled it and the
+/// displayed byte is exactly 6. Wrapped wire bytes always keep legacy mapping.
+pub fn select_configured(scene: u8, starfield_enabled: bool) -> &'static SceneEntry {
+    &REGISTRY[usize::from(normalize_scene_byte(scene, starfield_enabled))]
+}
+
+/// What a legacy scene byte selects: 7 is the colour field on every target;
+/// all other bytes use the original modulo-six native-scene mapping.
 #[derive(Clone, Copy)]
 pub enum Selected {
     ColourField,
@@ -178,10 +215,15 @@ impl Selected {
 }
 
 pub fn dispatch(scene: u8) -> Selected {
+    dispatch_configured(scene, false)
+}
+
+/// Dispatches a scene byte with the explicit local Starfield opt-in applied.
+pub fn dispatch_configured(scene: u8, starfield_enabled: bool) -> Selected {
     if scene == colour_field::SCENE {
         Selected::ColourField
     } else {
-        Selected::Registry(select(scene))
+        Selected::Registry(select_configured(scene, starfield_enabled))
     }
 }
 
@@ -276,7 +318,7 @@ mod tests {
     const ELAPSED: [f32; 4] = [0.0, 0.5, 3.25, 120.0];
 
     /// FNV-1a over the instance bytes for every profile/frame/elapsed sample,
-    /// with the scene byte forced to `scene` or its wrapped `scene + REGISTRY.len()`.
+    /// with the scene byte forced to `scene` or its wrapped `scene + 6`.
     fn fingerprint(
         scene: u8,
         build: fn(&RenderProfile, ControlFrame, f32) -> Vec<Instance>,
@@ -286,7 +328,7 @@ mod tests {
             for index in INDICES {
                 for elapsed in ELAPSED {
                     let frame = ControlFrame {
-                        scene: scene + REGISTRY.len() as u8 * (index as u8 % 2),
+                        scene: scene + LEGACY_SCENE_COUNT as u8 * (index as u8 % 2),
                         ..ControlFrame::procedural(index)
                     };
                     let instances = build(&profile, frame, elapsed);
@@ -301,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_maps_scene_byte_modulo_length() {
+    fn legacy_registry_mapping_is_unchanged_for_every_scene_byte() {
         let names: Vec<_> = (0..=9).map(|scene| select(scene).name).collect();
         assert_eq!(
             names,
@@ -312,13 +354,26 @@ mod tests {
                 "Lines",
                 "Static",
                 "Object",
-                "Starfield",
                 "SignalField",
                 "SpectrumVolume",
                 "PulseTunnel",
+                "Lines",
             ]
         );
-        assert_eq!(select(255).name, REGISTRY[255 % REGISTRY.len()].name);
+        for scene in 0..=u8::MAX {
+            assert_eq!(
+                select(scene).name,
+                REGISTRY[usize::from(scene) % LEGACY_SCENE_COUNT].name
+            );
+            assert_eq!(normalize_scene_byte(scene, false), scene % 6);
+            assert_eq!(select_configured(scene, false).name, select(scene).name);
+            if scene != starfield::SCENE {
+                assert_eq!(normalize_scene_byte(scene, true), scene % 6);
+                assert_eq!(select_configured(scene, true).name, select(scene).name);
+            }
+        }
+        assert_eq!(normalize_scene_byte(6, true), 6);
+        assert_eq!(select_configured(6, true).name, "Starfield");
         let cameras: Vec<_> = REGISTRY.iter().map(|entry| entry.camera).collect();
         let orbit = CameraMode::Orbit3D;
         let flat = CameraMode::ScreenSpace;
@@ -336,12 +391,13 @@ mod tests {
         }
         assert_eq!(dispatch(7).camera(), CameraMode::ScreenSpace);
         assert!(REGISTRY.iter().all(|entry| entry.name != "ColourField"));
-        assert_eq!(dispatch(6).name(), "Starfield");
+        assert_eq!(dispatch(6).name(), "SignalField");
+        assert_eq!(select_configured(6, true).name, "Starfield");
     }
 
     #[test]
     fn starfield_dispatch_and_profile_instance_budgets() {
-        let selected = dispatch(starfield::SCENE);
+        let selected = dispatch_configured(starfield::SCENE, true);
         assert_eq!(selected.name(), "Starfield");
         assert_eq!(selected.camera(), CameraMode::ScreenSpace);
 
@@ -359,6 +415,7 @@ mod tests {
             unix_seconds: 946_728_000.0,
             follow_elapsed: false,
         }));
+        state.configure_starfield_dispatch(true);
         for (profile, budget) in [(RenderProfile::m1(), 16_384), (RenderProfile::pi5(), 4_096)] {
             let frame = ControlFrame {
                 scene: starfield::SCENE,
@@ -397,7 +454,7 @@ mod tests {
                     build_instances(profile, frame, elapsed, 16.0 / 9.0, &SceneState::default())
                 }),
                 fingerprint(scene, |profile, frame, elapsed| {
-                    let scene = frame.scene % REGISTRY.len() as u8;
+                    let scene = frame.scene % LEGACY_SCENE_COUNT as u8;
                     reference::build_instances(profile, ControlFrame { scene, ..frame }, elapsed)
                 }),
                 "scene {scene}"

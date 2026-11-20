@@ -159,6 +159,9 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     renderer
         .pipeline_mut()
         .configure_starfield(starfield.clone());
+    renderer
+        .pipeline_mut()
+        .enable_starfield_dispatch(args.scene == Some(starfield::SCENE));
     renderer.pipeline_mut().limit_colour_field_steps();
     if mic_layers::allowed(args.mic_layers) != args.mic_layers {
         eprintln!("{}", mic_layers::NO_LAYERS_NOTICE);
@@ -327,7 +330,8 @@ Options:
   --location LAT,LON      observer position in decimal degrees (longitude east)
   --time UNIX_SECONDS     UTC observation time for scene 6 (1800..2200; default: current UTC)
   --scene N               override the displayed scene byte (0-255), including UDP;
-                          without this option, incoming and procedural scenes are unchanged
+                          byte 7 is ColourField, byte 6 opts into Starfield, and other
+                          bytes keep the original modulo-six mapping
   --mic                   drive frames from live microphone analysis instead of
                           procedural frames; UDP packets, when they arrive, still win
   --audio-device INDEX|NAME
@@ -731,7 +735,7 @@ fn observe_fresh_frames(
 }
 
 fn needs_starfield_catalog(scene: u8) -> bool {
-    scenes::dispatch(scene).name() == "Starfield"
+    scene == starfield::SCENE
 }
 
 fn parse_location(value: &str) -> Result<(f64, f64), AppError> {
@@ -1003,10 +1007,23 @@ mod tests {
         assert_eq!(unchanged.scene, 13);
         assert_eq!(unchanged.energy, frame.energy);
         assert_eq!(unchanged.spectrum, frame.spectrum);
+        assert_eq!(scenes::select(unchanged.scene).name, "SpectrumVolume");
         let overridden = with_scene_override(frame, Some(6));
         assert_eq!(overridden.scene, 6);
         assert_eq!(overridden.energy, frame.energy);
         assert_eq!(overridden.spectrum, frame.spectrum);
+        assert_eq!(
+            scenes::select_configured(overridden.scene, true).name,
+            "Starfield"
+        );
+
+        let legacy_six = with_scene_override(ControlFrame { scene: 6, ..frame }, None);
+        assert_eq!(scenes::select(legacy_six.scene).name, "SignalField");
+        let forced_six = with_scene_override(legacy_six, Some(6));
+        assert_eq!(
+            scenes::select_configured(forced_six.scene, true).name,
+            "Starfield"
+        );
     }
 
     #[test]
@@ -1017,10 +1034,13 @@ mod tests {
         field.step(colour_field::Controls::default());
         assert_eq!(field.display(), colour_field::Display::Native(6));
         assert_eq!(
-            scenes::dispatch(match field.display() {
-                colour_field::Display::Native(scene) => scene,
-                colour_field::Display::ColourField(_) => unreachable!(),
-            })
+            scenes::select_configured(
+                match field.display() {
+                    colour_field::Display::Native(scene) => scene,
+                    colour_field::Display::ColourField(_) => unreachable!(),
+                },
+                true,
+            )
             .name(),
             "Starfield"
         );
@@ -1028,10 +1048,13 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_scene_selection_requires_catalog() {
+    fn only_explicit_scene_six_requires_catalog() {
         assert!(needs_starfield_catalog(6));
-        assert!(needs_starfield_catalog(13));
+        assert!(!needs_starfield_catalog(13));
         assert!(!needs_starfield_catalog(7));
+        assert_eq!(parse_run(&["--scene", "13"]).scene, Some(13));
+        assert!(parse(&["--scene", "6"]).is_err());
+        assert!(parse(&["--udp", "127.0.0.1:6464"]).is_ok());
     }
 
     #[test]
@@ -1053,7 +1076,7 @@ mod tests {
         assert_eq!(observed.len(), 2);
         assert_eq!(observed[0], (0, audio::BEAT_FLAG | audio::DROP_FLAG, 1.5));
         assert_eq!(observed[1], (13, 0, 1.5));
-        assert!(needs_starfield_catalog(observed[1].0));
+        assert!(!needs_starfield_catalog(observed[1].0));
     }
 
     #[test]
@@ -1067,8 +1090,7 @@ mod tests {
 
     #[test]
     fn parses_starfield_catalog_location_and_time() {
-        let wrapped_error = parse(&["--scene", "13"]).unwrap_err().to_string();
-        assert!(wrapped_error.contains("requires --star-catalog PATH"));
+        assert_eq!(parse_run(&["--scene", "13"]).scene, Some(13));
         let args = parse_run(&[
             "--scene",
             "6",

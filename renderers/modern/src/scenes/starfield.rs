@@ -1,6 +1,6 @@
 //! Catalog-driven local-sky star field.
 
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use super::{CameraMode, SceneBuild, SceneEntry};
@@ -20,6 +20,8 @@ pub const STARFIELD_SNAPSHOT_PERIOD_SECONDS: f64 = 10.0;
 const MAX_STAR_LINEAR_LUMINANCE: f32 = 0.05;
 const MAX_RENDERED_STARS: usize = 200;
 const MAX_CATALOG_ROWS: usize = 131_072;
+const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CSV_RECORD_BYTES: usize = 1024 * 1024;
 const RIGHT_ASCENSION_BINS: usize = 48;
 const DECLINATION_BINS: usize = 18;
 const MIN_STAR_MAGNITUDE: f64 = -2.0;
@@ -33,6 +35,46 @@ pub struct StarfieldConfig {
     pub unix_seconds: f64,
     /// Advance from the base UTC epoch with the renderer's monotonic clock.
     pub follow_elapsed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionKey {
+    catalog: usize,
+    latitude: u64,
+    longitude: u64,
+    epoch: u64,
+    viewport: (u32, u32),
+    aspect: u32,
+    instance_budget: usize,
+    existing_instances: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectionCache {
+    key: ProjectionKey,
+    instances: Vec<Instance>,
+}
+
+impl ProjectionKey {
+    fn new(
+        config: &StarfieldConfig,
+        profile: &RenderProfile,
+        viewport: (u32, u32),
+        aspect: f32,
+        existing_instances: usize,
+        elapsed: f32,
+    ) -> Self {
+        Self {
+            catalog: Arc::as_ptr(&config.catalog) as usize,
+            latitude: config.latitude_degrees.to_bits(),
+            longitude: config.longitude_degrees.to_bits(),
+            epoch: config.epoch_at(elapsed).to_bits(),
+            viewport,
+            aspect: aspect.to_bits(),
+            instance_budget: profile.instance_count,
+            existing_instances,
+        }
+    }
 }
 
 fn star_brightness(magnitude: f64) -> f32 {
@@ -107,9 +149,20 @@ pub struct StarCatalog {
 
 impl StarCatalog {
     pub fn from_reader(reader: impl Read) -> Result<Self, CatalogError> {
+        let mut input = Vec::new();
+        reader
+            .take((MAX_CATALOG_BYTES + 1) as u64)
+            .read_to_end(&mut input)
+            .map_err(|error| CatalogError(format!("could not read catalog CSV: {error}")))?;
+        if input.len() > MAX_CATALOG_BYTES {
+            return Err(CatalogError(format!(
+                "catalog CSV exceeds the supported size of {MAX_CATALOG_BYTES} bytes; reduce the file and retry"
+            )));
+        }
+        validate_csv_quotes(&input)?;
         let mut reader = csv::ReaderBuilder::new()
             .flexible(false)
-            .from_reader(reader);
+            .from_reader(Cursor::new(input));
         let headers = reader
             .headers()
             .map_err(|error| CatalogError(format!("could not read CSV header row: {error}")))?;
@@ -121,6 +174,7 @@ impl StarCatalog {
                 )));
             }
         }
+
         for required in ["ra", "dec", "mag"] {
             if !columns.contains_key(required) {
                 return Err(CatalogError(format!(
@@ -241,6 +295,85 @@ impl std::fmt::Display for CatalogError {
 
 impl std::error::Error for CatalogError {}
 
+fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
+    #[derive(Clone, Copy)]
+    enum FieldState {
+        Start,
+        Unquoted,
+        Quoted,
+        AfterQuote,
+    }
+
+    let mut state = FieldState::Start;
+    let mut record_bytes = 0usize;
+    let mut index = 0usize;
+    while index < input.len() {
+        let byte = input[index];
+        record_bytes += 1;
+        if record_bytes > MAX_CSV_RECORD_BYTES {
+            return Err(CatalogError(format!(
+                "CSV record exceeds the supported size of {MAX_CSV_RECORD_BYTES} bytes; reduce long fields and retry"
+            )));
+        }
+        match state {
+            FieldState::Start => match byte {
+                b'"' => state = FieldState::Quoted,
+                b',' => {}
+                b'\n' | b'\r' => record_bytes = 0,
+                _ => state = FieldState::Unquoted,
+            },
+            FieldState::Unquoted => match byte {
+                b'"' => {
+                    return Err(CatalogError(
+                        "malformed CSV: quote found inside an unquoted field".to_string(),
+                    ));
+                }
+                b',' => state = FieldState::Start,
+                b'\n' | b'\r' => {
+                    state = FieldState::Start;
+                    record_bytes = 0;
+                }
+                _ => {}
+            },
+            FieldState::Quoted => {
+                if byte == b'"' {
+                    if input.get(index + 1) == Some(&b'"') {
+                        record_bytes += 1;
+                        if record_bytes > MAX_CSV_RECORD_BYTES {
+                            return Err(CatalogError(format!(
+                                "CSV record exceeds the supported size of {MAX_CSV_RECORD_BYTES} bytes; reduce long fields and retry"
+                            )));
+                        }
+                        index += 1;
+                    } else {
+                        state = FieldState::AfterQuote;
+                    }
+                }
+            }
+            FieldState::AfterQuote => match byte {
+                b',' => state = FieldState::Start,
+                b'\n' | b'\r' => {
+                    state = FieldState::Start;
+                    record_bytes = 0;
+                }
+                b' ' | b'\t' => {}
+                _ => {
+                    return Err(CatalogError(
+                        "malformed CSV: unexpected data after a quoted field".to_string(),
+                    ));
+                }
+            },
+        }
+        index += 1;
+    }
+    if matches!(state, FieldState::Quoted) {
+        return Err(CatalogError(
+            "malformed CSV: quoted field is not terminated before end of file".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_field(
     record: &csv::StringRecord,
     column: usize,
@@ -353,8 +486,50 @@ fn build(
     let Some(config) = state.starfield() else {
         return;
     };
+    let key = ProjectionKey::new(config, profile, viewport, aspect, instances.len(), elapsed);
+    if let Some(snapshot) = state
+        .starfield_projection()
+        .as_ref()
+        .filter(|snapshot| snapshot.key == key)
+    {
+        instances.extend(snapshot.instances.iter().copied());
+        return;
+    }
+
+    let mut projected = Vec::new();
+    let available_budget = profile.instance_count.saturating_sub(instances.len());
+    if available_budget == 0 {
+        *state.starfield_projection_mut() = Some(ProjectionCache {
+            key,
+            instances: projected,
+        });
+        return;
+    }
+    build_uncached(
+        elapsed,
+        aspect,
+        viewport,
+        available_budget,
+        config,
+        &mut projected,
+    );
+    *state.starfield_projection_mut() = Some(ProjectionCache {
+        key,
+        instances: projected.clone(),
+    });
+    instances.extend(projected);
+}
+
+fn build_uncached(
+    elapsed: f32,
+    aspect: f32,
+    viewport: (u32, u32),
+    instance_budget: usize,
+    config: &StarfieldConfig,
+    instances: &mut Vec<Instance>,
+) {
     let unix_seconds = config.epoch_at(elapsed);
-    let mut visible = Vec::with_capacity(MAX_RENDERED_STARS.min(profile.instance_count) * 4);
+    let mut visible = Vec::with_capacity(MAX_RENDERED_STARS.min(instance_budget) * 4);
     for (bin_index, bin) in config.catalog.candidate_bins.iter().enumerate() {
         if bin.is_empty() {
             continue;
@@ -406,13 +581,9 @@ fn build(
                 .then_with(|| spatial_order_key(*left_bin).cmp(&spatial_order_key(*right_bin)))
         },
     );
-    let candidate_limit = MAX_RENDERED_STARS;
-    let mut candidate_order = Vec::with_capacity(candidate_limit);
+    let mut candidate_order = Vec::with_capacity(visible.len());
     let mut reserved = vec![false; visible.len()];
     for quarter in 0..4 {
-        if candidate_order.len() == candidate_limit {
-            break;
-        }
         if let Some((index, _)) = visible.iter().enumerate().find(|(index, candidate)| {
             !reserved[*index] && screen_quarter(candidate.1[0]) == quarter
         }) {
@@ -421,16 +592,16 @@ fn build(
         }
     }
     for index in 0..visible.len() {
-        if candidate_order.len() == candidate_limit {
-            break;
-        }
         if !reserved[index] {
             candidate_order.push(index);
         }
     }
-    let mut selected = Vec::with_capacity(MAX_RENDERED_STARS.min(profile.instance_count));
+    let mut selected = Vec::with_capacity(MAX_RENDERED_STARS.min(instance_budget));
     let mut selected_instances = 0;
     for index in candidate_order {
+        if selected_instances >= instance_budget {
+            break;
+        }
         let (star, center, _, _, _) = visible[index];
         if selected.len() >= MAX_RENDERED_STARS {
             break;
@@ -459,17 +630,16 @@ fn build(
             pattern: [0.0; 2],
         };
         let wrapped = crosses_horizontal_seam(instance);
-        if let Some(draw_wrap) = seam_wrap_within_budget(
-            wrapped,
-            profile.instance_count.saturating_sub(selected_instances),
-        ) {
+        if let Some(draw_wrap) =
+            seam_wrap_within_budget(wrapped, instance_budget.saturating_sub(selected_instances))
+        {
             selected.push((star.magnitude, instance, draw_wrap));
             selected_instances += if draw_wrap { 2 } else { 1 };
         }
     }
     selected.sort_by(|(left, _, _), (right, _, _)| left.total_cmp(right));
     for (_, instance, wrapped) in selected.into_iter().rev() {
-        append_wrapped(instance, wrapped, profile.instance_count, instances);
+        append_wrapped(instance, wrapped, instance_budget, instances);
     }
 }
 
@@ -576,11 +746,43 @@ mod tests {
                 "dec must be finite and in [-90, 90]",
             ),
             ("ra,dec,mag,ci\n1,2,1,nope\n", "ci must be"),
-            ("ra,dec,mag\n\"unterminated,2,1\n", "malformed CSV record"),
+            ("ra,dec,mag\n\"unterminated,2,1\n", "not terminated"),
         ] {
             let error = catalog(contents).expect_err("invalid catalog");
             assert!(error.to_string().contains(expected), "{contents}: {error}");
         }
+    }
+
+    #[test]
+    fn validates_csv_quote_termination_while_allowing_escaped_and_multiline_fields() {
+        let error = catalog("ra,dec,mag,proper\n0,0,1,\"unfinished\n6,0,2,Second\n").unwrap_err();
+        assert!(
+            error.0.contains("quoted field is not terminated"),
+            "{error}"
+        );
+
+        let valid =
+            catalog("ra,dec,mag,proper\n0,0,1,\"A \"\"bright\"\" star\"\n6,0,2,\"Two\nlines\"\n")
+                .expect("escaped quotes and multiline quoted names are valid");
+        assert_eq!(valid.stars()[0].name.as_deref(), Some("A \"bright\" star"));
+        assert_eq!(valid.stars()[1].name.as_deref(), Some("Two\nlines"));
+    }
+
+    #[test]
+    fn bounds_csv_record_and_total_input_bytes() {
+        let large_record = format!(
+            "ra,dec,mag,proper\n0,0,1,\"{}\"\n",
+            "x".repeat(MAX_CSV_RECORD_BYTES)
+        );
+        let error = catalog(&large_record).unwrap_err();
+        assert!(error.0.contains("CSV record exceeds"), "{error}");
+
+        let oversized = vec![b'x'; MAX_CATALOG_BYTES + 1];
+        let error = StarCatalog::from_reader(oversized.as_slice()).unwrap_err();
+        assert!(
+            error.0.contains("catalog CSV exceeds the supported size"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -706,6 +908,121 @@ mod tests {
     }
 
     #[test]
+    fn projection_cache_hits_and_invalidates_every_projection_input() {
+        let catalog = Arc::new(catalog("ra,dec,mag\n0,45,1\n6,45,2\n").unwrap());
+        let mut state = SceneState::default();
+        let mut config = StarfieldConfig {
+            catalog: Arc::clone(&catalog),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: true,
+        };
+        state.configure_starfield(Some(config.clone()));
+        let profile = RenderProfile::pi5();
+        let mut instances = Vec::new();
+        build(
+            &profile,
+            ControlFrame::procedural(0),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        let first = state
+            .starfield_projection()
+            .as_ref()
+            .expect("snapshot cached")
+            .key
+            .clone();
+        let first_instances = instances.clone();
+        instances.clear();
+        build(
+            &profile,
+            ControlFrame::procedural(1),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<Instance, u8>(&instances),
+            bytemuck::cast_slice::<Instance, u8>(&first_instances)
+        );
+        assert_eq!(
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("snapshot retained")
+                .key,
+            first
+        );
+
+        let key_after = |state: &SceneState,
+                         profile: &RenderProfile,
+                         elapsed: f32,
+                         aspect: f32,
+                         viewport: (u32, u32)| {
+            let mut output = Vec::new();
+            build(
+                profile,
+                ControlFrame::procedural(2),
+                elapsed,
+                aspect,
+                viewport,
+                state,
+                &mut output,
+            );
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("snapshot cached")
+                .key
+                .clone()
+        };
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90)),
+            first
+        );
+        let epoch_key = key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90));
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 4.0 / 3.0, (160, 90)),
+            epoch_key
+        );
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (320, 180)),
+            epoch_key
+        );
+        let mut tight_profile = profile.clone();
+        tight_profile.instance_count = 1;
+        assert_ne!(
+            key_after(&state, &tight_profile, 10.0, 16.0 / 9.0, (160, 90)),
+            epoch_key
+        );
+
+        config.latitude_degrees = 44.0;
+        state.configure_starfield(Some(config));
+        assert!(state.starfield_projection().is_none());
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90)),
+            epoch_key
+        );
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog("ra,dec,mag\n1,45,1\n").unwrap()),
+            latitude_degrees: 44.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: true,
+        }));
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90)),
+            epoch_key
+        );
+    }
+
+    #[test]
     fn utc_clock_resynchronizes_to_wall_clock_at_snapshot_cadence() {
         let mut clock = UtcClock::new(1_000.0);
         assert_eq!(clock.update(1_000.1, 0.1), 1_000.1);
@@ -754,6 +1071,42 @@ mod tests {
         assert_eq!(seam_wrap_within_budget(true, 2), Some(true));
         assert_eq!(seam_wrap_within_budget(false, 1), Some(false));
         assert_eq!(seam_wrap_within_budget(true, 0), None);
+    }
+
+    #[test]
+    fn one_slot_budget_continues_past_unrenderable_seam_candidates() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for _ in 0..200 {
+            csv.push_str("18.698374558,45,1\n");
+        }
+        csv.push_str("20.697374558,45,2\n");
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let mut profile = RenderProfile::pi5();
+        profile.instance_count = 1;
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &profile,
+            ControlFrame::procedural(0),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert_eq!(instances.len(), 1);
+        assert!(
+            instances[0].center[0].abs() < 0.9,
+            "later non-seam candidate should fill the single slot: {:?}",
+            instances[0].center
+        );
     }
 
     #[test]
