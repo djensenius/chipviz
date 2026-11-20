@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Check short native overlay inputs through the production ROM in mGBA.
+"""Check native snapshots, field exits and cadence in the production ROM.
 
-Runs headlessly with synthetic pad input and no memory injection. A two-frame
-press starts after the first native redraw poll and is released before the
-page is presented. Each overlay must appear on a complete native page and
-disappear again. Requires an already-built ROM and an mGBA libretro core.
+Runs headlessly with synthetic pad input and no memory injection. Requires an
+already-built ROM and an mGBA libretro core; baseline comparisons require the
+original ROM. Emulator callback boundaries can add one frame of phase jitter.
 """
 
 import argparse
@@ -12,6 +11,8 @@ import ctypes
 import pathlib
 
 import nes_libretro_capture as libretro
+
+libretro.BUTTONS.update({"l": 10, "r": 11})
 
 
 class GbaCore(libretro.NesCore):
@@ -73,7 +74,7 @@ def assert_overlay_sequence(frames, expected, label):
   print(f"{label}: observed sampled states {changes} in order")
 
 
-def field_exit_sample(rom, core, schedule=None):
+def field_exit_sample(rom, core, schedule=None, spectral=False):
   gba = GbaCore(rom, core)
   try:
     for _ in range(120):
@@ -85,15 +86,35 @@ def field_exit_sample(rom, core, schedule=None):
         gba.run_frame()
     for _ in range(70):
       gba.run_frame()
+    if spectral:
+      for _ in range(8):
+        gba.run_frame(("right",))
+      for _ in range(50):
+        gba.run_frame()
     field = gba.pixels()
     frames = []
     for step in range(100):
-      buttons = ("down",) if step < 8 else ()
-      gba.run_frame(buttons + (schedule(step) if schedule else ()))
+      buttons = schedule(step) if schedule else (("down",) if step < 8 else ())
+      gba.run_frame(buttons)
       frames.append(gba.pixels())
     return field, frames
   finally:
     gba.close()
+
+
+def is_native(pixels):
+  return len(set(zip(pixels[::2], pixels[1::2]))) > 16
+
+
+def exit_index(frames):
+  return next((i for i, frame in enumerate(frames) if is_native(frame)), None)
+
+
+def assert_exit_timing(departure, start=0):
+  # One frame accounts for the callback/key-sampling phase, not an extra
+  # native redraw. The C state-machine test checks the exact step.
+  if departure is None or not start + 29 <= departure <= start + 31:
+    raise AssertionError(f"field exit expected at frames {start + 29}..{start + 31}, got {departure}")
 
 
 def native_sequence(rom, core, count=300):
@@ -179,61 +200,84 @@ def main():
       first = next(i for i, (a, b) in enumerate(zip(actual, reference)) if a != b)
       raise AssertionError(f"native page {first} differs from reference ROM")
     print("native production pages: 300 after startup match reference ROM pixel-for-pixel")
-  baseline = sample(args.rom, args.core)
-  changes = [i for i in range(1, len(baseline)) if baseline[i] != baseline[i - 1]]
-  if len(changes) < 3:
-    raise AssertionError("native renderer did not update")
-  # A page flip completes one redraw. Two frames later is inside the next
-  # redraw, not the poll on which that page's native state was first made.
-  start = changes[1] + 2
-  for button, axis, coordinate in (("a", "row", 12), ("b", "column", 12),
-                                    ("start", "row", 78), ("select", "column", 118)):
-    frames = sample(args.rom, args.core, button, start)
-    if any(uniform_line(frame, axis, coordinate) for frame in baseline[start:]):
-      raise AssertionError(f"{button}: baseline already has a solid overlay line")
-    shown = [i for i in range(start, len(frames)) if uniform_line(frames[i], axis, coordinate)]
-    if not shown:
-      raise AssertionError(f"{button}: short mid-redraw press was lost")
-    if shown[-1] >= len(frames) - 8:
-      raise AssertionError(f"{button}: released overlay did not clear")
-    print(f"{button}: short mid-redraw press shown at frames {shown[0]}..{shown[-1]}, then cleared")
-  if any(overlay_mask(frame) for frame in baseline[start:]):
-    raise AssertionError("baseline already resembles an A or B overlay")
-
   def ordered(step):
-    offset = step - start
-    return ("a",) if 0 <= offset < 2 else ("b",) if 4 <= offset < 6 else ()
+    return ("a",) if 8 <= step < 24 else ("b",) if 40 <= step < 56 else ()
 
   def simultaneous(step):
-    return ("a", "b") if start <= step < start + 2 else ()
+    return ("a", "b") if 8 <= step < 24 else ()
 
   def overlap(step):
-    offset = step - start
-    return ("a",) if 0 <= offset < 2 else ("a", "b") if offset < 4 and offset >= 2 else \
-           ("b",) if 4 <= offset < 6 else ()
+    return ("a",) if 8 <= step < 24 else ("a", "b") if 24 <= step < 40 else \
+           ("b",) if 40 <= step < 56 else ()
 
-  assert_overlay_sequence(sample(args.rom, args.core, schedule=ordered), [1, 0, 2, 0],
-                          "sequential A then B")
-  assert_overlay_sequence(sample(args.rom, args.core, schedule=simultaneous), [3, 0],
-                          "simultaneous A+B")
-  assert_overlay_sequence(sample(args.rom, args.core, schedule=overlap), [1, 3, 2, 0],
-                          "overlapping A then B")
+  for schedule, expected, label in ((ordered, [1, 0, 2, 0], "sequential A then B"),
+                                    (simultaneous, [3, 0], "simultaneous A+B"),
+                                    (overlap, [1, 3, 2, 0], "overlapping A then B")):
+    assert_overlay_sequence(sample(args.rom, args.core, schedule=schedule), expected, label)
+    if args.cadence_baseline:
+      assert_overlay_sequence(sample(args.cadence_baseline, args.core, schedule=schedule),
+                              expected, f"baseline {label}")
+
+  if args.cadence_baseline:
+    # Align to each ROM's own visible page flip. Short presses may be missed;
+    # what matters is that the new ROM samples like the original, not that it
+    # queues or combines states seen during the rest of the redraw.
+    for button, axis, coordinate in (("a", "row", 12), ("b", "column", 12),
+                                      ("start", "row", 78), ("select", "column", 118)):
+      outcomes = []
+      for rom in (args.cadence_baseline, args.rom):
+        idle = sample(rom, args.core)
+        changes = [i for i in range(1, len(idle)) if idle[i] != idle[i - 1]]
+        if len(changes) < 3:
+          raise AssertionError(f"{button}: native renderer did not update")
+        if any(uniform_line(frame, axis, coordinate) for frame in idle):
+          raise AssertionError(f"{button}: idle already has a solid overlay line")
+        outcomes.append([any(uniform_line(frame, axis, coordinate)
+                             for frame in sample(rom, args.core, button, changes[1] + offset))
+                         for offset in (1, 2, 3, 4)])
+      if outcomes[0] != outcomes[1]:
+        raise AssertionError(f"{button}: short-press sampling differs from baseline: {outcomes}")
+      print(f"{button}: short-press page snapshots match baseline {outcomes[0]}")
 
   field, exit_baseline = field_exit_sample(args.rom, args.core)
-  departure = next((i for i, frame in enumerate(exit_baseline) if frame != field), None)
-  if departure is None or departure < 30:
-    raise AssertionError(f"field exit did not debounce: {departure}")
+  departure = exit_index(exit_baseline)
+  assert_exit_timing(departure)
+  if any(frame != field for frame in exit_baseline[:departure]):
+    raise AssertionError("held field changed before native presentation")
 
   def exit_inputs(step):
-    return ("a",) if departure - 2 <= step < departure else \
-           ("b",) if departure + 1 <= step < departure + 3 else ()
+    return ("down", "a") if step < 8 else ("b",) if 20 <= step < 40 else ()
 
   exit_field, exit_frames = field_exit_sample(args.rom, args.core, exit_inputs)
   if exit_field != field:
     raise AssertionError("field-exit setup is not deterministic")
-  native_frames = [frame for frame in exit_frames if frame != field]
-  assert_overlay_sequence(native_frames, [1, 0, 2, 0], "inputs during field-exit redraw")
-  print("gba native production-loop overlay tests: 8 passed")
+  assert_exit_timing(exit_index(exit_frames))
+  assert_overlay_sequence(exit_frames[exit_index(exit_frames):], [1, 2, 0],
+                          "page-start A snapshot, later B and release")
+
+  def exit_chord(step):
+    return ("down", "a", "b") if step < 8 else ()
+
+  _, chord_frames = field_exit_sample(args.rom, args.core, exit_chord)
+  assert_exit_timing(exit_index(chord_frames))
+  assert_overlay_sequence(chord_frames[exit_index(chord_frames):], [3, 0], "real exit chord")
+
+  def cancelled(step):
+    return ("down",) if step < 8 or 30 <= step < 33 else ("up",) if 25 <= step < 28 else ()
+
+  _, cancelled_frames = field_exit_sample(args.rom, args.core, cancelled)
+  assert_exit_timing(exit_index(cancelled_frames), 30)
+
+  def energy_during_prepare(step):
+    return (("down",) if step < 8 else ()) + (("l",) if 10 <= step < 28 else ())
+
+  spectral_field, spectral_frames = field_exit_sample(args.rom, args.core, energy_during_prepare, spectral=True)
+  spectral_exit = exit_index(spectral_frames)
+  assert_exit_timing(spectral_exit)
+  if all(frame == spectral_field for frame in spectral_frames[:spectral_exit]):
+    raise AssertionError("field palette did not update during native preparation")
+  print(f"field exit: next-step presentation at frame {departure}; cancellation and live field updates OK")
+  print("gba native production-loop snapshot/control checks passed")
 
 
 if __name__ == "__main__":

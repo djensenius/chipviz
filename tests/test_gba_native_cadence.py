@@ -68,5 +68,22 @@ class OverlayComparison(unittest.TestCase):
       native.assert_overlay_sequence([frames[i] for i in (0, 3, 0)], [1, 0, 2, 0], "manufactured chord")
 
 
+class ExitComparison(unittest.TestCase):
+  def test_rejects_early_or_redraw_delayed_exit(self):
+    for departure in (29, 30, 31):
+      native.assert_exit_timing(departure)
+      native.assert_exit_timing(departure + 30, 30)
+    for departure in (None, 28, 32, 34):
+      with self.assertRaisesRegex(AssertionError, "field exit expected"):
+        native.assert_exit_timing(departure)
+
+  def test_detects_native_after_field_palette_changes(self):
+    field_a = b"\x01\x00" * (240 * 160)
+    field_b = b"\x02\x00" * (240 * 160)
+    page = overlay_frame(0)
+    self.assertFalse(native.is_native(field_a))
+    self.assertEqual(native.exit_index([field_a, field_b, page]), 2)
+
+
 if __name__ == "__main__":
   unittest.main()

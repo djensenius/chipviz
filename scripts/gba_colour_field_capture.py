@@ -233,7 +233,7 @@ for i in range(100):
   if frame != current:
     departure = i
     break
-assert departure is not None and departure >= 29, f"scene exit debounce: {departure}"
+assert departure is not None and 29 <= departure <= 31, f"scene exit debounce/presentation: {departure}"
 native_colours = len(set(struct.iter_unpack("<H", c.pixels())))
 assert native_colours > 16, f"native page has only {native_colours} colours"
 print("scene ring: scene 7 to native after", departure, "vblanks;", native_colours, "native colours", flush=True)

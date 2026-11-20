@@ -44,12 +44,11 @@ keys; it does **not** synthesize the gamepad D-pad pulses. Consequently it
 does not currently stream scene or palette selections to this GBA receiver.
 No keyboard or richer control-frame input is implemented by this ROM.
 
-For native overlays, sampled A/B/Select/Start states, including releases, are
-presented in order rather than combined across polls. The 16-transition queue
-drops newer transitions if input outruns presentation; after it drains, the
-latest held state is used. Scene and palette D-pad edges remain separate.
-On field exit, the last field page stays visible while the next native page is
-prepared in chunks and pad input continues to be polled.
+Native overlays use the A/B/Select/Start state sampled at the beginning of each
+page; short presses between snapshots can be missed. Scene and palette D-pad
+edges are polled separately. While a field exit debounces, the candidate
+native page is prepared in the hidden buffer using a page-start input and
+palette snapshot. A changed candidate discards that preparation.
 
 ## Constraints
 

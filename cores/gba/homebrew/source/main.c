@@ -2,7 +2,7 @@
 
 #include "colour_field.h"
 #include "input.h"
-#include "native_overlay.h"
+#include "native_prefetch.h"
 
 #define REG_DISPCNT (*(volatile uint16_t *)0x04000000)
 #define REG_VCOUNT (*(volatile uint16_t *)0x04000006)
@@ -197,38 +197,34 @@ static void render_background_rows(volatile uint16_t *target, uint16_t frame, co
   }
 }
 
+static void render_overlay_items(volatile uint16_t *target, uint16_t frame, const demo_state_t *state,
+                                 uint16_t keys, unsigned first, unsigned end) {
+  unsigned item;
+  for (item = first; item < end; ++item) {
+    if (item < 8u) {
+      int x = (int)item;
+      int bar_height = 10 + (state->spectrum[x] >> 2);
+      uint8_t bar_color = color_index(31, (uint8_t)((x * 3 + state->palette) & 31), (uint8_t)(31 - x * 3));
+      uint8_t tick_color = color_index((uint8_t)(state->energy >> 3), 31, 31);
+      fill_rect(target, 16 + x * 26, 150 - bar_height, 16, bar_height, bar_color);
+      fill_rect(target, 20 + x * 25, 32 + ((frame + x * 13) & 63), 12, 4, tick_color);
+    } else if (item == 8u && state->beat) {
+      fill_rect(target, 0, 0, SCREEN_WIDTH, 4, color_index(31, 31, 31));
+      fill_rect(target, 0, SCREEN_HEIGHT - 4, SCREEN_WIDTH, 4, color_index(31, 31, 31));
+    } else if (item == 9u && (keys & KEY_START)) {
+      fill_rect(target, 0, 78, SCREEN_WIDTH, 4, color_index(31, 31, 31));
+    } else if (item == 10u && (keys & KEY_SELECT)) {
+      fill_rect(target, 118, 0, 4, SCREEN_HEIGHT, color_index(31, 31, 31));
+    } else if (item >= 11u && item < 25u && (keys & KEY_A)) {
+      fill_rect(target, 0, (int)(item - 11u) * 12, SCREEN_WIDTH, 2, color_index(31, 31, 0));
+    } else if (item >= 25u && (keys & KEY_B)) {
+      fill_rect(target, (int)(item - 25u) * 12, 0, 2, SCREEN_HEIGHT, color_index(0, 31, 31));
+    }
+  }
+}
+
 static void render_overlay(volatile uint16_t *target, uint16_t frame, const demo_state_t *state, uint16_t keys) {
-  int x;
-  int y;
-
-  for (x = 0; x < 8; x++) {
-    int bar_height = 10 + (state->spectrum[x] >> 2);
-    uint8_t bar_color = color_index(31, (uint8_t)((x * 3 + state->palette) & 31), (uint8_t)(31 - x * 3));
-    uint8_t tick_color = color_index((uint8_t)(state->energy >> 3), 31, 31);
-    fill_rect(target, 16 + x * 26, 150 - bar_height, 16, bar_height, bar_color);
-    fill_rect(target, 20 + x * 25, 32 + ((frame + x * 13) & 63), 12, 4, tick_color);
-  }
-
-  if (state->beat) {
-    fill_rect(target, 0, 0, SCREEN_WIDTH, 4, color_index(31, 31, 31));
-    fill_rect(target, 0, SCREEN_HEIGHT - 4, SCREEN_WIDTH, 4, color_index(31, 31, 31));
-  }
-  if (keys & KEY_START) {
-    fill_rect(target, 0, 78, SCREEN_WIDTH, 4, color_index(31, 31, 31));
-  }
-  if (keys & KEY_SELECT) {
-    fill_rect(target, 118, 0, 4, SCREEN_HEIGHT, color_index(31, 31, 31));
-  }
-  if (keys & KEY_A) {
-    for (y = 0; y < SCREEN_HEIGHT; y += 12) {
-      fill_rect(target, 0, y, SCREEN_WIDTH, 2, color_index(31, 31, 0));
-    }
-  }
-  if (keys & KEY_B) {
-    for (x = 0; x < SCREEN_WIDTH; x += 12) {
-      fill_rect(target, x, 0, 2, SCREEN_HEIGHT, color_index(0, 31, 31));
-    }
-  }
+  render_overlay_items(target, frame, state, keys, 0u, GBA_PREFETCH_OVERLAYS);
 }
 
 static void make_field_palette(uint16_t *palette, const gba_cf_view_t *view) {
@@ -255,13 +251,16 @@ int main(void) {
   uint8_t native_polls = 0;
   int native_row = 0;
   uint16_t prev_keys = 0;
+  uint16_t native_keys = 0;
   uint16_t staged_palette[256];
+  uint16_t prefetch_palette[256];
   demo_state_t native_state;
+  demo_state_t prefetch_state;
   gba_cf_t field;
-  gba_native_overlay_t native_overlay;
+  gba_native_prefetch_t prefetch;
 
   gba_cf_init(&field);
-  gba_native_overlay_init(&native_overlay);
+  gba_native_prefetch_init(&prefetch);
   REG_DISPCNT = MODE4 | BG2_ENABLE;
   /* Do not take a pre-VBlank boot sample in addition to the frame samples. */
   wait_vblank();
@@ -280,28 +279,55 @@ int main(void) {
         /* Four x and four y classes encode all layout boundaries; only the
          * 16 palette entries change while this prepared page is shown. */
         gba_cf_render_bitmap(draw_target);
-      }
-      make_field_palette(staged_palette, &field.view);
-      wait_vblank();
-      present_palette(staged_palette, 16u);
-      if (!displaying_field) {
+        make_field_palette(staged_palette, &field.view);
+        wait_vblank();
+        present_palette(staged_palette, 16u);
         display_page ^= 1u;
         REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
         displaying_field = 1u;
+        gba_native_prefetch_init(&prefetch);
+      } else {
+        uint8_t first, end, work;
+        if (gba_native_prefetch_observe(&prefetch, scene, palette, keys)) {
+          make_demo_state(frame, prefetch.scene, prefetch.palette, &prefetch_state);
+          make_palette(prefetch_palette, frame, &prefetch_state);
+        }
+        work = gba_native_prefetch_next(&prefetch, &first, &end);
+        if (work == GBA_PREFETCH_BACKGROUND) {
+          render_background_rows(draw_target, frame, &prefetch_state, first, end);
+        } else if (work == GBA_PREFETCH_OVERLAY) {
+          render_overlay_items(draw_target, frame, &prefetch_state, prefetch.keys, first, end);
+        }
+        make_field_palette(staged_palette, &field.view);
+        wait_vblank();
+        present_palette(staged_palette, 16u);
       }
-      /* Discard an unfinished native page and its queued native inputs. */
       native_row = 0;
       native_polls = 0u;
-      gba_native_overlay_init(&native_overlay);
+    } else if (displaying_field && prefetch.ready) {
+      /* The committed candidate is already complete in the hidden page.
+       * Its palette and page flip are presented together at this step. */
+      wait_vblank();
+      present_palette(prefetch_palette, 256u);
+      display_page ^= 1u;
+      REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
+      displaying_field = 0u;
+      native_row = 0;
+      native_polls = 0u;
+      gba_native_prefetch_init(&prefetch);
+      frame++;
     } else {
       uint8_t seen_visible = 0u;
       uint8_t reached_vblank = 0u;
       uint16_t line = REG_VCOUNT;
-      /* Poll while building every native page, including the first after a
-       * field exit; the field remains visible until that page is complete. */
-      gba_native_overlay_sample(&native_overlay, keys);
+      /* If the preparation invariant ever fails, finish a page off-screen
+       * rather than expose partial VRAM. A stable 30-step candidate supplies
+       * at least 29 work polls for the 25-poll prefetch. */
+      /* Native overlays use the baseline's one snapshot per page. Scene and
+       * palette direction edges are still processed on every poll. */
       if (native_row == 0) {
         make_demo_state(frame, native_scene, palette, &native_state);
+        native_keys = keys;
       }
       if (native_polls < NATIVE_PRESENT_POLLS) {
         ++native_polls;
@@ -320,7 +346,7 @@ int main(void) {
       }
       if (native_row == BLOCK_ROWS && native_polls >= NATIVE_PRESENT_POLLS) {
         uint16_t before_overlay = line;
-        render_overlay(draw_target, frame, &native_state, gba_native_overlay_next(&native_overlay));
+        render_overlay(draw_target, frame, &native_state, native_keys);
         make_palette(staged_palette, frame, &native_state);
         line = REG_VCOUNT;
         if (seen_visible && before_overlay < SCREEN_HEIGHT && line >= SCREEN_HEIGHT) {
