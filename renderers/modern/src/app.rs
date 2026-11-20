@@ -201,7 +201,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                 // The colour field sees each received or generated frame once;
                 // held redraws only repeat its last step.
                 for fresh in frame_source.fresh() {
-                    renderer.pipeline_mut().observe(fresh);
+                    renderer.pipeline_mut().observe(fresh, elapsed);
                 }
                 // The waveform side channel only describes mic frames; UDP
                 // and procedural frames make the layers fall back.

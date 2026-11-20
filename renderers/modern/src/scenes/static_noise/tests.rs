@@ -823,13 +823,14 @@ impl Series {
     }
 }
 
-/// `frames` rendered through a state stepped on every frame, or
-/// frame-timed (`observe` false): the frames of `sections` and the first
-/// second of the next (or until `frames` ends), sampled every frame in
-/// pixel sections and every `GLYPH_STRIDE`th in glyph sections.
+/// `frames` rendered through a state stepped on every frame, untimed (each
+/// frame 1/60 s) or, with `fps`, on a clock at that rate as the renderer
+/// runs it: the frames of `sections` and the first 60 frames of the next
+/// (or until `frames` ends), sampled every frame in pixel sections and
+/// every `GLYPH_STRIDE`th in glyph sections.
 fn tile_series(
     frames: impl Iterator<Item = ControlFrame>,
-    observe: bool,
+    fps: Option<f64>,
     sections: std::ops::Range<u16>,
 ) -> Series {
     let until = sections.end;
@@ -840,8 +841,9 @@ fn tile_series(
     let mut instances = Vec::new();
     let mut reached = None;
     for (index, frame) in frames.enumerate() {
-        if observe {
-            state.observe(&frame);
+        match fps {
+            Some(fps) => state.observe_at(&frame, index as f64 / fps),
+            None => state.observe(&frame),
         }
         let clock = state.static_noise.clock(frame);
         if clock.index == until {
@@ -864,10 +866,10 @@ fn tile_series(
 }
 
 /// WCAG 2.3.1 general flashes, as the colour field's `wcag_flashes` counts
-/// them, for one luminance series (`values`, sampled on `frames` at 60
-/// frames per second): opposing changes of at least 0.1 with the darker
+/// them, for one luminance series (`values`, sampled on `frames`, `second`
+/// frames to a second): opposing changes of at least 0.1 with the darker
 /// state below 0.8, paired, most in any one-second window.
-fn most_flashes(frames: &[usize], values: &[f32]) -> usize {
+fn most_flashes(frames: &[usize], values: &[f32], second: usize) -> usize {
     let mut opposing: Vec<usize> = Vec::new();
     let mut last = None;
     // Changes accumulate between reversals, so a slow ramp counts too.
@@ -894,7 +896,7 @@ fn most_flashes(frames: &[usize], values: &[f32]) -> usize {
         .map(|start| {
             opposing[start..]
                 .iter()
-                .take_while(|&&frame| frame < opposing[start] + SECOND)
+                .take_while(|&&frame| frame < opposing[start] + second)
                 .count()
                 / 2
         })
@@ -961,16 +963,19 @@ fn luminance_report(series: &Series) -> (f32, f32, usize) {
             per_second = per_second.max(tiles[highs[0]][tile] - tiles[lows[0]][tile]);
         }
     }
-    let flashes = (0..TILES_X * TILES_Y)
+    (per_sample, per_second, worst_flashes(series, SECOND))
+}
+
+/// The most WCAG flashes in 1 s in any tile of `series`, with `second`
+/// frames to a second.
+fn worst_flashes(series: &Series, second: usize) -> usize {
+    (0..TILES_X * TILES_Y)
         .map(|tile| {
-            most_flashes(
-                frames,
-                &tiles.iter().map(|tiles| tiles[tile]).collect::<Vec<_>>(),
-            )
+            let values: Vec<f32> = series.tiles.iter().map(|tiles| tiles[tile]).collect();
+            most_flashes(&series.frames, &values, second)
         })
         .max()
-        .unwrap_or(0);
-    (per_sample, per_second, flashes)
+        .unwrap_or(0)
 }
 
 /// Steady energy and palette, so the only large-area changes are the
@@ -1053,8 +1058,10 @@ fn one_second_change_counts_a_rise_and_fall_within_the_second() {
 ///
 /// Supporting evidence only, not a substitute for PEAT or a Harding check.
 /// Energy drives noise density, slew-limited (#116):
-/// `procedural_energy_keeps_noise_flashes_bounded` and
-/// `square_wave_energy_keeps_noise_flashes_bounded` bound that.
+/// `procedural_energy_keeps_noise_flashes_bounded` and the
+/// `square_wave_energy_keeps_pixel_noise_flashes_bounded` and
+/// `square_wave_energy_keeps_glyph_noise_flashes_bounded` tests (with the
+/// pixel test at 120 and 240 fps) bound that.
 #[test]
 fn beat_changes_keep_luminance_flashes_bounded() {
     type Input = (&'static str, fn(u64) -> ControlFrame);
@@ -1081,7 +1088,7 @@ fn beat_changes_keep_luminance_flashes_bounded() {
             .flat_map(|&(name, input)| {
                 [0..4, 4..8].map(|half| {
                     scope.spawn(move || {
-                        let series = tile_series((0..).map(input), true, half.clone());
+                        let series = tile_series((0..).map(input), None, half.clone());
                         (name, half, series)
                     })
                 })
@@ -1114,24 +1121,42 @@ fn beat_changes_keep_luminance_flashes_bounded() {
 /// if rendered as a sequence.
 #[test]
 fn procedural_energy_keeps_noise_flashes_bounded() {
-    // One thread per half, as in the flash test.
+    // One thread per rate and half, as in the flash test.
     let flashes = std::thread::scope(|scope| {
-        [0..4, 4..8]
-            .map(|half| {
-                scope.spawn(move || {
-                    let frames = (0..4096).map(ControlFrame::procedural);
-                    luminance_report(&tile_series(frames, true, half)).2
+        [60.0, 120.0, 240.0]
+            .map(|fps| {
+                [0..4, 4..8].map(|half| {
+                    scope.spawn(move || {
+                        let frames = (0..4096).map(ControlFrame::procedural);
+                        let series = tile_series(frames, Some(fps), half);
+                        worst_flashes(&series, fps as usize)
+                    })
                 })
             })
-            .map(|run| run.join().unwrap())
+            .map(|halves| halves.map(|run| run.join().unwrap()))
     });
-    assert!(flashes.iter().all(|&flashes| flashes <= 3), "{flashes:?}");
+    eprintln!("procedural {flashes:?}");
+    assert!(
+        flashes.iter().flatten().all(|&flashes| flashes <= 3),
+        "{flashes:?}"
+    );
 }
 
-/// Worst flash pairs in 1 s in any tile for a square wave of `period`
-/// frames between silence and full energy, over 150 frames from each of
-/// `starts`, sampled every `stride` frames.
-fn square_wave_flashes(period: usize, starts: &[u16], stride: usize) -> usize {
+/// An energy square wave as the renderer would see it: `fps` observations
+/// a second (the frame counter advancing on each, as procedural and mic
+/// input do on every redraw), energy jumping between `low` and 255 every
+/// half `period` observations, and `palette` held or (`None`) procedural.
+#[derive(Clone, Copy)]
+struct Wave {
+    fps: f64,
+    period: usize,
+    low: u8,
+    palette: Option<u8>,
+}
+
+/// Worst flash pairs in 1 s in any tile for `wave` over 2.5 s from each of
+/// `starts`, sampled every `stride` observations.
+fn square_wave_flashes(wave: Wave, starts: &[u16], stride: usize) -> usize {
     let profile = RenderProfile::pi5();
     let rainbow = rainbow_luminance();
     let mut worst = 0;
@@ -1139,13 +1164,15 @@ fn square_wave_flashes(period: usize, starts: &[u16], stride: usize) -> usize {
         let mut state = SceneState::default();
         let mut series = Series::default();
         let mut instances = Vec::new();
-        for index in 0..150 {
-            let high = index * 2 / period % 2 == 1;
+        for index in 0..(2.5 * wave.fps) as usize {
+            let high = index * 2 / wave.period % 2 == 1;
+            let procedural = ControlFrame::procedural(u64::from(start) + index as u64);
             let frame = ControlFrame {
-                energy: if high { 255 } else { 0 },
-                ..ControlFrame::procedural(u64::from(start) + index as u64)
+                energy: if high { 255 } else { wave.low },
+                palette: wave.palette.unwrap_or(procedural.palette),
+                ..procedural
             };
-            state.observe(&frame);
+            state.observe_at(&frame, index as f64 / wave.fps);
             if index % stride != 0 {
                 continue;
             }
@@ -1155,23 +1182,22 @@ fn square_wave_flashes(period: usize, starts: &[u16], stride: usize) -> usize {
             series.tiles.push(tile_estimate(&instances, rainbow));
             series.sections.push(0);
         }
-        worst = worst.max(luminance_report(&series).2);
+        worst = worst.max(worst_flashes(&series, wave.fps as usize));
     }
     worst
 }
 
-/// `square_wave_flashes` for every period from 2 to 60 frames, a thread
-/// per few periods: (period, flashes).
-fn square_wave_sweep(starts: [u16; 2], stride: usize) -> Vec<(usize, usize)> {
-    let periods: Vec<usize> = (2..=60).collect();
+/// `square_wave_flashes` for each of `waves`, a thread per few waves:
+/// (wave, flashes).
+fn square_wave_sweep(waves: &[Wave], starts: &[u16], stride: usize) -> Vec<(Wave, usize)> {
     std::thread::scope(|scope| {
-        let runs: Vec<_> = periods
-            .chunks(5)
+        let runs: Vec<_> = waves
+            .chunks(waves.len().div_ceil(12))
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|&period| (period, square_wave_flashes(period, &starts, stride)))
+                        .map(|&wave| (wave, square_wave_flashes(wave, starts, stride)))
                         .collect::<Vec<_>>()
                 })
             })
@@ -1180,6 +1206,39 @@ fn square_wave_sweep(starts: [u16; 2], stride: usize) -> Vec<(usize, usize)> {
             .flat_map(|run| run.join().unwrap())
             .collect()
     })
+}
+
+/// Silence to full energy at 60 fps, every period from 2 to 60 frames,
+/// with the procedural palettes.
+fn sixty_fps_waves() -> Vec<Wave> {
+    (2..=60)
+        .map(|period| Wave {
+            fps: 60.0,
+            period,
+            low: 0,
+            palette: None,
+        })
+        .collect()
+}
+
+fn assert_bounded(results: Vec<(Wave, usize)>) {
+    eprintln!(
+        "{:?}",
+        results
+            .iter()
+            .filter(|(_, flashes)| *flashes > 1)
+            .map(|(wave, flashes)| (wave.fps, wave.period, wave.low, *flashes))
+            .collect::<Vec<_>>()
+    );
+    for (wave, flashes) in results {
+        let Wave {
+            fps, period, low, ..
+        } = wave;
+        assert!(
+            flashes <= 3,
+            "{fps} fps, period {period}, {low}..255: {flashes} flashes"
+        );
+    }
 }
 
 /// #116, the worst case for pixel noise, which follows energy most: energy
@@ -1196,9 +1255,7 @@ fn square_wave_sweep(starts: [u16; 2], stride: usize) -> Vec<(usize, usize)> {
 #[test]
 fn square_wave_energy_keeps_pixel_noise_flashes_bounded() {
     let starts = [4 * SECTION_FRAMES, 7 * SECTION_FRAMES];
-    for (period, flashes) in square_wave_sweep(starts, 1) {
-        assert!(flashes <= 3, "period {period}: {flashes} flashes");
-    }
+    assert_bounded(square_wave_sweep(&sixty_fps_waves(), &starts, 1));
 }
 
 /// As above for glyph noise: plain noise (section 3) and the white glyph
@@ -1209,9 +1266,57 @@ fn square_wave_energy_keeps_pixel_noise_flashes_bounded() {
 #[test]
 fn square_wave_energy_keeps_glyph_noise_flashes_bounded() {
     let starts = [3 * SECTION_FRAMES, 9 * SECTION_FRAMES];
-    for (period, flashes) in square_wave_sweep(starts, GLYPH_STRIDE) {
-        assert!(flashes <= 3, "period {period}: {flashes} flashes");
-    }
+    assert_bounded(square_wave_sweep(&sixty_fps_waves(), &starts, GLYPH_STRIDE));
+}
+
+/// The pixel test above at redraw rates over 60 fps (`fps / 60`
+/// observations per 1/60 s), where a per-frame limit would let the energy
+/// move two or four times as fast: square waves between silence or 180
+/// (the review's case, where luminance is steepest) and full energy, with
+/// palette 2 (the steepest) on black pixel noise (7), at periods of 2 to 60
+/// sixtieths of a second (every other sixtieth at 120 fps, every seventh at
+/// 240) plus 17 observations; and the review's 180..255
+/// wave at period 17 on both pixel sections (4 and 7). The limit is per
+/// 1/60 s of clock, so the bound and argument are those at 60 fps.
+fn high_rate_waves(fps: f64, step: usize) -> Vec<Wave> {
+    let per = fps as usize / 60;
+    (per * 2..=per * 60)
+        .step_by(step)
+        .chain([17])
+        .flat_map(|period| {
+            [0, 180].map(|low| Wave {
+                fps,
+                period,
+                low,
+                palette: Some(2),
+            })
+        })
+        .collect()
+}
+
+fn review_case(fps: f64) -> Vec<(Wave, usize)> {
+    let wave = Wave {
+        fps,
+        period: 17,
+        low: 180,
+        palette: Some(2),
+    };
+    let starts = [4 * SECTION_FRAMES, 7 * SECTION_FRAMES];
+    square_wave_sweep(&[wave], &starts, 1)
+}
+
+#[test]
+fn square_wave_energy_keeps_pixel_noise_flashes_bounded_at_120_fps() {
+    let starts = [7 * SECTION_FRAMES];
+    assert_bounded(square_wave_sweep(&high_rate_waves(120.0, 4), &starts, 1));
+    assert_bounded(review_case(120.0));
+}
+
+#[test]
+fn square_wave_energy_keeps_pixel_noise_flashes_bounded_at_240_fps() {
+    let starts = [7 * SECTION_FRAMES];
+    assert_bounded(square_wave_sweep(&high_rate_waves(240.0, 28), &starts, 1));
+    assert_bounded(review_case(240.0));
 }
 
 /// A solid white quad over pixels `x` x `y` of the `RASTER_W` x
