@@ -698,7 +698,7 @@ fn build_uncached(
             .colour_index
             .map(color_index_rgb)
             .unwrap_or([1.0, 1.0, 1.0]);
-        let tint = tint_at_luminance(tint, star_output_luminance(brightness));
+        let color = tint_at_luminance(tint, star_output_luminance(brightness));
         // The size curve preserves magnitude ordering while keeping points
         // discernible at small output sizes.
         let size_pixels = star_size_pixels(brightness);
@@ -707,12 +707,7 @@ fn build_uncached(
         let instance = Instance {
             center: [center[0], center[1], 0.0],
             size,
-            color: [
-                tint[0] * brightness,
-                tint[1] * brightness,
-                tint[2] * brightness,
-                1.0,
-            ],
+            color: [color[0], color[1], color[2], 1.0],
             rotation: 0.0,
             scene_mix: 0.0,
             pattern: [0.0; 2],
@@ -1833,6 +1828,42 @@ mod tests {
         assert_eq!(
             tint_at_luminance([f32::NAN, 0.0, 0.0], fallback_luminance),
             [fallback_luminance; 3]
+        );
+    }
+
+    #[test]
+    fn built_faint_white_star_applies_magnitude_luminance_once() {
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog("ra,dec,mag\n18.7,45,6.5\n").unwrap()),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+
+        assert_eq!(instances.len(), 1);
+        let instance = instances[0];
+        let luminance = rec709_luminance([instance.color[0], instance.color[1], instance.color[2]]);
+        assert!(
+            (0.0050..=0.0053).contains(&luminance),
+            "built magnitude-6.5 white star should retain about 0.00515 linear luminance, got {luminance}"
+        );
+        assert_eq!(instance.color[3], 1.0);
+        assert!(
+            instance.color[..3]
+                .iter()
+                .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
         );
     }
 
