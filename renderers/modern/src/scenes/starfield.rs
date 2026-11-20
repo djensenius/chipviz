@@ -170,9 +170,13 @@ impl StarCatalog {
         let mut reader = csv::ReaderBuilder::new()
             .flexible(false)
             .from_reader(Cursor::new(input.as_slice()));
-        let headers = reader
-            .headers()
-            .map_err(|error| CatalogError(format!("could not read CSV header row: {error}")))?;
+        let header_line = record_lines.first().copied().unwrap_or(1);
+        let headers = reader.headers().map_err(|error| {
+            let detail = csv_record_error_detail(&error);
+            CatalogError(format!(
+                "could not read CSV header row on line {header_line}: {detail}"
+            ))
+        })?;
         let mut columns = std::collections::HashMap::new();
         for (index, name) in headers.iter().enumerate() {
             if columns.insert(name.to_string(), index).is_some() {
@@ -881,6 +885,27 @@ mod tests {
                     .0
                     .starts_with("malformed CSV record on line 3: found 2 fields, expected 3"),
                 "expected one consistent physical source line for {contents:?}, got {error}"
+            );
+            assert!(
+                !error.0.contains("line:"),
+                "CSV library line metadata must not contradict the physical line: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_header_reports_physical_line_after_blank_records() {
+        for contents in [
+            &b"\n\nra,dec,mag\xff\n0,0,1\n"[..],
+            &b"\r\n\r\nra,dec,mag\xff\r\n0,0,1\r\n"[..],
+            &b"\r\rra,dec,mag\xff\r0,0,1\r"[..],
+        ] {
+            let error = StarCatalog::from_reader(contents).unwrap_err();
+            assert!(
+                error
+                    .0
+                    .starts_with("could not read CSV header row on line 3: invalid UTF-8:"),
+                "expected sanitized physical line 3 in header error, got {error}"
             );
             assert!(
                 !error.0.contains("line:"),
