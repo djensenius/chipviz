@@ -10,9 +10,10 @@ Records are retrieved individually as complete envelopes, never as stripped
 legacy frames. The snapshot is not a playback or transport interface.
 Snapshot access is not thread-safe.
 
-Structural validity is not renderer availability or authorization. In
-particular Starfield is unavailable: no private assets or provenance documents
-are read or verified here. CRC and hashes do not authenticate input.
+Structural validity is not renderer availability or authorization. Starfield
+is unavailable and files containing it are rejected after structural
+validation; no private assets or provenance documents are read or verified
+here. CRC and hashes do not authenticate input.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ MAX_FILE_SIZE = HEADER_SIZE + RECORD_SIZE * MAX_RECORDS
 _MIN_EPOCH = 946_684_800_000
 _MAX_EPOCH = 4_102_444_799_999
 _MAX_VARIANT = (0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0)
+
+
+class UnavailableSceneError(ValueError):
+  """The structurally valid catalog contains a currently unavailable scene."""
 
 
 def _crc(data: bytes) -> int:
@@ -163,9 +168,10 @@ def open_catalog(fd: int) -> Catalog:
   on remote, virtual, or faulty filesystems.
 
   Raises TypeError for path arguments, ValueError for invalid structure or
-  non-regular input, or OSError for I/O failures. No record is exposed on
-  failure, including errors in later records, at EOF, or while flushing the
-  snapshot. The caller must independently establish renderer and safety
+  non-regular input, UnavailableSceneError for structurally valid files
+  containing Starfield, or OSError for I/O failures. No record is exposed
+  on failure, including errors in later records, at EOF, or while flushing
+  the snapshot. The caller must independently establish renderer and safety
   conditions.
   """
   snapshot = None
@@ -195,6 +201,8 @@ def open_catalog(fd: int) -> Catalog:
         snapshot.write(wire)
       if source.read(1):
         raise ValueError("trailing bytes")
+      if star_metadata is not None:
+        raise UnavailableSceneError("Starfield is unavailable")
       snapshot.flush()
     return Catalog(snapshot, header, count)
   except BaseException:
