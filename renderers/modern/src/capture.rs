@@ -625,7 +625,7 @@ mod tests {
                 last = match mode {
                     Some(_) => renderer.render(frame, elapsed).unwrap(),
                     None => {
-                        renderer.pipeline_mut().observe(&frame);
+                        renderer.pipeline_mut().observe(&frame, elapsed);
                         renderer
                             .render_with(|pipeline, encoder, view| {
                                 pipeline.encode_without_mic_layers(
@@ -710,7 +710,7 @@ mod tests {
             };
             let elapsed = elapsed(index);
             let drawn = layered.render(frame, elapsed).unwrap();
-            baseline.pipeline_mut().observe(&frame);
+            baseline.pipeline_mut().observe(&frame, elapsed);
             let base = baseline
                 .render_with(|pipeline, encoder, view| {
                     pipeline.encode_without_mic_layers(
@@ -803,7 +803,7 @@ mod tests {
             };
             let elapsed = elapsed(index);
             let drawn = layered.render(frame, elapsed).unwrap();
-            baseline.pipeline_mut().observe(&frame);
+            baseline.pipeline_mut().observe(&frame, elapsed);
             let base = baseline
                 .render_with(|pipeline, encoder, view| {
                     pipeline.encode_without_mic_layers(

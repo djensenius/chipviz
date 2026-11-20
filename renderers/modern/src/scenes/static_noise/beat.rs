@@ -8,6 +8,12 @@
 //! state starts: it joins that schedule on its first frame. With procedural
 //! input (a beat every 16 frames) sections then start on exactly the frames
 //! the frame-timed schedule used.
+//!
+//! The state also slew-limits the energy the noise follows (see
+//! `ENERGY_SLEW`), so no energy signal can strobe the noise density. The
+//! limit is per unit of time, not per frame: the renderer passes its clock
+//! ([`StaticState::observe_at`]), so redraws or packets faster than 60 per
+//! second, and counter jumps, do not speed the noise up.
 
 use super::{Content, DISSOLVE_START, HOLD_START, SECTION_FRAMES, section_at};
 use crate::control_frame::ControlFrame;
@@ -36,6 +42,13 @@ pub(super) const FLIP_SPREAD: u16 = 24;
 pub(super) const FLIP_CYCLE: u16 = 12;
 /// A flip must finish before the section's dissolve starts.
 pub(super) const LAST_FLIP: u16 = DISSOLVE_START - FLIP_SPREAD - FLIP_CYCLE;
+/// Most the energy the noise follows (0 to 1) moves per 1/60 s, so silence
+/// to full energy takes `1 / ENERGY_SLEW` sixtieths of a second (see the
+/// module docs' flash safety).
+pub(super) const ENERGY_SLEW: f32 = 1.0 / 48.0;
+/// Longest gap between observations the energy slew credits, in seconds,
+/// so a stall does not let the energy jump.
+const MAX_ENERGY_GAP_S: f64 = MAX_FRAME_STEP as f64 / FRAME_RATE as f64;
 
 /// A camera framing applied on top of the section's move: yaw and pitch
 /// (radians) are added, `zoom` scales the distance.
@@ -103,10 +116,18 @@ pub(super) struct Clock {
     /// `local` when the last flip started.
     pub flip_at: u16,
     pub framing: Framing,
+    /// The energy (0 to 1) the noise follows, slew-limited.
+    pub energy: f32,
+}
+
+/// `frame`'s energy, 0 to 1.
+fn raw_energy(frame: ControlFrame) -> f32 {
+    f32::from(frame.energy) / 255.0
 }
 
 impl Clock {
-    /// The frame-timed schedule: a section every 512 frames, head on.
+    /// The frame-timed schedule: a section every 512 frames, head on, at
+    /// the frame's own energy.
     pub(super) fn frame_timed(frame: ControlFrame) -> Self {
         Self {
             index: frame.frame / SECTION_FRAMES,
@@ -114,6 +135,7 @@ impl Clock {
             flips: 0,
             flip_at: 0,
             framing: REST,
+            energy: raw_energy(frame),
         }
     }
 }
@@ -143,6 +165,17 @@ pub struct StaticState {
     ease: f32,
     flips: u16,
     flip_at: u16,
+    /// The slew-limited energy (see `ENERGY_SLEW`).
+    energy: f32,
+    /// The latest clock (seconds) observed, if the last observation was
+    /// timed.
+    energy_at: Option<f64>,
+    /// The energy before, and the slew allowed in, the latest clock step:
+    /// frames observed at the same clock (packets queued for one redraw)
+    /// share that step, each re-aiming it at its own energy, so the newest
+    /// one sets it.
+    energy_from: f32,
+    energy_reach: f32,
 }
 
 impl Default for StaticState {
@@ -159,14 +192,31 @@ impl Default for StaticState {
             ease: MIN_EASE_FRAMES,
             flips: 0,
             flip_at: 0,
+            energy: 0.0,
+            energy_at: None,
+            energy_from: 0.0,
+            energy_reach: 0.0,
         }
     }
 }
 
 impl StaticState {
-    /// Steps on one new frame. A frame whose counter repeats the last one is
-    /// ignored, like Lines' state.
+    /// Steps on one new frame, counted as 1/60 s for the energy slew
+    /// whatever the frame counter's step (tests). A frame
+    /// whose counter repeats the last one is ignored, like Lines' state.
+    #[cfg(test)]
     pub fn observe(&mut self, frame: &ControlFrame) {
+        self.step(frame, None);
+    }
+
+    /// As [`observe`](Self::observe), with the energy slewing by the
+    /// `elapsed` seconds since the last timed observation (at most
+    /// `MAX_ENERGY_GAP_S`): the renderer's path, at any frame rate.
+    pub fn observe_at(&mut self, frame: &ControlFrame, elapsed: f64) {
+        self.step(frame, Some(elapsed));
+    }
+
+    fn step(&mut self, frame: &ControlFrame, elapsed: Option<f64>) {
         let seen = Seen {
             frame: frame.frame,
             beat_count: frame.beat_count,
@@ -175,6 +225,10 @@ impl StaticState {
             // Join the frame-timed schedule.
             let clock = Clock::frame_timed(*frame);
             (self.index, self.local) = (clock.index, clock.local);
+            self.energy = clock.energy;
+            self.energy_at = elapsed;
+            // Frames queued with this one join at their own energy too.
+            (self.energy_from, self.energy_reach) = (0.0, f32::INFINITY);
             self.last = Some(seen);
             return;
         };
@@ -186,6 +240,38 @@ impl StaticState {
         let frames = if step <= MAX_FRAME_STEP { step } else { 1 };
         self.local = self.local.saturating_add(frames);
         self.since_bar = self.since_bar.saturating_add(frames);
+        // Sixtieths of a second since the latest clock seen (`None` when it
+        // is exactly that clock, a frame queued for the same redraw). At exactly 60 fps this rounds to 1.0, so timed
+        // and untimed replays match.
+        let ticks = match (elapsed, self.energy_at) {
+            (Some(now), Some(then)) => {
+                // A backward or NaN clock starts a step with no time, so
+                // the energy holds rather than re-aiming the last step.
+                let gap = now - then;
+                if gap > 0.0 {
+                    Some((gap.min(MAX_ENERGY_GAP_S) * f64::from(FRAME_RATE)) as f32)
+                } else if gap == 0.0 {
+                    None
+                } else {
+                    Some(0.0)
+                }
+            }
+            _ => Some(1.0),
+        };
+        // Keep the latest time (`max` ignores NaN), so a clock stepping back
+        // and forth cannot re-earn the gap.
+        self.energy_at = match (elapsed, self.energy_at) {
+            (Some(now), Some(then)) => Some(now.max(then)),
+            _ => elapsed,
+        };
+        // A new clock step slews from the current energy; a frame at the
+        // same clock re-aims the latest step at its own energy instead of
+        // spending more (or, for an older frame first, all) of it.
+        if let Some(ticks) = ticks {
+            (self.energy_from, self.energy_reach) = (self.energy, ENERGY_SLEW * ticks);
+        }
+        let (from, reach) = (self.energy_from, self.energy_reach);
+        self.energy = from + (raw_energy(*frame) - from).clamp(-reach, reach);
         let beats = frame.beat_count.wrapping_sub(last.beat_count);
         let advanced = (1..=MAX_BEAT_STEP).contains(&beats);
         self.stalled = if advanced {
@@ -228,6 +314,7 @@ impl StaticState {
             flips: self.flips,
             flip_at: self.flip_at,
             framing: REST,
+            energy: self.energy,
         }
     }
 
@@ -477,5 +564,207 @@ mod tests {
     fn states_are_deterministic() {
         let frames: Vec<_> = (0..3000).map(live).collect();
         assert_eq!(run(frames.iter().copied()), run(frames.iter().copied()));
+    }
+
+    /// Square waves between silence and full energy, every period from 2
+    /// to 60 frames, then a 60-frame hold at full energy.
+    fn square_waves() -> Vec<ControlFrame> {
+        let mut frames: Vec<_> = (2..=60u64)
+            .flat_map(|period| (0..120).map(move |index| index * 2 / period % 2 == 1))
+            .chain((0..60).map(|_| true))
+            .map(|high| ControlFrame {
+                energy: if high { 255 } else { 0 },
+                ..ControlFrame::procedural(0)
+            })
+            .collect();
+        for (index, frame) in frames.iter_mut().enumerate() {
+            frame.frame = index as u16;
+        }
+        frames
+    }
+
+    #[test]
+    fn energy_follows_any_input_within_the_slew() {
+        // The flash argument in the module docs needs a 0.1 reversal of
+        // tile luminance (about 0.39 per unit of energy) to take well over
+        // 60 / 7 frames; this catches the limit being removed or loosened.
+        const { assert!(ENERGY_SLEW <= 1.0 / 30.0) };
+        // Untimed, each observation is 1/60 s, whatever the counter's
+        // step: dropped frames and jumps (here 8 on every frame, then 3,
+        // 8 and 900) move it no faster.
+        let frames = square_waves();
+        let jumps = frames.iter().map(|frame| ControlFrame {
+            frame: frame.frame.wrapping_mul(MAX_FRAME_STEP),
+            ..*frame
+        });
+        let mut jumped: Vec<_> = jumps.collect();
+        for (offset, skip) in [3, MAX_FRAME_STEP, 900].into_iter().enumerate() {
+            let last = jumped[jumped.len() - 1];
+            jumped.push(ControlFrame {
+                frame: last.frame.wrapping_add(skip),
+                energy: if offset % 2 == 0 { 0 } else { 255 },
+                ..last
+            });
+        }
+        for frames in [&frames, &jumped] {
+            let clocks = run(frames.iter().copied());
+            for (index, pair) in clocks.windows(2).enumerate() {
+                let moved = (pair[1].energy - pair[0].energy).abs();
+                assert!(moved <= ENERGY_SLEW + 1e-6, "frame {index}: {moved}");
+                assert!((0.0..=1.0).contains(&pair[1].energy));
+            }
+        }
+        // The hold reaches full energy within `1 / ENERGY_SLEW` frames.
+        let clocks = run(frames.iter().copied());
+        assert_eq!(clocks[clocks.len() - 1].energy, 1.0);
+        // A state starts at the first frame's energy, as the frame-timed
+        // clock does.
+        assert_eq!(clocks[0].energy, 0.0);
+        assert_eq!(run([ControlFrame::procedural(7)])[0].energy, 139.0 / 255.0);
+    }
+
+    /// Steps a fresh state through `frames` at the clock times `times`.
+    fn run_at(frames: &[ControlFrame], times: &[f64]) -> Vec<f32> {
+        let mut state = StaticState::default();
+        frames
+            .iter()
+            .zip(times)
+            .map(|(frame, &time)| {
+                state.observe_at(frame, time);
+                state.clock(*frame).energy
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timed_energy_slews_per_second_at_any_frame_rate() {
+        let frames = square_waves();
+        // At exactly 60 fps the timed path is the untimed one, bit for bit,
+        // so captures and goldens match.
+        let sixty: Vec<f64> = (0..frames.len()).map(|index| index as f64 / 60.0).collect();
+        let untimed: Vec<f32> = run(frames.iter().copied())
+            .iter()
+            .map(|clock| clock.energy)
+            .collect();
+        assert_eq!(run_at(&frames, &sixty), untimed);
+        // At 120 and 240 fps, and with a stall, a backward step and a NaN
+        // clock, the energy moves at most `ENERGY_SLEW` per 1/60 s of
+        // clock (a stall credits at most `MAX_ENERGY_GAP_S`).
+        for fps in [120.0, 240.0] {
+            let mut times: Vec<f64> = (0..frames.len()).map(|index| index as f64 / fps).collect();
+            let at = times.len() / 2;
+            times[at..].iter_mut().for_each(|time| *time += 5.0);
+            times[at + 10] = 0.0;
+            times[at + 20] = f64::NAN;
+            let energies = run_at(&frames, &times);
+            // Each observation stays within its clock step's slew of the
+            // energy before that step (observations that do not advance
+            // the clock share the latest step).
+            let (mut latest, mut from, mut ticks) = (times[0], energies[0], 0.0);
+            for (index, pair) in energies.windows(2).enumerate() {
+                let now = times[index + 1];
+                if now - latest > 0.0 {
+                    (from, ticks) = (pair[0], (now - latest).min(MAX_ENERGY_GAP_S) * 60.0);
+                    latest = now;
+                }
+                let moved = (pair[1] - from).abs();
+                assert!(
+                    moved <= ENERGY_SLEW * ticks as f32 + 1e-6,
+                    "{fps} fps observation {index}: {moved}"
+                );
+            }
+            // Over any 1/60 s (`fps / 60` observations), at most one step.
+            let per = (fps / 60.0) as usize;
+            for (index, window) in energies[..at].windows(per + 1).enumerate() {
+                let moved = (window[per] - window[0]).abs();
+                assert!(
+                    moved <= ENERGY_SLEW + 1e-6,
+                    "{fps} fps from {index}: {moved}"
+                );
+            }
+        }
+    }
+
+    /// A clock alternating between 1 s and 0 earns no time from returning
+    /// to 1 s: the latest time is kept, so after the first gap (capped at
+    /// `MAX_ENERGY_GAP_S`) the energy holds.
+    #[test]
+    fn alternating_clock_cannot_re_earn_the_gap() {
+        let frames: Vec<ControlFrame> = (0..40)
+            .map(|index| ControlFrame {
+                energy: if index == 0 { 0 } else { 255 },
+                ..ControlFrame::procedural(index)
+            })
+            .collect();
+        let times: Vec<f64> = (0..40)
+            .map(|index| if index % 2 == 1 { 1.0 } else { 0.0 })
+            .collect();
+        let energies = run_at(&frames, &times);
+        let credit = ENERGY_SLEW * (MAX_ENERGY_GAP_S * 60.0) as f32;
+        assert!((energies[1] - credit).abs() < 1e-6, "{}", energies[1]);
+        assert!(
+            energies.iter().all(|&energy| energy <= credit + 1e-6),
+            "{energies:?}"
+        );
+        // Copilot review on #120: nor can the energy change while the clock
+        // steps back (or is NaN) and forth, whatever the frames' energies.
+        // From 191 at 0 s, alternating 0 at 1 s and 255 at 0 s (or NaN), the
+        // energy takes the first credited step towards 0, then holds.
+        let frames: Vec<ControlFrame> = (0..40)
+            .map(|index| ControlFrame {
+                energy: match index {
+                    0 => 191,
+                    _ if index % 2 == 1 => 0,
+                    _ => 255,
+                },
+                ..ControlFrame::procedural(index)
+            })
+            .collect();
+        for back in [0.0, f64::NAN] {
+            let times: Vec<f64> = (0..40)
+                .map(|index| match index {
+                    0 => 0.0,
+                    _ if index % 2 == 1 => 1.0,
+                    _ => back,
+                })
+                .collect();
+            let energies = run_at(&frames, &times);
+            let first = 191.0 / 255.0 - credit;
+            assert!((energies[1] - first).abs() < 1e-6, "{}", energies[1]);
+            assert!(
+                energies[1..].iter().all(|&energy| energy == energies[1]),
+                "back to {back}: {energies:?}"
+            );
+        }
+    }
+
+    /// Copilot review on #120: packets queued between redraws arrive
+    /// oldest first at one clock. A 120 Hz sender alternating silence and
+    /// full energy, two packets a 60 Hz redraw (the newest, displayed one
+    /// at full), must still raise the energy a slew step a redraw, not
+    /// spend each step on the older, silent packet.
+    #[test]
+    fn queued_packets_slew_towards_the_newest_energy() {
+        let frames: Vec<ControlFrame> = (0..121)
+            .map(|index| ControlFrame {
+                energy: if index % 2 == 1 || index == 0 { 0 } else { 255 },
+                ..ControlFrame::procedural(index)
+            })
+            .collect();
+        // Joined silent on its own, then two packets a redraw: silent,
+        // then full.
+        let times: Vec<f64> = (0..121)
+            .map(|index| ((index + 1) / 2) as f64 / 60.0)
+            .collect();
+        let energies = run_at(&frames, &times);
+        assert_eq!(energies[0], 0.0);
+        for redraw in 1..=60 {
+            let energy = energies[redraw * 2];
+            let expected = (redraw as f32 * ENERGY_SLEW).min(1.0);
+            assert!(
+                (energy - expected).abs() < 1e-4,
+                "redraw {redraw}: {energy}, expected {expected}"
+            );
+        }
     }
 }

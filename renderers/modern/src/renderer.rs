@@ -323,7 +323,7 @@ impl ScenePipeline {
     /// `elapsed` is f64 seconds: the mic layers time bursts with it exactly
     /// however long the renderer runs; scenes take it as f32.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
-        self.observe(&frame);
+        self.observe(&frame, elapsed);
         let (frame, display) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed as f32, size_aspect(size));
@@ -379,10 +379,10 @@ impl ScenePipeline {
     /// detection, and the newest frame for its next step) and the stateful
     /// registry scenes (see `SceneState`). Call once per new
     /// frame, never for a held display repeat; `encode` steps on what was
-    /// observed.
-    pub fn observe(&mut self, frame: &ControlFrame) {
+    /// observed. `elapsed` is the clock `encode` gets (seconds).
+    pub fn observe(&mut self, frame: &ControlFrame, elapsed: f64) {
         self.colour_field.observe(frame);
-        self.scene_state.observe(frame);
+        self.scene_state.observe_at(frame, elapsed);
     }
 
     /// Scene dispatch: the colour field steps once per new observed frame
@@ -808,7 +808,7 @@ impl OffscreenRenderer {
     /// give each frame a distinct counter (or call
     /// [`ScenePipeline::reset_state`]) when rendering unrelated frames.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f64) -> Result<Vec<u8>, RendererError> {
-        self.pipeline.observe(&frame);
+        self.pipeline.observe(&frame, elapsed);
         let size = (self.width, self.height);
         self.render_with(|pipeline, encoder, view| {
             pipeline.encode(encoder, view, frame, elapsed, size);
