@@ -198,16 +198,12 @@ impl StarCatalog {
 
         let mut stars = Vec::new();
         for (record_index, result) in reader.records().enumerate() {
-            let fallback_line = record_index as u64 + 2;
+            let fallback_line = record_index + 2;
             let record = result.map_err(|error| {
-                let line = error
-                    .position()
-                    .map_or(fallback_line, |position| position.line());
+                let line = source_line(error.position(), fallback_line);
                 CatalogError(format!("malformed CSV record on line {line}: {error}"))
             })?;
-            let line = record
-                .position()
-                .map_or(fallback_line, |position| position.line());
+            let line = source_line(record.position(), fallback_line);
             if record_index >= MAX_CATALOG_ROWS {
                 return Err(CatalogError(format!(
                     "catalog exceeds the supported limit of {MAX_CATALOG_ROWS} CSV data rows; reduce the catalog and retry"
@@ -386,6 +382,12 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
         ));
     }
     Ok(())
+}
+
+fn source_line(position: Option<&csv::Position>, fallback: usize) -> usize {
+    position
+        .and_then(|position| usize::try_from(position.line()).ok())
+        .unwrap_or(fallback)
 }
 
 fn parse_field(
