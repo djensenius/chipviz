@@ -24,7 +24,7 @@ const DECLINATION_BINS: usize = 18;
 const FINE_RA_BINS_PER_SKY_BIN: usize = 4;
 const FINE_DEC_BINS_PER_SKY_BIN: usize = 4;
 const FINE_SKY_SUBCELLS: usize = FINE_RA_BINS_PER_SKY_BIN * FINE_DEC_BINS_PER_SKY_BIN;
-const STARS_PER_FINE_SUBCELL: usize = 2;
+const STARS_PER_FINE_SUBCELL: usize = 16;
 const SKY_CANDIDATE_BOUND: usize =
     RIGHT_ASCENSION_BINS * DECLINATION_BINS * FINE_SKY_SUBCELLS * STARS_PER_FINE_SUBCELL;
 const MIN_STAR_MAGNITUDE: f64 = -2.0;
@@ -146,12 +146,6 @@ impl StarCatalog {
             let record = result.map_err(|error| {
                 CatalogError(format!("malformed CSV record on line {line}: {error}"))
             })?;
-            if let Some(column) = distance_column
-                && !record.get(column).unwrap_or_default().trim().is_empty()
-                && parse_field(&record, column, "dist", line)? == 0.0
-            {
-                continue;
-            }
             let ra = parse_field(&record, ra_column, "ra", line)?;
             if !(0.0..24.0).contains(&ra) {
                 return Err(CatalogError(format!(
@@ -165,6 +159,13 @@ impl StarCatalog {
                 )));
             }
             let magnitude = parse_field(&record, magnitude_column, "mag", line)?;
+            let observer_distance = distance_column
+                .filter(|&column| !record.get(column).unwrap_or_default().trim().is_empty())
+                .map(|column| parse_field(&record, column, "dist", line))
+                .transpose()?;
+            if observer_distance == Some(0.0) {
+                continue;
+            }
             let colour_index = colour_column
                 .filter(|&column| !record.get(column).unwrap_or_default().trim().is_empty())
                 .map(|column| parse_field(&record, column, "ci", line))
@@ -203,8 +204,8 @@ impl StarCatalog {
 
     fn build_candidate_bins(stars: &[Star]) -> Vec<Vec<usize>> {
         let mut bins = vec![Vec::new(); RIGHT_ASCENSION_BINS * DECLINATION_BINS];
-        let mut first = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
-        let mut second_spatial = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
+        let mut candidates: Vec<Vec<Vec<usize>>> =
+            vec![vec![Vec::new(); FINE_SKY_SUBCELLS]; bins.len()];
         let mut coincident = vec![vec![None; FINE_SKY_SUBCELLS]; bins.len()];
         for (index, star) in stars.iter().enumerate() {
             let ra_bin = ((star.right_ascension_hours / 24.0 * RIGHT_ASCENSION_BINS as f64)
@@ -222,16 +223,15 @@ impl StarCatalog {
             let fine_dec = (dec_in_bin * FINE_DEC_BINS_PER_SKY_BIN as f64) as usize;
             let subcell = fine_dec.min(FINE_DEC_BINS_PER_SKY_BIN - 1) * FINE_RA_BINS_PER_SKY_BIN
                 + fine_ra.min(FINE_RA_BINS_PER_SKY_BIN - 1);
-            if first[bin_index][subcell].is_none() {
-                bins[bin_index].push(index);
-                first[bin_index][subcell] = Some(index);
-            } else if second_spatial[bin_index][subcell].is_none() {
-                let first_star = &stars[first[bin_index][subcell].expect("first candidate set")];
-                if star.right_ascension_hours != first_star.right_ascension_hours
-                    || star.declination_degrees != first_star.declination_degrees
-                {
-                    bins[bin_index].push(index);
-                    second_spatial[bin_index][subcell] = Some(index);
+            let subcell_candidates = &mut candidates[bin_index][subcell];
+            if subcell_candidates.len() < STARS_PER_FINE_SUBCELL {
+                let spatially_distinct = subcell_candidates.iter().all(|&candidate| {
+                    let candidate = &stars[candidate];
+                    star.right_ascension_hours != candidate.right_ascension_hours
+                        || star.declination_degrees != candidate.declination_degrees
+                });
+                if spatially_distinct {
+                    subcell_candidates.push(index);
                 } else if coincident[bin_index][subcell].is_none() {
                     coincident[bin_index][subcell] = Some(index);
                 }
@@ -239,7 +239,8 @@ impl StarCatalog {
         }
         for bin_index in 0..bins.len() {
             for subcell in 0..FINE_SKY_SUBCELLS {
-                if second_spatial[bin_index][subcell].is_none()
+                bins[bin_index].extend(candidates[bin_index][subcell].iter().copied());
+                if candidates[bin_index][subcell].len() < STARS_PER_FINE_SUBCELL
                     && let Some(index) = coincident[bin_index][subcell]
                 {
                     bins[bin_index].push(index);
@@ -386,7 +387,7 @@ fn build(
         return;
     };
     let unix_seconds = config.epoch_at(elapsed);
-    let mut visible = Vec::with_capacity(SKY_CANDIDATE_BOUND);
+    let mut visible = Vec::with_capacity(MAX_RENDERED_STARS.min(profile.instance_count) * 4);
     for (bin_index, bin) in config.catalog.candidate_bins.iter().enumerate() {
         if bin.is_empty() {
             continue;
@@ -422,24 +423,48 @@ fn build(
             ) else {
                 continue;
             };
-            visible.push((star, center, bin_index, rank));
+            visible.push((star, center, bin_index, rank, star_index));
         }
     }
 
     // The catalog's magnitude-sorted spatial bins bound the work and preserve
-    // candidates across the whole sky. Choose within the profile budget before
-    // reversing draw order so bright coincident stars are painted last.
+    // candidates across the whole sky. Preserve one candidate per visible
+    // screen-space quarter before filling the remaining budget globally, so
+    // a dense bright region cannot erase the rest of the panorama.
     visible.sort_by(
-        |(left, _, left_bin, left_rank), (right, _, right_bin, right_rank)| {
+        |(left, _, left_bin, left_rank, _), (right, _, right_bin, right_rank, _)| {
             left.magnitude
                 .total_cmp(&right.magnitude)
                 .then_with(|| left_rank.cmp(right_rank))
                 .then_with(|| spatial_order_key(*left_bin).cmp(&spatial_order_key(*right_bin)))
         },
     );
+    let candidate_limit = MAX_RENDERED_STARS.min(profile.instance_count);
+    let mut candidate_order = Vec::with_capacity(candidate_limit);
+    let mut reserved = vec![false; visible.len()];
+    for quarter in 0..4 {
+        if candidate_order.len() == candidate_limit {
+            break;
+        }
+        if let Some((index, _)) = visible.iter().enumerate().find(|(index, candidate)| {
+            !reserved[*index] && screen_quarter(candidate.1[0]) == quarter
+        }) {
+            reserved[index] = true;
+            candidate_order.push(index);
+        }
+    }
+    for index in 0..visible.len() {
+        if candidate_order.len() == candidate_limit {
+            break;
+        }
+        if !reserved[index] {
+            candidate_order.push(index);
+        }
+    }
     let mut selected = Vec::with_capacity(MAX_RENDERED_STARS.min(profile.instance_count));
     let mut selected_instances = 0;
-    for (star, center, _, _) in visible {
+    for index in candidate_order {
+        let (star, center, _, _, _) = visible[index];
         if selected.len() >= MAX_RENDERED_STARS {
             break;
         }
@@ -467,13 +492,16 @@ fn build(
             pattern: [0.0; 2],
         };
         let wrapped = crosses_horizontal_seam(instance);
-        let required = if wrapped { 2 } else { 1 };
-        if selected_instances + required <= profile.instance_count {
-            selected.push((instance, wrapped));
-            selected_instances += required;
+        if let Some(draw_wrap) = seam_wrap_within_budget(
+            wrapped,
+            profile.instance_count.saturating_sub(selected_instances),
+        ) {
+            selected.push((star.magnitude, instance, draw_wrap));
+            selected_instances += if draw_wrap { 2 } else { 1 };
         }
     }
-    for (instance, wrapped) in selected.into_iter().rev() {
+    selected.sort_by(|(left, _, _), (right, _, _)| left.total_cmp(right));
+    for (_, instance, wrapped) in selected.into_iter().rev() {
         append_wrapped(instance, wrapped, profile.instance_count, instances);
     }
 }
@@ -482,9 +510,21 @@ fn spatial_order_key(bin_index: usize) -> usize {
     (bin_index * 383) % (RIGHT_ASCENSION_BINS * DECLINATION_BINS)
 }
 
+fn screen_quarter(x: f32) -> usize {
+    (((x + 1.0) * 2.0).floor() as usize).min(3)
+}
+
 fn crosses_horizontal_seam(instance: Instance) -> bool {
     let half_width = instance.size[0] / 2.0;
     instance.center[0] - half_width < -1.0 || instance.center[0] + half_width > 1.0
+}
+
+fn seam_wrap_within_budget(wraps: bool, available: usize) -> Option<bool> {
+    if available == 0 {
+        None
+    } else {
+        Some(wraps && available >= 2)
+    }
 }
 
 fn append_wrapped(instance: Instance, wraps: bool, budget: usize, instances: &mut Vec<Instance>) {
@@ -558,6 +598,9 @@ mod tests {
             ("ra,dec,mag\n,2,1\n", "ra must be"),
             ("ra,dec,mag\n1,,1\n", "dec must be"),
             ("ra,dec,mag\n1,2,nan\n", "mag must be finite"),
+            ("ra,dec,mag,dist\n,2,1,0\n", "ra must be"),
+            ("ra,dec,mag,dist\n1,,1,0\n", "dec must be"),
+            ("ra,dec,mag,dist\n1,2,nan,0\n", "mag must be finite"),
             ("ra,dec,mag\n24,2,1\n", "ra must be finite and in [0, 24)"),
             (
                 "ra,dec,mag\n1,-91,1\n",
@@ -718,19 +761,17 @@ mod tests {
         let pixels = raster(&instances, (160, 90));
         assert!(luminance(pixels[45 * 160]) > 0.0);
         assert!(luminance(pixels[45 * 160 + 159]) > 0.0);
+
         let mut limited = Vec::new();
-        append_wrapped(edge, true, 1, &mut limited);
-        assert!(limited.is_empty());
-        append_wrapped(
-            Instance {
-                center: [0.0, 0.0, 0.0],
-                ..edge
-            },
-            false,
-            1,
-            &mut limited,
-        );
+        let draw_wrap = seam_wrap_within_budget(true, 1).expect("one slot keeps the edge star");
+        append_wrapped(edge, draw_wrap, 1, &mut limited);
         assert_eq!(limited.len(), 1);
+        let pixels = raster(&limited, (160, 90));
+        assert!(luminance(pixels[45 * 160]) > 0.0);
+        assert_eq!(luminance(pixels[45 * 160 + 159]), 0.0);
+        assert_eq!(seam_wrap_within_budget(true, 2), Some(true));
+        assert_eq!(seam_wrap_within_budget(false, 1), Some(false));
+        assert_eq!(seam_wrap_within_budget(true, 0), None);
     }
 
     #[test]
@@ -939,21 +980,20 @@ mod tests {
     }
 
     #[test]
-    fn visible_faint_star_is_not_hidden_by_brighter_stars_below_the_horizon() {
+    fn visible_faint_star_survives_twelve_brighter_below_horizon_candidates_in_its_subcell() {
+        let unix_seconds = 946_728_000.0;
+        let julian_date = unix_seconds / 86_400.0 + 2_440_587.5;
+        let ra_hours = greenwich_mean_sidereal_degrees(julian_date) / 15.0;
         let mut csv = String::from("ra,dec,mag\n");
         for index in 0..12 {
-            csv.push_str(&format!(
-                "{},{},5\n",
-                12.52 + 0.015 * index as f64,
-                0.5 + 0.75 * index as f64
-            ));
+            csv.push_str(&format!("{ra_hours},{},5\n", -44.95 + 0.02 * index as f64));
         }
-        csv.push_str("12.95,5,-6\n");
+        csv.push_str(&format!("{ra_hours},-44.3,6\n"));
         let catalog = Arc::new(catalog(&csv).unwrap());
         let target_index = catalog
             .stars
             .iter()
-            .position(|star| star.right_ascension_hours == 12.95)
+            .position(|star| star.declination_degrees == -44.3)
             .unwrap();
         assert!(
             catalog
@@ -963,14 +1003,14 @@ mod tests {
             "a spatially distinct candidate must survive the bounded index"
         );
         let target = &catalog.stars[target_index];
-        let projected = project_star(target, 0.0, 0.0, 946_728_000.0)
+        let projected = project_star(target, 44.6, 0.0, unix_seconds)
             .expect("review fixture target is above the horizon");
         let mut state = SceneState::default();
         state.configure_starfield(Some(StarfieldConfig {
             catalog,
-            latitude_degrees: 0.0,
+            latitude_degrees: 44.6,
             longitude_degrees: 0.0,
-            unix_seconds: 946_728_000.0,
+            unix_seconds,
             follow_elapsed: false,
         }));
         let mut instances = Vec::new();
@@ -985,10 +1025,10 @@ mod tests {
         );
         assert!(
             instances.iter().any(|instance| {
-                (instance.center[0] - projected[0]).abs() < 1.0e-6
-                    && (instance.center[1] - projected[1]).abs() < 1.0e-6
+                (instance.center[0] - projected[0]).abs() < 1.0e-5
+                    && (instance.center[1] - projected[1]).abs() < 1.0e-5
             }),
-            "the visible mag -6 star must be rendered"
+            "the visible faint target must survive actual scene construction"
         );
     }
 

@@ -7,7 +7,6 @@ mod profile;
 mod renderer;
 mod scene;
 mod scenes;
-mod transition;
 
 pub use app::{AppError, run};
 pub use profile::RenderProfile;

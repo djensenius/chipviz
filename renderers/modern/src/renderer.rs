@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,9 @@ use crate::scene::{
     Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances_for_viewport, scene_uniforms,
 };
 use crate::scenes::{self, CameraMode, SceneConfig, SceneState, colour_field, mic_layers};
-use crate::transition::TransitionOutput;
+
+const MAX_STARFIELD_CROSSINGS_PER_SECOND: usize = 2;
+const STARFIELD_CROSSING_WINDOW_SECONDS: f64 = 1.0;
 
 /// Offscreen capture format; sRGB like the window's preferred surface format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -56,8 +59,8 @@ pub struct ScenePipeline {
     phosphor: Option<phosphor::Phosphor>,
     /// Holds off remaking the phosphor while the target is being resized.
     settle: phosphor::Settle,
-    /// Full-frame output history, active only around Starfield transitions.
-    transition_output: TransitionOutput,
+    /// Rate-limits only actual transitions into and out of Starfield.
+    crossing_gate: StarfieldCrossingGate,
 }
 
 pub struct Renderer {
@@ -121,34 +124,128 @@ impl std::fmt::Display for RendererError {
 
 impl std::error::Error for RendererError {}
 
-fn resolve_dispatch_frame(
-    mut frame: ControlFrame,
-    display: colour_field::Display,
-    fallback: &mut Option<u8>,
-) -> (ControlFrame, colour_field::Display) {
-    match display {
-        colour_field::Display::Native(scene) => {
-            let requested_fallback = fallback.take();
-            let scene = if scenes::select(scene).name == "Starfield" {
-                requested_fallback.unwrap_or(scene)
-            } else {
-                scene
-            };
-            frame.scene = scene;
-            (frame, colour_field::Display::Native(scene))
-        }
-        colour_field::Display::ColourField(trace) => {
-            (frame, colour_field::Display::ColourField(trace))
+#[derive(Debug)]
+struct StarfieldCrossingGate {
+    displayed: colour_field::Display,
+    recent_crossings: VecDeque<f64>,
+    last_elapsed: f64,
+}
+
+impl Default for StarfieldCrossingGate {
+    fn default() -> Self {
+        Self {
+            displayed: colour_field::Display::Native(0),
+            recent_crossings: VecDeque::new(),
+            last_elapsed: 0.0,
         }
     }
 }
 
-fn preview_dispatch_frame(
-    frame: ControlFrame,
+impl StarfieldCrossingGate {
+    fn resolve(
+        &mut self,
+        requested: colour_field::Display,
+        elapsed: f64,
+        commit: bool,
+    ) -> colour_field::Display {
+        let now = if elapsed.is_finite() {
+            elapsed.max(self.last_elapsed)
+        } else {
+            self.last_elapsed
+        };
+        let crossing = is_starfield_display(self.displayed) != is_starfield_display(requested);
+        let recent_count = self
+            .recent_crossings
+            .iter()
+            .filter(|&&time| now - time <= STARFIELD_CROSSING_WINDOW_SECONDS)
+            .count();
+        let allowed = !crossing || recent_count < MAX_STARFIELD_CROSSINGS_PER_SECOND;
+        let displayed = if allowed { requested } else { self.displayed };
+        if commit {
+            if crossing && allowed {
+                while self
+                    .recent_crossings
+                    .front()
+                    .is_some_and(|&time| now - time > STARFIELD_CROSSING_WINDOW_SECONDS)
+                {
+                    self.recent_crossings.pop_front();
+                }
+                self.recent_crossings.push_back(now);
+            }
+            if allowed {
+                self.displayed = requested;
+            }
+            self.last_elapsed = now;
+        }
+        displayed
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn is_starfield_display(display: colour_field::Display) -> bool {
+    matches!(
+        display,
+        colour_field::Display::Native(scene) if scenes::select(scene).name == "Starfield"
+    )
+}
+
+fn mic_layers_shown(mode: mic_layers::Mode, display: colour_field::Display) -> bool {
+    mic_layers::shown(mode, display) && !is_starfield_display(display)
+}
+
+fn displayed_scene_byte(display: colour_field::Display) -> u8 {
+    match display {
+        colour_field::Display::Native(scene) => scene,
+        colour_field::Display::ColourField(_) => colour_field::SCENE,
+    }
+}
+
+fn prepare_starfield_attachment_colors(
+    instances: &mut [Instance],
+    srgb_target: bool,
+    is_starfield: bool,
+) {
+    if srgb_target || !is_starfield {
+        return;
+    }
+    for instance in instances {
+        for channel in &mut instance.color[..3] {
+            *channel = if *channel <= 0.003_130_8 {
+                *channel * 12.92
+            } else {
+                1.055 * channel.powf(1.0 / 2.4) - 0.055
+            };
+        }
+    }
+}
+
+fn resolve_dispatch_frame(
+    mut frame: ControlFrame,
     display: colour_field::Display,
-) -> (ControlFrame, colour_field::Display) {
-    let mut no_fallback = None;
-    resolve_dispatch_frame(frame, display, &mut no_fallback)
+    fallback: Option<u8>,
+) -> (ControlFrame, colour_field::Display, bool) {
+    match display {
+        colour_field::Display::Native(scene) => {
+            let fallback_applied = scenes::select(scene).name == "Starfield" && fallback.is_some();
+            let scene = if fallback_applied {
+                fallback.unwrap_or(scene)
+            } else {
+                scene
+            };
+            frame.scene = scene;
+            (
+                frame,
+                colour_field::Display::Native(scene),
+                fallback_applied,
+            )
+        }
+        colour_field::Display::ColourField(trace) => {
+            (frame, colour_field::Display::ColourField(trace), false)
+        }
+    }
 }
 
 impl From<wgpu::CreateSurfaceError> for RendererError {
@@ -308,8 +405,6 @@ impl ScenePipeline {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let transition_output = TransitionOutput::new(&device, format);
-
         Self {
             profile,
             camera: Camera::default(),
@@ -335,7 +430,7 @@ impl ScenePipeline {
             phosphor_pipelines,
             phosphor: None,
             settle: phosphor::Settle::default(),
-            transition_output,
+            crossing_gate: StarfieldCrossingGate::default(),
         }
     }
 
@@ -351,26 +446,23 @@ impl ScenePipeline {
         self.next_native_fallback = None;
         self.phosphor = None;
         self.settle = phosphor::Settle::default();
-        self.transition_output.reset();
+        self.crossing_gate.reset();
     }
 
     /// Steps camera smoothing, the colour field and the mic layers for a
     /// frame that is not drawn, at a target of `size` pixels.
     ///
-    /// Builds the same scene and final output history as a drawn frame, but
-    /// skips the screen readback. Capture replay uses this to reproduce
-    /// Starfield transition slew as well as stateful scene and mic-layer state.
+    /// Advances scene, camera, debounce, crossing-gate and mic-layer state
+    /// without drawing a frame. Capture replay uses this for stateful scenes.
     ///
     /// `elapsed` is f64 seconds: the mic layers time bursts with it exactly
     /// however long the renderer runs; scenes take it as f32.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame, elapsed);
-        let (frame, display, starfield_involved) = self.dispatch(frame, false);
+        let (frame, display) = self.dispatch(frame, true, elapsed);
         let (width, height) = size;
         let aspect = size_aspect(size);
-        self.transition_output.ensure_targets(&self.device, size);
-        let scene_view = self.transition_output.take_scene_view();
-        let (instances, camera) = match display {
+        let (mut instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
                 let mut instances = Vec::new();
                 colour_field::build(&trace, width, height, self.srgb_target, &mut instances);
@@ -388,6 +480,11 @@ impl ScenePipeline {
                 scenes::select(frame.scene).camera,
             ),
         };
+        prepare_starfield_attachment_colors(
+            &mut instances,
+            self.srgb_target,
+            is_starfield_display(display),
+        );
         let uniforms = scene_uniforms(
             camera,
             &mut self.camera,
@@ -396,24 +493,14 @@ impl ScenePipeline {
             elapsed as f32,
             aspect,
         );
-        let mut encoder = self.command_encoder();
-        match self.prepare_mic_layers(frame, display, elapsed, size) {
-            Some(count) => {
-                let phosphor = self.phosphor.take().expect("prepared above");
-                self.encode_layers(&mut encoder, phosphor.scene(), &instances, &uniforms);
-                self.phosphor = Some(phosphor);
-                self.encode_phosphor(&mut encoder, Some(&scene_view), count, elapsed);
-            }
-            None => self.encode_layers(&mut encoder, &scene_view, &instances, &uniforms),
+        if let Some(count) = self.prepare_mic_layers(frame, display, elapsed, size) {
+            let mut encoder = self.command_encoder();
+            let phosphor = self.phosphor.take().expect("prepared above");
+            self.encode_layers(&mut encoder, phosphor.scene(), &instances, &uniforms);
+            self.phosphor = Some(phosphor);
+            self.encode_phosphor(&mut encoder, None, count, elapsed);
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
-        self.transition_output.restore_scene_view(scene_view);
-        self.transition_output.encode_history(
-            &mut encoder,
-            &self.queue,
-            elapsed,
-            starfield_involved,
-        );
-        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Sets the mic layers' mode without applying the build gate. Callers
@@ -472,16 +559,16 @@ impl ScenePipeline {
         self.scene_state.observe_at(frame, elapsed);
     }
 
-    /// Previews dispatch without consuming a pending fallback. Surface
-    /// acquisition can fail after this query; only a successful encode
-    /// consumes the fallback. Re-dispatch is safe because the colour field
-    /// steps only once per observed frame.
-    pub fn displayed_scene(&mut self, frame: ControlFrame) -> u8 {
-        let (_, display, _) = self.dispatch(frame, false);
-        match display {
-            colour_field::Display::Native(scene) => scene,
-            colour_field::Display::ColourField(_) => colour_field::SCENE,
-        }
+    /// Previews dispatch without consuming a fallback or recording a
+    /// Starfield crossing. Surface acquisition can fail after this query.
+    pub fn displayed_scene(&mut self, frame: ControlFrame, elapsed: f64) -> u8 {
+        let (_, display) = self.dispatch(frame, false, elapsed);
+        displayed_scene_byte(display)
+    }
+
+    /// Scene byte of the last successfully encoded/replayed frame.
+    pub fn committed_displayed_scene(&self) -> u8 {
+        displayed_scene_byte(self.crossing_gate.displayed)
     }
 
     /// Uses a safe native scene for the next encode if scene dispatch selects
@@ -492,12 +579,14 @@ impl ScenePipeline {
 
     /// Scene dispatch: the colour field steps once per new observed frame
     /// and owns scene 7; otherwise the native scene goes through the
-    /// registry unchanged. `frame` is only drawn, never observed here.
+    /// registry unchanged. The crossing gate commits only when this frame
+    /// will be encoded; `frame` is never observed here.
     fn dispatch(
         &mut self,
         frame: ControlFrame,
-        consume_fallback: bool,
-    ) -> (ControlFrame, colour_field::Display, bool) {
+        commit: bool,
+        elapsed: f64,
+    ) -> (ControlFrame, colour_field::Display) {
         let (clock, now) = match &mut self.step_clock {
             Some((clock, start)) => (Some(clock), start.elapsed()),
             None => (None, Duration::ZERO),
@@ -508,16 +597,17 @@ impl ScenePipeline {
             now,
             &mut self.colour_controls,
         );
-        let starfield_selected = matches!(
-            display,
-            colour_field::Display::Native(scene) if scenes::select(scene).name == "Starfield"
-        );
-        let (frame, display) = if consume_fallback {
-            resolve_dispatch_frame(frame, display, &mut self.next_native_fallback)
-        } else {
-            preview_dispatch_frame(frame, display)
-        };
-        (frame, display, starfield_selected)
+        let (frame, requested, fallback_applied) =
+            resolve_dispatch_frame(frame, display, self.next_native_fallback);
+        let display = self.crossing_gate.resolve(requested, elapsed, commit);
+        let mut frame = frame;
+        if let colour_field::Display::Native(scene) = display {
+            frame.scene = scene;
+        }
+        if commit && fallback_applied && display == requested {
+            self.next_native_fallback = None;
+        }
+        (frame, display)
     }
 
     /// Uploads this frame's instances and uniforms, then records its render pass.
@@ -559,8 +649,8 @@ impl ScenePipeline {
         let elapsed = elapsed as f32;
         let (width, height) = size;
         let aspect = size_aspect(size);
-        let (frame, display, starfield_involved) = self.dispatch(frame, true);
-        let (instances, camera) = match display {
+        let (frame, display) = self.dispatch(frame, true, overlay_elapsed);
+        let (mut instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
                 let mut instances = Vec::new();
                 colour_field::build(&trace, width, height, self.srgb_target, &mut instances);
@@ -578,6 +668,11 @@ impl ScenePipeline {
                 scenes::select(frame.scene).camera,
             ),
         };
+        prepare_starfield_attachment_colors(
+            &mut instances,
+            self.srgb_target,
+            is_starfield_display(display),
+        );
         let uniforms = scene_uniforms(
             camera,
             &mut self.camera,
@@ -591,27 +686,17 @@ impl ScenePipeline {
         } else {
             None
         };
-        self.transition_output.ensure_targets(&self.device, size);
-        let scene_view = self.transition_output.take_scene_view();
         match glow {
             // The scene goes into the phosphor's copy, which the composite
-            // writes to the transition scene target with the layers added.
+            // writes to the acquired surface with the layers added.
             Some(count) => {
                 let phosphor = self.phosphor.take().expect("prepared above");
                 self.encode_layers(encoder, phosphor.scene(), &instances, &uniforms);
                 self.phosphor = Some(phosphor);
-                self.encode_phosphor(encoder, Some(&scene_view), count, overlay_elapsed);
+                self.encode_phosphor(encoder, Some(view), count, overlay_elapsed);
             }
-            None => self.encode_layers(encoder, &scene_view, &instances, &uniforms),
+            None => self.encode_layers(encoder, view, &instances, &uniforms),
         }
-        self.transition_output.restore_scene_view(scene_view);
-        self.transition_output.encode_surface(
-            encoder,
-            &self.queue,
-            view,
-            overlay_elapsed,
-            starfield_involved,
-        );
     }
 
     /// Steps the mic layers and uploads their instances. Returns the
@@ -638,13 +723,14 @@ impl ScenePipeline {
             size,
             elapsed,
         );
-        let shown = mic_layers::shown(self.mic_layers.mode(), display) && drawable;
+        let shown = mic_layers_shown(self.mic_layers.mode(), display) && drawable;
         self.mic_layers
             .step(frame, self.live_scope.as_ref(), elapsed, shown);
-        // Entering the colour field is already a full-screen change; its
-        // colours must follow its trace alone, so no afterglow lingers. The
-        // drop holds the layers dark as a resize's does.
-        if matches!(display, colour_field::Display::ColourField(_)) {
+        // The colour field must follow its trace alone, and Starfield keeps
+        // its per-pixel luminance bound without an overlay or lingering
+        // afterglow. The drop holds layers dark as a resize's does.
+        if matches!(display, colour_field::Display::ColourField(_)) || is_starfield_display(display)
+        {
             if let Some(glow) = self.phosphor.take() {
                 self.settle.drop_lit(glow.fading(), elapsed);
             }
@@ -1082,94 +1168,49 @@ mod tests {
     }
 
     #[test]
-    fn live_dispatch_fallback_respects_wrapping_colour_field_debounce_and_events() {
-        let mut field = colour_field::ColourField::new(colour_field::Config::default());
-        let mut fallback = None;
-        let mut dispatched = Vec::new();
-        for (index, scene) in [(0, 6), (1, 13)] {
-            let frame = ControlFrame {
-                scene,
-                flags: if index == 1 { 0x05 } else { 0 },
-                ..ControlFrame::procedural(index)
-            };
-            field.observe(&frame);
-            if field.has_new_frame() {
-                field.step(colour_field::Controls::default());
-            }
-            let (shown, display) = resolve_dispatch_frame(frame, field.display(), &mut fallback);
-            dispatched.push((shown, display));
-        }
-        assert_eq!(dispatched[0].0.scene, 6);
-        assert_eq!(dispatched[1].0.scene, 13);
-        assert_eq!(scenes::select(dispatched[1].0.scene).name, "Starfield");
+    fn crossing_gate_limits_starfield_reversals_and_leaves_native_changes_alone() {
+        let mut gate = StarfieldCrossingGate::default();
+        let starfield = colour_field::Display::Native(13);
+        let native = colour_field::Display::Native(0);
+        assert_eq!(gate.resolve(starfield, 0.0, true), starfield);
+        assert_eq!(gate.resolve(native, 0.1, true), native);
 
-        for scene in [6, 13] {
-            let udp = ControlFrame {
-                scene,
-                flags: 0x05,
-                ..ControlFrame::procedural(2)
-            };
-            fallback = Some(0);
-            let (safe, display) =
-                resolve_dispatch_frame(udp, colour_field::Display::Native(scene), &mut fallback);
-            assert_eq!(safe.scene, 0);
-            assert_eq!(safe.flags, udp.flags);
-            assert_eq!(display, colour_field::Display::Native(0));
-        }
+        // A third transition inside the rolling second is denied. Preview is
+        // non-consuming, and changes between native scenes remain immediate.
+        assert_eq!(gate.resolve(starfield, 0.5, true), native);
+        assert_eq!(gate.resolve(starfield, 0.6, false), native);
+        assert_eq!(gate.displayed, native);
+        assert_eq!(
+            gate.resolve(colour_field::Display::Native(4), 0.7, true),
+            colour_field::Display::Native(4)
+        );
+        assert_eq!(
+            gate.resolve(starfield, 1.100_01, true),
+            starfield,
+            "old crossings expire only after the closed one-second boundary"
+        );
 
-        for index in 3..40 {
-            let frame = ControlFrame {
-                scene: 7,
-                ..ControlFrame::procedural(index)
-            };
-            field.observe(&frame);
-            if field.has_new_frame() {
-                field.step(colour_field::Controls::default());
-            }
-        }
-
-        assert!(matches!(
-            field.display(),
-            colour_field::Display::ColourField(_)
-        ));
-        let colour_frame = ControlFrame {
-            scene: 7,
-            ..ControlFrame::procedural(40)
-        };
-        field.observe(&colour_frame);
-        if field.has_new_frame() {
-            field.step(colour_field::Controls::default());
-        }
-        let (shown, display) = resolve_dispatch_frame(colour_frame, field.display(), &mut fallback);
-        assert_eq!(shown.scene, 7);
-        assert!(matches!(display, colour_field::Display::ColourField(_)));
+        let colour = colour_field::Display::ColourField(colour_field::Trace {
+            mode: 0,
+            family: 0,
+            layout: 0,
+            combo: 0,
+            rot: 0,
+            lvl: [0; 3],
+        });
+        assert_eq!(gate.resolve(colour, 1.2, true), colour);
+        assert_eq!(gate.resolve(starfield, 1.21, true), colour);
+        assert_eq!(gate.resolve(starfield, 2.200_02, true), starfield);
     }
 
     #[test]
-    fn surface_failure_preview_does_not_consume_fallback_before_successful_encode() {
-        let frame = ControlFrame {
-            scene: 13,
-            flags: 0x05,
-            beat_count: 7,
-            ..ControlFrame::procedural(9)
-        };
-        let mut fallback = Some(0);
-        let preview = preview_dispatch_frame(frame, colour_field::Display::Native(13));
-        assert_eq!(preview.0.scene, 13);
-        assert_eq!(fallback, Some(0));
-
-        // A failed surface acquisition skips encode entirely. Retrying the
-        // same debounced frame applies the pending safe fallback only once.
-        let retried =
-            resolve_dispatch_frame(frame, colour_field::Display::Native(13), &mut fallback);
-        assert_eq!(retried.0.scene, 0);
-        assert_eq!(retried.0.flags, frame.flags);
-        assert_eq!(retried.0.beat_count, frame.beat_count);
-        assert_eq!(fallback, None);
-
-        fallback = Some(0);
-        let color_field_preview = preview_dispatch_frame(
-            frame,
+    fn optional_mic_layers_are_not_composited_over_starfield() {
+        let mode = mic_layers::Mode::Both;
+        assert!(mic_layers_shown(mode, colour_field::Display::Native(4)));
+        assert!(!mic_layers_shown(mode, colour_field::Display::Native(6)));
+        assert!(!mic_layers_shown(mode, colour_field::Display::Native(13)));
+        assert!(!mic_layers_shown(
+            mode,
             colour_field::Display::ColourField(colour_field::Trace {
                 mode: 0,
                 family: 0,
@@ -1177,10 +1218,85 @@ mod tests {
                 combo: 0,
                 rot: 0,
                 lvl: [0; 3],
-            }),
-        );
-        assert_eq!(color_field_preview.0.scene, frame.scene);
+            })
+        ));
+    }
+
+    #[test]
+    fn fallback_is_not_counted_as_a_starfield_display_and_preserves_frame_events() {
+        let mut field = colour_field::ColourField::new(colour_field::Config::default());
+        let frame = ControlFrame {
+            scene: 13,
+            flags: 0x05,
+            beat_count: 7,
+            ..ControlFrame::procedural(9)
+        };
+        // Match live dispatch: observe before previewing the frame.
+        field.observe(&frame);
+        if field.has_new_frame() {
+            field.step(colour_field::Controls::default());
+        }
+        let fallback = Some(0);
+        let (preview_frame, preview, fallback_applied) =
+            resolve_dispatch_frame(frame, field.display(), fallback);
+        assert!(fallback_applied);
+        assert_eq!(preview_frame.flags, frame.flags);
+        assert_eq!(preview_frame.beat_count, frame.beat_count);
+        assert_eq!(preview, colour_field::Display::Native(0));
+        assert!(!is_starfield_display(preview));
+
+        let mut gate = StarfieldCrossingGate::default();
+        assert_eq!(gate.resolve(preview, 0.0, false), preview);
+        assert_eq!(gate.displayed, colour_field::Display::Native(0));
+        // A surface-acquisition failure commits neither the fallback nor a
+        // crossing. The successful retry observes the same input first.
         assert_eq!(fallback, Some(0));
+        field.observe(&frame);
+        if field.has_new_frame() {
+            field.step(colour_field::Controls::default());
+        }
+        let (_, retry, applied) = resolve_dispatch_frame(frame, field.display(), fallback);
+        let committed = gate.resolve(retry, 0.0, true);
+        assert!(applied);
+        assert_eq!(committed, colour_field::Display::Native(0));
+
+        assert!(is_starfield_display(colour_field::Display::Native(13)));
+        assert!(!is_starfield_display(colour_field::Display::Native(0)));
+        assert_eq!(scenes::dispatch(7).name(), "ColourField");
+    }
+
+    #[test]
+    fn faint_star_unorm_is_encoded_before_attachment_quantization() {
+        let linear = [0.01, 0.02, 0.05];
+        let make_instance = || Instance {
+            center: [0.0; 3],
+            size: [0.0; 2],
+            color: [linear[0], linear[1], linear[2], 1.0],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern: [0.0; 2],
+        };
+        let mut instance = make_instance();
+        prepare_starfield_attachment_colors(std::slice::from_mut(&mut instance), false, true);
+        for (encoded, expected_linear) in instance.color[..3].iter().zip(linear) {
+            let code = (encoded * 255.0).round() as u8;
+            assert!(code > 0, "faint channel was rounded to black");
+            let readback = f32::from(code) / 255.0;
+            let decoded = if readback <= 0.04045 {
+                readback / 12.92
+            } else {
+                ((readback + 0.055) / 1.055).powf(2.4)
+            };
+            assert!((decoded - expected_linear).abs() < 0.002);
+        }
+
+        let mut srgb_instance = make_instance();
+        prepare_starfield_attachment_colors(std::slice::from_mut(&mut srgb_instance), true, true);
+        assert_eq!(&srgb_instance.color[..3], &linear);
+
+        let mut unrelated = make_instance();
+        prepare_starfield_attachment_colors(std::slice::from_mut(&mut unrelated), false, false);
+        assert_eq!(&unrelated.color[..3], &linear);
     }
 
     #[test]

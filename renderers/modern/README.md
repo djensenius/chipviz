@@ -432,28 +432,30 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
   brightness and point size; colour index controls approximate hue. At most
-  200 stars are rendered, selected from at most 27,648 brightest-per-subcell
-  candidates so below-horizon bright stars do not crowd out visible stars.
-  Each star's linear-RGB channel is capped at 0.05. A final full-frame output
-  limiter bounds each channel's change to 0.15 linear units per second while
-  Starfield is displayed and until one full linear-light range of slew has
-  been allowed after it (at least about 6.7 seconds at normal refresh rates).
-  Its initial Starfield frame starts from black with a maximum per-channel
-  change of 0.05. History is kept in linear `Rgba32Float` rather than the
-  8-bit surface format, so gamma-encoded readback cannot erase sub-code slew
-  progress. Per-pixel limiting remains active after the global settling window
-  only until that pixel catches the current output. This includes scene 7,
-  fallback and optional-overlay output.
+  200 stars are rendered from a bounded candidate index: at most 16 distinct
+  sky positions per fine subcell (221,184 overall) are retained before the
+  horizon test. Thus up to 15 brighter below-horizon records cannot hide the
+  next visible star in a subcell. Each star's linear-RGB channel is capped at
+  0.05; stars are opaque and brightest-first, so changing star membership or
+  overlap changes a Starfield pixel by at most 0.05 linear luminance.
+  Transitions into or out of Starfield are separately gated to at most two
+  successful crossings in any rolling one-second window. While the gate is
+  full, it continues showing the last committed scene and retries the latest
+  request; native-to-native changes are immediate. Optional mic overlays are
+  not composited over Starfield. The monotonic-time gate is committed only
+  after successful surface acquisition, survives resize, and is replayed
+  deterministically in captures.
+  This bounds Starfield crossings, not native-to-native or ColourField-internal
+  flashing, which remain separate safety work (#119/#124); it is not
+  independent photosensitivity certification.
   Live wall-clock corrections are synchronized at the next ten-second
   snapshot; the full star snapshot (positions, membership, ordering and
   brightness) is held between updates.
-  These output limits are conservative scene behavior, not independent
-  photosensitivity certification. The limiter keeps two full-frame
-  `Rgba32Float` history textures (about 253 MiB at 3840x2160) and adds a resolve
-  pass; verify memory and frame-time costs on target adapters. Stars fainter
+  The renderer writes sRGB-encoded star colors explicitly on non-sRGB targets
+  so faint linear-light stars survive attachment quantization. Stars fainter
   than magnitude 6.5 are excluded. Below-horizon stars are culled; the
-  brightest are considered first, and output respects each profile's instance
-  budget.
+  visible candidates are selected by brightness with a screen-quarter coverage
+  reserve, and output respects each profile's instance budget.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
