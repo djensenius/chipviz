@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from dataclasses import replace
 from unittest import mock
 
 
@@ -135,6 +136,16 @@ class CatalogTests(unittest.TestCase):
       self.assertTrue(copies[0].closed)
       source.seek(0)
       self.assertEqual(source.read(4), b"CVXE")
+
+  def test_record_replace_is_unsupported(self) -> None:
+    with self.open_bytes(GOLDEN_HEADER + GOLDEN_RECORD) as result:
+      item = result.record(0)
+      for changes in ({}, {"family": 6}):
+        with self.subTest(changes=changes):
+          with self.assertRaisesRegex(TypeError, "records must come from open_catalog"):
+            replace(item, **changes)
+      self.assertEqual(item.envelope, GOLDEN_RECORD)
+      self.assertEqual(result.record(0), item)
 
   def test_normative_golden_and_crc(self) -> None:
     self.assertEqual(zlib.crc32(b"123456789"), 0xCBF43926)

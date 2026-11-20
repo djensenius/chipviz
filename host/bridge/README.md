@@ -135,9 +135,10 @@ a snapshot. An invalid argument type raises `TypeError`; I/O errors raise
 `OSError`. Use the snapshot as a context manager or close it explicitly;
 access is not thread-safe. It retains the header and returns individual
 complete envelopes and metadata, not stripped legacy frames. Obtain catalogs
-only through `open_catalog` and records through `catalog.record()`; direct
-construction is unsupported. These Python API guards prevent accidental
-bypasses, not deliberate introspection or manipulation by untrusted code.
+only through `open_catalog` and `Record` instances through `catalog.record()`;
+direct construction and `dataclasses.replace(record)` are unsupported (even
+without changes). These Python API guards prevent accidental bypasses, not
+deliberate introspection or manipulation by untrusted code.
 
 The limit is 1,000,000 records, or 145,000,020 input bytes. Input read
 requests are at most 145 bytes; the temporary snapshot uses at most

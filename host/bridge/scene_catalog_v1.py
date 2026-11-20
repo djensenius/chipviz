@@ -47,7 +47,10 @@ def _crc(data: bytes) -> int:
 
 @dataclass(frozen=True)
 class Record:
-  """An intact extended envelope obtained from a validated catalog."""
+  """An intact envelope from a validated catalog.
+
+  Direct construction and dataclasses.replace are unsupported.
+  """
 
   envelope: bytes
   sequence: int
