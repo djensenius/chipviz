@@ -105,7 +105,11 @@ intentional encoder change with `--write-fixtures`.
 the default keyboard/gamepad JSON states. For a gamepad-only GBA data-role
 receiver, opt in with `--gba-gamepad --initial-scene 0 --initial-palette 0
 --initial-release-polled` only after independently establishing those receiver
-ring values and completing the release preamble.
+ring values and completing the release preamble. You must supply a compatible
+scene-7-capable GBA DATA-role receiver with the exact scene ring `0, 1, 2, 3,
+7`. Legacy four-scene ROMs do not work with this mapping. The converter cannot
+detect receiver compatibility; testing a #125 development ROM does not imply
+support in a released ROM.
 See the [HID transport spec](../../shared/specs/usb-hid-transport-v0.md#gba-gamepad-only-json-conversion)
 for aliases, pulse timing, latest-wins behavior, safe palette restrictions,
 and resynchronization. This file converter does not send USB reports or verify

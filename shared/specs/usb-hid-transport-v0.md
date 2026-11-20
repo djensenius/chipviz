@@ -60,6 +60,12 @@ an array containing at most one of `up`, `down`, `left`, `right` (empty means
 release). These are abstract JSON states, not a HID report descriptor or USB
 gadget driver.
 
+The user must supply a compatible scene-7-capable GBA `data`-role receiver
+implementing the exact scene ring `0, 1, 2, 3, 7`. Legacy four-scene ROMs
+using `0, 1, 2, 3` do not work with this mapping. The converter does not
+detect receiver compatibility; tests with a #125 development ROM do not imply
+support in a released ROM.
+
 The GBA ring is `0, 1, 2, 3, 7`; the palette ring is `0..7`. The low three
 scene bits select 7 directly, otherwise they select a native scene modulo 4
 (thus 4, 5, 6 alias 0, 1, 2). Palette uses its low three bits. Each pulse

@@ -226,7 +226,9 @@ def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--input", type=Path, required=True, help="raw control-frame-v0 stream")
   parser.add_argument("--output", type=Path, help="JSON HID state stream; stdout if omitted")
-  parser.add_argument("--gba-gamepad", action="store_true", help="opt in to GBA relative D-pad output")
+  parser.add_argument("--gba-gamepad", action="store_true",
+                      help="relative D-pad output requires a scene-7-capable GBA DATA receiver with "
+                           "ring 0,1,2,3,7; incompatible with legacy four-scene ROMs")
   parser.add_argument("--initial-scene", type=int, choices=GBA_SCENES)
   parser.add_argument("--initial-palette", type=int, choices=range(8))
   parser.add_argument("--initial-release-polled", action="store_true",
