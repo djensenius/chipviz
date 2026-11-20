@@ -23,6 +23,8 @@ pub struct ScenePipeline {
     camera: Camera,
     colour_field: colour_field::ColourField,
     colour_controls: colour_field::Controls,
+    /// One-frame scene fallback requested after displayed-scene validation.
+    next_native_fallback: Option<u8>,
     /// Wall-clock step cap for live rendering; `None` steps every new frame.
     step_clock: Option<(colour_field::StepClock, Instant)>,
     /// Waveform/onset overlay over native scenes; see `scenes::mic_layers`.
@@ -115,6 +117,28 @@ impl std::fmt::Display for RendererError {
 }
 
 impl std::error::Error for RendererError {}
+
+fn resolve_dispatch_frame(
+    mut frame: ControlFrame,
+    display: colour_field::Display,
+    fallback: &mut Option<u8>,
+) -> (ControlFrame, colour_field::Display) {
+    match display {
+        colour_field::Display::Native(scene) => {
+            let requested_fallback = fallback.take();
+            let scene = if scenes::select(scene).name == "Starfield" {
+                requested_fallback.unwrap_or(scene)
+            } else {
+                scene
+            };
+            frame.scene = scene;
+            (frame, colour_field::Display::Native(scene))
+        }
+        colour_field::Display::ColourField(trace) => {
+            (frame, colour_field::Display::ColourField(trace))
+        }
+    }
+}
 
 impl From<wgpu::CreateSurfaceError> for RendererError {
     fn from(error: wgpu::CreateSurfaceError) -> Self {
@@ -279,6 +303,7 @@ impl ScenePipeline {
             camera: Camera::default(),
             colour_field: colour_field::ColourField::new(colour_field::Config::default()),
             colour_controls: colour_field::Controls::default(),
+            next_native_fallback: None,
             step_clock: None,
             mic_layers: mic_layers::MicLayers::new(mic_layers::Mode::Off),
             live_scope: None,
@@ -310,6 +335,7 @@ impl ScenePipeline {
         self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
         self.scene_state = SceneState::new(self.scene_state.config());
         self.scene_state.configure_starfield(starfield);
+        self.next_native_fallback = None;
         self.phosphor = None;
         self.settle = phosphor::Settle::default();
     }
@@ -403,6 +429,12 @@ impl ScenePipeline {
         }
     }
 
+    /// Uses a safe native scene for the next encode if scene dispatch selects
+    /// Starfield without a configured catalog.
+    pub fn fallback_next_missing_starfield(&mut self) {
+        self.next_native_fallback = Some(0);
+    }
+
     /// Scene dispatch: the colour field steps once per new observed frame
     /// and owns scene 7; otherwise the native scene goes through the
     /// registry unchanged. `frame` is only drawn, never observed here.
@@ -417,10 +449,7 @@ impl ScenePipeline {
             now,
             &mut self.colour_controls,
         );
-        match display {
-            colour_field::Display::Native(scene) => (ControlFrame { scene, ..frame }, display),
-            colour_field::Display::ColourField(_) => (frame, display),
-        }
+        resolve_dispatch_frame(frame, display, &mut self.next_native_fallback)
     }
 
     /// Uploads this frame's instances and uniforms, then records its render pass.
@@ -972,6 +1001,69 @@ mod tests {
         };
         assert!(check_target_size(64, 4, &tight).is_ok());
         assert!(check_target_size(64, 5, &tight).is_err());
+    }
+
+    #[test]
+    fn live_dispatch_fallback_respects_wrapping_colour_field_debounce_and_events() {
+        let mut field = colour_field::ColourField::new(colour_field::Config::default());
+        let mut fallback = None;
+        let mut dispatched = Vec::new();
+        for (index, scene) in [(0, 6), (1, 13)] {
+            let frame = ControlFrame {
+                scene,
+                flags: if index == 1 { 0x05 } else { 0 },
+                ..ControlFrame::procedural(index)
+            };
+            field.observe(&frame);
+            if field.has_new_frame() {
+                field.step(colour_field::Controls::default());
+            }
+            let (shown, display) = resolve_dispatch_frame(frame, field.display(), &mut fallback);
+            dispatched.push((shown, display));
+        }
+        assert_eq!(dispatched[0].0.scene, 6);
+        assert_eq!(dispatched[1].0.scene, 13);
+        assert_eq!(scenes::select(dispatched[1].0.scene).name, "Starfield");
+
+        for scene in [6, 13] {
+            let udp = ControlFrame {
+                scene,
+                flags: 0x05,
+                ..ControlFrame::procedural(2)
+            };
+            fallback = Some(0);
+            let (safe, display) =
+                resolve_dispatch_frame(udp, colour_field::Display::Native(scene), &mut fallback);
+            assert_eq!(safe.scene, 0);
+            assert_eq!(safe.flags, udp.flags);
+            assert_eq!(display, colour_field::Display::Native(0));
+        }
+
+        for index in 3..40 {
+            let frame = ControlFrame {
+                scene: 7,
+                ..ControlFrame::procedural(index)
+            };
+            field.observe(&frame);
+            if field.has_new_frame() {
+                field.step(colour_field::Controls::default());
+            }
+        }
+        assert!(matches!(
+            field.display(),
+            colour_field::Display::ColourField(_)
+        ));
+        let colour_frame = ControlFrame {
+            scene: 7,
+            ..ControlFrame::procedural(40)
+        };
+        field.observe(&colour_frame);
+        if field.has_new_frame() {
+            field.step(colour_field::Controls::default());
+        }
+        let (shown, display) = resolve_dispatch_frame(colour_frame, field.display(), &mut fallback);
+        assert_eq!(shown.scene, 7);
+        assert!(matches!(display, colour_field::Display::ColourField(_)));
     }
 
     #[test]

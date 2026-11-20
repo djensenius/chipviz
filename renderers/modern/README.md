@@ -431,8 +431,12 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   dates from 1800 through 2200. Proper motion, parallax and atmospheric
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude and colour index control bounded point
-  brightness and approximate hue; display brightness is lifted for visibility
-  and does not react to audio, avoiding flashing under overlapping catalogs.
+  brightness and approximate hue. At most 200 stars are rendered, with a
+  bounded set of bright candidates per 7.5-by-10-degree sky cell. Each
+  linear-RGB channel is capped at 0.05, bounding opaque per-pixel luminance;
+  no unmeasured flash feature is enabled or claimed as certified. The complete
+  star snapshot (positions, membership, ordering and brightness) is held
+  between ten-second updates.
   Stars fainter than magnitude 6.5 are
   excluded. Below-horizon stars are culled, brightest stars are considered
   first, and output respects each profile's instance budget.
@@ -611,7 +615,7 @@ for the analyser.
 ## Capture
 
 `chipviz-capture` renders frames through the same pipeline and shader into an
-offscreen texture, then writes PNGs plus `manifest.json` (profile, input, size,
+offscreen texture, then writes PNGs plus `manifest.json` (profile, input, size, resolved Starfield epoch/clock mode,
 and per-frame file, index, elapsed time and scene). It opens no window and
 needs no screen-recording permission, only a GPU adapter.
 
@@ -622,6 +626,11 @@ just modern-capture --input host/fixtures/musical/groove.cvz --frames 0,30 --out
 
 Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
 frame 0, so very large frame indices take longer to capture.
+Starfield captures without `--time` advance from the resolved current UTC epoch
+in ten-second snapshot steps. That epoch and advancing mode are recorded in the
+manifest. To reproduce a moving-sky set, pass the recorded
+`starfield_epoch_unix_seconds` as `--time` together with `--follow-time`.
+An explicit `--time` remains fixed unless `--follow-time` is supplied.
 A `.cvz` input does not wrap: indices past its last frame are an error.
 `--scene` overrides each frame's scene byte; without it the input's
 scene byte is used. `--scene 7` captures the colour field, which is replayed

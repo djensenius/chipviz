@@ -19,7 +19,7 @@ const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scen
                        [--frames 0,60,120] [--input procedural|synth-mic|PATH.cvz]
                        [--size WxH] [--mic-layers off|scope|bursts|both]
                        [--lines-drop-cuts] [--catalog FILE --location LAT,LON]
-                       [--time UNIX_SECONDS]
+                       [--time UNIX_SECONDS] [--follow-time]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
@@ -41,7 +41,8 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
              user-supplied HYG-compatible star CSV for scene 6; not bundled
   --catalog  alias for --star-catalog
   --location observer latitude,longitude in decimal degrees; longitude east
-  --time     observation UTC as Unix seconds (1800..2200); defaults to current UTC";
+  --time     observation UTC as Unix seconds (1800..2200); defaults to current UTC
+  --follow-time advance from --time (or current UTC), for reproducible moving-sky captures";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -63,6 +64,7 @@ pub struct CaptureArgs {
     pub catalog_path: Option<PathBuf>,
     pub location: Option<(f64, f64)>,
     pub unix_seconds: Option<f64>,
+    pub follow_time: bool,
 }
 
 #[derive(Debug)]
@@ -83,6 +85,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     let mut catalog_path = None;
     let mut location = None;
     let mut unix_seconds = None;
+    let mut follow_time = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -154,6 +157,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                 }
                 unix_seconds = Some(seconds);
             }
+            "--follow-time" => follow_time = true,
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -164,6 +168,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     }
     if unix_seconds.is_some() && catalog_path.is_none() {
         return Err("--time requires --star-catalog and --location".into());
+    }
+    if follow_time && catalog_path.is_none() {
+        return Err("--follow-time requires --star-catalog and --location".into());
     }
     if scene.is_some_and(|scene| scenes::dispatch(scene).name() == "Starfield")
         && catalog_path.is_none()
@@ -185,6 +192,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
         catalog_path,
         location,
         unix_seconds,
+        follow_time,
     })))
 }
 
@@ -378,7 +386,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
                 latitude_degrees,
                 longitude_degrees,
                 unix_seconds,
-                follow_elapsed: args.unix_seconds.is_none(),
+                follow_elapsed: args.unix_seconds.is_none() || args.follow_time,
             })
         }
         _ => None,
@@ -615,6 +623,26 @@ mod tests {
         assert_eq!(args.catalog_path.as_deref(), Some(Path::new("stars.csv")));
         assert_eq!(args.location, Some((45.0, -73.0)));
         assert_eq!(args.unix_seconds, Some(946_728_000.0));
+        assert!(!args.follow_time);
+        let advancing = parse(&[
+            "--out",
+            "shots",
+            "--scene",
+            "6",
+            "--star-catalog",
+            "stars.csv",
+            "--location",
+            "45,-73",
+            "--time",
+            "946728000",
+            "--follow-time",
+        ])
+        .unwrap();
+        assert!(advancing.follow_time);
+        assert!(
+            parse(&["--out", "shots", "--follow-time"]).is_err(),
+            "follow-time needs a starfield catalog and location"
+        );
 
         for options in [
             &["--star-catalog", "stars.csv"][..],

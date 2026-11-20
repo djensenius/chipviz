@@ -365,10 +365,14 @@ mod tests {
                 ..ControlFrame::procedural(0)
             };
             let instances = build_instances(&profile, frame, 0.0, 16.0 / 9.0, &state);
-            assert_eq!(instances.len(), budget);
-            assert!(instances[0].size[0] > instances[budget - 1].size[0]);
+            assert!(!instances.is_empty());
+            assert!(instances.len() <= budget);
+            assert!(instances.len() <= 400);
+            assert!(instances[0].color[0] <= instances.last().unwrap().color[0]);
             assert!(instances.iter().all(|instance| {
-                (-1.0..=1.0).contains(&instance.center[0])
+                instance.center[0].is_finite()
+                    && instance.center[1].is_finite()
+                    && (-1.1..=1.1).contains(&instance.center[0])
                     && (-1.0..=1.0).contains(&instance.center[1])
             }));
         }

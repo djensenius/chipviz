@@ -77,8 +77,6 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         }
         ArgsCommand::Run(args) => args,
     };
-    let starfield = args.starfield_config()?;
-
     // Both list flags may be given together; each list gets a heading then.
     let both_lists = args.list_audio_devices && args.list_monitors;
     if args.list_audio_devices {
@@ -147,6 +145,11 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     window.set_cursor_visible(cursor_visible(args.fullscreen));
 
     let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
+    let mut starfield = args.starfield_config()?;
+    let live_starfield = args.unix_seconds.is_none() && starfield.is_some();
+    if let Some(config) = &mut starfield {
+        config.follow_elapsed = false;
+    }
     renderer
         .pipeline_mut()
         .configure_colour_field(colour_field_config(&args));
@@ -166,6 +169,20 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
+    if live_starfield && let Some(config) = &mut starfield {
+        config.unix_seconds = system_utc_seconds();
+        renderer
+            .pipeline_mut()
+            .configure_starfield(Some(config.clone()));
+    }
+    let mut utc_clock = starfield
+        .as_ref()
+        .filter(|_| live_starfield)
+        .map(|config| starfield::UtcClock::new(config.unix_seconds));
+    let mut last_starfield_snapshot = 0.0_f64;
+    if let Some(frame) = initial_scene_override(args.scene) {
+        renderer.pipeline_mut().observe(&frame, 0.0);
+    }
     let mut missing_starfield_warning = false;
 
     event_loop.run(move |event, target| match event {
@@ -204,7 +221,19 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
             }
             WindowEvent::RedrawRequested => {
                 let elapsed = start.elapsed().as_secs_f64();
-                let mut frame = with_scene_override(frame_source.next_frame(), args.scene);
+                if let (Some(clock), Some(config)) = (&mut utc_clock, &mut starfield) {
+                    let utc_now = clock.update(system_utc_seconds(), elapsed);
+                    if elapsed - last_starfield_snapshot
+                        >= starfield::STARFIELD_SNAPSHOT_PERIOD_SECONDS
+                    {
+                        config.unix_seconds = utc_now;
+                        renderer
+                            .pipeline_mut()
+                            .configure_starfield(Some(config.clone()));
+                        last_starfield_snapshot = elapsed;
+                    }
+                }
+                let frame = with_scene_override(frame_source.next_frame(), args.scene);
                 // The colour field sees each received or generated frame once;
                 // held redraws only repeat its last step.
                 observe_fresh_frames(
@@ -224,7 +253,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                         );
                         missing_starfield_warning = true;
                     }
-                    frame = safe_starfield_fallback(frame);
+                    renderer.pipeline_mut().fallback_next_missing_starfield();
                 }
                 // The waveform side channel only describes mic frames; UDP
                 // and procedural frames make the layers fall back.
@@ -277,6 +306,13 @@ fn print_monitors(monitors: &[MonitorHandle]) {
             monitor.scale_factor()
         );
     }
+}
+
+fn system_utc_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_else(|error| -error.duration().as_secs_f64())
 }
 
 fn usage(program: &str) -> String {
@@ -680,6 +716,10 @@ fn with_scene_override(mut frame: ControlFrame, scene: Option<u8>) -> ControlFra
     frame
 }
 
+fn initial_scene_override(scene: Option<u8>) -> Option<ControlFrame> {
+    scene.map(|scene| with_scene_override(ControlFrame::procedural(0), Some(scene)))
+}
+
 fn observe_fresh_frames(
     frames: &[ControlFrame],
     scene_override: Option<u8>,
@@ -696,10 +736,6 @@ fn needs_starfield_catalog(scene: u8) -> bool {
     scenes::dispatch(scene).name() == "Starfield"
 }
 
-fn safe_starfield_fallback(mut frame: ControlFrame) -> ControlFrame {
-    frame.scene = 0;
-    frame
-}
 fn parse_location(value: &str) -> Result<(f64, f64), AppError> {
     let Some((latitude, longitude)) = value.split_once(',') else {
         return Err(invalid_input(format!(
@@ -976,21 +1012,28 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_scene_selection_requires_catalog_and_falls_back_without_losing_frame_data() {
+    fn scene_override_is_observed_before_a_silent_udp_source_receives_a_packet() {
+        let frame = initial_scene_override(Some(6)).expect("scene override seed");
+        let mut field = colour_field::ColourField::new(colour_field::Config::default());
+        field.observe(&frame);
+        field.step(colour_field::Controls::default());
+        assert_eq!(field.display(), colour_field::Display::Native(6));
+        assert_eq!(
+            scenes::dispatch(match field.display() {
+                colour_field::Display::Native(scene) => scene,
+                colour_field::Display::ColourField(_) => unreachable!(),
+            })
+            .name(),
+            "Starfield"
+        );
+        assert!(initial_scene_override(None).is_none());
+    }
+
+    #[test]
+    fn wrapped_scene_selection_requires_catalog() {
         assert!(needs_starfield_catalog(6));
         assert!(needs_starfield_catalog(13));
         assert!(!needs_starfield_catalog(7));
-
-        let frame = ControlFrame {
-            scene: 13,
-            flags: audio::BEAT_FLAG | audio::DROP_FLAG,
-            energy: 177,
-            ..ControlFrame::procedural(44)
-        };
-        let fallback = safe_starfield_fallback(frame);
-        assert_eq!(fallback.scene, 0);
-        assert_eq!(fallback.flags, frame.flags);
-        assert_eq!(fallback.energy, frame.energy);
     }
 
     #[test]
