@@ -125,7 +125,11 @@ behaves as if the clock kept time. If the drift changes (a clock that starts or
 stops drifting, or whose rate wanders), the measured drift is dropped once it
 no longer fits, without filling or taking back anything for the change, and
 the capture behaves as if the clock kept time until the new drift is measured.
-While it does, a clock that has started running slow is filled as before.
+While it does, a clock that has started running slow is filled as before, and
+fills older than about 30 seconds are not taken back. Analysis polls every 5 ms
+or so; if it is held up so that polls come regularly no more often than audio
+blocks arrive, a drifting clock delivers exactly what lost blocks would, and
+the drift is not measured.
 
 The stream is not reopened if the device is unplugged or fails: the renderer
 prints a stream error (at most once every five seconds) and the levels fade to

@@ -49,9 +49,16 @@ const LOSS_CONFIRM: Duration = Duration::from_millis(50);
 /// Window and step size for [`DriftTracker`]. A change bigger than
 /// `DRIFT_STEP` from the fitted drift is a step: above the poll interval,
 /// since polling makes a ramp look like a staircase, and above the ramp of
-/// `MAX_DRIFT` over one window.
+/// `MAX_DRIFT` over one window. Polls that all stay further apart than
+/// `POLL` (the shortest interval of the last two windows) make taller stairs
+/// and widen it by the difference (irregular polls blur the stairs), but
+/// only while the smallest delivery so far is at least two stairs and rises
+/// `DRIFT_UNIT_GAP` beyond it when lost: where polls are as far apart as
+/// deliveries, a stair and a lost delivery look the same, and the loss is
+/// filled.
 const DRIFT_WINDOW: Duration = Duration::from_millis(500);
 const DRIFT_STEP: f64 = 0.0075;
+const DRIFT_UNIT_GAP: f64 = 0.0025;
 /// Windows of changes the drift is fitted over (20 minutes).
 const DRIFT_HISTORY: usize = 2400;
 /// Windows of changes needed before the drift may be trusted.
@@ -435,6 +442,7 @@ struct SampleClock {
     /// Start of the current run of deliveries whose gaps fit within `STALL`.
     normal_since: Option<Instant>,
     last_audio: Instant,
+    last_poll: Instant,
     /// Wall-clock time up to which the analyzer has been fed.
     covered_until: Instant,
     silence_debt: f64,
@@ -456,6 +464,7 @@ impl SampleClock {
             stall: STALL,
             normal_since: None,
             last_audio: now,
+            last_poll: now,
             covered_until: now,
             silence_debt: 0.0,
             unmatched_silence: 0,
@@ -472,6 +481,11 @@ impl SampleClock {
     fn poll(&mut self, now: Instant, real: usize) -> Accounting {
         let mut accounting = Accounting::default();
         let rate = f64::from(self.rate);
+        self.drift.polled(
+            now.duration_since(self.last_poll).as_secs_f64(),
+            real as f64 / rate,
+        );
+        self.last_poll = now;
         if real > 0 {
             let gap = now.duration_since(self.last_audio);
             let needed = gap + gap / 2;
@@ -571,7 +585,8 @@ impl SampleClock {
 /// and a lag that moves gradually means the drift has changed: a rise is
 /// filled only if it arrived at once (see `STEP_SHARE`), and only the steps
 /// are filled, not lag the trusted drift's small error built up before them.
-/// Only fill from the last `FRESH_FILL` is taken back. Lag that rises
+/// Only fill from the last `FRESH_FILL` is taken back, from then on (also
+/// while a withdrawn drift is measured again). Lag that rises
 /// gradually past the margin, or falls below the latency by more than the
 /// margin with no recent fill to take back, is a [`Self::take_residual`]: the
 /// latency follows it without fill or take-back, and the tracker withdraws
@@ -612,6 +627,10 @@ struct LossDetector {
     /// While trusted, the lag just before the first rise within the margin
     /// that arrived at once, until the lag is back at it.
     before_step: Option<f64>,
+    /// Whether a drift was ever trusted: fill older than `FRESH_FILL` stays
+    /// for good, even while a withdrawn drift is measured again, so a clock
+    /// that speeds up does not take back fill for audio the device lost.
+    ever_trusted: bool,
 }
 
 impl LossDetector {
@@ -632,6 +651,7 @@ impl LossDetector {
             absorbed: None,
             residual: false,
             before_step: None,
+            ever_trusted: false,
         }
     }
 
@@ -652,6 +672,7 @@ impl LossDetector {
     /// being measured) or, if negative, to restore (fill for lag that arrived
     /// at once, which a fast clock's drift took back).
     fn trust(&mut self, floor: f64, owed: f64) {
+        self.ever_trusted = true;
         self.owed = owed.min(self.filled);
         let latency = floor + self.owed;
         self.latency = Some(latency);
@@ -822,7 +843,7 @@ impl LossDetector {
                 self.absorbed = Some((at, absorbed - down));
             }
         }
-        let takeable = if trusted {
+        let takeable = if trusted || self.ever_trusted {
             self.fresh(now)
         } else {
             self.filled
@@ -973,6 +994,12 @@ struct DriftTracker {
     /// The lowest recent compensated real-sample lag when trust was last
     /// withdrawn, not yet passed on.
     withdrawn: Option<f64>,
+    /// The shortest interval between polls in the open window and the last:
+    /// the height of the stairs that regular polling makes of a ramp.
+    stair: f64,
+    last_stair: f64,
+    /// The smallest delivery so far (in seconds).
+    unit: f64,
 }
 
 /// How a window's smallest real-sample lag compares with the last accepted
@@ -1020,6 +1047,18 @@ impl DriftTracker {
             ramped_peak: 0.0,
             unraised: 0.0,
             withdrawn: None,
+            stair: f64::INFINITY,
+            last_stair: f64::INFINITY,
+            unit: f64::INFINITY,
+        }
+    }
+
+    /// The clock was polled `interval` seconds after the last poll, and
+    /// `delivered` seconds of real samples were waiting.
+    fn polled(&mut self, interval: f64, delivered: f64) {
+        self.stair = self.stair.min(interval);
+        if delivered > 0.0 {
+            self.unit = self.unit.min(delivered);
         }
     }
 
@@ -1136,8 +1175,17 @@ impl DriftTracker {
         // `MAX_DRIFT` and one poll interval of staircase allow: a bigger
         // rise is a step (a short loss), even if it is within `DRIFT_STEP`
         // of a drift that recurring losses steepened.
-        let ramp = rise <= MAX_DRIFT * span + POLL.as_secs_f64();
-        let change = if ramp && (rise - self.fitted * span).abs() <= DRIFT_STEP {
+        let stair = self.stair.min(self.last_stair);
+        self.last_stair = std::mem::replace(&mut self.stair, f64::INFINITY);
+        let widen = if self.unit >= 2.0 * stair {
+            (stair - POLL.as_secs_f64())
+                .min(self.unit - DRIFT_STEP - DRIFT_UNIT_GAP)
+                .max(0.0)
+        } else {
+            0.0
+        };
+        let ramp = rise <= MAX_DRIFT * span + POLL.as_secs_f64() + widen;
+        let change = if ramp && (rise - self.fitted * span).abs() <= DRIFT_STEP + widen {
             self.base = Some((at, lag));
             self.outliers = 0;
             Change::Ramp { at, span, rise }
@@ -2101,6 +2149,84 @@ mod tests {
         // The lag then falls: the recent 40 ms fill was already repaid, and
         // the older 80 ms is past `FRESH_FILL`, so nothing more is taken.
         assert_eq!(loss.check(at(42_000), -0.1, 1.0, true), 0.0);
+    }
+
+    #[test]
+    fn expired_fills_stay_protected_while_a_drift_is_remeasured() {
+        // An 80 ms loss at 5 s on a fast device clock, which then runs
+        // faster from 300 s: while the new drift is measured, the falling
+        // lag follows the clock instead of taking back the old fill.
+        for (before, after) in [(1.001, 1.005), (1.002, 1.005)] {
+            for ms in [10, 20] {
+                let rate = move |t: f64| if t < 300.0 { before } else { after };
+                let first = 5_000 / ms as usize;
+                let callbacks: Vec<_> = varying(ms, 900, rate, on_time)
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(k, _)| !(first..first + 80 / ms as usize).contains(&k))
+                    .map(|(_, callback)| callback)
+                    .collect();
+                let (_, _, net) = replay_net(&callbacks, Duration::ZERO);
+                assert!(
+                    (net - 80.0).abs() <= 15.0,
+                    "{before} then {after}, {ms} ms: {net} ms filled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn polls_further_apart_than_poll_still_follow_the_drift() {
+        // 20 ms callbacks from a slow device clock, polled every 10 ms (the
+        // analysis loop sleeps `POLL` after its work) or irregularly: the
+        // drift turns into 10 ms stairs, which are not losses. A 20 ms loss
+        // every 2 s is still filled.
+        type Step = Box<dyn FnMut() -> Duration>;
+        let regular = || -> Step { Box::new(|| Duration::from_millis(10)) };
+        let irregular = || -> Step {
+            let mut gap = random_lateness(0x9011, 1);
+            Box::new(move || Duration::from_micros(9_500) + gap(0))
+        };
+        for ratio in [0.995, 0.999] {
+            for (name, step) in [("regular", regular()), ("irregular", irregular())] {
+                let callbacks = drifting(20, 600, ratio, on_time, |_| false);
+                let (furthest, net) = replay_polled(&callbacks, step);
+                assert!(
+                    furthest <= 25.0 && net.abs() <= 20.0,
+                    "{ratio} {name}: {net} ms filled, {furthest} ms at most"
+                );
+            }
+        }
+        let lose = |at: u64| at % 2_000 == 1_000;
+        let callbacks = drifting(20, 300, 1.0, on_time, lose);
+        let (_, net) = replay_polled(&callbacks, regular());
+        assert!((net - 3_000.0).abs() <= 20.0, "{net} ms filled");
+    }
+
+    /// As [`replay_net`], polled after `step()` each time, and returning
+    /// only the furthest and the final net silence (in ms).
+    fn replay_polled(
+        callbacks: &[(Duration, usize)],
+        mut step: impl FnMut() -> Duration,
+    ) -> (f64, f64) {
+        let start = Instant::now();
+        let end = callbacks.last().unwrap().0 + LOSS_MARGIN;
+        let mut clock = SampleClock::new(RATE, start);
+        let (mut pending, mut net, mut furthest) = (0, 0i64, 0);
+        let mut next = callbacks.iter().peekable();
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= end {
+            while let Some((_, count)) = next.next_if(|(at, _)| *at <= elapsed) {
+                pending += count;
+            }
+            let accounting = clock.poll(start + elapsed, pending);
+            net += accounting.silence as i64 - accounting.overlap as i64;
+            furthest = furthest.max(net.abs());
+            pending = 0;
+            elapsed += step();
+        }
+        let ms = |samples: i64| samples as f64 * 1000.0 / f64::from(RATE);
+        (ms(furthest), ms(net))
     }
 
     /// Callbacks of `ms` milliseconds of device time for `seconds` of device
