@@ -1548,8 +1548,76 @@ mod tests {
                 .map(decode_srgb)
                 .fold(0.0_f32, f32::max);
             assert!(
-                (0.04..=0.053).contains(&maximum),
-                "{format:?}: expected bright, overlapping stars bounded near 0.05 linear, got {maximum}"
+                (0.019..=0.021).contains(&maximum) && maximum <= 0.05,
+                "{format:?}: expected overlapping white stars at normalized Rec.709 luminance 0.02 under the 0.05 channel cap, got {maximum}"
+            );
+        }
+    }
+
+    /// Reads back one isolated limiting-magnitude white star on both
+    /// attachment formats. Its Rec.709 luminance should remain near 0.0052
+    /// linear after tint normalization and sRGB encoding.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn isolated_faint_star_is_visible_on_srgb_and_unorm_attachments() {
+        let csv = b"ra,dec,mag\n18.7,45,6.5\n";
+        let catalog =
+            Arc::new(scenes::starfield::StarCatalog::from_reader(csv.as_slice()).unwrap());
+        let config = scenes::starfield::StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        let frame = ControlFrame {
+            scene: scenes::starfield::SCENE,
+            ..ControlFrame::procedural(0)
+        };
+        let decode_srgb = |code: u8| {
+            let value = f32::from(code) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                160,
+                90,
+                format,
+            ))
+            .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(config.clone()));
+            renderer.pipeline_mut().enable_starfield_dispatch(true);
+            let pixels = renderer.render(frame, 0.0).unwrap();
+            let lit_pixels = pixels
+                .chunks_exact(3)
+                .filter(|pixel| pixel.iter().any(|&channel| channel != 0))
+                .count();
+            let maximum_luminance = pixels
+                .chunks_exact(3)
+                .map(|pixel| {
+                    0.2126 * decode_srgb(pixel[0])
+                        + 0.7152 * decode_srgb(pixel[1])
+                        + 0.0722 * decode_srgb(pixel[2])
+                })
+                .fold(0.0_f32, f32::max);
+            assert!(
+                lit_pixels > 0,
+                "{format:?}: isolated limiting-magnitude star read back black"
+            );
+            assert!(
+                (0.0045..=0.0058).contains(&maximum_luminance),
+                "{format:?}: expected isolated faint-star readback near 0.0052 linear luminance, got {maximum_luminance}"
             );
         }
     }

@@ -434,10 +434,16 @@ frames. Bare or wrapped wire bytes and catalog options alone do not select it.
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
   brightness and point size; colour index controls approximate hue. A
-  square-root tone lift in linear light raises faint stars for 8-bit
-  legibility; this is deliberate tone compression, not an sRGB correction,
-  and the renderer's sRGB output encoding is unchanged. Point footprints are
-  approximately 2.8–3.5 output pixels over the rendered magnitude range. At most
+  0.30-power linear-light magnitude curve keeps a neutral magnitude-6.5 star
+  near 0.0052 linear luminance (about 16 sRGB codes). Tints are normalized to
+  Rec.709 linear luminance 0.4 before magnitude brightness is applied, keeping
+  different hues in the same brightness order. Across the complete
+  1000–40000 K black-body approximation, the luminance minimum is above 0.403
+  at the warm endpoint, so normalization only scales channels down and
+  preserves the 0.05 per-channel cap. This is deliberate tone shaping, not an
+  sRGB correction; the renderer's sRGB output encoding is unchanged. Point
+  footprints are approximately 2.8–3.5 output pixels over the rendered
+  magnitude range. At most
   200 stars are rendered from a spatial index that retains every in-limit
   star, so brighter below-horizon records cannot hide a fainter visible one.
   At most 131,072 CSV rows, 64 MiB total input, and 1 MiB per CSV record are

@@ -26,7 +26,8 @@ const RIGHT_ASCENSION_BINS: usize = 48;
 const DECLINATION_BINS: usize = 18;
 const MIN_STAR_MAGNITUDE: f64 = -2.0;
 const BRIGHTNESS_DECADES_PER_MAGNITUDE: f64 = 0.23;
-const LINEAR_LIGHT_TONE_EXPONENT: f64 = 0.5;
+const LINEAR_LIGHT_TONE_EXPONENT: f64 = 0.3;
+const STAR_TINT_REC709_LUMINANCE: f32 = 0.4;
 
 #[derive(Clone, Debug)]
 pub struct StarfieldConfig {
@@ -81,9 +82,9 @@ impl ProjectionKey {
 }
 
 fn star_brightness(magnitude: f64) -> f32 {
-    // This square-root tone lift is applied in linear light, not as an sRGB
-    // correction. It improves faint-star visibility while retaining the
-    // same per-channel output cap.
+    // The sublinear tone curve is applied in linear light, not as an sRGB
+    // correction. Its exponent keeps the limiting-magnitude white star near
+    // 0.0052 linear luminance after tint normalization.
     let relative_brightness =
         10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (magnitude - MIN_STAR_MAGNITUDE));
     (f64::from(MAX_STAR_LINEAR_LUMINANCE) * relative_brightness.powf(LINEAR_LIGHT_TONE_EXPONENT))
@@ -693,6 +694,7 @@ fn build_uncached(
             .colour_index
             .map(color_index_rgb)
             .unwrap_or([1.0, 1.0, 1.0]);
+        let tint = normalize_star_tint(tint);
         // The size curve preserves magnitude ordering while keeping points
         // discernible at small output sizes.
         let size_pixels = star_size_pixels(brightness);
@@ -789,6 +791,27 @@ fn color_index_rgb(colour_index: f64) -> [f32; 3] {
         (green / 255.0) as f32,
         (blue / 255.0) as f32,
     ]
+}
+
+fn rec709_luminance(rgb: [f32; 3]) -> f32 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+fn normalize_star_tint(tint: [f32; 3]) -> [f32; 3] {
+    // For normalized temperature t in [10, 400] (1000–40000 K), the
+    // black-body approximation has a global Rec.709 linear-luminance minimum
+    // at t=10: on [10, 19], R=1, B=0 and G increases, giving Y=0.403096...
+    // On [19, 66], R=1 while G and B increase; on [66, 400], B=1 while R
+    // and G decrease, giving the other endpoint Y=0.719009... at t=400.
+    // Thus Y >= 0.403096... > this 0.4 target throughout the full range.
+    // The scale is always <= 1, so normalization preserves hue and never
+    // boosts any channel above the unnormalized [0, 1] tint.
+    let luminance = rec709_luminance(tint);
+    if !luminance.is_finite() || luminance <= 0.0 {
+        return [STAR_TINT_REC709_LUMINANCE; 3];
+    }
+    let scale = STAR_TINT_REC709_LUMINANCE / luminance;
+    tint.map(|channel| channel * scale)
 }
 
 #[cfg(test)]
@@ -1691,8 +1714,8 @@ mod tests {
         assert!(brightness[0] > brightness[1]);
         assert!(brightness.windows(2).all(|pair| pair[0] > pair[1]));
         assert!(sizes.windows(2).all(|pair| pair[0] > pair[1]));
-        assert!((0.0052..=0.0054).contains(brightness.last().unwrap()));
-        assert!((2.8..=2.9).contains(sizes.last().unwrap()));
+        assert!((0.0128..=0.0131).contains(brightness.last().unwrap()));
+        assert!((3.0..=3.1).contains(sizes.last().unwrap()));
 
         let encode_srgb = |linear: f32| {
             let encoded = if linear <= 0.003_130_8 {
@@ -1702,13 +1725,14 @@ mod tests {
             };
             (encoded * 255.0).round() as u8
         };
-        let old_faint = (f64::from(MAX_STAR_LINEAR_LUMINANCE)
-            * 10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (6.5 - MIN_STAR_MAGNITUDE)))
-        .clamp(0.000_55, f64::from(MAX_STAR_LINEAR_LUMINANCE)) as f32;
-        assert!(brightness[5] > old_faint * 9.0);
-        assert!(encode_srgb(brightness[5]) >= encode_srgb(old_faint) * 8);
-        assert!(encode_srgb(brightness[5]) >= 16);
-        assert!(encode_srgb(brightness[0]) <= 63);
+        let relative_faint =
+            10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (6.5 - MIN_STAR_MAGNITUDE));
+        let previous_faint_luminance =
+            (f64::from(MAX_STAR_LINEAR_LUMINANCE) * relative_faint.sqrt()) as f32;
+        let faint_white_luminance = brightness[5] * STAR_TINT_REC709_LUMINANCE;
+        assert!(faint_white_luminance >= previous_faint_luminance * 0.98);
+        assert_eq!(encode_srgb(faint_white_luminance), 16);
+        assert_eq!(encode_srgb(brightness[0] * STAR_TINT_REC709_LUMINANCE), 39);
 
         let csv = format!(
             "ra,dec,mag\n{}",
@@ -1747,6 +1771,127 @@ mod tests {
             instances
                 .windows(2)
                 .all(|pair| pair[0].color[0] < pair[1].color[0])
+        );
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].size[1] < pair[1].size[1])
+        );
+    }
+
+    #[test]
+    fn normalized_tints_preserve_hue_and_bound_temperature_edges() {
+        let colour_indices = [
+            Some(100.0),     // Clamp to the 1000 K warm endpoint.
+            Some(1.5),       // Warm interior.
+            Some(0.65),      // Near-white interior.
+            Some(-1.8478),   // Clamp to the 40000 K cool endpoint.
+            Some(f64::MAX),  // Finite arithmetic edge, warm clamp.
+            Some(-f64::MAX), // Finite arithmetic edge, warm clamp.
+            None,            // Missing colour is neutral white.
+        ];
+        for colour_index in colour_indices {
+            let raw = colour_index.map(color_index_rgb).unwrap_or([1.0, 1.0, 1.0]);
+            let tint = normalize_star_tint(raw);
+            assert!(
+                (rec709_luminance(tint) - STAR_TINT_REC709_LUMINANCE).abs() < 1.0e-6,
+                "colour index {colour_index:?}: {tint:?}"
+            );
+            assert!(
+                tint.iter().all(|&channel| (0.0..=1.0).contains(&channel)),
+                "colour index {colour_index:?}: {tint:?}"
+            );
+
+            if rec709_luminance(raw) > 0.0 {
+                let expected_scale = STAR_TINT_REC709_LUMINANCE / rec709_luminance(raw);
+                assert!(expected_scale <= 1.0, "colour index {colour_index:?}");
+                for (raw_channel, normalized_channel) in raw.into_iter().zip(tint) {
+                    assert!(
+                        (raw_channel * expected_scale - normalized_channel).abs() < 1.0e-6,
+                        "normalization changed tint hue for {colour_index:?}"
+                    );
+                }
+            }
+
+            for magnitude in [-10.0, -2.0, 6.5] {
+                let channels = tint.map(|channel| channel * star_brightness(magnitude));
+                assert!(
+                    channels
+                        .iter()
+                        .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+                );
+                assert!(
+                    (rec709_luminance(channels)
+                        - STAR_TINT_REC709_LUMINANCE * star_brightness(magnitude))
+                    .abs()
+                        < 1.0e-6
+                );
+            }
+        }
+
+        assert_eq!(
+            normalize_star_tint([0.0, 0.0, 0.0]),
+            [STAR_TINT_REC709_LUMINANCE; 3]
+        );
+        assert_eq!(
+            normalize_star_tint([f32::NAN, 0.0, 0.0]),
+            [STAR_TINT_REC709_LUMINANCE; 3]
+        );
+    }
+
+    #[test]
+    fn mixed_colour_stars_keep_magnitude_order_in_rec709_luminance() {
+        let csv = "ra,dec,mag,ci\n\
+                   18.7,45,6.5,\n\
+                   18.7,45,5.5,100\n\
+                   18.7,45,5,-1.8478\n\
+                   18.7,45,4.5,1.5\n";
+        let warm = color_index_rgb(100.0);
+        assert!(
+            star_brightness(5.5) * rec709_luminance(warm) < star_brightness(6.5),
+            "fixture should expose the previous warm-versus-white luminance reversal"
+        );
+
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog(csv).unwrap()),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (960, 540),
+            &state,
+            &mut instances,
+        );
+
+        assert_eq!(instances.len(), 4);
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].center == pair[1].center)
+        );
+        assert!(instances.iter().all(|instance| {
+            instance.color[3] == 1.0
+                && instance.color[..3]
+                    .iter()
+                    .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+        }));
+        let luminances: Vec<_> = instances
+            .iter()
+            .map(|instance| {
+                rec709_luminance([instance.color[0], instance.color[1], instance.color[2]])
+            })
+            .collect();
+        assert!(
+            luminances.windows(2).all(|pair| pair[0] < pair[1]),
+            "faint-first draw order must remain increasing in Rec.709 luminance: {luminances:?}"
         );
         assert!(
             instances
