@@ -56,7 +56,11 @@ fn python_command_selects_interpreter_without_shell_evaluation() {
             .unwrap()
             .as_nanos()
     ));
-    std::fs::write(&path, []).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
     let command = python_command(Some(path.as_os_str().to_owned()));
     assert_eq!(command.get_program(), path.as_os_str());
     assert_eq!(command.get_args().count(), 0);
