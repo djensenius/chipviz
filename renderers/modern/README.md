@@ -108,7 +108,9 @@ device that stops sending audio) fades smoothly to zero. Audio dropped while
 analysis catches up still advances the beat clock, so it keeps real time, and
 so do short gaps where the device itself loses audio (they count as silence).
 Deliveries that run late for a while and then catch up, at once or
-gradually, are not counted as lost: any silence added for them is taken back.
+gradually, are not counted as lost: any silence added for them is taken back
+(once a drift has been measured, a gradual catch-up takes back only silence
+from the last 30 seconds or so).
 A device clock running slightly slow or fast (up to about 0.5%) is followed as
 a steady drift once it has been measured confidently, not mistaken for lost
 audio or delivery jitter. Losses during it are still filled, but losses too
@@ -126,7 +128,8 @@ stops drifting, or whose rate wanders), the measured drift is dropped once it
 no longer fits, without filling or taking back anything for the change, and
 the capture behaves as if the clock kept time until the new drift is measured.
 While it does, a clock that has started running slow is filled as before, and
-fills older than about 30 seconds are not taken back. Analysis polls every 5 ms
+fills older than about 30 seconds are taken back only when late deliveries
+catch up at once. Analysis polls every 5 ms
 or so; if it is held up so that polls come regularly no more often than audio
 blocks arrive, a drifting clock delivers exactly what lost blocks would, and
 the drift is not measured. When polls are held up to about half a block or

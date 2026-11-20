@@ -525,6 +525,7 @@ impl SampleClock {
             let lag = elapsed - self.fed as f64 / rate - self.drift.compensation(now);
             let spare = (real - accounting.overlap) as f64 / rate;
             let trusted = self.drift.trusted();
+            self.loss.stairs = self.drift.stairs();
             let adjust = self.loss.check(now, lag, spare, trusted) * rate;
             if self.loss.take_residual() && trusted {
                 self.drift.withdraw(self.drift.at(now));
@@ -586,7 +587,8 @@ impl SampleClock {
 /// filled only if it arrived at once (see `STEP_SHARE`), and only the steps
 /// are filled, not lag the trusted drift's small error built up before them.
 /// Only fill from the last `FRESH_FILL` is taken back, from then on (also
-/// while a withdrawn drift is measured again). Lag that rises
+/// while a withdrawn drift is measured again), unless the lag falls at once,
+/// as when a delayed delivery catches up. Lag that rises
 /// gradually past the margin, or falls below the latency by more than the
 /// margin with no recent fill to take back, is a [`Self::take_residual`]: the
 /// latency follows it without fill or take-back, and the tracker withdraws
@@ -631,6 +633,15 @@ struct LossDetector {
     /// for good, even while a withdrawn drift is measured again, so a clock
     /// that speeds up does not take back fill for audio the device lost.
     ever_trusted: bool,
+    /// Fill older than `FRESH_FILL` that a lag falling at once may still
+    /// take back, until the lag is back at the latency: a fall of over
+    /// `DRIFT_STEP` (and `stairs`) below the lowest lag of the
+    /// `STEP_LOOKBACK` before the last, far faster than any drift, is a
+    /// delayed delivery catching up.
+    caught_up: f64,
+    /// How much taller than `POLL` the poll stairs are (see
+    /// [`DriftTracker::stairs`]): a fall of one stair is not a catch-up.
+    stairs: f64,
 }
 
 impl LossDetector {
@@ -652,6 +663,8 @@ impl LossDetector {
             residual: false,
             before_step: None,
             ever_trusted: false,
+            caught_up: 0.0,
+            stairs: 0.0,
         }
     }
 
@@ -843,13 +856,30 @@ impl LossDetector {
                 self.absorbed = Some((at, absorbed - down));
             }
         }
+        if lag >= latency {
+            self.caught_up = 0.0;
+        } else if let Some(before) = self
+            .lags
+            .iter()
+            .filter(|&&(at, _)| {
+                let age = now.duration_since(at);
+                age > STEP_LOOKBACK && age <= 2 * STEP_LOOKBACK
+            })
+            .map(|&(_, lag)| lag)
+            .reduce(f64::min)
+            && before - lag > DRIFT_STEP + self.stairs
+        {
+            self.caught_up = self.caught_up.max(before - lag);
+        }
+        let fresh = self.fresh(now);
         let takeable = if trusted || self.ever_trusted {
-            self.fresh(now)
+            (fresh + self.caught_up).min(self.filled)
         } else {
             self.filled
         };
         if lag < latency && takeable > 0.0 {
             let back = (latency - lag).min(takeable).min(spare);
+            self.caught_up = (self.caught_up - (back - fresh).max(0.0)).max(0.0);
             self.filled -= back;
             self.unfill(back);
             // Fill taken back was a delay, not a loss: learn the whole
@@ -1050,6 +1080,18 @@ impl DriftTracker {
             stair: f64::INFINITY,
             last_stair: f64::INFINITY,
             unit: f64::INFINITY,
+        }
+    }
+
+    /// How much taller than `POLL` the stairs that polling makes of a ramp
+    /// are (the shortest interval between polls of the open window and the
+    /// last, less `POLL`).
+    fn stairs(&self) -> f64 {
+        let stair = self.stair.min(self.last_stair);
+        if stair.is_finite() {
+            (stair - POLL.as_secs_f64()).max(0.0)
+        } else {
+            0.0
         }
     }
 
@@ -2146,9 +2188,16 @@ mod tests {
         loss.trust(-0.04, 0.04);
         let back = loss.check(at(41_000), -0.04, 1.0, true);
         assert!((back + 0.04).abs() < 1e-9, "{back}");
-        // The lag then falls: the recent 40 ms fill was already repaid, and
-        // the older 80 ms is past `FRESH_FILL`, so nothing more is taken.
-        assert_eq!(loss.check(at(42_000), -0.1, 1.0, true), 0.0);
+        // The lag then falls gradually (a drift change, not a catch-up): the
+        // recent 40 ms fill was already repaid, and the older 80 ms is past
+        // `FRESH_FILL`, so nothing more is taken.
+        for step in 1..=60u32 {
+            let lag = -0.04 - f64::from(step) * 0.001;
+            assert_eq!(
+                loss.check(at(41_000 + u64::from(step) * 500), lag, 1.0, true),
+                0.0
+            );
+        }
     }
 
     #[test]
@@ -2171,6 +2220,38 @@ mod tests {
                     (net - 80.0).abs() <= 15.0,
                     "{before} then {after}, {ms} ms: {net} ms filled"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_delay_held_past_fresh_fill_is_taken_back_when_it_catches_up() {
+        // Once a drift is trusted, deliveries run 60 ms late for longer than
+        // `FRESH_FILL` and then catch up: the fill for the delay has expired,
+        // but the catch-up falls at once, so it is still taken back.
+        for ratio in [0.998, 1.002, 1.005] {
+            for ms in [10, 20] {
+                let (_, _, clean) = replay_net(
+                    &drifting(ms, 500, ratio, on_time, |_| false),
+                    Duration::ZERO,
+                );
+                for held in [45.0, 90.0] {
+                    let late = |k: usize| {
+                        let at = (k as u64 * ms) as f64 / 1000.0 / ratio;
+                        if (300.0..300.0 + held).contains(&at) {
+                            Duration::from_millis(60)
+                        } else {
+                            Duration::ZERO
+                        }
+                    };
+                    let callbacks = drifting(ms, 500, ratio, late, |_| false);
+                    let (_, _, net) = replay_net(&callbacks, Duration::ZERO);
+                    assert!(
+                        (net - clean).abs() <= 15.0,
+                        "{ratio}, {ms} ms, held {held} s: {} ms left",
+                        net - clean
+                    );
+                }
             }
         }
     }
