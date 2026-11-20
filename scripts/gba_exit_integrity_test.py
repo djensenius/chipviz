@@ -38,16 +38,16 @@ class Oracle:
       self.cache[key] = bytes(self.pixels)
     return self.cache[key]
 
-  def locate(self, pixels, scene, palette=0, keys=0):
-    matches = [frame for frame in range(150) if pixels == self.page(frame, scene, palette, keys)]
+  def locate(self, pixels, scene, palette=0, keys=0, first=0, end=150):
+    matches = [frame for frame in range(first, end) if pixels == self.page(frame, scene, palette, keys)]
     if len(matches) != 1:
       raise AssertionError(f"expected one complete native page, got frame matches {matches}")
     return matches[0]
 
 
-def setup(rom, core, oracle):
+def setup(rom, core, oracle, warmup=120):
   gba = controls.GbaCore(rom, core)
-  for _ in range(120):
+  for _ in range(warmup):
     gba.run_frame()
   for _ in range(3):
     for _ in range(8):
@@ -67,9 +67,9 @@ def setup(rom, core, oracle):
     last = pixels
   if entry is None or not 29 <= entry <= 31:
     raise AssertionError(f"field entry expected at frames 29..31, got {entry}")
+  frame = oracle.locate(last, 3, first=max(0, warmup // 4 - 2), end=warmup // 4 + 35) + 1
   for pixels in native_frames:
-    oracle.locate(pixels, 3)
-  frame = oracle.locate(last, 3) + 1
+    oracle.locate(pixels, 3, first=max(0, frame - 12), end=frame)
   for _ in range(40):
     gba.run_frame()
     if gba.pixels() != FIELD:
@@ -77,8 +77,8 @@ def setup(rom, core, oracle):
   return gba, frame, entry
 
 
-def scenario(rom, core, oracle, name, schedule, start, first, second, count=100):
-  gba, frame, entry = setup(rom, core, oracle)
+def scenario(rom, core, oracle, name, schedule, start, first, second, count=100, warmup=120):
+  gba, frame, entry = setup(rom, core, oracle, warmup)
   try:
     frames = []
     for step in range(count):
@@ -94,7 +94,8 @@ def scenario(rom, core, oracle, name, schedule, start, first, second, count=100)
     next_page = next((pixels for pixels in frames[departure + 1:] if pixels != first_page), None)
     if next_page != oracle.page(frame + 1, *second):
       raise AssertionError(f"{name}: next native page differs from complete rendered page")
-    print(f"{name}: field entry {entry}, exit {departure}; first two native pages exact")
+    print(f"{name}: warmup {warmup}, native frame {frame}, field entry {entry}, exit {departure}; "
+          "first two native pages exact")
   finally:
     gba.close()
 
@@ -141,6 +142,7 @@ def main():
   parser.add_argument("--rom", type=pathlib.Path, required=True)
   parser.add_argument("--core", type=pathlib.Path, required=True)
   parser.add_argument("--oracle", type=pathlib.Path, required=True)
+  parser.add_argument("--phase-sweep", action="store_true", help="repeat transitions at eight native animation phases")
   args = parser.parse_args()
   oracle = Oracle(args.oracle)
 
@@ -200,6 +202,18 @@ def main():
              (count - 1) * 10, (scene, 7, 15), (scene, 7, 15))
   repeated_entries(args.rom, args.core, oracle)
   print("gba mGBA entry/exit integrity: 13 scenarios passed")
+  if args.phase_sweep:
+    # The second value in each phrase selects a beat-border page.
+    for warmup in (120, 188, 504, 572, 888, 956, 1272, 1340):
+      for name, schedule, start, first, second in (
+          ("released A", early_a, 0, (3, 0, 0), (3, 0, 0)),
+          ("snapshot A", snapshot_a, 0, (3, 0, KEYS["a"]), (3, 0, 0)),
+          ("full chord", full_chord, 0, (3, 0, 15), (3, 0, 15)),
+          ("late palette", palette_before, 0, (3, 1, 0), (3, 1, 0)),
+          ("display boundary", scene_on_display, 0, (3, 0, 0), (2, 0, 0)),
+          ("30th-poll reversal", cancel_at_30, 29, (2, 0, 0), (2, 0, 0))):
+        scenario(args.rom, args.core, oracle, name, schedule, start, first, second, warmup=warmup)
+    print("gba mGBA animation phase sweep: 48 scenarios passed")
 
 
 if __name__ == "__main__":

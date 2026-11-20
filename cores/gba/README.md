@@ -39,9 +39,12 @@ run as hard cuts, never flash. South and East produce beat/bar edges and the
 left shoulder selects the high energy bucket. The digital-only path has no
 separate bands, notes, drop or silence input.
 
-The current host HID encoder emits absolute scene and palette as keyboard
-keys; it does **not** synthesize the gamepad D-pad pulses. Consequently it
-does not currently stream scene or palette selections to this GBA receiver.
+The default host HID encoder emits absolute scene and palette as keyboard keys,
+which this ROM does not read. Its opt-in `--gba-gamepad` conversion emits
+relative D-pad JSON states for this scene ring, subject to the known-ring and
+release-preamble requirements in the
+[HID transport spec](../../shared/specs/usb-hid-transport-v0.md#gba-gamepad-only-json-conversion).
+It is not a USB sender, and actual Dock/hardware operation is not yet verified.
 No keyboard or richer control-frame input is implemented by this ROM.
 
 Native overlays use the A/B/Select/Start state sampled at the beginning of each
