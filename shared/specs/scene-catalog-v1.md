@@ -210,6 +210,41 @@ application; overflow fails closed instead of silently resampling away a
 record. All ColourField decode, edge, entry, debounce, arming and budget rules
 still apply to those ordered steps.
 
+#### Live sender headroom
+
+The 60 Hz limit is a safety ceiling, not a sustainable throughput promise.
+Even small persistent scheduling delays accumulate if ingress matches the
+minimum application interval. A live extended sender must default to no more
+than 55 records/second: space actual sends by at least **18,181,819 ns** on
+its monotonic clock, without catch-up bursts. Choose a lower rate if needed
+for the verified receiver, network and workload. A faster explicitly
+configured rate is permitted only with independently verified end-to-end
+capacity and headroom; it must still obey the ColourField send-rate cap and
+all receiver gates. Neither 55 Hz nor such verification guarantees delivery
+under unbounded stalls, loss or network jitter.
+
+Generate each contiguous record at the chosen cadence. Do not silently drop
+records, renumber them, synthesize steps or burst to compensate for delay.
+The sender may use separately established, verified receiver feedback to slow
+the producer before capacity is exhausted; this envelope defines no feedback,
+acknowledgment or automatic negotiation. A one-way UDP sender must not assume
+receiver queue occupancy or delivery. Flow control or a slower rate cannot
+override the 500 ms deadlines: a pause that reaches a deadline requires the
+existing blackout and explicit restart. Capacity, loss, gaps and expiry still
+fail closed, not resampling or an implicit switch to legacy.
+
+The tick clock and live wall clock are different. Record `n` always represents
+logical time `n/60` seconds, regardless of send cadence or scheduling delay.
+For example, at a constant 55 records/second, 60 wall-clock seconds advance
+approximately 3,300 intervals, or 55 logical seconds: logical time falls
+behind by approximately 5 seconds. Live Starfield's epoch plus tick time
+likewise falls behind UTC; it must not be claimed to track the current sky
+during a slower session. Starting a new session with a newly validated epoch
+can re-anchor it, but does not stop subsequent drift. Scene-7 stability still
+counts actual applied steps; slower delivery makes its wall-clock gates longer,
+never shorter. Offline processing retains its deterministic `n/60` timeline,
+and legacy mode is unchanged.
+
 A gap, overflow, malformed or otherwise invalid record, disconnect, reset or
 mode change invalidates the session: discard the queue, stop applying input,
 clear pending requests and arming state, and immediately present steady black
@@ -419,8 +454,30 @@ is exercised.
   blackout. For `[10, 12] ms` dequeued at 15 ms, use 10 ms and give that
   record expiry 510 ms; `[10, 16] ms` is invalid at that dequeue time.
 - With exact timestamps, records entering and applying at 0, 16,666,667 and
-  33,333,334 ns advance both deadlines without a burst. The same ordered
-  records processed offline use ticks 0, 1, 2 without an ingress clock.
+  33,333,334 ns advance both deadlines without a burst. This short trace
+  does not prove sustained 60 Hz capacity. The same ordered records processed
+  offline use ticks 0, 1, 2 without an ingress clock.
+- In an idealized test overriding the default with no network delay, sequence 0
+  enters/applies at 0 ns, each later record enters at `n * 16,666,667 ns`, and
+  each backlogged application takes `16,766,667 ns` after its predecessor
+  (100 µs late).
+  At sequence 671's arrival, 11,183,333,557 ns, only 0..666 have applied
+  and 667..670 already fill the four waiting slots. Sequence 671 overflows:
+  immediately black out, without dropping or advancing it. This exact-ceiling
+  sender is not sustainable under that persistent lateness.
+- With no network delay, sends every 18,181,819 ns and a receiver whose
+  application is at most 200 µs after it is eligible have 1,315,152 ns of
+  per-interval headroom even at maximum lateness. With the repeating
+  scheduler delays 0, 50, 100, 150 and 200 µs and no other stalls, a
+  10,000-record run has at most one waiting record and no overflow or timeout.
+  This bounded example is not a guarantee for an unbounded live network.
+- With sequence 0 applied at 0 ns, network jitter compresses arrivals of
+  sequences 1..4 to 1..4 ms, filling the queue. With 100 µs application
+  lateness, sequence 1 applies at
+  16,766,667 ns; sequence 5 arriving at 18,181,819 ns then fills the freed
+  slot rather than overflowing. Continued 18,181,819 ns spacing with that
+  lateness drains the queue. If 5 instead arrives at 5 ms, it overflows and
+  blacks out as above; pacing must never be relaxed to rescue it.
 - For a hypothetical receiver supporting `org.example.renderer@1.2.3`, the
   exact UTF-8 bytes below, including the final LF, have SHA-256
   `e755ea1e5fc421dcf034e15a8ded19fbda696a1b39f49b2f54e9c2c9589d4bb3`
