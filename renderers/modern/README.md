@@ -434,15 +434,21 @@ frames. Bare or wrapped wire bytes and catalog options alone do not select it.
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
   brightness and point size; colour index controls approximate hue. A
-  0.30-power linear-light magnitude curve keeps a neutral magnitude-6.5 star
-  near 0.0052 linear luminance (about 16 sRGB codes). Tints are normalized to
-  Rec.709 linear luminance 0.4 before magnitude brightness is applied, keeping
-  different hues in the same brightness order. Across the complete
-  1000–40000 K black-body approximation, the luminance minimum is above 0.403
-  at the warm endpoint, so normalization only scales channels down and
-  preserves the 0.05 per-channel cap. This is deliberate tone shaping, not an
-  sRGB correction; the renderer's sRGB output encoding is unchanged. Point
-  footprints are approximately 2.8–3.5 output pixels over the rendered
+  existing square-root linear-light magnitude scalar `B` preserves the
+  point-size response; emitted luminance is `L = 0.02 * tanh(B / 0.02)`.
+  A neutral magnitude-6.5 star stays near 0.00514 linear luminance (about 16
+  sRGB codes), while very bright white stars top out near 0.01974 (about 38
+  codes). Each approximate black-body tint is scaled by `L / Y`, where `Y` is
+  its Rec.709 linear luminance, keeping different hues in the same magnitude
+  order. Over the complete 1000–40000 K range, `Y` is at least 0.403096 at the
+  warm endpoint (the cool endpoint is about 0.719); thus the worst channel is
+  below `0.01974 / 0.403 < 0.049`, leaving margin under the 0.05 linear
+  per-channel cap even with rounding. The tint values are linear RGB, not
+  sRGB-encoded inputs. This is deliberate tone shaping, not an sRGB correction;
+  the renderer's output encoding is unchanged. Very close magnitudes can
+  quantize to equal 8-bit codes; ordering is defined before that quantization.
+  Point footprints retain the
+  existing approximately 2.8–3.5 output-pixel curve over the rendered
   magnitude range. At most
   200 stars are rendered from a spatial index that retains every in-limit
   star, so brighter below-horizon records cannot hide a fainter visible one.

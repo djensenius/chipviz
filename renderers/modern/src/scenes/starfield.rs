@@ -26,8 +26,9 @@ const RIGHT_ASCENSION_BINS: usize = 48;
 const DECLINATION_BINS: usize = 18;
 const MIN_STAR_MAGNITUDE: f64 = -2.0;
 const BRIGHTNESS_DECADES_PER_MAGNITUDE: f64 = 0.23;
-const LINEAR_LIGHT_TONE_EXPONENT: f64 = 0.3;
-const STAR_TINT_REC709_LUMINANCE: f32 = 0.4;
+const LINEAR_LIGHT_TONE_EXPONENT: f64 = 0.5;
+const MAX_STAR_OUTPUT_LUMINANCE: f32 = 0.02;
+const MIN_STAR_TINT_LUMINANCE_BOUND: f32 = 0.403;
 
 #[derive(Clone, Debug)]
 pub struct StarfieldConfig {
@@ -82,13 +83,16 @@ impl ProjectionKey {
 }
 
 fn star_brightness(magnitude: f64) -> f32 {
-    // The sublinear tone curve is applied in linear light, not as an sRGB
-    // correction. Its exponent keeps the limiting-magnitude white star near
-    // 0.0052 linear luminance after tint normalization.
+    // Keep this square-root magnitude scalar for the existing point-size
+    // curve. The output luminance is compressed separately below.
     let relative_brightness =
         10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (magnitude - MIN_STAR_MAGNITUDE));
     (f64::from(MAX_STAR_LINEAR_LUMINANCE) * relative_brightness.powf(LINEAR_LIGHT_TONE_EXPONENT))
         .clamp(0.0, f64::from(MAX_STAR_LINEAR_LUMINANCE)) as f32
+}
+
+fn star_output_luminance(brightness: f32) -> f32 {
+    MAX_STAR_OUTPUT_LUMINANCE * (brightness / MAX_STAR_OUTPUT_LUMINANCE).tanh()
 }
 
 fn star_size_pixels(brightness: f32) -> f32 {
@@ -694,7 +698,7 @@ fn build_uncached(
             .colour_index
             .map(color_index_rgb)
             .unwrap_or([1.0, 1.0, 1.0]);
-        let tint = normalize_star_tint(tint);
+        let tint = tint_at_luminance(tint, star_output_luminance(brightness));
         // The size curve preserves magnitude ordering while keeping points
         // discernible at small output sizes.
         let size_pixels = star_size_pixels(brightness);
@@ -797,20 +801,23 @@ fn rec709_luminance(rgb: [f32; 3]) -> f32 {
     0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 }
 
-fn normalize_star_tint(tint: [f32; 3]) -> [f32; 3] {
+fn tint_at_luminance(tint: [f32; 3], output_luminance: f32) -> [f32; 3] {
     // For normalized temperature t in [10, 400] (1000–40000 K), the
     // black-body approximation has a global Rec.709 linear-luminance minimum
     // at t=10: on [10, 19], R=1, B=0 and G increases, giving Y=0.403096...
     // On [19, 66], R=1 while G and B increase; on [66, 400], B=1 while R
     // and G decrease, giving the other endpoint Y=0.719009... at t=400.
-    // Thus Y >= 0.403096... > this 0.4 target throughout the full range.
-    // The scale is always <= 1, so normalization preserves hue and never
-    // boosts any channel above the unnormalized [0, 1] tint.
+    // Thus Y >= 0.403096...; the conservative 0.403 denominator bound also
+    // absorbs f32 rounding. Since B <= 0.05, output_luminance <=
+    // 0.02*tanh(2.5) < 0.01974, so every channel is at most
+    // 0.01974/0.403 < 0.049, strictly below the 0.05 channel cap.
+    // Multiplication by one scalar preserves the tint's RGB ratios. These RGB
+    // values are linear-light approximations; do not decode them as sRGB.
     let luminance = rec709_luminance(tint);
     if !luminance.is_finite() || luminance <= 0.0 {
-        return [STAR_TINT_REC709_LUMINANCE; 3];
+        return [output_luminance; 3];
     }
-    let scale = STAR_TINT_REC709_LUMINANCE / luminance;
+    let scale = output_luminance / luminance.max(MIN_STAR_TINT_LUMINANCE_BOUND);
     tint.map(|channel| channel * scale)
 }
 
@@ -1714,8 +1721,8 @@ mod tests {
         assert!(brightness[0] > brightness[1]);
         assert!(brightness.windows(2).all(|pair| pair[0] > pair[1]));
         assert!(sizes.windows(2).all(|pair| pair[0] > pair[1]));
-        assert!((0.0128..=0.0131).contains(brightness.last().unwrap()));
-        assert!((3.0..=3.1).contains(sizes.last().unwrap()));
+        assert!((0.0052..=0.0054).contains(brightness.last().unwrap()));
+        assert!((2.8..=2.9).contains(sizes.last().unwrap()));
 
         let encode_srgb = |linear: f32| {
             let encoded = if linear <= 0.003_130_8 {
@@ -1729,10 +1736,10 @@ mod tests {
             10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (6.5 - MIN_STAR_MAGNITUDE));
         let previous_faint_luminance =
             (f64::from(MAX_STAR_LINEAR_LUMINANCE) * relative_faint.sqrt()) as f32;
-        let faint_white_luminance = brightness[5] * STAR_TINT_REC709_LUMINANCE;
-        assert!(faint_white_luminance >= previous_faint_luminance * 0.98);
+        let faint_white_luminance = star_output_luminance(brightness[5]);
+        assert!(faint_white_luminance >= previous_faint_luminance * 0.97);
         assert_eq!(encode_srgb(faint_white_luminance), 16);
-        assert_eq!(encode_srgb(brightness[0] * STAR_TINT_REC709_LUMINANCE), 39);
+        assert!((37..=39).contains(&encode_srgb(star_output_luminance(brightness[0]))));
 
         let csv = format!(
             "ra,dec,mag\n{}",
@@ -1780,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_tints_preserve_hue_and_bound_temperature_edges() {
+    fn luminance_scaled_tints_preserve_hue_and_bound_temperature_edges() {
         let colour_indices = [
             Some(100.0),     // Clamp to the 1000 K warm endpoint.
             Some(1.5),       // Warm interior.
@@ -1792,50 +1799,40 @@ mod tests {
         ];
         for colour_index in colour_indices {
             let raw = colour_index.map(color_index_rgb).unwrap_or([1.0, 1.0, 1.0]);
-            let tint = normalize_star_tint(raw);
-            assert!(
-                (rec709_luminance(tint) - STAR_TINT_REC709_LUMINANCE).abs() < 1.0e-6,
-                "colour index {colour_index:?}: {tint:?}"
-            );
-            assert!(
-                tint.iter().all(|&channel| (0.0..=1.0).contains(&channel)),
-                "colour index {colour_index:?}: {tint:?}"
-            );
-
-            if rec709_luminance(raw) > 0.0 {
-                let expected_scale = STAR_TINT_REC709_LUMINANCE / rec709_luminance(raw);
-                assert!(expected_scale <= 1.0, "colour index {colour_index:?}");
-                for (raw_channel, normalized_channel) in raw.into_iter().zip(tint) {
-                    assert!(
-                        (raw_channel * expected_scale - normalized_channel).abs() < 1.0e-6,
-                        "normalization changed tint hue for {colour_index:?}"
-                    );
-                }
-            }
-
             for magnitude in [-10.0, -2.0, 6.5] {
-                let channels = tint.map(|channel| channel * star_brightness(magnitude));
+                let brightness = star_brightness(magnitude);
+                let expected_luminance = star_output_luminance(brightness);
+                let output = tint_at_luminance(raw, expected_luminance);
                 assert!(
-                    channels
+                    (rec709_luminance(output) - expected_luminance).abs() < 1.0e-6,
+                    "colour index {colour_index:?}: {output:?}"
+                );
+                assert!(
+                    output
                         .iter()
-                        .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+                        .all(|&channel| (0.0..=MAX_STAR_LINEAR_LUMINANCE).contains(&channel))
                 );
-                assert!(
-                    (rec709_luminance(channels)
-                        - STAR_TINT_REC709_LUMINANCE * star_brightness(magnitude))
-                    .abs()
-                        < 1.0e-6
-                );
+
+                if rec709_luminance(raw) > 0.0 {
+                    let expected_scale = expected_luminance / rec709_luminance(raw);
+                    for (raw_channel, output_channel) in raw.into_iter().zip(output) {
+                        assert!(
+                            (raw_channel * expected_scale - output_channel).abs() < 1.0e-6,
+                            "luminance scaling changed tint hue for {colour_index:?}"
+                        );
+                    }
+                }
             }
         }
 
+        let fallback_luminance = star_output_luminance(star_brightness(6.5));
         assert_eq!(
-            normalize_star_tint([0.0, 0.0, 0.0]),
-            [STAR_TINT_REC709_LUMINANCE; 3]
+            tint_at_luminance([0.0, 0.0, 0.0], fallback_luminance),
+            [fallback_luminance; 3]
         );
         assert_eq!(
-            normalize_star_tint([f32::NAN, 0.0, 0.0]),
-            [STAR_TINT_REC709_LUMINANCE; 3]
+            tint_at_luminance([f32::NAN, 0.0, 0.0], fallback_luminance),
+            [fallback_luminance; 3]
         );
     }
 
