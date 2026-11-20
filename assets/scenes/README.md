@@ -32,13 +32,20 @@ part of this base; use a compatible renderer only after that work is
 integrated. The utility does not run or verify the binary.
 
 After that integration, build a renderer and supply your locally obtained HYG
-v4.4 `.csv` or `.csv.gz` (no network access is performed by this utility):
+v4.4 `.csv` or `.csv.gz` (no network access is performed by this utility).
+Before creating the destination, ensure the checkout, `build/`, and their
+ancestors are trusted and contain no symlinks:
 
 ```sh
 cargo build --release --manifest-path renderers/modern/Cargo.toml --bin chipviz-m1
-python3 scripts/personal-starfield-bundle.py \
-  --catalog "/path/to/local/hyg_v44.csv.gz" \
-  --binary "renderers/modern/target/release/chipviz-m1"
+mkdir -p build
+(
+  umask 077
+  mkdir -m 700 build/personal-starfield
+  python3 scripts/personal-starfield-bundle.py \
+    --catalog "/path/to/local/hyg_v44.csv.gz" \
+    --binary "renderers/modern/target/release/chipviz-m1"
+)
 ./build/personal-starfield/launch-starfield --location "0,0" --time 0
 ```
 
@@ -55,14 +62,25 @@ compatible modern profile executable may be supplied instead of `chipviz-m1`.
 Use `--upstream-notice "/path/to/local/notice"` for each additional upstream
 notice available locally; each is copied unchanged. The tool does not discover
 or verify upstream notices, the supplied catalog's version, origin, or CSV
-contents.
+contents. Both plain CSV and decompressed gzip are limited to 64 MiB
+(67,108,864 bytes); the known HYG v4.4 CSV is 33,929,696 bytes.
 
-To choose another local destination, add `--output "/private/path/new-bundle"`.
-Its parent must already exist and the output must not exist, even as a dangling
-symlink. Input files themselves must be regular files, not symlinks. Output
-paths cannot traverse symlinks or enter `dist/`, release paths, another Git
-checkout, or tracked areas of this checkout; use a physical path such as
-`/private/tmp/...` instead of macOS's symlinked `/tmp/...`. Only `build/` is
-created automatically. Existing files are never overwritten; if a partial
-directory cannot be safely cleaned up, the tool reports it for inspection.
+Create the destination yourself before running the utility. It must be an
+empty, private directory owned by you and below this checkout's ignored
+`build/`. For another destination, create it similarly and add, for example,
+`--output build/my-personal-bundle`. Input files must be regular files, not
+symlinks. Output paths cannot traverse symlinks or enter release paths or
+another Git checkout.
+
+The destination and all its ancestors, including their ACLs, must be trusted
+against concurrent changes. Permissions do **not** isolate processes using
+the same user account. The utility holds an open directory descriptor: if the
+directory is renamed while it runs, writes continue into the opened directory
+and the printed path may no longer locate it.
+
+The utility never changes permissions, deletes files, or overwrites entries.
+Failures can leave partial files (including an incomplete launcher); inspect
+them and manually remove only your own unwanted files, or prepare another
+empty directory before retrying. It reports an error if the process umask
+strips the launcher's required owner permissions.
 

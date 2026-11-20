@@ -19,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 DEFAULT_OUTPUT = BUILD / "personal-starfield"
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+MAX_CATALOG_BYTES = 64 * 1024 * 1024
 
 CATALOG_NAME = "hyg-v4.4.csv"
 BINARY_NAME = "chipviz-renderer"
@@ -126,12 +127,10 @@ def checked_output(path: pathlib.Path) -> pathlib.Path:
     raise BundleError("output path must use a single leading slash")
   if not path.is_absolute():
     path = pathlib.Path.cwd() / path
-  if not path.name:
-    raise BundleError("output must name a new directory")
   if any(part.casefold() in {".git", "dist", "release", "releases"} for part in path.parts):
     raise BundleError("output must not be in a Git metadata, dist, or release path")
-  if (path == ROOT or ROOT in path.parents) and BUILD not in path.parents:
-    raise BundleError("output inside this checkout must be below its ignored build/ directory")
+  if BUILD not in path.parents:
+    raise BundleError("output must be below this checkout's ignored build/ directory")
   return path
 
 
@@ -144,77 +143,63 @@ def reject_other_checkout(fd: int, path: pathlib.Path) -> None:
     raise BundleError(f"output must not be inside another Git checkout: {path}")
 
 
-def open_output_parent(path: pathlib.Path) -> int:
-  """Walk from / using directory descriptors; never follow output symlinks."""
+def open_output_directory(path: pathlib.Path) -> int:
+  """Open the trusted destination through directory descriptors, without symlinks."""
   fd = os.open("/", DIRECTORY_FLAGS)
   current = pathlib.Path("/")
   try:
     reject_other_checkout(fd, current)
     for part in path.parts[1:]:
       current /= part
-      if current == BUILD:
-        try:
-          os.mkdir(part, 0o700, dir_fd=fd)
-        except FileExistsError:
-          pass
       try:
         next_fd = os.open(part, DIRECTORY_FLAGS, dir_fd=fd)
       except OSError as error:
         raise BundleError(
-          f"output parent must exist and contain no symlinks: {current} ({error.strerror})"
+          f"output directory and ancestors must exist and contain no symlinks: "
+          f"{current} ({error.strerror})"
         ) from error
       os.close(fd)
       fd = next_fd
       reject_other_checkout(fd, current)
+    info = os.fstat(fd)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+      raise BundleError("output directory must be owned by this user and private (mkdir -m 700)")
+    if os.listdir(fd):
+      raise BundleError("output directory must be empty; existing files were not changed")
     return fd
   except BaseException:
     os.close(fd)
     raise
 
 
-def create_file(fd: int, name: str, mode: int, created: list[tuple[str, int, int]]) -> BinaryIO:
-  file_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=fd)
+def create_file(fd: int, name: str, mode: int) -> BinaryIO:
   try:
-    info = os.fstat(file_fd)
-    created.append((name, info.st_dev, info.st_ino))
-    os.fchmod(file_fd, mode)
+    file_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                      mode, dir_fd=fd)
+  except FileExistsError as error:
+    raise BundleError(f"refusing to overwrite destination entry: {name}") from error
+  try:
     return os.fdopen(file_fd, "wb")
   except BaseException:
     os.close(file_fd)
     raise
 
 
-def remove_partial(parent_fd: int, name: str, directory_fd: int | None,
-                   directory_info: os.stat_result | None,
-                   created: list[tuple[str, int, int]]) -> bool:
-  """Remove only entries we created and only if their identities still match."""
-  clean = True
-  if directory_fd is not None:
-    for filename, device, inode in reversed(created):
-      try:
-        info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == (device, inode):
-          os.unlink(filename, dir_fd=directory_fd)
-        else:
-          clean = False
-      except FileNotFoundError:
-        pass
-      except OSError:
-        clean = False
-  if directory_info is None:
-    return False
-  try:
-    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == (
-        directory_info.st_dev, directory_info.st_ino):
-      os.rmdir(name, dir_fd=parent_fd)
-    else:
-      clean = False
-  except FileNotFoundError:
-    pass
-  except OSError:
-    clean = False
-  return clean
+def copy_catalog(source: BinaryIO, dest: BinaryIO, limit: int) -> None:
+  """Copy at most limit bytes and detect the first byte beyond it."""
+  total = 0
+  while True:
+    remaining = limit - total
+    data = source.read(min(64 * 1024, remaining + 1))
+    if not data:
+      if total == 0:
+        raise BundleError("catalog is empty after decompression")
+      return
+    if len(data) > remaining:
+      dest.write(data[:remaining])
+      raise BundleError(f"catalog exceeds {limit} bytes; use a smaller catalog")
+    dest.write(data)
+    total += len(data)
 
 
 def create_bundle(catalog_path: pathlib.Path, binary_path: pathlib.Path,
@@ -238,43 +223,26 @@ def create_bundle(catalog_path: pathlib.Path, binary_path: pathlib.Path,
     if not compressed and magic == b"\x1f\x8b":
       raise BundleError("gzip catalog filename must end in .csv.gz")
 
-    parent_fd = open_output_parent(output.parent)
+    directory_fd = open_output_directory(output)
     try:
       try:
-        os.mkdir(output.name, 0o700, dir_fd=parent_fd)
-      except FileExistsError as error:
-        raise BundleError(f"output already exists; refusing to overwrite: {output}") from error
-
-      directory_fd = None
-      directory_info = None
-      created: list[tuple[str, int, int]] = []
-      try:
-        directory_info = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
-        directory_fd = os.open(output.name, DIRECTORY_FLAGS, dir_fd=parent_fd)
-        opened = os.fstat(directory_fd)
-        if (opened.st_dev, opened.st_ino) != (directory_info.st_dev, directory_info.st_ino):
-          raise BundleError("output directory changed while opening")
-        os.fchmod(directory_fd, 0o700)
-
-        with create_file(directory_fd, CATALOG_NAME, 0o600, created) as dest:
+        with create_file(directory_fd, CATALOG_NAME, 0o600) as dest:
           try:
             if compressed:
               with gzip.GzipFile(fileobj=catalog, mode="rb") as source:
-                shutil.copyfileobj(source, dest)
+                copy_catalog(source, dest, MAX_CATALOG_BYTES)
             else:
-              shutil.copyfileobj(catalog, dest)
+              copy_catalog(catalog, dest, MAX_CATALOG_BYTES)
           except (gzip.BadGzipFile, EOFError, zlib.error) as error:
             raise BundleError(f"invalid gzip catalog: {error}") from error
-          if dest.tell() == 0:
-            raise BundleError("catalog is empty after decompression")
 
-        with create_file(directory_fd, BINARY_NAME, 0o700, created) as dest:
+        with create_file(directory_fd, BINARY_NAME, 0o700) as dest:
           shutil.copyfileobj(binary, dest)
 
         notice_names = []
         for index, source in enumerate(notices, start=1):
           name = f"HYG-UPSTREAM-NOTICE-{index}.txt"
-          with create_file(directory_fd, name, 0o600, created) as dest:
+          with create_file(directory_fd, name, 0o600) as dest:
             shutil.copyfileobj(source, dest)
           notice_names.append(name)
 
@@ -283,21 +251,21 @@ def create_bundle(catalog_path: pathlib.Path, binary_path: pathlib.Path,
           additional += "".join(f"- {name}\n" for name in notice_names)
         else:
           additional = "\nNo additional upstream notice files were supplied to this tool.\n"
-        with create_file(directory_fd, NOTICE_NAME, 0o600, created) as dest:
+        with create_file(directory_fd, NOTICE_NAME, 0o600) as dest:
           dest.write((NOTICE + additional).encode("utf-8"))
 
-        with create_file(directory_fd, LAUNCHER_NAME, 0o700, created) as dest:
+        with create_file(directory_fd, LAUNCHER_NAME, 0o700) as dest:
+          if stat.S_IMODE(os.fstat(dest.fileno()).st_mode) != 0o700:
+            raise BundleError("launcher mode was restricted by umask; set umask 077 and retry "
+                              "in another empty directory")
           dest.write(LAUNCHER.encode("utf-8"))
       except BaseException:
-        if not remove_partial(parent_fd, output.name, directory_fd, directory_info, created):
-          print(f"Partial output remains at {output}; inspect it before removing anything.",
-                file=sys.stderr)
+        print(f"Bundle incomplete: partial files may remain in the opened directory {output} "
+              "(or wherever it was moved). No files were removed; inspect before retrying.",
+              file=sys.stderr)
         raise
-      finally:
-        if directory_fd is not None:
-          os.close(directory_fd)
     finally:
-      os.close(parent_fd)
+      os.close(directory_fd)
   return output
 
 
@@ -308,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
   parser.add_argument("--binary", type=pathlib.Path, required=True,
                       help="already-built modern renderer executable")
   parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUTPUT,
-                      help=f"new local output directory (default: {DEFAULT_OUTPUT})")
+                      help=f"existing empty private directory under build/ (default: {DEFAULT_OUTPUT})")
   parser.add_argument("--upstream-notice", type=pathlib.Path, action="append", default=[],
                       help="local upstream attribution/copyright file; may be repeated")
   args = parser.parse_args(argv)
