@@ -12,7 +12,7 @@
 //! splats. Models sit within about one unit of the origin, front facing +z.
 
 use super::super::static_noise::font::glyph;
-use super::super::{hash, sin_cos};
+use super::super::{cos, hash, sin_cos};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 pub(super) type Vec3 = [f32; 3];
@@ -485,8 +485,8 @@ fn compact_disc(mesh: &mut Mesh, look: &Look) {
                 return gloss(if ring { [0.45; 3] } else { [0.7, 0.74, 0.78] }, 1.0);
             }
             let angle = z.atan2(x);
-            let streak = (angle - light).cos().powi(2);
-            let rainbow = hue(r * 1.3 + 0.35 * (2.0 * (angle - light)).cos() + look.treble * 0.3);
+            let streak = cos(angle - light).powi(2);
+            let rainbow = hue(r * 1.3 + 0.35 * cos(2.0 * (angle - light)) + look.treble * 0.3);
             return Surface {
                 color: mix3([0.72, 0.74, 0.78], rainbow, 0.25 + 0.7 * streak),
                 shine: 1.0,

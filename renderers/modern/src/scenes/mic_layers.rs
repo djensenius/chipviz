@@ -62,7 +62,7 @@
 
 use std::cell::Cell;
 
-use super::{colour_field, hash, palette};
+use super::{colour_field, hash, palette, sin_cos};
 use crate::audio::scope::{POINTS, ScopeSnapshot, envelope};
 use crate::control_frame::ControlFrame;
 use crate::scene::{Instance, SCREEN_SPACE_TRANSFORM};
@@ -316,7 +316,7 @@ pub fn ribbon_area_bound(wave: &[[f32; POINTS]; OUTLINES], aspect: f32) -> f32 {
                 thickness,
                 overlap,
             );
-            let (cos, sin) = (rotation.cos(), rotation.sin());
+            let (sin, cos) = sin_cos(rotation);
             let (along, across) = (size[0] * 0.5, size[1] * 0.5);
             let corners = [
                 (-along, -across),
@@ -705,12 +705,9 @@ impl MicLayers {
             for spark in 0..SPARKS {
                 let angle = spin + spark as f32 / SPARKS as f32 * std::f32::consts::TAU;
                 let size = 0.05 * (0.4 + envelope) * scale;
+                let (sin, cos) = sin_cos(angle);
                 instances.push(Instance {
-                    center: [
-                        center[0] + angle.cos() * radius,
-                        center[1] + angle.sin() * radius,
-                        0.0,
-                    ],
+                    center: [center[0] + cos * radius, center[1] + sin * radius, 0.0],
                     size: [size, size],
                     color,
                     rotation: 0.0,
@@ -1078,10 +1075,8 @@ mod tests {
                 for pair in quads.chunks(segments).flat_map(|line| line.windows(2)) {
                     let end = |quad: &Instance, sign: f32| {
                         let half = quad.size[0] * 0.5 * sign;
-                        [
-                            quad.center[0] + half * quad.rotation.cos(),
-                            quad.center[1] + half * quad.rotation.sin(),
-                        ]
+                        let (sin, cos) = sin_cos(quad.rotation);
+                        [quad.center[0] + half * cos, quad.center[1] + half * sin]
                     };
                     let (a, b) = (end(&pair[0], 1.0), end(&pair[1], -1.0));
                     let gap = (a[0] - b[0]).hypot(a[1] - b[1]);
@@ -2283,7 +2278,7 @@ mod tests {
         for quad in instances {
             assert_eq!(quad.pattern, [0.0; 2]);
             assert!(quad.color[3] >= 0.95);
-            let (cos, sin) = (quad.rotation.cos(), quad.rotation.sin());
+            let (sin, cos) = sin_cos(quad.rotation);
             // The rotated rectangle's bounding box.
             let (half_width, half_height) = (0.5 * quad.size[0], 0.5 * quad.size[1]);
             let reach_x = cos.abs() * half_width + sin.abs() * half_height + cell;

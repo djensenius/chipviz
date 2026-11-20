@@ -34,7 +34,9 @@
 //! control frame and elapsed time, and the state steps only on observed
 //! frames, so captures replayed from frame 0 are reproducible.
 
-use super::{CameraMode, SceneBuild, SceneEntry, SceneState, hash, note_emphasis, palette};
+use super::{
+    CameraMode, SceneBuild, SceneEntry, SceneState, hash, note_emphasis, palette, sin_cos,
+};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
@@ -256,7 +258,8 @@ pub(crate) fn line_params(index: usize, frame: ControlFrame, elapsed: f32) -> Li
     let level = f32::from(frame.spectrum[band]) / 255.0;
     let high = band as f32 / (frame.spectrum.len() - 1) as f32;
     let angle = (hash(seed) * 8.0).floor() * FRAC_PI_4;
-    let direction = [angle.cos(), angle.sin()];
+    let (sin, cos) = sin_cos(angle);
+    let direction = [cos, sin];
     let speed = (0.4 + high * 2.6) * (0.6 + hash(seed + 1) * 0.8);
     let travel = speed * elapsed;
     let wrap = |start: f32, step: f32, span: f32| (start + step / span).rem_euclid(1.0) * span;
@@ -281,7 +284,7 @@ pub(crate) fn line_params(index: usize, frame: ControlFrame, elapsed: f32) -> Li
 /// Morph 0 lays it flat at `x = side * u`; morph 1 folds it up about
 /// `x = side * HALF_WIDTH` into a wall, mirrored across `x = 0`.
 pub(crate) fn fold(u: f32, v: f32, side: f32, morph: f32) -> [f32; 3] {
-    let (sin, cos) = (morph * FRAC_PI_2).sin_cos();
+    let (sin, cos) = sin_cos(morph * FRAC_PI_2);
     [
         side * (HALF_WIDTH + (u - HALF_WIDTH) * cos),
         (HALF_WIDTH - u) * sin,
@@ -304,11 +307,8 @@ fn camera_pose(swing: f32, sway: f32, energy: f32, morph: f32) -> ([f32; 3], [f3
     let angle = -FRAC_PI_2 + swing * (1.0 - morph);
     let radius = 16.0 + (HALF_LENGTH - 14.0) * morph;
     let height = 9.0 + energy * 2.0 + (HALF_WIDTH * 0.45 - 9.0 - energy * 2.0) * morph;
-    let eye = [
-        angle.cos() * radius + sway * 1.2 * morph,
-        height,
-        angle.sin() * radius,
-    ];
+    let (sin, cos) = sin_cos(angle);
+    let eye = [cos * radius + sway * 1.2 * morph, height, sin * radius];
     let target = [sway * -0.6, HALF_WIDTH * 0.5, HALF_LENGTH].map(|axis| axis * morph);
     (eye, target)
 }
@@ -778,7 +778,7 @@ mod tests {
         const HEIGHT: usize = 720;
         let mut rgb = vec![[0.0f32; 3]; WIDTH * HEIGHT];
         for instance in instances {
-            let (sin, cos) = instance.rotation.sin_cos();
+            let (sin, cos) = sin_cos(instance.rotation);
             let half = [instance.size[0] * 0.5, instance.size[1] * 0.5];
             let reach = [
                 cos.abs() * half[0] + sin.abs() * half[1],
@@ -995,7 +995,7 @@ mod tests {
         for aspect in [1.0, 16.0 / 9.0, 3.5] {
             for degrees in [0.0f32, 30.0, 45.0, 60.0, 90.0] {
                 // A line at `degrees` on screen, expressed in NDC.
-                let (sin, cos) = degrees.to_radians().sin_cos();
+                let (sin, cos) = sin_cos(degrees.to_radians());
                 let delta = [cos / aspect, sin];
                 let length = delta[0].hypot(delta[1]);
                 let direction = [delta[0] / length, delta[1] / length];
@@ -1003,7 +1003,7 @@ mod tests {
                 // Replay the shader: rotate the quad's edges in NDC, then
                 // scale x by aspect into screen units of NDC y.
                 let rotation = delta[1].atan2(delta[0]);
-                let (rs, rc) = rotation.sin_cos();
+                let (rs, rc) = sin_cos(rotation);
                 let long = [rc * aspect, rs];
                 let side = [-rs * width * aspect, rc * width];
                 let gap = (long[0] * side[1] - long[1] * side[0]).abs() / long[0].hypot(long[1]);

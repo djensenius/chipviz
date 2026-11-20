@@ -210,22 +210,33 @@ pub(crate) fn hash(mut value: u32) -> f32 {
 /// one `sincos` libm call (`__sincosf_stret` on Apple), which differs from
 /// separate `sinf`/`cosf` in the last ulp for some inputs, so instance data
 /// (and the recorded goldens) would depend on the build profile.
-/// Golden-covered scenes (Pulse Tunnel, Object, Static) use this instead of
-/// `f32::sin_cos` or a `sin`/`cos` pair; Lines and the camera still use the
-/// fusable forms, which have no goldens.
+/// Scene and camera code that feeds rendered output uses this instead of
+/// `f32::sin_cos` or a `sin`/`cos` pair on the same value.
+///
+/// `clippy.toml` bans `f32::sin_cos` and `f32::cos`
+/// (`clippy::disallowed_methods`). Every fused pair needs a `cos`, so banning
+/// it catches a same-value `x.sin()`/`x.cos()` pair as well as `sin_cos`; a
+/// lone cosine uses [`cos`] (see #112, #114).
 pub(crate) fn sin_cos(x: f32) -> (f32, f32) {
-    (sin(x), cos(x))
+    (out_of_line_sin(x), out_of_line_cos(x))
+}
+
+/// `x.cos()`, for a lone cosine now that `f32::cos` is banned (see
+/// [`sin_cos`]). Out of line, so it can never fuse with a `sin`.
+pub(crate) fn cos(x: f32) -> f32 {
+    out_of_line_cos(x)
 }
 
 // Out of line so LLVM never sees both calls on the same value, and so does
 // not fuse them (or constant-fold them differently from the runtime libm).
 #[inline(never)]
-fn sin(x: f32) -> f32 {
+fn out_of_line_sin(x: f32) -> f32 {
     x.sin()
 }
 
 #[inline(never)]
-fn cos(x: f32) -> f32 {
+#[allow(clippy::disallowed_methods)]
+fn out_of_line_cos(x: f32) -> f32 {
     x.cos()
 }
 
