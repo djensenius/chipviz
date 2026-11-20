@@ -50,15 +50,34 @@ variant together, only after validation. Variant configuration is independent
 per family, not a ColourField layout or palette.
 
 Existing scene next/previous controls in an explicitly extended receiver use
-the ordered ring `0, 1, ... 13`, wrapping at its ends. Existing palette,
-layout, role, auto/demo/manual and operator controls retain their meanings;
-configure variants separately, for example through startup configuration or
-the digital variant field, without stealing those controls. Selection of a
-family restores its configured variant, initially 0; a validated digital
-record explicitly selects its own variant. Legacy mode keeps its
-own rings and defaults. Procedural/demo sources must not select scene 7 or
-arm flash. If a target lacks a safe variant configuration path, it must report
-the limitation rather than reinterpret an existing control.
+its ring of **available** families, in ascending global ID order, wrapping at
+the ends. A family is available only if its configured variant is implemented,
+validated and usable with its required inputs on that receiver. Its configured
+variant starts at 0; do not silently substitute another variant. Skipping a
+family is not evidence that it is implemented or selectable; coverage needs
+independent evidence. Direct requests for unsupported or unavailable pairs,
+or for families outside the session ring, fail explicitly without aliasing to
+a ring member. An empty ring cannot enter extended mode; in a one-family ring
+both directions leave selection unchanged.
+
+Establish the exact ring before starting and keep it fixed for the session.
+If availability or the configured variant changes in a way that changes the
+ring, stop input, enter a non-flashing fallback and require explicit reset,
+revalidation and confirmation of the new ring before resuming. Never silently
+skip an unexpectedly unavailable member during a session. Relative senders
+and operators must know and reconfirm the exact receiver-specific ring before
+starting or resynchronizing. Passing over unavailable IDs is not an input for
+those IDs and does not bypass scene-7 gates when entering or leaving 7.
+
+Existing palette, layout, role, auto/demo/manual and operator controls retain
+their meanings; select variants separately, through startup configuration
+or the per-record digital variant field, without stealing those controls.
+Selection of a family restores its configured variant; a validated digital
+record explicitly selects its own available variant without changing that
+configuration. Legacy mode keeps its own rings and defaults. Procedural/demo
+sources must not select scene 7 or arm flash. If a target lacks a safe variant
+configuration path, it must report the limitation rather than reinterpret an
+existing control.
 
 ## Digital record and file
 
@@ -134,6 +153,26 @@ palette or arm inputs. A recording must be contiguous from zero. These
 counters do not identify sessions or authenticate traffic; operators must
 isolate the route and flush stale packets when restarting.
 
+Live UDP has no inherent disconnect notification. Use a monotonic real-time
+deadline of **500 ms** after explicit opt-in while awaiting sequence 0, or
+after the last accepted, validated advancing record thereafter. At or after
+the deadline, before processing another packet, invalidate the session as
+above and immediately present a steady black fallback until explicit reset
+and a valid selection passes the applicable gates. An independent timer must
+also enforce the deadline when no packets arrive.
+Duplicates and older records do not advance a step or refresh the deadline;
+no later packet can resume a timed-out session. This permits 30 nominal 60 Hz
+intervals of jitter while bounding stale armed output; it does not identify a
+sender or prove a disconnect. The fallback is a single safety cut, not a
+synthetic scene/palette input; it must not wait for scene debounce while
+flashing continues. Clear pending requests, stability windows and the latch,
+but retain scene-7 transition and change-budget history across restart. Account
+for blackout from scene 7 as an exit when enforcing re-entry and the budget,
+without inventing a scene input. Re-entry must satisfy the normal debounce
+and budget, not the power-on entry exemption; do not count blackout time as
+input steps. The timeout does not apply to offline processing or file
+playback, which remain deterministic on their tick clock.
+
 ### Starfield inputs and provenance
 
 Starfield requires user-supplied local catalog bytes and a local provenance
@@ -172,7 +211,8 @@ decoding. Keep the existing per-transport host flash guard, warning,
 scene-7 entry/exit debounce, palette stability, arming window and change
 budget. Only a validated absolute scene 7 and palette in the same report can
 contribute to absolute wire arming. Rejected metadata/frames are not inputs
-and cannot arm; restart after rejection as above. Relative palette pulses in
+and cannot arm; malformed input requires restart as above, while duplicates
+and old records do not refresh the live deadline. Relative palette pulses in
 the `data` role remain unarmed, including transit through 3/7. Do not weaken
 operator warning/confirmation or allow a HID data feed into an operator
 build. Scene 7 variant 0 retains all its existing palette and layout rules.
@@ -185,15 +225,17 @@ use; the existing HID and Joybus encoders are not extended encoders.
 
 For relative pad paths, no pulse carries catalog identity or proves delivery.
 Before sending, independently confirm the exact receiver build, extended
-catalog/ring and `data` role, the actual scene, palette, variant and **unarmed**
-state. Require a receiver-polled release preamble of at least 60 consecutive
-steps with all controls released, then deliver every press and release in
-order at the receiver's required rate, respecting debounce and budget. Use
+catalog and receiver-specific available-family ring, `data` role, actual
+scene, palette, variant and **unarmed** state. Require a receiver-polled
+release preamble of at least 60 consecutive steps with all controls released,
+then deliver every press and release in order at the receiver's required rate,
+respecting debounce and budget. Use
 one axis per poll, with at least 59 released polls after each press before
 the next press, unless a future validated mapping requires a longer interval.
 Intermediate ring positions are visible, not atomic. After loss, reset,
-disconnect, replay from an unknown point or external input, stop; independently
-re-establish all state and repeat the polled release before resuming. A host
+disconnect, ring or availability change, replay from an unknown point or
+external input, stop; independently reconfirm the exact ring, re-establish all
+state and repeat the polled release before resuming. A host
 assertion is not detection, feedback or a handshake. In particular, do not
 assume an unarmed state merely from a palette number. Existing
 [GBA HID preconditions](usb-hid-transport-v0.md#gba-gamepad-only-json-conversion)
@@ -233,6 +275,20 @@ validation is exercised:
 - After accepting sequence 0, duplicate 0 makes no step; sequence 2 causes
   desynchronization, not a fabricated sequence 1. Sequence 1 after that
   cannot resume without explicit reset. Sequence 65536 has payload frame 0.
+- With available ring `0, 2, 7, 11`, next from 0 is 2, previous from 0 is 11,
+  and next from 2 requests 7 through the normal scene-7 debounce. Direct
+  request 1 fails, not scene 2; 1 is not counted as implemented. If 2 becomes
+  unavailable, stop and reconfirm the new ring before further pulses. An
+  empty ring cannot start; `7` alone leaves next/previous unchanged. In ring
+  `0, 11`, next from 0 requests 11, not scene 7.
+- In live UDP, opt-in at 0 ms without a valid record times out at 500 ms.
+  If sequence 0 is accepted at 0 ms, repeated 0 at 499 ms does not refresh
+  its deadline: at 500 ms clear pending/arming and show steady black, even
+  without another datagram. Sequence 1 at 500 ms cannot revive the session.
+  If sequence 1 is instead accepted at 499 ms, the deadline is 999 ms; an
+  older sequence 0 at 998 ms does not extend it.
+  If scene 7 was active, a restart cannot use the power-on exemption to bypass
+  its debounce or budget. Offline processing has no wall-clock timeout.
 - A legacy raw scene 6 stays legacy, even if its other bytes match the payload
   of an extended scene 6. A `CVX1` prefix truncated to 33 bytes is not a v0
   frame; an alignment-only converter may nevertheless accept an aligned file.
