@@ -49,11 +49,11 @@ Every target now has a first-class SDK/toolchain path:
 `shared/tools/build_homebrew.py` still generates SDK-free C64/SNES/Genesis/NES/SMS
 fallback artifacts for local smoke tests. Except for SNES, these are also used
 for packaging when full SDKs are not installed. All SNES ROMs are temporarily
-withheld from public release assets pending
-[#109](https://github.com/djensenius/chipviz/issues/109); local builds and
-emulator use remain available. The generated SNES seed is a diagnostic, not a
-visualizer. These fallbacks are not the completion target for platforms that
-have a selected SDK path.
+withheld from future public release assets pending
+[#109](https://github.com/djensenius/chipviz/issues/109); past releases are
+unchanged. Local builds and emulator use remain available. The generated SNES
+seed is a diagnostic, not a visualizer. These fallbacks are not the completion
+target for platforms that have a selected SDK path.
 
 ## Pinned SDK builds
 
