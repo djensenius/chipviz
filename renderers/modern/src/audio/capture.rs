@@ -86,9 +86,12 @@ const DRIFT_RECOVERY: f64 = 10.0;
 /// older fill was for audio the device lost, and the lag falling below the
 /// latency for good is the drift changing.
 const FRESH_FILL: Duration = Duration::from_secs(30);
-/// At most this many recent fills are kept for `FRESH_FILL`; older ones are
-/// dropped first.
+/// At most this many recent fills are kept for `FRESH_FILL`; beyond that the
+/// two oldest are merged (so no fill is lost, only its age blurred).
 const FRESH_FILLS: usize = 32;
+/// Fills within this of the newest one (the polls of one stall, say) are
+/// merged into it, timed from its start.
+const FRESH_MERGE: Duration = Duration::from_secs(1);
 /// While a drift is trusted, lag above the margin is filled only if at
 /// least `STEP_SHARE` of the margin arrived at once, compared with the lowest
 /// lag of the `STEP_LOOKBACK` before: a rise that built up gradually is the
@@ -729,9 +732,20 @@ impl LossDetector {
             .fresh
             .front()
             .is_some_and(|&(at, _)| now.duration_since(at) >= FRESH_FILL)
-            || self.fresh.len() >= FRESH_FILLS
         {
             self.fresh.pop_front();
+        }
+        if let Some((at, newest)) = self.fresh.back_mut()
+            && now.duration_since(*at) < FRESH_MERGE
+        {
+            *newest += fill;
+            return;
+        }
+        if self.fresh.len() >= FRESH_FILLS
+            && let Some((_, oldest)) = self.fresh.pop_front()
+            && let Some((_, next)) = self.fresh.front_mut()
+        {
+            *next += oldest;
         }
         self.fresh.push_back((now, fill));
     }
@@ -2333,6 +2347,28 @@ mod tests {
             let callbacks = drifting(10, 90, ratio, late, |_| false);
             let (_, _, net) = replay_net(&callbacks, Duration::ZERO);
             assert!(net.abs() < 15.0, "{ratio}: {net} ms left");
+        }
+    }
+
+    #[test]
+    fn a_stall_while_drift_is_trusted_is_taken_back() {
+        // 10 ms callbacks stop for `gap` ms five minutes in, while a drift is
+        // trusted, then catch up over `catch_up` ms: the stall's silence
+        // (one fill per poll) is all taken back, however long the stall.
+        for ratio in [1.002, 0.995] {
+            for (gap, catch_up) in [(500, 2_000), (1_000, 3_000), (2_000, 3_000)] {
+                let late = move |k: usize| {
+                    let at = k as u64 * 10;
+                    if !(300_000..300_000 + gap + catch_up).contains(&at) {
+                        return Duration::ZERO;
+                    }
+                    let left = 1.0 - (at - 300_000) as f64 / (gap + catch_up) as f64;
+                    Duration::from_secs_f64(gap as f64 / 1000.0 * left)
+                };
+                let callbacks = drifting(10, 330, ratio, late, |_| false);
+                let (_, _, net) = replay_net(&callbacks, Duration::ZERO);
+                assert!(net.abs() < 10.0, "{ratio}, {gap} ms: {net} ms left");
+            }
         }
     }
 
