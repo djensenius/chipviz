@@ -1,4 +1,4 @@
-use chipviz_modern::catalog_v1::{Snapshot, ValidationError};
+use super::{Snapshot, ValidationError};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -133,6 +133,26 @@ fn snapshot_survives_source_file_replacement() {
 }
 
 #[test]
+fn maximum_record_count_produces_complete_owned_snapshot() {
+    let count = 1_000_000;
+    let mut input = Vec::with_capacity(20 + 145 * count);
+    input.extend_from_slice(&header(count as u64));
+    for sequence in 0..count {
+        input.extend_from_slice(&record(sequence as u64, 11, 3));
+    }
+    let snapshot = Snapshot::validate(&input).unwrap();
+    assert_eq!(snapshot.count(), count);
+    for index in [0, 65_536, count - 1] {
+        let item = snapshot.record(index).unwrap();
+        assert_eq!(item.envelope(), record(index as u64, 11, 3));
+        assert_eq!(item.tick(), index as u64);
+    }
+    assert!(snapshot.record(count).is_none());
+    input.fill(0);
+    assert_eq!(snapshot.record(count - 1).unwrap().sequence(), 999_999);
+}
+
+#[test]
 fn differential_recordings_against_python_host_validator() {
     let mut vectors: Vec<(&str, Vec<u8>, &str)> = Vec::new();
     vectors.push((
@@ -241,14 +261,48 @@ fn differential_recordings_against_python_host_validator() {
     let valid_star = star(0, 946_684_800_000);
     vectors.push((
         "star unavailable",
-        file(&[valid_star.clone()]),
+        file(std::slice::from_ref(&valid_star)),
         "unavailable",
     ));
     vectors.push(("star missing digest", file(&[record(0, 6, 0)]), "invalid"));
-    let mut invalid_latitude = star(0, 946_684_800_000);
-    invalid_latitude[97..101].copy_from_slice(&900_000_001i32.to_le_bytes());
-    fix_record(&mut invalid_latitude);
-    vectors.push(("star latitude", file(&[invalid_latitude]), "invalid"));
+    for (offset, min, max) in [
+        (97, -900_000_000i32, 900_000_000i32),
+        (101, -1_800_000_000, 1_800_000_000),
+        (105, -12_000_000, 100_000_000),
+    ] {
+        for (value, expected) in [
+            (min, "unavailable"),
+            (max, "unavailable"),
+            (min - 1, "invalid"),
+            (max + 1, "invalid"),
+            (i32::MIN, "invalid"),
+            (i32::MAX, "invalid"),
+        ] {
+            let mut wire = star(0, 946_684_800_000);
+            wire[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            fix_record(&mut wire);
+            vectors.push(("star signed location boundary", file(&[wire]), expected));
+        }
+    }
+    for (epoch, expected) in [
+        (946_684_800_000, "unavailable"),
+        (4_102_444_799_999, "unavailable"),
+        (946_684_799_999, "invalid"),
+        (4_102_444_800_000, "invalid"),
+        (i64::MIN, "invalid"),
+        (i64::MAX, "invalid"),
+    ] {
+        vectors.push((
+            "star signed epoch boundary",
+            file(&[star(0, epoch)]),
+            expected,
+        ));
+    }
+    for (tick, expected) in [(3, "unavailable"), (4, "invalid")] {
+        let mut records: Vec<_> = (0..tick).map(|i| record(i, 7, 0)).collect();
+        records.push(star(tick, 4_102_444_799_949));
+        vectors.push(("star rational sky time boundary", file(&records), expected));
+    }
     let mut changed_star = star(2, 946_684_800_000);
     changed_star[97] = 1;
     fix_record(&mut changed_star);

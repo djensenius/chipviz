@@ -10,6 +10,9 @@
 
 use std::fmt;
 
+#[cfg(test)]
+mod tests;
+
 const HEADER_SIZE: usize = 20;
 const RECORD_SIZE: usize = 145;
 const MAX_RECORDS: u64 = 1_000_000;
