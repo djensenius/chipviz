@@ -10,7 +10,7 @@ use crate::audio::scope::{ScopeSnapshot, ScopeTap};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{OffscreenRenderer, ScenePipeline};
-use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers};
+use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers, starfield};
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
 pub const CAPTURE_FPS: f32 = 60.0;
@@ -18,7 +18,8 @@ pub const CAPTURE_FPS: f32 = 60.0;
 const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scene N]
                        [--frames 0,60,120] [--input procedural|synth-mic|PATH.cvz]
                        [--size WxH] [--mic-layers off|scope|bursts|both]
-                       [--lines-drop-cuts]
+                       [--lines-drop-cuts] [--catalog FILE --location LAT,LON]
+                       [--time UNIX_SECONDS]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
@@ -35,7 +36,12 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --lines-drop-cuts
              Lines (scene 3) cuts on a rising drop flag, as the renderer's
              flag of the same name (default: drops are ignored); only
-             .cvz inputs carry drop flags, procedural input never does";
+             .cvz inputs carry drop flags, procedural input never does
+  --star-catalog PATH
+             user-supplied HYG-compatible star CSV for scene 6; not bundled
+  --catalog  alias for --star-catalog
+  --location observer latitude,longitude in decimal degrees; longitude east
+  --time     observation UTC as Unix seconds; defaults to current UTC";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -54,12 +60,15 @@ pub struct CaptureArgs {
     pub out: PathBuf,
     pub mic_layers: mic_layers::Mode,
     pub lines_drop_cuts: bool,
+    pub catalog_path: Option<PathBuf>,
+    pub location: Option<(f64, f64)>,
+    pub unix_seconds: Option<f64>,
 }
 
 #[derive(Debug)]
 pub enum Command {
     Help,
-    Capture(CaptureArgs),
+    Capture(Box<CaptureArgs>),
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
@@ -71,6 +80,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     let mut out = None;
     let mut layers = mic_layers::Mode::Off;
     let mut lines_drop_cuts = false;
+    let mut catalog_path = None;
+    let mut location = None;
+    let mut unix_seconds = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -128,13 +140,42 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                 })?;
             }
             "--lines-drop-cuts" => lines_drop_cuts = true,
+            "--catalog" | "--star-catalog" => catalog_path = Some(PathBuf::from(value()?)),
+            "--location" => location = Some(parse_location(&value()?)?),
+            "--time" => {
+                let text = value()?;
+                let seconds = text
+                    .parse::<f64>()
+                    .map_err(|_| format!("--time must be finite UNIX seconds, got {text}"))?;
+                if !seconds.is_finite()
+                    || !(-62_135_596_800.0..=253_402_300_799.0).contains(&seconds)
+                {
+                    return Err(format!(
+                        "--time must be finite UNIX seconds in the UTC year 0001..9999 range, got {text}"
+                    ));
+                }
+                unix_seconds = Some(seconds);
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
 
     let out = out.ok_or("--out DIR is required")?;
+    if catalog_path.is_some() != location.is_some() {
+        return Err("--star-catalog and --location must be supplied together for scene 6".into());
+    }
+    if unix_seconds.is_some() && catalog_path.is_none() {
+        return Err("--time requires --star-catalog and --location".into());
+    }
+    if scene.is_some_and(|scene| scenes::dispatch(scene).name() == "Starfield")
+        && catalog_path.is_none()
+    {
+        return Err(
+            "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON".to_string(),
+        );
+    }
     let size = size.unwrap_or((profile.target_width, profile.target_height));
-    Ok(Command::Capture(CaptureArgs {
+    Ok(Command::Capture(Box::new(CaptureArgs {
         profile,
         scene,
         frames,
@@ -143,7 +184,36 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
         out,
         mic_layers: layers,
         lines_drop_cuts,
-    }))
+        catalog_path,
+        location,
+        unix_seconds,
+    })))
+}
+
+fn parse_location(value: &str) -> Result<(f64, f64), String> {
+    let (latitude, longitude) = value
+        .split_once(',')
+        .filter(|(_, longitude)| !longitude.contains(','))
+        .ok_or_else(|| {
+            format!("--location expects exactly LAT,LON decimal degrees, got {value}")
+        })?;
+    let latitude = latitude
+        .parse::<f64>()
+        .map_err(|_| format!("--location latitude must be finite, got {latitude}"))?;
+    let longitude = longitude
+        .parse::<f64>()
+        .map_err(|_| format!("--location longitude must be finite, got {longitude}"))?;
+    if !latitude.is_finite() || !(-90.0..=90.0).contains(&latitude) {
+        return Err(format!(
+            "--location latitude must be finite and in [-90, 90], got {latitude}"
+        ));
+    }
+    if !longitude.is_finite() || !(-180.0..=180.0).contains(&longitude) {
+        return Err(format!(
+            "--location longitude must be finite and in [-180, 180] (east positive), got {longitude}"
+        ));
+    }
+    Ok((latitude, longitude))
 }
 
 /// Splits a `.cvz` file (concatenated control-frame-v0 packets) into frames.
@@ -289,8 +359,31 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     };
     // Validate every frame before touching the GPU or the output directory.
     for &index in &args.frames {
-        source.frame(index)?;
+        let frame = source.frame(index)?;
+        if scenes::dispatch(frame.scene).name() == "Starfield" && args.catalog_path.is_none() {
+            return Err(
+                "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON".to_string(),
+            );
+        }
     }
+    let starfield = match (&args.catalog_path, args.location) {
+        (Some(path), Some((latitude_degrees, longitude_degrees))) => {
+            let catalog = starfield::StarCatalog::load(path).map_err(|error| error.to_string())?;
+            let unix_seconds = args.unix_seconds.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs_f64())
+                    .unwrap_or_else(|error| -error.duration().as_secs_f64())
+            });
+            Some(starfield::StarfieldConfig {
+                catalog: std::sync::Arc::new(catalog),
+                latitude_degrees,
+                longitude_degrees,
+                unix_seconds,
+            })
+        }
+        _ => None,
+    };
     std::fs::create_dir_all(&args.out)
         .map_err(|error| format!("{}: {error}", args.out.display()))?;
     let (width, height) = args.size;
@@ -321,6 +414,9 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
     });
+    renderer
+        .pipeline_mut()
+        .configure_starfield(starfield.clone());
     let mut captures = Vec::new();
 
     for &index in &args.frames {
@@ -333,6 +429,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
         };
         let pipeline = renderer.pipeline_mut();
         pipeline.reset_state();
+        pipeline.configure_starfield(starfield.clone());
         for previous in 0..index {
             let frame = feed(pipeline, synth.as_mut(), source.frame(previous)?, previous);
             pipeline.advance_state(frame, elapsed(previous), size);
@@ -434,7 +531,7 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<CaptureArgs, String> {
         match parse_args(args.iter().map(|arg| arg.to_string()))? {
-            Command::Capture(args) => Ok(args),
+            Command::Capture(args) => Ok(*args),
             Command::Help => Err("help".into()),
         }
     }
@@ -467,6 +564,40 @@ mod tests {
         assert_eq!(args.input, Input::File("fixture.cvz".into()));
         assert_eq!(args.size, (1920, 1080));
         assert_eq!(args.out, PathBuf::from("shots"));
+    }
+
+    #[test]
+    fn parses_starfield_options_and_requires_them_for_scene_six() {
+        let error = parse(&["--out", "shots", "--scene", "6"]).unwrap_err();
+        assert!(error.contains("--star-catalog PATH and --location LAT,LON"));
+
+        let args = parse(&[
+            "--out",
+            "shots",
+            "--scene",
+            "6",
+            "--star-catalog",
+            "stars.csv",
+            "--location",
+            "45,-73",
+            "--time",
+            "946728000",
+        ])
+        .unwrap();
+        assert_eq!(args.catalog_path.as_deref(), Some(Path::new("stars.csv")));
+        assert_eq!(args.location, Some((45.0, -73.0)));
+        assert_eq!(args.unix_seconds, Some(946_728_000.0));
+
+        for options in [
+            &["--star-catalog", "stars.csv"][..],
+            &["--location", "0,0"][..],
+            &["--location", "91,0"][..],
+            &["--time", "inf"][..],
+        ] {
+            let mut args = vec!["--out", "shots"];
+            args.extend_from_slice(options);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
@@ -511,7 +642,7 @@ mod tests {
         assert_eq!(frame.scene, 7);
         assert_eq!(frame.energy, ControlFrame::procedural(120).energy);
         assert_eq!(scenes::dispatch(frame.scene).name(), colour_field::NAME);
-        assert_eq!(scenes::dispatch(13).name(), "SpectrumVolume");
+        assert_eq!(scenes::dispatch(13).name(), "Starfield");
         let unforced = FrameSource {
             fixture: None,
             scene: None,

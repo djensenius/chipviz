@@ -54,45 +54,48 @@ upstream repository at the crate's commit.
 | coreaudio-rs | 0.14.2 | MIT/Apache-2.0 | https://github.com/RustAudio/coreaudio-rs.git | [5](#notice-5), [26](#notice-26) |
 | cpal | 0.18.2 | Apache-2.0 | https://github.com/RustAudio/cpal | [5](#notice-5) |
 | crc32fast | 1.5.5 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast | [27](#notice-27), [28](#notice-28) |
-| cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | https://github.com/rust-windowing/cursor-icon | [22](#notice-22), [29](#notice-29), [30](#notice-30) |
+| csv | 1.4.0 | Unlicense/MIT | https://github.com/BurntSushi/rust-csv | [29](#notice-29), [30](#notice-30), [31](#notice-31) |
+| csv-core | 0.1.13 | Unlicense/MIT | https://github.com/BurntSushi/rust-csv | [29](#notice-29), [30](#notice-30), [31](#notice-31) |
+| cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | https://github.com/rust-windowing/cursor-icon | [22](#notice-22), [32](#notice-32), [33](#notice-33) |
 | dasp_sample | 0.11.0 | MIT OR Apache-2.0 | https://github.com/rustaudio/sample.git | [5](#notice-5) (fallback) |
 | dispatch | 0.2.0 | MIT | http://github.com/SSheldon/rust-dispatch | [17](#notice-17) (fallback) |
 | dispatch2 | 0.3.1 | Zlib OR Apache-2.0 OR MIT | https://github.com/madsmtm/objc2 | [5](#notice-5) (fallback) |
-| dlib | 0.5.3 | MIT | https://github.com/elinorbgr/dlib | [31](#notice-31) |
-| document-features | 0.2.12 | MIT OR Apache-2.0 | https://github.com/slint-ui/document-features | [5](#notice-5), [32](#notice-32) |
-| downcast-rs | 1.2.1 | MIT/Apache-2.0 | https://github.com/marcianx/downcast-rs | [5](#notice-5), [33](#notice-33) |
-| equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent | [5](#notice-5), [34](#notice-34) |
-| errno | 0.3.14 | MIT OR Apache-2.0 | https://github.com/lambda-fairy/rust-errno | [5](#notice-5), [35](#notice-35) |
-| fdeflate | 0.3.7 | MIT OR Apache-2.0 | https://github.com/image-rs/fdeflate | [1](#notice-1), [36](#notice-36) |
-| flate2 | 1.1.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/flate2-rs | [5](#notice-5), [37](#notice-37) |
-| foldhash | 0.1.5 | Zlib | https://github.com/orlp/foldhash | [38](#notice-38) |
-| foreign-types | 0.5.0 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types | [27](#notice-27), [39](#notice-39) |
-| foreign-types-macros | 0.2.3 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types | [27](#notice-27), [39](#notice-39) |
-| foreign-types-shared | 0.3.1 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types | [27](#notice-27), [39](#notice-39) |
+| dlib | 0.5.3 | MIT | https://github.com/elinorbgr/dlib | [34](#notice-34) |
+| document-features | 0.2.12 | MIT OR Apache-2.0 | https://github.com/slint-ui/document-features | [5](#notice-5), [35](#notice-35) |
+| downcast-rs | 1.2.1 | MIT/Apache-2.0 | https://github.com/marcianx/downcast-rs | [5](#notice-5), [36](#notice-36) |
+| equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent | [5](#notice-5), [37](#notice-37) |
+| errno | 0.3.14 | MIT OR Apache-2.0 | https://github.com/lambda-fairy/rust-errno | [5](#notice-5), [38](#notice-38) |
+| fdeflate | 0.3.7 | MIT OR Apache-2.0 | https://github.com/image-rs/fdeflate | [1](#notice-1), [39](#notice-39) |
+| flate2 | 1.1.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/flate2-rs | [5](#notice-5), [40](#notice-40) |
+| foldhash | 0.1.5 | Zlib | https://github.com/orlp/foldhash | [41](#notice-41) |
+| foreign-types | 0.5.0 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types | [27](#notice-27), [42](#notice-42) |
+| foreign-types-macros | 0.2.3 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types | [27](#notice-27), [42](#notice-42) |
+| foreign-types-shared | 0.3.1 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types | [27](#notice-27), [42](#notice-42) |
 | gethostname | 1.1.0 | Apache-2.0 | https://codeberg.org/swsnr/gethostname.rs.git | [5](#notice-5) |
-| getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | [40](#notice-40), [41](#notice-41) |
-| glow | 0.13.1 | MIT OR Apache-2.0 OR Zlib | https://github.com/grovesNL/glow | [4](#notice-4), [5](#notice-5), [42](#notice-42) |
+| getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | [43](#notice-43), [44](#notice-44) |
+| glow | 0.13.1 | MIT OR Apache-2.0 OR Zlib | https://github.com/grovesNL/glow | [4](#notice-4), [5](#notice-5), [45](#notice-45) |
 | gpu-alloc | 0.6.0 | MIT OR Apache-2.0 | https://github.com/zakarumych/gpu-alloc | [5](#notice-5) (fallback) |
 | gpu-alloc-types | 0.3.0 | MIT OR Apache-2.0 | https://github.com/zakarumych/gpu-alloc | [5](#notice-5) (fallback) |
 | gpu-descriptor | 0.3.2 | MIT OR Apache-2.0 | https://github.com/zakarumych/gpu-descriptor | [5](#notice-5) (fallback) |
 | gpu-descriptor-types | 0.2.0 | MIT OR Apache-2.0 | https://github.com/zakarumych/gpu-descriptor | [5](#notice-5) (fallback) |
-| hashbrown | 0.15.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown | [5](#notice-5), [43](#notice-43) |
-| hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown | [5](#notice-5), [43](#notice-43) |
-| hexf-parse | 0.2.1 | CC0-1.0 | https://github.com/lifthrasiir/hexf | [44](#notice-44) (fallback) |
+| hashbrown | 0.15.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown | [5](#notice-5), [46](#notice-46) |
+| hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown | [5](#notice-5), [46](#notice-46) |
+| hexf-parse | 0.2.1 | CC0-1.0 | https://github.com/lifthrasiir/hexf | [47](#notice-47) (fallback) |
 | icrate | 0.0.4 | MIT | https://github.com/madsmtm/objc2 | [18](#notice-18) (fallback) |
-| indexmap | 2.14.0 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/indexmap | [5](#notice-5), [45](#notice-45) |
+| indexmap | 2.14.0 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/indexmap | [5](#notice-5), [48](#notice-48) |
+| itoa | 1.0.19 | MIT OR Apache-2.0 | https://github.com/dtolnay/itoa | [1](#notice-1), [4](#notice-4) |
 | khronos-egl | 6.0.0 | MIT/Apache-2.0 | https://github.com/timothee-haudebourg/khronos-egl | [4](#notice-4), [5](#notice-5) |
-| libc | 0.2.186 | MIT OR Apache-2.0 | https://github.com/rust-lang/libc | [1](#notice-1), [46](#notice-46) |
-| libloading | 0.7.4 | ISC | https://github.com/nagisa/rust_libloading/ | [47](#notice-47) |
-| libloading | 0.8.9 | ISC | https://github.com/nagisa/rust_libloading/ | [47](#notice-47) |
-| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/sunfishcode/linux-raw-sys | [4](#notice-4), [5](#notice-5), [48](#notice-48), [49](#notice-49) |
-| linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/sunfishcode/linux-raw-sys | [4](#notice-4), [5](#notice-5), [48](#notice-48), [49](#notice-49) |
-| litrs | 1.0.0 | MIT OR Apache-2.0 | https://github.com/LukasKalbertodt/litrs | [1](#notice-1), [50](#notice-50) |
+| libc | 0.2.186 | MIT OR Apache-2.0 | https://github.com/rust-lang/libc | [1](#notice-1), [49](#notice-49) |
+| libloading | 0.7.4 | ISC | https://github.com/nagisa/rust_libloading/ | [50](#notice-50) |
+| libloading | 0.8.9 | ISC | https://github.com/nagisa/rust_libloading/ | [50](#notice-50) |
+| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/sunfishcode/linux-raw-sys | [4](#notice-4), [5](#notice-5), [51](#notice-51), [52](#notice-52) |
+| linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/sunfishcode/linux-raw-sys | [4](#notice-4), [5](#notice-5), [51](#notice-51), [52](#notice-52) |
+| litrs | 1.0.0 | MIT OR Apache-2.0 | https://github.com/LukasKalbertodt/litrs | [1](#notice-1), [53](#notice-53) |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot | [5](#notice-5), [14](#notice-14) |
 | log | 0.4.33 | MIT OR Apache-2.0 | https://github.com/rust-lang/log | [5](#notice-5), [16](#notice-16) |
-| mach2 | 0.6.0 | BSD-2-Clause OR MIT OR Apache-2.0 | https://github.com/JohnTitor/mach2 | [1](#notice-1), [51](#notice-51), [52](#notice-52) |
+| mach2 | 0.6.0 | BSD-2-Clause OR MIT OR Apache-2.0 | https://github.com/JohnTitor/mach2 | [1](#notice-1), [54](#notice-54), [55](#notice-55) |
 | malloc_buf | 0.0.6 | MIT | https://github.com/SSheldon/malloc_buf | [17](#notice-17) (fallback) |
-| memchr | 2.8.2 | Unlicense OR MIT | https://github.com/BurntSushi/memchr | [53](#notice-53), [54](#notice-54), [55](#notice-55) |
+| memchr | 2.8.2 | Unlicense OR MIT | https://github.com/BurntSushi/memchr | [29](#notice-29), [30](#notice-30), [31](#notice-31) |
 | memmap2 | 0.9.10 | MIT OR Apache-2.0 | https://github.com/RazrFalcon/memmap2-rs | [56](#notice-56), [57](#notice-57) |
 | metal | 0.28.0 | MIT OR Apache-2.0 | https://github.com/gfx-rs/metal-rs | [5](#notice-5), [58](#notice-58) |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide | [1](#notice-1), [59](#notice-59), [60](#notice-60) |
@@ -132,55 +135,56 @@ upstream repository at the crate's commit.
 | rtrb | 0.4.1 | MIT OR Apache-2.0 | https://github.com/mgeier/rtrb | [4](#notice-4), [5](#notice-5) |
 | rustc-hash | 1.1.0 | Apache-2.0/MIT | https://github.com/rust-lang-nursery/rustc-hash | [4](#notice-4), [5](#notice-5) |
 | rustfft | 6.4.1 | MIT OR Apache-2.0 | https://github.com/ejmahler/RustFFT | [27](#notice-27), [70](#notice-70) |
-| rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix | [4](#notice-4), [5](#notice-5), [49](#notice-49), [71](#notice-71) |
-| rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix | [4](#notice-4), [5](#notice-5), [49](#notice-49), [71](#notice-71) |
+| rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix | [4](#notice-4), [5](#notice-5), [52](#notice-52), [71](#notice-71) |
+| rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix | [4](#notice-4), [5](#notice-5), [52](#notice-52), [71](#notice-71) |
+| ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 | https://github.com/dtolnay/ryu | [1](#notice-1), [72](#notice-72) |
 | scoped-tls | 1.0.1 | MIT/Apache-2.0 | https://github.com/alexcrichton/scoped-tls | [5](#notice-5), [23](#notice-23) |
-| scopeguard | 1.2.0 | MIT OR Apache-2.0 | https://github.com/bluss/scopeguard | [5](#notice-5), [72](#notice-72) |
-| sctk-adwaita | 0.8.3 | MIT (also contains OFL-1.1) | https://github.com/PolyMeilex/sctk-adwaita | [73](#notice-73), [74](#notice-74) |
+| scopeguard | 1.2.0 | MIT OR Apache-2.0 | https://github.com/bluss/scopeguard | [5](#notice-5), [73](#notice-73) |
+| sctk-adwaita | 0.8.3 | MIT (also contains OFL-1.1) | https://github.com/PolyMeilex/sctk-adwaita | [74](#notice-74), [75](#notice-75) |
 | serde | 1.0.228 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | [1](#notice-1), [4](#notice-4) |
 | serde_core | 1.0.228 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | [1](#notice-1), [4](#notice-4) |
-| simd-adler32 | 0.3.10 | MIT | https://github.com/mcountryman/simd-adler32 | [75](#notice-75) |
-| slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab | [76](#notice-76) |
-| smallvec | 1.15.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-smallvec | [5](#notice-5), [77](#notice-77) |
+| simd-adler32 | 0.3.10 | MIT | https://github.com/mcountryman/simd-adler32 | [76](#notice-76) |
+| slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab | [77](#notice-77) |
+| smallvec | 1.15.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-smallvec | [5](#notice-5), [78](#notice-78) |
 | smithay-client-toolkit | 0.18.1 | MIT | https://github.com/smithay/client-toolkit | [21](#notice-21) |
 | smol_str | 0.2.2 | MIT OR Apache-2.0 | https://github.com/rust-analyzer/smol_str | [4](#notice-4), [5](#notice-5) |
 | spirv | 0.3.0+sdk-1.3.268.0 | Apache-2.0 | https://github.com/gfx-rs/rspirv | [5](#notice-5) (fallback) |
-| static_assertions | 1.1.0 | MIT OR Apache-2.0 | https://github.com/nvzqz/static-assertions-rs | [5](#notice-5), [78](#notice-78) |
+| static_assertions | 1.1.0 | MIT OR Apache-2.0 | https://github.com/nvzqz/static-assertions-rs | [5](#notice-5), [79](#notice-79) |
 | strength_reduce | 0.2.4 | MIT OR Apache-2.0 | http://github.com/ejmahler/strength_reduce | [27](#notice-27), [70](#notice-70) |
-| strict-num | 0.1.1 | MIT | https://github.com/RazrFalcon/strict-num | [79](#notice-79) |
+| strict-num | 0.1.1 | MIT | https://github.com/RazrFalcon/strict-num | [80](#notice-80) |
 | syn | 2.0.118 | MIT OR Apache-2.0 | https://github.com/dtolnay/syn | [1](#notice-1), [4](#notice-4) |
-| termcolor | 1.4.1 | Unlicense OR MIT | https://github.com/BurntSushi/termcolor | [53](#notice-53), [54](#notice-54), [55](#notice-55) |
+| termcolor | 1.4.1 | Unlicense OR MIT | https://github.com/BurntSushi/termcolor | [29](#notice-29), [30](#notice-30), [31](#notice-31) |
 | thiserror | 1.0.69 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror | [1](#notice-1), [4](#notice-4) |
 | thiserror-impl | 1.0.69 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror | [1](#notice-1), [4](#notice-4) |
-| tiny-skia | 0.11.4 | BSD-3-Clause | https://github.com/RazrFalcon/tiny-skia | [80](#notice-80) |
-| tiny-skia-path | 0.11.4 | BSD-3-Clause | https://github.com/RazrFalcon/tiny-skia/tree/master/path | [80](#notice-80) |
-| transpose | 0.2.3 | MIT OR Apache-2.0 | https://github.com/ejmahler/transpose | [81](#notice-81), [82](#notice-82) |
-| ttf-parser | 0.25.1 | MIT OR Apache-2.0 | https://github.com/harfbuzz/ttf-parser | [5](#notice-5), [83](#notice-83) |
-| unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/dtolnay/unicode-ident | [1](#notice-1), [4](#notice-4), [84](#notice-84) |
+| tiny-skia | 0.11.4 | BSD-3-Clause | https://github.com/RazrFalcon/tiny-skia | [81](#notice-81) |
+| tiny-skia-path | 0.11.4 | BSD-3-Clause | https://github.com/RazrFalcon/tiny-skia/tree/master/path | [81](#notice-81) |
+| transpose | 0.2.3 | MIT OR Apache-2.0 | https://github.com/ejmahler/transpose | [82](#notice-82), [83](#notice-83) |
+| ttf-parser | 0.25.1 | MIT OR Apache-2.0 | https://github.com/harfbuzz/ttf-parser | [5](#notice-5), [84](#notice-84) |
+| unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/dtolnay/unicode-ident | [1](#notice-1), [4](#notice-4), [85](#notice-85) |
 | unicode-width | 0.1.14 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-width | [5](#notice-5), [15](#notice-15), [25](#notice-25) |
 | unicode-xid | 0.2.6 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-xid | [5](#notice-5), [15](#notice-15), [25](#notice-25) |
-| wayland-backend | 0.3.15 | MIT | https://github.com/smithay/wayland-rs | [85](#notice-85) |
-| wayland-client | 0.31.14 | MIT (1 per-protocol notice) | https://github.com/smithay/wayland-rs | [85](#notice-85), [86](#notice-86) |
+| wayland-backend | 0.3.15 | MIT | https://github.com/smithay/wayland-rs | [86](#notice-86) |
+| wayland-client | 0.31.14 | MIT (1 per-protocol notice) | https://github.com/smithay/wayland-rs | [86](#notice-86), [87](#notice-87) |
 | wayland-csd-frame | 0.3.0 | MIT | https://github.com/rust-windowing/wayland-csd-frame | [22](#notice-22) |
-| wayland-cursor | 0.31.14 | MIT | https://github.com/smithay/wayland-rs | [85](#notice-85) |
-| wayland-protocols | 0.31.2 | MIT (38 per-protocol notices) | https://github.com/smithay/wayland-rs | [85](#notice-85), [87](#notice-87), [88](#notice-88) |
-| wayland-protocols-plasma | 0.2.0 | MIT (also contains BSD-3-Clause, CC0-1.0, LGPL-2.1-or-later, MIT, MIT-CMU; 27 per-protocol notices) | https://github.com/smithay/wayland-rs | [90](#notice-90) (fallback), [44](#notice-44), [89](#notice-89), [91](#notice-91), [92](#notice-92), [93](#notice-93), [94](#notice-94), [95](#notice-95) |
-| wayland-protocols-wlr | 0.2.0 | MIT (10 per-protocol notices) | https://github.com/smithay/wayland-rs | [90](#notice-90) (fallback), [96](#notice-96) |
-| wayland-scanner | 0.31.10 | MIT (1 per-protocol notice) | https://github.com/smithay/wayland-rs | [85](#notice-85), [97](#notice-97) |
-| wayland-sys | 0.31.11 | MIT | https://github.com/smithay/wayland-rs | [85](#notice-85) |
-| wgpu | 0.20.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [98](#notice-98) |
-| wgpu-core | 0.21.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [98](#notice-98) |
-| wgpu-hal | 0.21.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [98](#notice-98) |
-| wgpu-types | 0.20.0 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [98](#notice-98) |
+| wayland-cursor | 0.31.14 | MIT | https://github.com/smithay/wayland-rs | [86](#notice-86) |
+| wayland-protocols | 0.31.2 | MIT (38 per-protocol notices) | https://github.com/smithay/wayland-rs | [86](#notice-86), [88](#notice-88), [89](#notice-89) |
+| wayland-protocols-plasma | 0.2.0 | MIT (also contains BSD-3-Clause, CC0-1.0, LGPL-2.1-or-later, MIT, MIT-CMU; 27 per-protocol notices) | https://github.com/smithay/wayland-rs | [91](#notice-91) (fallback), [47](#notice-47), [90](#notice-90), [92](#notice-92), [93](#notice-93), [94](#notice-94), [95](#notice-95), [96](#notice-96) |
+| wayland-protocols-wlr | 0.2.0 | MIT (10 per-protocol notices) | https://github.com/smithay/wayland-rs | [91](#notice-91) (fallback), [97](#notice-97) |
+| wayland-scanner | 0.31.10 | MIT (1 per-protocol notice) | https://github.com/smithay/wayland-rs | [86](#notice-86), [98](#notice-98) |
+| wayland-sys | 0.31.11 | MIT | https://github.com/smithay/wayland-rs | [86](#notice-86) |
+| wgpu | 0.20.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [99](#notice-99) |
+| wgpu-core | 0.21.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [99](#notice-99) |
+| wgpu-hal | 0.21.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [99](#notice-99) |
+| wgpu-types | 0.20.0 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | [1](#notice-1), [99](#notice-99) |
 | winit | 0.29.15 | Apache-2.0 | https://github.com/rust-windowing/winit | [27](#notice-27) |
 | x11-dl | 2.21.0 | MIT | https://github.com/AltF02/x11-rs.git | [4](#notice-4) |
-| x11rb | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | [5](#notice-5), [99](#notice-99) |
-| x11rb-protocol | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | [5](#notice-5), [99](#notice-99) |
-| xcursor | 0.3.10 | MIT | https://github.com/esposm03/xcursor-rs | [100](#notice-100) |
-| xkbcommon-dl | 0.4.2 | MIT | https://github.com/rust-windowing/xkbcommon-dl | [101](#notice-101) |
-| xkeysym | 0.2.1 | MIT OR Apache-2.0 OR Zlib | https://github.com/notgull/xkeysym | [102](#notice-102), [103](#notice-103), [104](#notice-104) |
-| zerocopy | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy | [105](#notice-105), [106](#notice-106), [107](#notice-107) |
-| zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs | [108](#notice-108) |
+| x11rb | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | [5](#notice-5), [100](#notice-100) |
+| x11rb-protocol | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | [5](#notice-5), [100](#notice-100) |
+| xcursor | 0.3.10 | MIT | https://github.com/esposm03/xcursor-rs | [101](#notice-101) |
+| xkbcommon-dl | 0.4.2 | MIT | https://github.com/rust-windowing/xkbcommon-dl | [102](#notice-102) |
+| xkeysym | 0.2.1 | MIT OR Apache-2.0 OR Zlib | https://github.com/notgull/xkeysym | [103](#notice-103), [104](#notice-104), [105](#notice-105) |
+| zerocopy | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy | [106](#notice-106), [107](#notice-107), [108](#notice-108) |
+| zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs | [109](#notice-109) |
 
 ## Copyleft components
 
@@ -212,7 +216,7 @@ exception.
 
 <a id="notice-1"></a>
 
-Used by: ab_glyph 0.2.32 (LICENSE); ab_glyph_rasterizer 0.1.10 (LICENSE); alsa 0.11.0 (LICENSE-APACHE); fdeflate 0.3.7 (LICENSE-APACHE); libc 0.2.186 (LICENSE-APACHE); litrs 1.0.0 (LICENSE-APACHE); mach2 0.6.0 (LICENSE-APACHE); miniz_oxide 0.8.9 (LICENSE-APACHE.md); miniz_oxide 0.9.1 (LICENSE-APACHE.md); owned_ttf_parser 0.25.1 (LICENSE); paste 1.0.15 (LICENSE-APACHE); proc-macro2 1.0.106 (LICENSE-APACHE); quote 1.0.45 (LICENSE-APACHE); raw-window-handle 0.6.2 (LICENSE-APACHE.md); serde 1.0.228 (LICENSE-APACHE); serde_core 1.0.228 (LICENSE-APACHE); syn 2.0.118 (LICENSE-APACHE); thiserror 1.0.69 (LICENSE-APACHE); thiserror-impl 1.0.69 (LICENSE-APACHE); unicode-ident 1.0.24 (LICENSE-APACHE); wgpu 0.20.1 (LICENSE.APACHE); wgpu-core 0.21.1 (LICENSE.APACHE); wgpu-hal 0.21.1 (LICENSE.APACHE); wgpu-types 0.20.0 (LICENSE.APACHE).
+Used by: ab_glyph 0.2.32 (LICENSE); ab_glyph_rasterizer 0.1.10 (LICENSE); alsa 0.11.0 (LICENSE-APACHE); fdeflate 0.3.7 (LICENSE-APACHE); itoa 1.0.19 (LICENSE-APACHE); libc 0.2.186 (LICENSE-APACHE); litrs 1.0.0 (LICENSE-APACHE); mach2 0.6.0 (LICENSE-APACHE); miniz_oxide 0.8.9 (LICENSE-APACHE.md); miniz_oxide 0.9.1 (LICENSE-APACHE.md); owned_ttf_parser 0.25.1 (LICENSE); paste 1.0.15 (LICENSE-APACHE); proc-macro2 1.0.106 (LICENSE-APACHE); quote 1.0.45 (LICENSE-APACHE); raw-window-handle 0.6.2 (LICENSE-APACHE.md); ryu 1.0.23 (LICENSE-APACHE); serde 1.0.228 (LICENSE-APACHE); serde_core 1.0.228 (LICENSE-APACHE); syn 2.0.118 (LICENSE-APACHE); thiserror 1.0.69 (LICENSE-APACHE); thiserror-impl 1.0.69 (LICENSE-APACHE); unicode-ident 1.0.24 (LICENSE-APACHE); wgpu 0.20.1 (LICENSE.APACHE); wgpu-core 0.21.1 (LICENSE.APACHE); wgpu-hal 0.21.1 (LICENSE.APACHE); wgpu-types 0.20.0 (LICENSE.APACHE).
 
 ```text
                                  Apache License
@@ -628,7 +632,7 @@ limitations under the License.
 
 <a id="notice-4"></a>
 
-Used by: adler2 2.0.1 (LICENSE-MIT); glow 0.13.1 (LICENSE-MIT); khronos-egl 6.0.0 (LICENSE-MIT); linux-raw-sys 0.12.1 (LICENSE-MIT); linux-raw-sys 0.4.15 (LICENSE-MIT); once_cell 1.21.4 (LICENSE-MIT); paste 1.0.15 (LICENSE-MIT); polling 3.11.0 (LICENSE-MIT); proc-macro2 1.0.106 (LICENSE-MIT); quote 1.0.45 (LICENSE-MIT); rtrb 0.4.1 (LICENSE-MIT); rustc-hash 1.1.0 (LICENSE-MIT); rustix 0.38.44 (LICENSE-MIT); rustix 1.1.4 (LICENSE-MIT); serde 1.0.228 (LICENSE-MIT); serde_core 1.0.228 (LICENSE-MIT); smol_str 0.2.2 (LICENSE-MIT); syn 2.0.118 (LICENSE-MIT); thiserror 1.0.69 (LICENSE-MIT); thiserror-impl 1.0.69 (LICENSE-MIT); unicode-ident 1.0.24 (LICENSE-MIT); x11-dl 2.21.0 (LICENSE-MIT).
+Used by: adler2 2.0.1 (LICENSE-MIT); glow 0.13.1 (LICENSE-MIT); itoa 1.0.19 (LICENSE-MIT); khronos-egl 6.0.0 (LICENSE-MIT); linux-raw-sys 0.12.1 (LICENSE-MIT); linux-raw-sys 0.4.15 (LICENSE-MIT); once_cell 1.21.4 (LICENSE-MIT); paste 1.0.15 (LICENSE-MIT); polling 3.11.0 (LICENSE-MIT); proc-macro2 1.0.106 (LICENSE-MIT); quote 1.0.45 (LICENSE-MIT); rtrb 0.4.1 (LICENSE-MIT); rustc-hash 1.1.0 (LICENSE-MIT); rustix 0.38.44 (LICENSE-MIT); rustix 1.1.4 (LICENSE-MIT); serde 1.0.228 (LICENSE-MIT); serde_core 1.0.228 (LICENSE-MIT); smol_str 0.2.2 (LICENSE-MIT); syn 2.0.118 (LICENSE-MIT); thiserror 1.0.69 (LICENSE-MIT); thiserror-impl 1.0.69 (LICENSE-MIT); unicode-ident 1.0.24 (LICENSE-MIT); x11-dl 2.21.0 (LICENSE-MIT).
 
 ```text
 Permission is hereby granted, free of charge, to any
@@ -1783,6 +1787,81 @@ SOFTWARE.
 
 <a id="notice-29"></a>
 
+Used by: csv 1.4.0 (COPYING); csv-core 0.1.13 (COPYING); memchr 2.8.2 (COPYING); termcolor 1.4.1 (COPYING).
+
+```text
+This project is dual-licensed under the Unlicense and MIT licenses.
+
+You may use this code under the terms of either license.
+```
+
+### Notice 30
+
+<a id="notice-30"></a>
+
+Used by: csv 1.4.0 (LICENSE-MIT); csv-core 0.1.13 (LICENSE-MIT); memchr 2.8.2 (LICENSE-MIT); termcolor 1.4.1 (LICENSE-MIT).
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+### Notice 31
+
+<a id="notice-31"></a>
+
+Used by: csv 1.4.0 (UNLICENSE); csv-core 0.1.13 (UNLICENSE); memchr 2.8.2 (UNLICENSE); termcolor 1.4.1 (UNLICENSE).
+
+```text
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+```
+
+### Notice 32
+
+<a id="notice-32"></a>
+
 Used by: cursor-icon 1.2.0 (LICENSE-APACHE).
 
 ```text
@@ -1989,9 +2068,9 @@ Used by: cursor-icon 1.2.0 (LICENSE-APACHE).
    limitations under the License.
 ```
 
-### Notice 30
+### Notice 33
 
-<a id="notice-30"></a>
+<a id="notice-33"></a>
 
 Used by: cursor-icon 1.2.0 (LICENSE-ZLIB).
 
@@ -2009,9 +2088,9 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### Notice 31
+### Notice 34
 
-<a id="notice-31"></a>
+<a id="notice-34"></a>
 
 Used by: dlib 0.5.3 (LICENSE.txt).
 
@@ -2037,9 +2116,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Notice 32
+### Notice 35
 
-<a id="notice-32"></a>
+<a id="notice-35"></a>
 
 Used by: document-features 0.2.12 (LICENSE-MIT).
 
@@ -2065,9 +2144,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 33
+### Notice 36
 
-<a id="notice-33"></a>
+<a id="notice-36"></a>
 
 Used by: downcast-rs 1.2.1 (LICENSE-MIT).
 
@@ -2099,9 +2178,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 34
+### Notice 37
 
-<a id="notice-34"></a>
+<a id="notice-37"></a>
 
 Used by: equivalent 1.0.2 (LICENSE-MIT).
 
@@ -2133,9 +2212,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 35
+### Notice 38
 
-<a id="notice-35"></a>
+<a id="notice-38"></a>
 
 Used by: errno 0.3.14 (LICENSE-MIT).
 
@@ -2167,9 +2246,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 36
+### Notice 39
 
-<a id="notice-36"></a>
+<a id="notice-39"></a>
 
 Used by: fdeflate 0.3.7 (LICENSE-MIT).
 
@@ -2201,9 +2280,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 37
+### Notice 40
 
-<a id="notice-37"></a>
+<a id="notice-40"></a>
 
 Used by: flate2 1.1.11 (LICENSE-MIT).
 
@@ -2235,9 +2314,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 38
+### Notice 41
 
-<a id="notice-38"></a>
+<a id="notice-41"></a>
 
 Used by: foldhash 0.1.5 (LICENSE).
 
@@ -2263,9 +2342,9 @@ the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### Notice 39
+### Notice 42
 
-<a id="notice-39"></a>
+<a id="notice-42"></a>
 
 Used by: foreign-types 0.5.0 (LICENSE-MIT); foreign-types-macros 0.2.3 (LICENSE-MIT); foreign-types-shared 0.3.1 (LICENSE-MIT).
 
@@ -2291,9 +2370,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 40
+### Notice 43
 
-<a id="notice-40"></a>
+<a id="notice-43"></a>
 
 Used by: getrandom 0.3.4 (LICENSE-APACHE).
 
@@ -2501,9 +2580,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### Notice 41
+### Notice 44
 
-<a id="notice-41"></a>
+<a id="notice-44"></a>
 
 Used by: getrandom 0.3.4 (LICENSE-MIT).
 
@@ -2536,9 +2615,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 42
+### Notice 45
 
-<a id="notice-42"></a>
+<a id="notice-45"></a>
 
 Used by: glow 0.13.1 (LICENSE-ZLIB).
 
@@ -2560,9 +2639,9 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### Notice 43
+### Notice 46
 
-<a id="notice-43"></a>
+<a id="notice-46"></a>
 
 Used by: hashbrown 0.15.5 (LICENSE-MIT); hashbrown 0.17.1 (LICENSE-MIT).
 
@@ -2594,9 +2673,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 44
+### Notice 47
 
-<a id="notice-44"></a>
+<a id="notice-47"></a>
 
 Used by: hexf-parse 0.2.1 (fallback SPDX CC0-1.0 text); wayland-protocols-plasma 0.2.0 (plasma-wayland-protocols/LICENSES/CC0-1.0.txt).
 
@@ -2724,9 +2803,9 @@ express Statement of Purpose.
     this CC0 or use of the Work.
 ```
 
-### Notice 45
+### Notice 48
 
-<a id="notice-45"></a>
+<a id="notice-48"></a>
 
 Used by: indexmap 2.14.0 (LICENSE-MIT).
 
@@ -2758,9 +2837,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 46
+### Notice 49
 
-<a id="notice-46"></a>
+<a id="notice-49"></a>
 
 Used by: libc 0.2.186 (LICENSE-MIT).
 
@@ -2792,9 +2871,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 47
+### Notice 50
 
-<a id="notice-47"></a>
+<a id="notice-50"></a>
 
 Used by: libloading 0.7.4 (LICENSE); libloading 0.8.9 (LICENSE).
 
@@ -2813,9 +2892,9 @@ NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE US
 THIS SOFTWARE.
 ```
 
-### Notice 48
+### Notice 51
 
-<a id="notice-48"></a>
+<a id="notice-51"></a>
 
 Used by: linux-raw-sys 0.12.1 (COPYRIGHT); linux-raw-sys 0.4.15 (COPYRIGHT).
 
@@ -2851,9 +2930,9 @@ is licensed under:
 at your option.
 ```
 
-### Notice 49
+### Notice 52
 
-<a id="notice-49"></a>
+<a id="notice-52"></a>
 
 Used by: linux-raw-sys 0.12.1 (LICENSE-Apache-2.0_WITH_LLVM-exception); linux-raw-sys 0.4.15 (LICENSE-Apache-2.0_WITH_LLVM-exception); rustix 0.38.44 (LICENSE-Apache-2.0_WITH_LLVM-exception); rustix 1.1.4 (LICENSE-Apache-2.0_WITH_LLVM-exception).
 
@@ -3078,9 +3157,9 @@ the License, but only in their entirety and only with respect to the Combined
 Software.
 ```
 
-### Notice 50
+### Notice 53
 
-<a id="notice-50"></a>
+<a id="notice-53"></a>
 
 Used by: litrs 1.0.0 (LICENSE-MIT).
 
@@ -3112,9 +3191,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 51
+### Notice 54
 
-<a id="notice-51"></a>
+<a id="notice-54"></a>
 
 Used by: mach2 0.6.0 (LICENSE-BSD).
 
@@ -3144,9 +3223,9 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Notice 52
+### Notice 55
 
-<a id="notice-52"></a>
+<a id="notice-55"></a>
 
 Used by: mach2 0.6.0 (LICENSE-MIT).
 
@@ -3176,81 +3255,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
-```
-
-### Notice 53
-
-<a id="notice-53"></a>
-
-Used by: memchr 2.8.2 (COPYING); termcolor 1.4.1 (COPYING).
-
-```text
-This project is dual-licensed under the Unlicense and MIT licenses.
-
-You may use this code under the terms of either license.
-```
-
-### Notice 54
-
-<a id="notice-54"></a>
-
-Used by: memchr 2.8.2 (LICENSE-MIT); termcolor 1.4.1 (LICENSE-MIT).
-
-```text
-The MIT License (MIT)
-
-Copyright (c) 2015 Andrew Gallant
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-```
-
-### Notice 55
-
-<a id="notice-55"></a>
-
-Used by: memchr 2.8.2 (UNLICENSE); termcolor 1.4.1 (UNLICENSE).
-
-```text
-This is free and unencumbered software released into the public domain.
-
-Anyone is free to copy, modify, publish, use, compile, sell, or
-distribute this software, either in source code form or as a compiled
-binary, for any purpose, commercial or non-commercial, and by any
-means.
-
-In jurisdictions that recognize copyright laws, the author or authors
-of this software dedicate any and all copyright interest in the
-software to the public domain. We make this dedication for the benefit
-of the public at large and to the detriment of our heirs and
-successors. We intend this dedication to be an overt act of
-relinquishment in perpetuity of all present and future rights to this
-software under copyright law.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-OTHER DEALINGS IN THE SOFTWARE.
-
-For more information, please refer to <http://unlicense.org/>
 ```
 
 ### Notice 56
@@ -3941,6 +3945,38 @@ at your option.
 
 <a id="notice-72"></a>
 
+Used by: ryu 1.0.23 (LICENSE-BOOST).
+
+```text
+Boost Software License - Version 1.0 - August 17th, 2003
+
+Permission is hereby granted, free of charge, to any person or organization
+obtaining a copy of the software and accompanying documentation covered by
+this license (the "Software") to use, reproduce, display, distribute,
+execute, and transmit the Software, and to prepare derivative works of the
+Software, and to permit third-parties to whom the Software is furnished to
+do so, all subject to the following:
+
+The copyright notices in the Software and this entire statement, including
+the above license grant, this restriction and the following disclaimer,
+must be included in all copies of the Software, in whole or in part, and
+all derivative works of the Software, unless such copies or derivative
+works are solely in the form of machine-executable object code generated by
+a source language processor.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
+FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### Notice 73
+
+<a id="notice-73"></a>
+
 Used by: scopeguard 1.2.0 (LICENSE-MIT).
 
 ```text
@@ -3971,9 +4007,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 73
+### Notice 74
 
-<a id="notice-73"></a>
+<a id="notice-74"></a>
 
 Used by: sctk-adwaita 0.8.3 (LICENSE).
 
@@ -4001,9 +4037,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 74
+### Notice 75
 
-<a id="notice-74"></a>
+<a id="notice-75"></a>
 
 Used by: sctk-adwaita 0.8.3 (embedded src/title/Cantarell-Regular.ttf, OFL-1.1; copyright from the font's name table (nameID 0); embedded with include_bytes! as documented at https://github.com/PolyMeilex/sctk-adwaita/blob/1ff9a966a386b4850f28c78ceda50899346dc398/src/title/ab_glyph_renderer.rs#L1-L12).
 
@@ -4056,9 +4092,9 @@ DISCLAIMER
 THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
 ```
 
-### Notice 75
+### Notice 76
 
-<a id="notice-75"></a>
+<a id="notice-76"></a>
 
 Used by: simd-adler32 0.3.10 (LICENSE.md).
 
@@ -4086,9 +4122,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 76
+### Notice 77
 
-<a id="notice-76"></a>
+<a id="notice-77"></a>
 
 Used by: slab 0.4.12 (LICENSE).
 
@@ -4120,9 +4156,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 77
+### Notice 78
 
-<a id="notice-77"></a>
+<a id="notice-78"></a>
 
 Used by: smallvec 1.15.2 (LICENSE-MIT).
 
@@ -4154,9 +4190,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 78
+### Notice 79
 
-<a id="notice-78"></a>
+<a id="notice-79"></a>
 
 Used by: static_assertions 1.1.0 (LICENSE-MIT).
 
@@ -4184,9 +4220,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 79
+### Notice 80
 
-<a id="notice-79"></a>
+<a id="notice-80"></a>
 
 Used by: strict-num 0.1.1 (LICENSE).
 
@@ -4212,9 +4248,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Notice 80
+### Notice 81
 
-<a id="notice-80"></a>
+<a id="notice-81"></a>
 
 Used by: tiny-skia 0.11.4 (LICENSE); tiny-skia-path 0.11.4 (LICENSE).
 
@@ -4251,9 +4287,9 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Notice 81
+### Notice 82
 
-<a id="notice-81"></a>
+<a id="notice-82"></a>
 
 Used by: transpose 0.2.3 (LICENSE-APACHE).
 
@@ -4461,9 +4497,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### Notice 82
+### Notice 83
 
-<a id="notice-82"></a>
+<a id="notice-83"></a>
 
 Used by: transpose 0.2.3 (LICENSE-MIT).
 
@@ -4495,9 +4531,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 83
+### Notice 84
 
-<a id="notice-83"></a>
+<a id="notice-84"></a>
 
 Used by: ttf-parser 0.25.1 (LICENSE-MIT).
 
@@ -4523,9 +4559,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Notice 84
+### Notice 85
 
-<a id="notice-84"></a>
+<a id="notice-85"></a>
 
 Used by: unicode-ident 1.0.24 (LICENSE-UNICODE).
 
@@ -4571,9 +4607,9 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-### Notice 85
+### Notice 86
 
-<a id="notice-85"></a>
+<a id="notice-86"></a>
 
 Used by: wayland-backend 0.3.15 (LICENSE.txt); wayland-client 0.31.14 (LICENSE.txt); wayland-cursor 0.31.14 (LICENSE.txt); wayland-protocols 0.31.2 (LICENSE.txt); wayland-scanner 0.31.10 (LICENSE.txt); wayland-sys 0.31.11 (LICENSE.txt).
 
@@ -4599,9 +4635,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Notice 86
+### Notice 87
 
-<a id="notice-86"></a>
+<a id="notice-87"></a>
 
 Used by: wayland-client 0.31.14 (<copyright> blocks of 1 protocol XML files).
 
@@ -4633,9 +4669,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 87
+### Notice 88
 
-<a id="notice-87"></a>
+<a id="notice-88"></a>
 
 Used by: wayland-protocols 0.31.2 (<copyright> blocks of 38 protocol XML files).
 
@@ -5513,9 +5549,9 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 88
+### Notice 89
 
-<a id="notice-88"></a>
+<a id="notice-89"></a>
 
 Used by: wayland-protocols 0.31.2 (protocols/COPYING).
 
@@ -5555,9 +5591,9 @@ The above is the version of the MIT "Expat" License used by X.org:
     http://cgit.freedesktop.org/xorg/xserver/tree/COPYING
 ```
 
-### Notice 89
+### Notice 90
 
-<a id="notice-89"></a>
+<a id="notice-90"></a>
 
 Used by: wayland-protocols-plasma 0.2.0 (<copyright> blocks of 27 protocol XML files).
 
@@ -5718,9 +5754,9 @@ SPDX-License-Identifier: MIT
 SPDX-License-Identifier: LGPL-2.1-or-later
 ```
 
-### Notice 90
+### Notice 91
 
-<a id="notice-90"></a>
+<a id="notice-91"></a>
 
 Used by: wayland-protocols-plasma 0.2.0 (fallback SPDX MIT text, copyright line from https://github.com/smithay/wayland-rs/blob/ea4c856cca609bf658cc7945ffa7e4b4aa268171/LICENSE.txt); wayland-protocols-wlr 0.2.0 (fallback SPDX MIT text, copyright line from https://github.com/smithay/wayland-rs/blob/8050a7bd668154f99ebfed805705cd10a1435b5a/LICENSE.txt).
 
@@ -5745,9 +5781,9 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTI
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 91
+### Notice 92
 
-<a id="notice-91"></a>
+<a id="notice-92"></a>
 
 Used by: wayland-protocols-plasma 0.2.0 (plasma-wayland-protocols/COPYING.LIB).
 
@@ -6261,9 +6297,9 @@ if necessary.  Here is a sample; alter the names:
 That's all there is to it!
 ```
 
-### Notice 92
+### Notice 93
 
-<a id="notice-92"></a>
+<a id="notice-93"></a>
 
 Used by: wayland-protocols-plasma 0.2.0 (plasma-wayland-protocols/LICENSES/BSD-3-Clause.txt).
 
@@ -6296,9 +6332,9 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Notice 93
+### Notice 94
 
-<a id="notice-93"></a>
+<a id="notice-94"></a>
 
 Used by: wayland-protocols-plasma 0.2.0 (plasma-wayland-protocols/LICENSES/LGPL-2.1-or-later.txt).
 
@@ -6773,9 +6809,9 @@ Ty Coon, President of Vice
 That's all there is to it!
 ```
 
-### Notice 94
+### Notice 95
 
-<a id="notice-94"></a>
+<a id="notice-95"></a>
 
 Used by: wayland-protocols-plasma 0.2.0 (plasma-wayland-protocols/LICENSES/MIT-CMU.txt).
 
@@ -6799,9 +6835,9 @@ PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
 ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### Notice 95
+### Notice 96
 
-<a id="notice-95"></a>
+<a id="notice-96"></a>
 
 Used by: wayland-protocols-plasma 0.2.0 (plasma-wayland-protocols/LICENSES/MIT.txt).
 
@@ -6827,9 +6863,9 @@ WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
 OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 96
+### Notice 97
 
-<a id="notice-96"></a>
+<a id="notice-97"></a>
 
 Used by: wayland-protocols-wlr 0.2.0 (<copyright> blocks of 10 protocol XML files).
 
@@ -7070,9 +7106,9 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 97
+### Notice 98
 
-<a id="notice-97"></a>
+<a id="notice-98"></a>
 
 Used by: wayland-scanner 0.31.10 (<copyright> blocks of 1 protocol XML files).
 
@@ -7084,9 +7120,9 @@ Including a few more lines.
 Of text.
 ```
 
-### Notice 98
+### Notice 99
 
-<a id="notice-98"></a>
+<a id="notice-99"></a>
 
 Used by: wgpu 0.20.1 (LICENSE.MIT); wgpu-core 0.21.1 (LICENSE.MIT); wgpu-hal 0.21.1 (LICENSE.MIT); wgpu-types 0.20.0 (LICENSE.MIT).
 
@@ -7114,9 +7150,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 99
+### Notice 100
 
-<a id="notice-99"></a>
+<a id="notice-100"></a>
 
 Used by: x11rb 0.13.2 (LICENSE-MIT); x11rb-protocol 0.13.2 (LICENSE-MIT).
 
@@ -7148,9 +7184,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 100
+### Notice 101
 
-<a id="notice-100"></a>
+<a id="notice-101"></a>
 
 Used by: xcursor 0.3.10 (LICENSE).
 
@@ -7178,9 +7214,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 101
+### Notice 102
 
-<a id="notice-101"></a>
+<a id="notice-102"></a>
 
 Used by: xkbcommon-dl 0.4.2 (LICENSE).
 
@@ -7208,9 +7244,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 102
+### Notice 103
 
-<a id="notice-102"></a>
+<a id="notice-103"></a>
 
 Used by: xkeysym 0.2.1 (LICENSE-APACHE).
 
@@ -7418,9 +7454,9 @@ Used by: xkeysym 0.2.1 (LICENSE-APACHE).
    limitations under the License.
 ```
 
-### Notice 103
+### Notice 104
 
-<a id="notice-103"></a>
+<a id="notice-104"></a>
 
 Used by: xkeysym 0.2.1 (LICENSE-MIT).
 
@@ -7446,9 +7482,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Notice 104
+### Notice 105
 
-<a id="notice-104"></a>
+<a id="notice-105"></a>
 
 Used by: xkeysym 0.2.1 (LICENSE-ZLIB).
 
@@ -7466,9 +7502,9 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### Notice 105
+### Notice 106
 
-<a id="notice-105"></a>
+<a id="notice-106"></a>
 
 Used by: zerocopy 0.8.52 (LICENSE-APACHE).
 
@@ -7676,9 +7712,9 @@ Used by: zerocopy 0.8.52 (LICENSE-APACHE).
    limitations under the License.
 ```
 
-### Notice 106
+### Notice 107
 
-<a id="notice-106"></a>
+<a id="notice-107"></a>
 
 Used by: zerocopy 0.8.52 (LICENSE-BSD).
 
@@ -7709,9 +7745,9 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Notice 107
+### Notice 108
 
-<a id="notice-107"></a>
+<a id="notice-108"></a>
 
 Used by: zerocopy 0.8.52 (LICENSE-MIT).
 
@@ -7743,9 +7779,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Notice 108
+### Notice 109
 
-<a id="notice-108"></a>
+<a id="notice-109"></a>
 
 Used by: zlib-rs 0.6.8 (LICENSE).
 

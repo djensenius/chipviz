@@ -21,6 +21,31 @@ just modern-pi5
 just modern-m1 -- --udp 127.0.0.1:6464
 ```
 
+Scene 6 (`Starfield`) reads a user-supplied HYG-compatible CSV; no catalog is
+bundled. It requires both an observer location and the catalog path. The
+observation time defaults to current UTC:
+
+```sh
+just modern-m1 -- --udp 127.0.0.1:6464 \
+  --star-catalog /path/to/stars.csv --location 45.5,-73.25
+just modern-m1 -- --scene 6 --star-catalog /path/to/stars.csv \
+  --location 45.5,-73.25
+just modern-pi5 -- --star-catalog /path/to/stars.csv \
+  --location 45.5,-73.25 --time 946728000
+```
+
+The CSV must have `ra` (hours), `dec` (degrees) and `mag` columns; `ci` and
+`proper` are optional. Standard CSV quoting is supported. Scene 6 without both
+setup options prints an actionable message and skips that scene, while other
+scenes remain usable. `--catalog` is an alias for `--star-catalog`; both load
+the file at runtime and never embed it in the executable. Scene 7 stays the
+colour field. `--scene 6` forces Starfield for procedural or microphone frames
+without a UDP sender; it also overrides UDP scene bytes when explicitly set.
+Without `--scene`, UDP, microphone and procedural scene selection is unchanged.
+Scene 6 requires its catalog and location at startup when selected with
+`--scene`; a scene-6 UDP frame without setup is skipped with a clear message,
+and subsequent non-star scenes continue normally.
+
 Without `--udp` or `--mic`, the renderer uses deterministic procedural frames. With UDP,
 it consumes `control-frame-v0` packets from the host bridge:
 
@@ -38,6 +63,10 @@ The renderer starts windowed by default.
 | `--monitor INDEX\|NAME` | Choose the display by the index from `--list-monitors` (all-digit values are indices) or by a case-insensitive name substring. Names matching several displays, including identical models, are rejected as ambiguous; use the index. Without `--fullscreen`, the window opens on that display. |
 | `--list-monitors` | Print each display's index, name, size, and scale, then exit. |
 | `--layout auto\|v2\|h2\|v3\|h3` | Pin the colour-field (scene 7) layout: two vertical or horizontal regions, or three. Default `auto` lets events change it. |
+| `--star-catalog PATH` | Read a user-supplied HYG-compatible CSV for scene 6; catalogs are not bundled or embedded. `--catalog` is an alias. |
+| `--location LAT,LON` | Observer latitude and longitude in decimal degrees, longitude east positive. Required with `--star-catalog`. |
+| `--time UNIX_SECONDS` | Observation time in UTC seconds since the Unix epoch; defaults to current UTC and requires `--star-catalog` plus `--location`. |
+| `--scene N` | Force the displayed scene byte (0-255), including UDP frames; absent by default, preserving the selected input's scene. Scene 6 requires `--star-catalog` and `--location`. |
 | `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
@@ -349,15 +378,22 @@ table in `src/scenes/mod.rs`. Scene byte 7 is checked first and always selects
 the colour field, whatever the registry length; every other byte selects
 `REGISTRY[scene % REGISTRY.len()]`:
 
+Starfield is appended at registry index 6: bytes 0-5 keep their original
+registry scenes, byte 6 becomes Starfield, and the registry modulus changes
+from six to seven for other wrapped byte values. Thus some bytes >=6 that
+previously wrapped to a different scene now select a different registry
+entry. The explicit scene-7 ColourField dispatch is unchanged.
+
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
 | 7 | `ColourField` | `ScreenSpace` |
-| 0, 6, 12, ... | `SignalField` | `Orbit3D` |
-| 1, 13, 19, ... | `SpectrumVolume` | `Orbit3D` |
-| 2, 8, 14, ... | `PulseTunnel` | `Orbit3D` |
-| 3, 9, 15, ... | `Lines` | `ScreenSpace` |
-| 4, 10, 16, ... | `Static` | `ScreenSpace` |
-| 5, 11, 17, ... | `Object` | `ScreenSpace` |
+| 0, 14, 21, ... | `SignalField` | `Orbit3D` |
+| 1, 8, 15, ... | `SpectrumVolume` | `Orbit3D` |
+| 2, 9, 16, ... | `PulseTunnel` | `Orbit3D` |
+| 3, 10, 17, ... | `Lines` | `ScreenSpace` |
+| 4, 11, 18, ... | `Static` | `ScreenSpace` |
+| 5, 12, 19, ... | `Object` | `ScreenSpace` |
+| 6, 13, 20, ... | `Starfield` | `ScreenSpace` |
 
 - `ColourField` (scene 7, `src/scenes/colour_field/`): two or three large
   regions of flat colour, meant to be projected onto performers in the dark.
@@ -383,6 +419,21 @@ the colour field, whatever the registry length; every other byte selects
   steps with incoming scene 7 throughout) arms it, since hosts send those
   only when started with `--allow-flash`. Relative palette inputs, procedural
   and mic frames never arm, and unarmed 3 and 7 run as hard cuts (2 and 6).
+- `Starfield` (scene 6, `src/scenes/starfield.rs`): reads a user-supplied CSV
+  with HYG-compatible `ra` hours, `dec` degrees, and `mag` columns (optional
+  `ci` and quoted `proper` name). No catalog is distributed while the data
+  licensing research is unresolved. The coordinates are treated as HYG-style
+  J2000; a UTC timestamp and east-positive longitude feed an approximate GMST
+  rotation and local horizon conversion. Visible stars are mapped to a
+  rectangular azimuth/altitude panorama (north wraps at both horizontal
+  edges; east, south and west map across the middle; horizon at the bottom).
+  There is no precession, proper-motion correction, parallax or atmospheric
+  refraction, so this is a useful sky view rather than a precision
+  planetarium. Magnitude and colour index control bounded point brightness
+  and approximate hue; display brightness is lifted for visibility and audio
+  only adjusts it within a narrow range. Stars fainter than magnitude 6.5 are
+  excluded. Below-horizon stars are culled, brightest stars are considered
+  first, and output respects each profile's instance budget.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.

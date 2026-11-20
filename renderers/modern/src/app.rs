@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::{SceneConfig, colour_field, mic_layers};
+use crate::scenes::{SceneConfig, colour_field, mic_layers, starfield};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -23,6 +23,7 @@ pub enum AppError {
     Renderer(RendererError),
     Monitor(String),
     Audio(String),
+    Starfield(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -34,6 +35,7 @@ impl std::fmt::Display for AppError {
             Self::Renderer(error) => write!(formatter, "renderer error: {error}"),
             Self::Monitor(message) => write!(formatter, "monitor error: {message}"),
             Self::Audio(message) => write!(formatter, "audio error: {message}"),
+            Self::Starfield(message) => write!(formatter, "starfield error: {message}"),
         }
     }
 }
@@ -75,6 +77,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         }
         ArgsCommand::Run(args) => args,
     };
+    let starfield = args.starfield_config()?;
 
     // Both list flags may be given together; each list gets a heading then.
     let both_lists = args.list_audio_devices && args.list_monitors;
@@ -150,6 +153,9 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     renderer.pipeline_mut().configure_scenes(SceneConfig {
         lines_drop_cuts: args.lines_drop_cuts,
     });
+    renderer
+        .pipeline_mut()
+        .configure_starfield(starfield.clone());
     renderer.pipeline_mut().limit_colour_field_steps();
     if mic_layers::allowed(args.mic_layers) != args.mic_layers {
         eprintln!("{}", mic_layers::NO_LAYERS_NOTICE);
@@ -160,6 +166,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
+    let mut missing_starfield_warning = false;
 
     event_loop.run(move |event, target| match event {
         Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
@@ -197,11 +204,23 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
             }
             WindowEvent::RedrawRequested => {
                 let elapsed = start.elapsed().as_secs_f64();
-                let frame = frame_source.next_frame();
+                let frame = with_scene_override(frame_source.next_frame(), args.scene);
+                if frame.scene == starfield::SCENE && starfield.is_none() {
+                    if !missing_starfield_warning {
+                        eprintln!(
+                            "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON; \
+                             this frame is skipped. Supply both options to render it; \
+                             other scenes remain available."
+                        );
+                        missing_starfield_warning = true;
+                    }
+                    return;
+                }
                 // The colour field sees each received or generated frame once;
                 // held redraws only repeat its last step.
                 for fresh in frame_source.fresh() {
-                    renderer.pipeline_mut().observe(fresh, elapsed);
+                    let fresh = with_scene_override(*fresh, args.scene);
+                    renderer.pipeline_mut().observe(&fresh, elapsed);
                 }
                 // The waveform side channel only describes mic frames; UDP
                 // and procedural frames make the layers fall back.
@@ -260,11 +279,17 @@ fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
-       [--lines-drop-cuts]
+       [--lines-drop-cuts] [--scene N]
        {program} --list-monitors | --list-audio-devices
 
 Options:
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
+  --star-catalog PATH     HYG-compatible star CSV for scene 6 (not bundled)
+  --catalog FILE          alias for --star-catalog
+  --location LAT,LON      observer position in decimal degrees (longitude east)
+  --time UNIX_SECONDS     UTC observation time for scene 6 (default: current UTC)
+  --scene N               override the displayed scene byte (0-255), including UDP;
+                          without this option, incoming and procedural scenes are unchanged
   --mic                   drive frames from live microphone analysis instead of
                           procedural frames; UDP packets, when they arrive, still win
   --audio-device INDEX|NAME
@@ -288,6 +313,7 @@ Options:
                           default builds print a notice and draw nothing
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
+  Scene 6 requires both --star-catalog and --location; scene 7 remains ColourField
   -h, --help              print this help
 
 Keys:
@@ -464,13 +490,13 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum ArgsCommand {
     Run(AppArgs),
     Help,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 struct AppArgs {
     udp_endpoint: Option<String>,
     fullscreen: bool,
@@ -484,6 +510,10 @@ struct AppArgs {
     allow_flash: bool,
     mic_layers: mic_layers::Mode,
     lines_drop_cuts: bool,
+    scene: Option<u8>,
+    catalog_path: Option<std::path::PathBuf>,
+    location: Option<(f64, f64)>,
+    unix_seconds: Option<f64>,
 }
 
 /// Wire palettes go through the stability gate, and a stable absolute 3 or 7
@@ -515,6 +545,29 @@ fn parse_layout(value: &str) -> Result<Option<u8>, AppError> {
 }
 
 impl AppArgs {
+    fn starfield_config(&self) -> Result<Option<starfield::StarfieldConfig>, AppError> {
+        let (Some(path), Some((latitude_degrees, longitude_degrees))) =
+            (&self.catalog_path, self.location)
+        else {
+            return Ok(None);
+        };
+        let catalog = starfield::StarCatalog::load(path)
+            .map_err(|error| AppError::Starfield(error.to_string()))?;
+        let unix_seconds = match self.unix_seconds {
+            Some(seconds) => seconds,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs_f64())
+                .unwrap_or_else(|error| -error.duration().as_secs_f64()),
+        };
+        Ok(Some(starfield::StarfieldConfig {
+            catalog: std::sync::Arc::new(catalog),
+            latitude_degrees,
+            longitude_degrees,
+            unix_seconds,
+        }))
+    }
+
     fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<ArgsCommand, AppError> {
         let mut parsed = Self::default();
         let mut args = args.into_iter();
@@ -553,6 +606,37 @@ impl AppArgs {
                     })?;
                 }
                 "--lines-drop-cuts" => parsed.lines_drop_cuts = true,
+                "--scene" => {
+                    let value = required_value(&mut args, "--scene", "0-255")?;
+                    parsed.scene = Some(value.parse::<u8>().map_err(|_| {
+                        invalid_input(format!("--scene expects 0-255, got {value}"))
+                    })?);
+                }
+                "--catalog" | "--star-catalog" => {
+                    parsed.catalog_path = Some(std::path::PathBuf::from(required_value(
+                        &mut args,
+                        arg.as_str(),
+                        "PATH",
+                    )?));
+                }
+                "--location" => {
+                    let value = required_value(&mut args, "--location", "LAT,LON")?;
+                    parsed.location = Some(parse_location(&value)?);
+                }
+                "--time" => {
+                    let value = required_value(&mut args, "--time", "UNIX_SECONDS")?;
+                    let seconds = value.parse::<f64>().map_err(|_| {
+                        invalid_input(format!("--time must be finite UNIX seconds, got {value}"))
+                    })?;
+                    if !seconds.is_finite()
+                        || !(-62_135_596_800.0..=253_402_300_799.0).contains(&seconds)
+                    {
+                        return Err(invalid_input(format!(
+                            "--time must be finite UNIX seconds in the UTC year 0001..9999 range, got {value}"
+                        )));
+                    }
+                    parsed.unix_seconds = Some(seconds);
+                }
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
@@ -563,9 +647,66 @@ impl AppArgs {
         if parsed.audio_device.is_some() && !parsed.mic && !parsed.list_audio_devices {
             return Err(invalid_input("--audio-device requires --mic".to_string()));
         }
+        if parsed.catalog_path.is_some() != parsed.location.is_some() {
+            return Err(invalid_input(
+                "--star-catalog and --location must be supplied together for scene 6".to_string(),
+            ));
+        }
+        if parsed.unix_seconds.is_some() && parsed.catalog_path.is_none() {
+            return Err(invalid_input(
+                "--time requires --star-catalog and --location".to_string(),
+            ));
+        }
+        if parsed.scene == Some(starfield::SCENE) && parsed.catalog_path.is_none() {
+            return Err(invalid_input(
+                "--scene 6 (Starfield) requires --star-catalog PATH and --location LAT,LON"
+                    .to_string(),
+            ));
+        }
 
         Ok(ArgsCommand::Run(parsed))
     }
+}
+
+fn with_scene_override(mut frame: ControlFrame, scene: Option<u8>) -> ControlFrame {
+    if let Some(scene) = scene {
+        frame.scene = scene;
+    }
+    frame
+}
+
+fn parse_location(value: &str) -> Result<(f64, f64), AppError> {
+    let Some((latitude, longitude)) = value.split_once(',') else {
+        return Err(invalid_input(format!(
+            "--location expects LAT,LON decimal degrees, got {value}"
+        )));
+    };
+    if longitude.contains(',') {
+        return Err(invalid_input(format!(
+            "--location expects exactly LAT,LON, got {value}"
+        )));
+    }
+    let latitude = latitude.parse::<f64>().map_err(|_| {
+        invalid_input(format!(
+            "--location latitude must be finite, got {latitude}"
+        ))
+    })?;
+    let longitude = longitude.parse::<f64>().map_err(|_| {
+        invalid_input(format!(
+            "--location longitude must be finite, got {longitude}"
+        ))
+    })?;
+    if !latitude.is_finite() || !(-90.0..=90.0).contains(&latitude) {
+        return Err(invalid_input(format!(
+            "--location latitude must be finite and in [-90, 90], got {latitude}"
+        )));
+    }
+    if !longitude.is_finite() || !(-180.0..=180.0).contains(&longitude) {
+        return Err(invalid_input(format!(
+            "--location longitude must be finite and in [-180, 180] (east positive), got {longitude}"
+        )));
+    }
+    Ok((latitude, longitude))
 }
 
 fn required_value(
@@ -790,6 +931,23 @@ mod tests {
     fn default_args_are_windowed() {
         assert_eq!(parse_run(&[]), AppArgs::default());
         assert!(!AppArgs::default().fullscreen);
+        assert_eq!(AppArgs::default().scene, None);
+    }
+
+    #[test]
+    fn scene_override_changes_only_the_displayed_scene() {
+        let frame = ControlFrame {
+            scene: 13,
+            ..ControlFrame::procedural(12)
+        };
+        let unchanged = with_scene_override(frame, None);
+        assert_eq!(unchanged.scene, 13);
+        assert_eq!(unchanged.energy, frame.energy);
+        assert_eq!(unchanged.spectrum, frame.spectrum);
+        let overridden = with_scene_override(frame, Some(6));
+        assert_eq!(overridden.scene, 6);
+        assert_eq!(overridden.energy, frame.energy);
+        assert_eq!(overridden.spectrum, frame.spectrum);
     }
 
     #[test]
@@ -799,6 +957,100 @@ mod tests {
         assert_eq!(args.monitor, Some(DeviceSelector::Index(1)));
         assert_eq!(args.udp_endpoint.as_deref(), Some("127.0.0.1:6464"));
         assert!(!args.list_monitors);
+    }
+
+    #[test]
+    fn parses_starfield_catalog_location_and_time() {
+        let args = parse_run(&[
+            "--scene",
+            "6",
+            "--star-catalog",
+            "stars.csv",
+            "--location",
+            "45.5,-73.25",
+            "--time",
+            "946728000",
+        ]);
+        assert_eq!(
+            args.catalog_path.as_deref(),
+            Some(std::path::Path::new("stars.csv"))
+        );
+        assert_eq!(args.location, Some((45.5, -73.25)));
+        assert_eq!(args.unix_seconds, Some(946_728_000.0));
+        assert_eq!(args.scene, Some(6));
+        assert_eq!(
+            parse_run(&["--catalog", "stars.csv", "--location", "0,0"]).location,
+            Some((0.0, 0.0))
+        );
+        assert_eq!(
+            parse_run(&["--catalog", "stars.csv", "--location", "0,180"]).location,
+            Some((0.0, 180.0))
+        );
+    }
+
+    #[test]
+    fn starfield_cli_loads_a_local_csv_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chipviz-starfield-{}-{unique}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "ra,dec,mag,ci,proper\n0,90,1,,\n").expect("write fixture");
+        let args = parse_run(&[
+            "--scene",
+            "6",
+            "--star-catalog",
+            path.to_str().expect("UTF-8 temp path"),
+            "--location",
+            "45,-73",
+            "--time",
+            "946728000",
+        ]);
+        let loaded = args.starfield_config();
+        let _ = std::fs::remove_file(&path);
+        let config = loaded
+            .expect("catalog setup")
+            .expect("configured starfield");
+        assert_eq!(config.catalog.stars().len(), 1);
+        assert_eq!(config.latitude_degrees, 45.0);
+        assert_eq!(config.longitude_degrees, -73.0);
+    }
+
+    #[test]
+    fn rejects_incomplete_and_invalid_starfield_options() {
+        for args in [
+            &["--catalog", "stars.csv"][..],
+            &["--location", "0,0"][..],
+            &["--scene", "6"][..],
+            &["--scene", "256"][..],
+            &["--scene"][..],
+            &["--time", "1"][..],
+            &["--catalog", "stars.csv", "--location", "91,0"][..],
+            &["--catalog", "stars.csv", "--location", "0,181"][..],
+            &["--catalog", "stars.csv", "--location", "nan,0"][..],
+            &[
+                "--catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+                "--time",
+                "inf",
+            ][..],
+        ] {
+            let error = parse(args).expect_err("invalid starfield options");
+            assert!(
+                matches!(error, AppError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput),
+                "{args:?}: {error}"
+            );
+        }
+        let error = parse(&["--scene", "6"]).unwrap_err().to_string();
+        assert!(
+            error.contains("--star-catalog PATH and --location LAT,LON"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1403,6 +1655,13 @@ mod tests {
             "--allow-flash",
             "--mic-layers off|scope|bursts|both",
             "--lines-drop-cuts",
+            "--star-catalog PATH",
+            "--catalog FILE",
+            "--location LAT,LON",
+            "--time UNIX_SECONDS",
+            "--scene N",
+            "Scene 6 requires both --star-catalog and --location",
+            "without this option, incoming and procedural scenes are unchanged",
             "cycle the colour-field layout pin",
             "cycle the mic layers",
             "Esc",

@@ -304,10 +304,12 @@ impl ScenePipeline {
     /// Restarts camera smoothing, the colour field and scene state, as at
     /// renderer start-up.
     pub fn reset_state(&mut self) {
+        let starfield = self.scene_state.starfield().cloned();
         self.camera = Camera::default();
         self.colour_field = colour_field::ColourField::new(self.colour_field.config());
         self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
         self.scene_state = SceneState::new(self.scene_state.config());
+        self.scene_state.configure_starfield(starfield);
         self.phosphor = None;
         self.settle = phosphor::Settle::default();
     }
@@ -363,6 +365,11 @@ impl ScenePipeline {
     /// Replaces the registry scenes' options and restarts their state.
     pub fn configure_scenes(&mut self, config: SceneConfig) {
         self.scene_state = SceneState::new(config);
+    }
+
+    /// Supplies the optional catalog and observer setup for registry scene 6.
+    pub fn configure_starfield(&mut self, config: Option<scenes::starfield::StarfieldConfig>) {
+        self.scene_state.configure_starfield(config);
     }
 
     /// Caps colour-field steps at 60 in any wall-clock second (live window).

@@ -11,17 +11,14 @@
 //!
 //! Each scene lives in its own module and exposes one [`SceneEntry`]. The
 //! control frame's `scene` byte selects `REGISTRY[scene % REGISTRY.len()]`, so
-//! with the current six entries scene 0/6/12... is SignalField, 1/7/13... is
-//! SpectrumVolume, 2/8/14... is PulseTunnel, 3/9/15... is Lines, 4/10/16...
-//! is Static and 5/11/17... is Object. Adding a scene is one new module plus
+//! with the current seven entries scene 0/14/21... is SignalField, 1/8/15... is
+//! SpectrumVolume, 2/9/16... is PulseTunnel, 3/10/17... is Lines, 4/11/18...
+//! is Static, 5/12/19... is Object and 6/13/20... is Starfield. Byte 7 is
+//! separately reserved for ColourField. Adding a scene is one new module plus
 //! one `REGISTRY` entry. Appending keeps every index below the old length on
 //! the same scene; wrapped indices (>= length) move with the new length.
-//! Adding Lines shifted bytes 3, 4 and 5 to Lines, SignalField and
-//! SpectrumVolume; adding Static shifted bytes 4..7 (formerly SignalField,
-//! SpectrumVolume, PulseTunnel and Lines) to Static, SignalField,
-//! SpectrumVolume and PulseTunnel; adding Object shifted bytes 5..9 (formerly
-//! SignalField, SpectrumVolume, PulseTunnel, Lines and Static) to Object,
-//! SignalField, SpectrumVolume, PulseTunnel and Lines.
+//! Starfield is appended at byte 6, leaving the ColourField override at byte
+//! 7 untouched.
 
 pub mod colour_field;
 mod lines;
@@ -32,6 +29,7 @@ mod pulse_tunnel;
 mod reference;
 mod signal_field;
 mod spectrum_volume;
+pub mod starfield;
 mod static_noise;
 #[cfg(test)]
 pub(crate) use static_noise::gpu_reference as static_gpu_reference;
@@ -92,6 +90,7 @@ pub struct SceneState {
     config: SceneConfig,
     pub(crate) lines: lines::LinesState,
     pub(crate) static_noise: static_noise::StaticState,
+    starfield: Option<starfield::StarfieldConfig>,
 }
 
 impl SceneState {
@@ -100,11 +99,20 @@ impl SceneState {
             config,
             lines: lines::LinesState::new(config.lines_drop_cuts),
             static_noise: static_noise::StaticState::default(),
+            starfield: None,
         }
     }
 
     pub fn config(&self) -> SceneConfig {
         self.config
+    }
+
+    pub fn configure_starfield(&mut self, config: Option<starfield::StarfieldConfig>) {
+        self.starfield = config;
+    }
+
+    pub(crate) fn starfield(&self) -> Option<&starfield::StarfieldConfig> {
+        self.starfield.as_ref()
     }
 
     /// Feeds one new (not held) frame to every stateful scene, counted as
@@ -131,6 +139,7 @@ pub const REGISTRY: &[SceneEntry] = &[
     lines::ENTRY,
     static_noise::ENTRY,
     object::ENTRY,
+    starfield::ENTRY,
 ];
 
 /// The registry mapping for native scenes. Callers check
@@ -298,17 +307,17 @@ mod tests {
                 "Lines",
                 "Static",
                 "Object",
+                "Starfield",
                 "SignalField",
                 "SpectrumVolume",
                 "PulseTunnel",
-                "Lines",
             ]
         );
         assert_eq!(select(255).name, REGISTRY[255 % REGISTRY.len()].name);
         let cameras: Vec<_> = REGISTRY.iter().map(|entry| entry.camera).collect();
         let orbit = CameraMode::Orbit3D;
         let flat = CameraMode::ScreenSpace;
-        assert_eq!(cameras, [orbit, orbit, orbit, flat, flat, flat]);
+        assert_eq!(cameras, [orbit, orbit, orbit, flat, flat, flat, flat]);
     }
 
     #[test]
@@ -322,6 +331,41 @@ mod tests {
         }
         assert_eq!(dispatch(7).camera(), CameraMode::ScreenSpace);
         assert!(REGISTRY.iter().all(|entry| entry.name != "ColourField"));
+        assert_eq!(dispatch(6).name(), "Starfield");
+    }
+
+    #[test]
+    fn starfield_dispatch_and_profile_instance_budgets() {
+        let selected = dispatch(starfield::SCENE);
+        assert_eq!(selected.name(), "Starfield");
+        assert_eq!(selected.camera(), CameraMode::ScreenSpace);
+
+        let mut csv = String::from("ra,dec,mag\n");
+        for index in 0..20_000 {
+            let magnitude = 6.5 - (index % 8_000) as f64 / 1_000.0;
+            csv.push_str(&format!("0,90,{magnitude}\n"));
+        }
+        let catalog = starfield::StarCatalog::from_reader(csv.as_bytes()).expect("catalog");
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(starfield::StarfieldConfig {
+            catalog: std::sync::Arc::new(catalog),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+        }));
+        for (profile, budget) in [(RenderProfile::m1(), 16_384), (RenderProfile::pi5(), 4_096)] {
+            let frame = ControlFrame {
+                scene: starfield::SCENE,
+                ..ControlFrame::procedural(0)
+            };
+            let instances = build_instances(&profile, frame, 0.0, 16.0 / 9.0, &state);
+            assert_eq!(instances.len(), budget);
+            assert!(instances[0].size[0] > instances[budget - 1].size[0]);
+            assert!(instances.iter().all(|instance| {
+                (-1.0..=1.0).contains(&instance.center[0])
+                    && (-1.0..=1.0).contains(&instance.center[1])
+            }));
+        }
     }
 
     #[test]
