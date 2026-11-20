@@ -254,18 +254,33 @@ fn dmg_shader_matches_native_examples_on_srgb_and_unorm_targets() {
                 },
                 "native display at tick {ticks}"
             );
-            // Explicit geometry, independently of the renderer's viewport
-            // function: the latter has asymmetric one- and two-pixel bars.
-            for (size, origin, scale) in [((160, 144), (0, 0), 1), ((323, 291), (1, 1), 2)] {
+            // Explicit pixel coverage and rational scales, independently of
+            // the renderer's viewport helper. At 3/5 scale the 86.4-high
+            // image starts at y=1: 86 pixel centres are covered, leaving one
+            // black row above and three below. At 4/5 it is 115.2 high, so
+            // 115 centres are covered and the final row is black. Neither
+            // fractional scale puts a sample centre on a texel boundary.
+            // The portrait case has asymmetric horizontal and vertical bars.
+            for (size, origin, covered, scale_num, scale_den) in [
+                ((160, 144), (0, 0), (160, 144), 1, 1),
+                ((323, 291), (1, 1), (320, 288), 2, 1),
+                ((96, 90), (0, 1), (96, 86), 3, 5),
+                ((128, 116), (0, 0), (128, 115), 4, 5),
+                ((163, 293), (1, 74), (160, 144), 1, 1),
+            ] {
                 let rgba = gpu.render(&renderer, format, size, scene.shown(), ticks == 0);
                 for y in 0..size.1 {
                     for x in 0..size.0 {
                         let inside = x >= origin.0
-                            && x < origin.0 + 160 * scale
+                            && x < origin.0 + covered.0
                             && y >= origin.1
-                            && y < origin.1 + 144 * scale;
+                            && y < origin.1 + covered.1;
                         let expected = if inside {
-                            expected_pixel(example, (x - origin.0) / scale, (y - origin.1) / scale)
+                            // Floor the source coordinate at each output
+                            // pixel centre using exact integer arithmetic.
+                            let source_x = (2 * (x - origin.0) + 1) * scale_den / (2 * scale_num);
+                            let source_y = (2 * (y - origin.1) + 1) * scale_den / (2 * scale_num);
+                            expected_pixel(example, source_x, source_y)
                         } else {
                             0
                         };
