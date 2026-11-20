@@ -1,7 +1,9 @@
 """Host-only validation of fixture/oracle handoff and capture comparators."""
 
+import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -19,6 +21,13 @@ class SmsTraceToolTests(unittest.TestCase):
     cls.oracle = Path(cls.temp.name) / "oracle"
     subprocess.run(["rustc", "--edition=2024", str(ROOT / "tests/sms_shared_oracle.rs"),
                     "-o", str(cls.oracle)], check=True)
+    cls.pad_reference = Path(cls.temp.name) / "pad-reference"
+    cls.procedural_reference = Path(cls.temp.name) / "procedural-reference"
+    for source, output in (("sms_pad_reference.c", cls.pad_reference),
+                           ("sms_procedural_oracle.c", cls.procedural_reference)):
+      subprocess.run(["cc", "-std=c99", "-Wall", "-Wextra", "-Werror",
+                      "-I", str(ROOT / "shared/include"), str(ROOT / "tests" / source),
+                      str(ROOT / "shared/src/control_frame.c"), "-o", str(output)], check=True)
 
   @classmethod
   def tearDownClass(cls):
@@ -86,16 +95,71 @@ class SmsTraceToolTests(unittest.TestCase):
       writes = [{"cycle": start + 10 + i, "kind": "cram", "address": i + 1, "value": c}
                 for i, c in enumerate(colours)]
       writes.append({"cycle": start + 13, "kind": "reg", "address": 2, "value": reg})
-      frames.append({"step": step, "start": start, "active": start + 100, "writes": writes})
-    tool.compare_vblank(expected, frames)
+      frames.append({"step": step, "vdp_frame": step + 100,
+                     "start": start, "active": start + 100, "writes": writes})
+    with self.assertRaisesRegex(tool.VBlankInconclusive, "provenance"):
+      tool.compare_vblank(expected, frames, frame_period=1000)
     frames[300]["writes"][0]["cycle"] = frames[300]["active"]
     with self.assertRaisesRegex(ValueError, "step 300: write outside VBlank"):
-      tool.compare_vblank(expected, frames)
+      tool.compare_vblank(expected, frames, frame_period=1000)
     frames[300]["writes"][0]["cycle"] = frames[300]["start"] + 10
     frames[300]["writes"].append({"cycle": frames[300]["start"] + 14,
                                   "kind": "reg", "address": 1, "value": 0x80})
     with self.assertRaisesRegex(ValueError, "step 300: VDP write sequence differs"):
+      tool.compare_vblank(expected, frames, frame_period=1000)
+
+  def test_vblank_rejects_missing_frame_and_missing_independent_evidence(self):
+    trace = bytes((1, 2, 0, 0, 0, 0, 3, 3, 0))
+    expected = trace * 600
+    frames = []
+    for step in range(600):
+      start = step * 1000
+      reg, colours = tool.expected_vdp(trace)
+      writes = [{"cycle": start + 10 + i, "kind": "cram", "address": i + 1, "value": c}
+                for i, c in enumerate(colours)]
+      writes.append({"cycle": start + 13, "kind": "reg", "address": 2, "value": reg})
+      frames.append({"step": step, "vdp_frame": step + 100,
+                     "start": start, "active": start + 100, "writes": writes})
+    with self.assertRaisesRegex(tool.VBlankInconclusive, "period"):
       tool.compare_vblank(expected, frames)
+    del frames[0]["vdp_frame"]
+    with self.assertRaisesRegex(tool.VBlankInconclusive, "frame index"):
+      tool.compare_vblank(expected, frames, frame_period=1000)
+    frames[0]["vdp_frame"] = 100
+    frames[300]["vdp_frame"] += 1
+    with self.assertRaisesRegex(ValueError, "step 300: missing or duplicate VDP frame"):
+      tool.compare_vblank(expected, frames, frame_period=1000)
+    frames[300]["vdp_frame"] -= 1
+    for frame in frames[300:]:
+      frame["start"] += 1000
+      frame["active"] += 1000
+      for write in frame["writes"]:
+        write["cycle"] += 1000
+    with self.assertRaisesRegex(ValueError, "step 300: VBlank period"):
+      tool.compare_vblank(expected, frames, frame_period=1000)
+
+  def test_vblank_cli_cannot_claim_success_from_synthetic_metadata(self):
+    trace = bytes((1, 2, 0, 0, 0, 0, 3, 3, 0))
+    expected = Path(self.temp.name) / "vblank.expected"
+    capture = Path(self.temp.name) / "vblank.json"
+    expected.write_bytes(trace * 600)
+    reg, colours = tool.expected_vdp(trace)
+    frames = []
+    for step in range(600):
+      start = step * 1000
+      writes = [{"cycle": start + 10 + i, "kind": "cram", "address": i + 1, "value": c}
+                for i, c in enumerate(colours)]
+      writes.append({"cycle": start + 13, "kind": "reg", "address": 2, "value": reg})
+      frames.append({"step": step, "vdp_frame": step, "start": start,
+                     "active": start + 100, "writes": writes})
+    capture.write_text(json.dumps(frames))
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tests/sms_trace_tool.py"), "compare-vblank",
+         "--expected", str(expected), "--capture", str(capture), "--frame-period", "1000"],
+        capture_output=True, text=True)
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("INCONCLUSIVE", result.stderr)
+    self.assertNotIn("PASS", result.stdout + result.stderr)
 
   def test_pad_schedule_and_trace_comparator(self):
     schedule = tool.pad_schedule()
@@ -130,6 +194,37 @@ class SmsTraceToolTests(unittest.TestCase):
     self.assertEqual(row[2:18], bytes((64, 64, 64, 64, 0, 0, 0, 0, 0, 0, 0, 0,
                                        1, 0, 0, 0)))
     self.assertEqual(len(capture_oracle.oracle(capture_oracle.schedule(), self.oracle)), 940 * 27)
+
+  def assert_pad_inputs_match_c(self, pads):
+    actual = capture_oracle.oracle(pads, self.oracle)
+    reference = subprocess.run([str(self.pad_reference)], input=pads, capture_output=True, check=True).stdout
+    self.assertEqual(len(reference), len(pads) * 16)
+    for step in range(len(pads)):
+      self.assertEqual(actual[step * 27 + 2:step * 27 + 18],
+                       reference[step * 16:step * 16 + 16], f"poll {step}")
+    return actual
+
+  def test_procedural_inputs_match_c_and_sms_model_through_16bit_wrap(self):
+    table = Path(self.temp.name) / "procedural.bin"
+    table.write_bytes(tool.assets.procedural_inputs())
+    model = subprocess.run([str(self.procedural_reference), str(table)],
+                           capture_output=True, text=True, check=True)
+    self.assertIn("65536 frames passed", model.stdout)
+    actual = self.assert_pad_inputs_match_c(bytes(65553))
+    self.assertEqual(actual[4096 * 27 + 16], 64)
+    self.assertEqual(actual[65521 * 27 + 16], 63)
+    self.assertEqual(actual[65536 * 27 + 16], 48)
+
+  def test_long_trace_digital_transition_latches_across_release(self):
+    for switch in (4096, 65535, 65536, 65537):
+      pads = bytearray(switch + 16)
+      pads[switch] = 0x10
+      pads[switch + 2] = 0x20
+      actual = self.assert_pad_inputs_match_c(bytes(pads))
+      for offset, flags in ((0, 1), (1, 0), (2, 2), (3, 0), (15, 0)):
+        step = switch + offset
+        self.assertEqual(actual[step * 27 + 2:step * 27 + 18],
+                         bytes((64, 64, 64, 64)) + bytes(8) + bytes((flags, 0, 0, 0)))
 
 
 if __name__ == "__main__":

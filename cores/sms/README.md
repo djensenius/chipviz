@@ -133,7 +133,11 @@ These host checks do **not** execute the Z80 state machine:
 F19–F24 receiver traces, VBlank timing and hardware remain unverified.
 
 `tests/sms_shared_oracle.rs` checks the fixture expectations against the
-actual shared Rust reference without building the renderer:
+actual shared Rust reference without building the renderer. Its SMS pad path
+uses the wrapping 16-bit procedural counter and note calculation from the
+shared C generator; it does not change the renderer's Rust generator. Long
+host traces compare those inputs against C and the SMS lookup/counter model,
+not executed Z80 instructions:
 
 ```sh
 rustc --edition=2024 tests/sms_shared_oracle.rs -o "$SMS_SCRATCH/sms-shared-oracle"
@@ -219,21 +223,26 @@ so it cannot establish controller or temporal safety.
 To check presentation timing, an adapter must log **all** decoded VRAM, CRAM
 and register writes after startup, not just writes it expects to see, and
 derive VBlank boundaries independently from the emulated VDP. For each of
-600 candidate pad steps, record one JSON object with `step`, absolute Z80
-cycle `start` (VBlank begins), `active` (next active display begins), and
+600 candidate pad steps, record one JSON object with `step`, independently
+observed monotonic `vdp_frame`, absolute Z80 cycle `start` (VBlank begins),
+`active` (next active display begins), and
 `writes`: ordered objects `{ "cycle": n, "kind": "cram"|"reg"|"vram",
 "address": n, "value": n }`. Include writes outside VBlank as well; do not
 omit display-enable register writes. Associate each step with its publication
-and capture consecutive frames, including missed or extra frames. Then:
+and capture consecutive frames, including missed or extra frames. Independently
+calibrate an exact frame period in the same cycle units; then the diagnostic
+can screen the data, with `SMS_FRAME_PERIOD` set to that integer:
 
 ```sh
-python3 tests/sms_trace_tool.py compare-vblank --expected "$SMS_SCRATCH/vectors/pad.expected.bin" --capture /path/to/vblank.json
+python3 tests/sms_trace_tool.py compare-vblank --expected "$SMS_SCRATCH/vectors/pad.expected.bin" --capture /path/to/vblank.json --frame-period "$SMS_FRAME_PERIOD"
 ```
 
-This checks the exact three CRAM entries and name-table register value,
-ordering, and their independently logged VBlank interval. An incomplete
-emulator log cannot establish atomicity; PAL/NTSC, real hardware, missed-frame
-handling and pixel/control evidence still need independent validation.
+This rejects gaps in the supplied frame indices or period, and checks the
+three CRAM entries, name-table register, order and reported intervals. It
+always exits **INCONCLUSIVE** (status 2) after screening: supplied indices and
+period alone do not prove their provenance, complete capture or synchronization.
+No target timing or atomicity is established. PAL/NTSC, real hardware,
+missed-frame handling and pixel/control evidence need independent validation.
 
 ## First demo
 

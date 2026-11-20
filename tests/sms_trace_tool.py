@@ -9,6 +9,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import sms_detector_fixtures as fixtures
 
@@ -19,6 +20,10 @@ assets = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(assets)
 SCENARIOS = ("f18", "f19", "f20", "f21", "f22", "f24")
 STEPS = 600
+
+
+class VBlankInconclusive(RuntimeError):
+  """The supplied records do not establish independent VDP timing evidence."""
 
 
 def inputs(name):
@@ -96,22 +101,43 @@ def compare_pixels(trace, actual):
                        f"{actual[offset:offset + 3].hex()} != {expected[offset:offset + 3].hex()}")
 
 
-def compare_vblank(expected, frames):
+def compare_vblank(expected, frames, frame_period=None):
+  """Screen reported writes and continuity, but never certify their provenance."""
   if len(expected) != STEPS * 9 or len(frames) != STEPS:
     raise ValueError("expected 600 traces and 600 complete VDP frame records")
+  if frame_period is None:
+    raise VBlankInconclusive("missing independently calibrated VDP frame period")
+  if type(frame_period) is not int or frame_period <= 0:
+    raise ValueError("VDP frame period must be a positive integer")
   previous_active = -1
+  previous_start = None
+  previous_frame = None
   for step, frame in enumerate(frames):
-    if frame["step"] != step or not previous_active < frame["start"] < frame["active"]:
+    vdp_frame = frame.get("vdp_frame")
+    if vdp_frame is None:
+      raise VBlankInconclusive(f"step {step}: missing independently captured VDP frame index")
+    if type(vdp_frame) is not int or vdp_frame < 0:
+      raise ValueError(f"step {step}: invalid VDP frame index")
+    if previous_frame is not None and vdp_frame != previous_frame + 1:
+      raise ValueError(f"step {step}: missing or duplicate VDP frame")
+    start, active = frame["start"], frame["active"]
+    if (frame["step"] != step or type(start) is not int or type(active) is not int
+        or not previous_active < start < active or active > start + frame_period):
       raise ValueError(f"step {step}: invalid frame bounds/order")
-    previous_active = frame["active"]
+    if previous_start is not None and start - previous_start != frame_period:
+      raise ValueError(f"step {step}: VBlank period differs; missing or extra frame")
+    previous_active, previous_start, previous_frame = active, start, vdp_frame
     register, cram = expected_vdp(expected[step * 9:step * 9 + 9])
     want = [("cram", i + 1, value) for i, value in enumerate(cram)] + [("reg", 2, register)]
     writes = frame["writes"]
     if [(w["kind"], w["address"], w["value"]) for w in writes] != want:
       raise ValueError(f"step {step}: VDP write sequence differs")
     cycles = [w["cycle"] for w in writes]
-    if cycles != sorted(set(cycles)) or any(not frame["start"] <= cycle < frame["active"] for cycle in cycles):
+    if (any(type(cycle) is not int for cycle in cycles)
+        or cycles != sorted(set(cycles)) or any(not start <= cycle < active for cycle in cycles)):
       raise ValueError(f"step {step}: write outside VBlank or nonmonotonic cycles")
+  raise VBlankInconclusive(
+      "VDP frame/period provenance, complete writes and poll-to-publication alignment are unverified")
 
 
 def pad_schedule():
@@ -181,6 +207,8 @@ def main():
   vblank = commands.add_parser("compare-vblank")
   vblank.add_argument("--expected", required=True, type=Path)
   vblank.add_argument("--capture", required=True, type=Path)
+  vblank.add_argument("--frame-period", type=int,
+                      help="independently calibrated frame period in capture cycle units")
   pad = commands.add_parser("export-pad")
   pad.add_argument("--oracle", required=True, type=Path)
   pad.add_argument("--output", required=True, type=Path)
@@ -209,8 +237,11 @@ def main():
     compare_pixels(expected[args.step * 9:args.step * 9 + 9], args.capture.read_bytes())
     print(f"PASS: 256x192 active pixels at step {args.step}")
   elif args.command == "compare-vblank":
-    compare_vblank(args.expected.read_bytes(), json.loads(args.capture.read_text()))
-    print("PASS: 600 complete VBlank write sequences")
+    try:
+      compare_vblank(args.expected.read_bytes(), json.loads(args.capture.read_text()), args.frame_period)
+    except VBlankInconclusive as error:
+      print(f"INCONCLUSIVE: {error}", file=sys.stderr)
+      return 2
   elif args.command == "export-pad":
     rows = pad_schedule()
     traces = pad_oracle(rows, args.oracle.resolve())
@@ -226,4 +257,4 @@ def main():
 
 
 if __name__ == "__main__":
-  main()
+  raise SystemExit(main())

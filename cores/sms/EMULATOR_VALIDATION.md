@@ -60,8 +60,11 @@ proof that a setting took effect.
 - `tests/sms_trace_tool.py` exports inputs/oracle traces and compares supplied
   captures. It never loads an emulator. Its mailbox protocol requires calls
   at Z80 entry points; its pad comparator requires one snapshot at each
-  `sms_main_finish`; its VBlank comparator requires complete decoded writes
-  with independently recorded VBlank boundaries. Whole-frame `retro_run`
+  `sms_main_finish`. Its VBlank diagnostic screens reported writes, frame
+  indices and period, but always exits inconclusively: it does not verify
+  independent provenance, capture completeness or poll/publication alignment.
+  Complete decoded writes and independently recorded boundaries are still
+  required. Whole-frame `retro_run`
   alone supplies none of those guarantees. Standard libretro frame callbacks
   do not provide Z80 PC breakpoints or cycle-stamped VDP writes. Do not label
   frame-only captures as per-poll traces or atomicity evidence.
@@ -117,6 +120,10 @@ and compares scene/palette, input bytes, visibility/entry, effective palette
 and every field-trace byte. It checks coverage of all safe modes, families,
 layouts, unarmed relative palette 3 and field exit. It refuses frame JSON.
 The later GX port-hook calibration below rebuilt and exercised this oracle.
+The historical 940-poll schedule ends before poll 4096. Its procedural input
+oracle now uses the shared C/SMS 16-bit note arithmetic and wrap; the shared
+renderer Rust generator remains unchanged. Long host-only comparisons against
+the shared C generator and SMS lookup/counter model do not execute Z80 code.
 
 For each NTSC and PAL run, a debugger-capable adapter must independently:
 
@@ -277,9 +284,13 @@ does not convert frame snapshots into instruction-level trace evidence.
    VDP-derived VBlank/active boundaries, including unexpected writes and
    missed or extra frames. Validate the capture path with deliberately
    late, missing and extra synthetic records before comparing the actual
-   600-step logs using `compare-vblank`. Record counter units, poll counts,
-   transition frames and full logs. If only frame-level snapshots are
-   available, report timing/atomic publication as unverified.
+   600-step logs using `compare-vblank`, including independently observed VDP
+   indices and an independently calibrated frame period. The current tool
+   screens records but always reports INCONCLUSIVE; separately implement and
+   verify provenance, completeness and poll/publication alignment before any
+   timing claim. Record counter units, poll counts, transition frames and full
+   logs. If only frame-level snapshots are available, report timing/atomic
+   publication as unverified.
 
 Never infer physical SMS timing from emulator timing. Neither this plan nor
 emulator results establish photosensitivity safety, PEAT/Harding results, or
