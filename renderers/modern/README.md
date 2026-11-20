@@ -107,11 +107,13 @@ loud rooms both move the scenes, room hiss stays dark, and silence (or a
 device that stops sending audio) fades smoothly to zero. Audio dropped while
 analysis catches up still advances the beat clock, so it keeps real time, and
 so do short gaps where the device itself loses audio (they count as silence).
-Deliveries that run late for a while and then catch up are not counted as
-lost: any silence added for them is taken back. A device clock running
-slightly slow or fast (up to about 0.5%) is followed as a steady drift once
-it has been measured confidently, not mistaken for lost audio or delivery
-jitter; heavy delivery jitter can keep it from being measured.
+Deliveries that run late for a while and then catch up, at once or
+gradually, are not counted as lost: any silence added for them is taken back.
+A device clock running slightly slow or fast (up to about 0.5%) is followed as
+a steady drift once it has been measured confidently, not mistaken for lost
+audio or delivery jitter, and small losses during it still add up. Heavy
+delivery jitter, or frequent delays or losses, can keep the drift from being
+measured; the capture then behaves as if the clock kept time.
 
 The stream is not reopened if the device is unplugged or fails: the renderer
 prints a stream error (at most once every five seconds) and the levels fade to
