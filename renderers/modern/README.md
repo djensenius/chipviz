@@ -113,7 +113,7 @@ A device clock running slightly slow or fast (up to about 0.5%) is followed as
 a steady drift once it has been measured confidently, not mistaken for lost
 audio or delivery jitter. Losses during it are still filled, but losses too
 small to fill on their own (under about 20 ms) can be partly missed: in
-simulations up to about a sixth of them at 0.1% drift and up to about 60% at
+simulations up to about a fifth of them at 0.1% drift and up to about 60% at
 0.5%. A device that regularly loses about 5 ms of audio delivers exactly what
 a slightly slower clock would, so those losses are followed as drift and not
 filled; larger regular losses are filled, except, rarely, 10 ms losses whose
