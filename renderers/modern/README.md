@@ -433,8 +433,8 @@ frames. Bare or wrapped wire bytes and catalog options alone do not select it.
   dates from 1800 through 2200. Proper motion, parallax and atmospheric
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
-  brightness and point size; colour index controls approximate hue. A
-  The existing square-root linear-light magnitude scalar `B` preserves the
+  brightness and point size; colour index controls approximate hue. The
+  existing square-root linear-light magnitude scalar `B` preserves the
   point-size response; emitted luminance is `L = 0.02 * tanh(B / 0.02)`.
   A neutral magnitude-6.5 star stays near 0.00514 linear luminance (about 16
   sRGB codes), while very bright white stars top out near 0.01974 (about 38
