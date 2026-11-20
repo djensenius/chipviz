@@ -107,10 +107,20 @@ impl SceneState {
         self.config
     }
 
-    /// Feeds one new (not held) frame to every stateful scene.
+    /// Feeds one new (not held) frame to every stateful scene, counted as
+    /// 1/60 s where a scene needs time (tests).
+    #[cfg(test)]
     pub fn observe(&mut self, frame: &ControlFrame) {
         self.lines.observe(frame);
         self.static_noise.observe(frame);
+    }
+
+    /// As [`observe`](Self::observe) at `elapsed` seconds on the renderer's
+    /// clock, so time-limited changes (Static's energy slew) hold at any
+    /// frame rate.
+    pub fn observe_at(&mut self, frame: &ControlFrame, elapsed: f64) {
+        self.lines.observe(frame);
+        self.static_noise.observe_at(frame, elapsed);
     }
 }
 
