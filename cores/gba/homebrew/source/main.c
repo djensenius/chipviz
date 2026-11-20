@@ -2,6 +2,7 @@
 
 #include "colour_field.h"
 #include "input.h"
+#include "native_overlay.h"
 
 #define REG_DISPCNT (*(volatile uint16_t *)0x04000000)
 #define REG_VCOUNT (*(volatile uint16_t *)0x04000006)
@@ -230,11 +231,6 @@ static void render_overlay(volatile uint16_t *target, uint16_t frame, const demo
   }
 }
 
-static void render_frame(volatile uint16_t *target, uint16_t frame, const demo_state_t *state, uint16_t keys) {
-  render_background_rows(target, frame, state, 0, BLOCK_ROWS);
-  render_overlay(target, frame, state, keys);
-}
-
 static void make_field_palette(uint16_t *palette, const gba_cf_view_t *view) {
   uint8_t i;
   for (i = 0; i < 16u; ++i) {
@@ -259,12 +255,13 @@ int main(void) {
   uint8_t native_polls = 0;
   int native_row = 0;
   uint16_t prev_keys = 0;
-  uint16_t native_keys = 0;
   uint16_t staged_palette[256];
   demo_state_t native_state;
   gba_cf_t field;
+  gba_native_overlay_t native_overlay;
 
   gba_cf_init(&field);
+  gba_native_overlay_init(&native_overlay);
   REG_DISPCNT = MODE4 | BG2_ENABLE;
   /* Do not take a pre-VBlank boot sample in addition to the frame samples. */
   wait_vblank();
@@ -291,34 +288,21 @@ int main(void) {
         display_page ^= 1u;
         REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
         displaying_field = 1u;
-        native_row = 0;
-        native_polls = 0u;
       }
-    } else if (displaying_field) {
-      /* Prepare a complete native page before restoring its palette and
-       * flipping away from the field. No partially rendered page is shown. */
-      make_demo_state(frame, native_scene, palette, &native_state);
-      render_frame(draw_target, frame, &native_state, keys);
-      make_palette(staged_palette, frame, &native_state);
-      wait_vblank();
-      present_palette(staged_palette, 256u);
-      display_page ^= 1u;
-      REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
-      displaying_field = 0u;
+      /* Discard an unfinished native page and its queued native inputs. */
       native_row = 0;
       native_polls = 0u;
-      frame++;
+      gba_native_overlay_init(&native_overlay);
     } else {
       uint8_t seen_visible = 0u;
       uint8_t reached_vblank = 0u;
       uint16_t line = REG_VCOUNT;
-      /* Keep transient overlay inputs sampled anywhere during this native
-       * page. Direction edges still go through update_input once per poll. */
+      /* Poll while building every native page, including the first after a
+       * field exit; the field remains visible until that page is complete. */
+      gba_native_overlay_sample(&native_overlay, keys);
       if (native_row == 0) {
         make_demo_state(frame, native_scene, palette, &native_state);
-        native_keys = 0u;
       }
-      native_keys |= keys;
       if (native_polls < NATIVE_PRESENT_POLLS) {
         ++native_polls;
       }
@@ -336,7 +320,7 @@ int main(void) {
       }
       if (native_row == BLOCK_ROWS && native_polls >= NATIVE_PRESENT_POLLS) {
         uint16_t before_overlay = line;
-        render_overlay(draw_target, frame, &native_state, native_keys);
+        render_overlay(draw_target, frame, &native_state, gba_native_overlay_next(&native_overlay));
         make_palette(staged_palette, frame, &native_state);
         line = REG_VCOUNT;
         if (seen_visible && before_overlay < SCREEN_HEIGHT && line >= SCREEN_HEIGHT) {
@@ -348,6 +332,7 @@ int main(void) {
         present_palette(staged_palette, 256u);
         display_page ^= 1u;
         REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
+        displaying_field = 0u;
         native_row = 0;
         native_polls = 0u;
         frame++;

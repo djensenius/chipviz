@@ -34,16 +34,64 @@ def uniform_line(pixels, axis, coordinate):
   return all(sample == samples[0] for sample in samples)
 
 
-def sample(rom, core, button=None, start=0, duration=2, count=80):
+def sample(rom, core, button=None, start=0, duration=2, count=80, schedule=None):
   gba = GbaCore(rom, core)
   try:
     for _ in range(120):
       gba.run_frame()
     frames = []
     for step in range(count):
-      gba.run_frame((button,) if button and start <= step < start + duration else ())
+      buttons = schedule(step) if schedule else ((button,) if button and start <= step < start + duration else ())
+      gba.run_frame(buttons)
       frames.append(gba.pixels())
     return frames
+  finally:
+    gba.close()
+
+
+def overlay_mask(pixels):
+  # B is drawn after A, so omit B's two-pixel vertical stripes when checking
+  # A's horizontal line. This distinguishes a real A+B chord from either key.
+  y = 12
+  samples = [pixels[(y * 240 + x) * 2:(y * 240 + x + 1) * 2]
+             for x in range(240) if x % 12 >= 2]
+  a = all(sample == samples[0] for sample in samples)
+  b = uniform_line(pixels, "column", 12)
+  return int(a) | (int(b) << 1)
+
+
+def assert_overlay_sequence(frames, expected, label):
+  changes = []
+  for frame in frames:
+    state = overlay_mask(frame)
+    if not changes or changes[-1] != state:
+      changes.append(state)
+  while changes and changes[0] == 0:
+    changes.pop(0)
+  if changes != expected:
+    raise AssertionError(f"{label}: expected {expected}, observed {changes}")
+  print(f"{label}: observed sampled states {changes} in order")
+
+
+def field_exit_sample(rom, core, schedule=None):
+  gba = GbaCore(rom, core)
+  try:
+    for _ in range(120):
+      gba.run_frame()
+    for _ in range(4):
+      for _ in range(8):
+        gba.run_frame(("up",))
+      for _ in range(8):
+        gba.run_frame()
+    for _ in range(70):
+      gba.run_frame()
+    field = gba.pixels()
+    frames = []
+    for step in range(100):
+      buttons = ("down",) if step < 8 else ()
+      gba.run_frame(buttons + (schedule(step) if schedule else ()))
+      frames.append(gba.pixels())
+    return field, frames
   finally:
     gba.close()
 
@@ -149,7 +197,43 @@ def main():
     if shown[-1] >= len(frames) - 8:
       raise AssertionError(f"{button}: released overlay did not clear")
     print(f"{button}: short mid-redraw press shown at frames {shown[0]}..{shown[-1]}, then cleared")
-  print("gba native production-loop overlay tests: 4 passed")
+  if any(overlay_mask(frame) for frame in baseline[start:]):
+    raise AssertionError("baseline already resembles an A or B overlay")
+
+  def ordered(step):
+    offset = step - start
+    return ("a",) if 0 <= offset < 2 else ("b",) if 4 <= offset < 6 else ()
+
+  def simultaneous(step):
+    return ("a", "b") if start <= step < start + 2 else ()
+
+  def overlap(step):
+    offset = step - start
+    return ("a",) if 0 <= offset < 2 else ("a", "b") if offset < 4 and offset >= 2 else \
+           ("b",) if 4 <= offset < 6 else ()
+
+  assert_overlay_sequence(sample(args.rom, args.core, schedule=ordered), [1, 0, 2, 0],
+                          "sequential A then B")
+  assert_overlay_sequence(sample(args.rom, args.core, schedule=simultaneous), [3, 0],
+                          "simultaneous A+B")
+  assert_overlay_sequence(sample(args.rom, args.core, schedule=overlap), [1, 3, 2, 0],
+                          "overlapping A then B")
+
+  field, exit_baseline = field_exit_sample(args.rom, args.core)
+  departure = next((i for i, frame in enumerate(exit_baseline) if frame != field), None)
+  if departure is None or departure < 30:
+    raise AssertionError(f"field exit did not debounce: {departure}")
+
+  def exit_inputs(step):
+    return ("a",) if departure - 2 <= step < departure else \
+           ("b",) if departure + 1 <= step < departure + 3 else ()
+
+  exit_field, exit_frames = field_exit_sample(args.rom, args.core, exit_inputs)
+  if exit_field != field:
+    raise AssertionError("field-exit setup is not deterministic")
+  native_frames = [frame for frame in exit_frames if frame != field]
+  assert_overlay_sequence(native_frames, [1, 0, 2, 0], "inputs during field-exit redraw")
+  print("gba native production-loop overlay tests: 8 passed")
 
 
 if __name__ == "__main__":

@@ -44,6 +44,13 @@ keys; it does **not** synthesize the gamepad D-pad pulses. Consequently it
 does not currently stream scene or palette selections to this GBA receiver.
 No keyboard or richer control-frame input is implemented by this ROM.
 
+For native overlays, sampled A/B/Select/Start states, including releases, are
+presented in order rather than combined across polls. The 16-transition queue
+drops newer transitions if input outruns presentation; after it drains, the
+latest held state is used. Scene and palette D-pad edges remain separate.
+On field exit, the last field page stays visible while the next native page is
+prepared in chunks and pad input continues to be polled.
+
 ## Constraints
 
 GBA is ideal for fast 2D motion and palette work. Keep scenes stylized and data-light so they can be shared with Pocket and cartridge/flashcart workflows.

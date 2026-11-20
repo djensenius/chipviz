@@ -44,5 +44,29 @@ class CadenceComparison(unittest.TestCase):
       self.compare(baseline, actual)
 
 
+def overlay_frame(mask):
+  pixels = bytearray(240 * 160 * 2)
+  for y in range(160):
+    for x in range(240):
+      value = (x + y * 251) & 0xFFFF
+      if mask & 1 and y == 12:
+        value = 0x1234
+      if mask & 2 and x == 12:
+        value = 0x5678
+      offset = (y * 240 + x) * 2
+      pixels[offset:offset + 2] = value.to_bytes(2, "little")
+  return bytes(pixels)
+
+
+class OverlayComparison(unittest.TestCase):
+  def test_distinguishes_real_chord_from_separate_buttons(self):
+    frames = [overlay_frame(mask) for mask in range(4)]
+    self.assertEqual([native.overlay_mask(frame) for frame in frames], [0, 1, 2, 3])
+    native.assert_overlay_sequence([frames[i] for i in (0, 1, 0, 2, 0)], [1, 0, 2, 0], "sequential")
+    native.assert_overlay_sequence([frames[i] for i in (0, 1, 3, 2, 0)], [1, 3, 2, 0], "overlapping")
+    with self.assertRaisesRegex(AssertionError, "expected"):
+      native.assert_overlay_sequence([frames[i] for i in (0, 3, 0)], [1, 0, 2, 0], "manufactured chord")
+
+
 if __name__ == "__main__":
   unittest.main()
