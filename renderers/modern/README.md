@@ -41,6 +41,7 @@ The renderer starts windowed by default.
 | `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
+| `--tunnel-variant original\|hallway\|abstract` | Choose the PulseTunnel look at startup, for every scene byte selecting it. Default `original` preserves the orbiting tunnel. Also supported by `chipviz-capture`. |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -386,7 +387,24 @@ the colour field, whatever the registry length; every other byte selects
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.
-- `PulseTunnel`: beat-driven planes and bars moving through depth.
+- `PulseTunnel`: beat-driven planes and bars moving through depth by default.
+  `--tunnel-variant hallway` instead draws receding rectangular line frames
+  and corner rails; `abstract` draws spiralling radial dashes. These are
+  PulseTunnel looks, not the separate Lines scene. Both use a screen-space
+  projection, slowly moving depth and time-smoothed energy, bass and treble
+  (hallway uses energy and bass); palette still chooses the line colour.
+  The envelope starts at zero and follows the newest displayed audio once per
+  redraw, including a held UDP packet, with a 0.8 s response. A redraw after
+  a stall advances it by at most 1/30 s and discards the excess, avoiding a
+  large one-frame audio jump; equal or backward timestamps do not advance it.
+  Capture replay advances it once per replayed frame on the same clock.
+  Selection does not consume any wire, palette or layout bits. It applies
+  whenever scene 2, 8, 14, ... is selected; live procedural input cycles
+  scenes 0 to 2, or a host can send scene 2. Capture can force `--scene 2`.
+  The new looks use dim thin lines, faded depth wraps and no beat-triggered
+  full-screen flashes. Palette changes and upstream control changes still
+  matter; this is not physical-display or photosensitivity certification.
+  Frame-based safety/timing dependencies #119 and #124 remain open.
 - `Lines`: lines of varied direction, speed, length and thickness travel
   across a mirrored plane; each spectrum band drives its own group and energy
   sets density (up to an eighth of the instance budget per half, fading lines
@@ -589,3 +607,52 @@ so its results can differ slightly from a live microphone.
 `--size` defaults to the profile's target size. Run `just modern-capture --help`
 for every option. The GPU smoke test is ignored by default; run it with
 `cargo test --manifest-path renderers/modern/Cargo.toml --lib -- --ignored`.
+
+Library callers can keep constructing `capture::CaptureArgs` and calling
+`capture::run` for the original tunnel. To select a look programmatically,
+pass `capture::CaptureOptions { tunnel_variant: capture::TunnelVariant::Hallway }`
+to `capture::run_with_options`. For command-line parsing in a library caller,
+`capture::parse_args_with_options` returns both arguments and options;
+the original `capture::parse_args` rejects the new flag rather than losing it.
+
+### PulseTunnel evaluation
+
+After the serialized build slot is available, a catalog-free GPU check is:
+
+```sh
+cargo test --manifest-path renderers/modern/Cargo.toml --lib tunnel_variants_render_synthetic_input_at_representative_aspects -- --ignored
+cargo test --manifest-path renderers/modern/Cargo.toml --lib tunnel_variants_bound_gpu_luminance_changes -- --ignored --nocapture
+```
+
+The second check samples 120 frames with energy and palette alternating on
+every frame, at 320x180 and 180x320 for both profile budgets. It reports
+whole-frame luminance changes; this is supporting evidence, not a WCAG
+viewing-area test or real-display assessment.
+
+For reproducible stills, run the following in this worktree. It covers both
+profile budgets, landscape and portrait, all three looks and two synthetic
+inputs. The capture manifest names the selected look and camera; inspect the
+images before selecting safe screenshots for a PR.
+
+```sh
+for profile in m1 pi5; do
+  for variant in original hallway abstract; do
+    for input in procedural synth-mic; do
+      for size in 960x540 540x960; do
+        just modern-capture --profile "$profile" --scene 2 --tunnel-variant "$variant" \
+          --input "$input" --frames 60,120,240 --size "$size" \
+          --out "build/tunnel-evidence/$profile/$variant/$input/$size"
+      done
+    done
+  done
+done
+```
+
+For #123, make local playable videos of all three looks under both profile
+budgets with at least two meaningful synthetic input patterns; record the
+input, dimensions, profile (not native hardware), settings and limitations in
+the local index, validate with `ffprobe`, and visually spot-check them. Do not
+upload the videos. Console adaptation in #138 should preserve all three
+selectable identities, the receding/moving geometry and audio response using
+each target's own controls and budgets; a static picture is not a finished
+port. Timing and flash behaviour need target-specific validation.

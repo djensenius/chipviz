@@ -324,6 +324,7 @@ impl ScenePipeline {
     /// however long the renderer runs; scenes take it as f32.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame, elapsed);
+        self.scene_state.advance_tunnel(&frame, elapsed);
         let (frame, display) = self.dispatch(frame);
         self.camera
             .build_uniforms(&self.profile, frame, elapsed as f32, size_aspect(size));
@@ -440,6 +441,7 @@ impl ScenePipeline {
         size: (u32, u32),
         mic_layers: bool,
     ) {
+        self.scene_state.advance_tunnel(&frame, elapsed);
         let overlay_elapsed = elapsed;
         let elapsed = elapsed as f32;
         let (width, height) = size;
@@ -453,7 +455,7 @@ impl ScenePipeline {
             }
             colour_field::Display::Native(_) => (
                 build_instances(&self.profile, frame, elapsed, aspect, &self.scene_state),
-                scenes::select(frame.scene).camera,
+                scenes::selected_camera(frame.scene, self.scene_state.config()),
             ),
         };
         let uniforms = scene_uniforms(

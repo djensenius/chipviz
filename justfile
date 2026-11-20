@@ -339,8 +339,8 @@ rust-lint:
     @echo "chipviz Rust lint OK"
 
 rust-test:
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --features unmeasured-flash
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
