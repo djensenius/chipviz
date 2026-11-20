@@ -67,8 +67,8 @@ The renderer starts windowed by default.
 | `--star-catalog PATH` | Read a user-supplied HYG-compatible CSV for scene 6; catalogs are not bundled or embedded. `--catalog` is an alias. |
 | `--location LAT,LON` | Observer latitude and longitude in decimal degrees, longitude east positive. Required with `--star-catalog`. |
 | `--time UNIX_SECONDS` | Observation time in UTC seconds since the Unix epoch (1800–2200); defaults to current UTC, advances while live, and requires `--star-catalog` plus `--location`. Capture manifests record the resolved epoch and whether it advances. |
-| `--scene N` | Override the input scene byte (0-255), including UDP frames; absent by default. Byte 7 is ColourField, byte 6 opts into Starfield, and other bytes keep the original modulo-six mapping. Scene 6 requires `--star-catalog` and `--location`. |
-| `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over the native scenes. Default `off`. |
+| `--scene N` | Override the input scene byte (0-255), including UDP frames; absent by default. Byte 7 is ColourField, byte 6 selects Starfield when its catalog and location are configured, and other bytes keep the original modulo-six mapping. |
+| `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over eligible native scenes (not ColourField or Starfield). Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
 | `--tunnel-variant original\|hallway\|abstract` | Choose the PulseTunnel look at startup, for every scene byte selecting it. Default `original` preserves the orbiting tunnel. Also supported by `chipviz-capture`. |
@@ -202,10 +202,11 @@ library `libasound2` (e.g. `sudo apt install libasound2`).
 
 ## Mic layers
 
-Two overlay layers can be drawn on top of any native scene (never over the
-colour field, scene 7, whose colours depend only on its trace). They are off by
-default; choose them with `--mic-layers` or cycle them with `M`. They do not
-change the control-frame wire format. Their red flashes are not yet bounded
+Two overlay layers can be drawn on eligible native scenes. They are suppressed
+over the colour field (scene 7), whose colours depend only on its trace, and
+over Starfield to preserve its luminance bound. They are off by default; choose
+them with `--mic-layers` or cycle them with `M`. They do not change the
+control-frame wire format. Their red flashes are not yet bounded
 (see below), so like flash/gate they are drawn only in builds with the
 `unmeasured-flash` Cargo feature, for measurement and development. Default
 builds (including release packages) accept `--mic-layers` and `M`, print a
@@ -378,9 +379,10 @@ cargo run --manifest-path renderers/modern/Cargo.toml \
 Scenes live in `src/scenes/`, one module per scene, behind the `REGISTRY`
 table in `src/scenes/mod.rs`. Scene byte 7 is checked first and always selects
 the colour field. To preserve all existing wire behavior, bytes other than 7
-keep the original modulo-six mapping. Starfield is selected only when the
-local caller explicitly opts in with `--scene 6`; it is not selected by
-wrapped bytes or by a catalog option alone.
+keep the original modulo-six mapping. For the live app, Starfield is selected
+with `--scene 6` and both catalog and location options. Capture can also use
+`--starfield` with those options to enable Starfield only on recorded scene-6
+frames. Bare or wrapped wire bytes and catalog options alone do not select it.
 
 | `scene` byte | Scene | Camera |
 | --- | --- | --- |
@@ -391,7 +393,7 @@ wrapped bytes or by a catalog option alone.
 | 3, 9, 15, ... | `Lines` | `ScreenSpace` |
 | 4, 10, 16, ... | `Static` | `ScreenSpace` |
 | 5, 11, 17, ... | `Object` | `ScreenSpace` |
-| `--scene 6` with catalog/location, or `--starfield` | `Starfield` | `ScreenSpace` |
+| Live `--scene 6` with catalog/location, or capture `--starfield` | `Starfield` | `ScreenSpace` |
 
 - `ColourField` (scene 7, `src/scenes/colour_field/`): two or three large
   regions of flat colour, meant to be projected onto performers in the dark.

@@ -1557,7 +1557,21 @@ mod tests {
             root.join("opt-in/frame000001-Starfield.png").exists(),
             "explicit programmatic opt-in should render the recorded scene-6 frame"
         );
+        for (frame, scene_name) in [(0, "SignalField"), (2, "SignalField")] {
+            assert!(
+                root.join(format!("opt-in/frame{frame:06}-{scene_name}.png"))
+                    .exists(),
+                "opt-in must preserve recorded scene {scene_name} at frame {frame}"
+            );
+            assert!(
+                !root
+                    .join(format!("opt-in/frame{frame:06}-Starfield.png"))
+                    .exists(),
+                "opt-in must not force Starfield at frame {frame}"
+            );
+        }
         let opted_manifest = std::fs::read_to_string(root.join("opt-in/manifest.json")).unwrap();
+        assert!(opted_manifest.contains("\"scene\": 0, \"displayed_scene\": 0"));
         assert!(opted_manifest.contains("\"scene\": 6, \"displayed_scene\": 6"));
 
         let legacy_args = CaptureArgs {
@@ -1565,11 +1579,21 @@ mod tests {
             ..args
         };
         run_with_options(&legacy_args, CaptureOptions::default()).unwrap();
-        assert!(
-            root.join("legacy/frame000001-SignalField.png").exists(),
-            "legacy capture keeps raw scene 6 on SignalField"
-        );
+        for frame in 0..=2 {
+            assert!(
+                root.join(format!("legacy/frame{frame:06}-SignalField.png"))
+                    .exists(),
+                "legacy capture should keep frame {frame} on SignalField"
+            );
+            assert!(
+                !root
+                    .join(format!("legacy/frame{frame:06}-Starfield.png"))
+                    .exists(),
+                "legacy capture must not display Starfield at frame {frame}"
+            );
+        }
         let legacy_manifest = std::fs::read_to_string(root.join("legacy/manifest.json")).unwrap();
+        assert!(legacy_manifest.contains("\"scene\": 0, \"displayed_scene\": 0"));
         assert!(legacy_manifest.contains("\"scene\": 6, \"displayed_scene\": 0"));
         std::fs::remove_dir_all(root).unwrap();
     }

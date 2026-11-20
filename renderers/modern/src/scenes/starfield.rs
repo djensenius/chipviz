@@ -166,11 +166,10 @@ impl StarCatalog {
             input.copy_within(3.., 0);
             input.truncate(input_len - 3);
         }
-        validate_csv_quotes(&input)?;
+        let record_lines = scan_csv_records(&input)?;
         let mut reader = csv::ReaderBuilder::new()
             .flexible(false)
             .from_reader(Cursor::new(input.as_slice()));
-        let mut source_lines = CsvSourceLines::new(&input);
         let headers = reader
             .headers()
             .map_err(|error| CatalogError(format!("could not read CSV header row: {error}")))?;
@@ -200,16 +199,19 @@ impl StarCatalog {
         let mut stars = Vec::new();
         for (record_index, result) in reader.records().enumerate() {
             let fallback_line = record_index + 2;
+            let line = record_lines
+                .get(record_index + 1)
+                .copied()
+                .unwrap_or(fallback_line);
             let record = match result {
                 Ok(record) => record,
                 Err(error) => {
-                    let line = source_lines.line(error.position(), fallback_line);
+                    let detail = csv_record_error_detail(&error);
                     return Err(CatalogError(format!(
-                        "malformed CSV record on line {line}: {error}"
+                        "malformed CSV record on line {line}: {detail}"
                     )));
                 }
             };
-            let line = source_lines.line(record.position(), fallback_line);
             if record_index >= MAX_CATALOG_ROWS {
                 return Err(CatalogError(format!(
                     "catalog exceeds the supported limit of {MAX_CATALOG_ROWS} CSV data rows; reduce the catalog and retry"
@@ -311,7 +313,7 @@ impl std::fmt::Display for CatalogError {
 
 impl std::error::Error for CatalogError {}
 
-fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
+fn scan_csv_records(input: &[u8]) -> Result<Vec<usize>, CatalogError> {
     #[derive(Clone, Copy)]
     enum FieldState {
         Start,
@@ -324,16 +326,48 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
     let mut record_bytes = 0usize;
     let mut index = 0usize;
     let mut line = 1usize;
+    let mut record_start_line = 1usize;
+    let mut has_record_content = false;
+    let mut record_lines = Vec::new();
     let mut quoted_field_line = None;
-    let mut previous_was_cr = false;
     while index < input.len() {
         let byte = input[index];
+        let line_ending_len = match byte {
+            b'\r' if input.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => 0,
+        };
+        if line_ending_len > 0 {
+            record_bytes += line_ending_len;
+            if record_bytes > MAX_CSV_RECORD_BYTES {
+                return Err(CatalogError(format!(
+                    "CSV record exceeds the supported size of {MAX_CSV_RECORD_BYTES} bytes; reduce long fields and retry"
+                )));
+            }
+            let ends_record = !matches!(state, FieldState::Quoted);
+            if ends_record {
+                if has_record_content && record_lines.len() < MAX_CATALOG_ROWS + 2 {
+                    record_lines.push(record_start_line);
+                }
+                state = FieldState::Start;
+                record_bytes = 0;
+                has_record_content = false;
+            }
+            line += 1;
+            index += line_ending_len;
+            if ends_record {
+                record_start_line = line;
+            }
+            continue;
+        }
+
         record_bytes += 1;
         if record_bytes > MAX_CSV_RECORD_BYTES {
             return Err(CatalogError(format!(
                 "CSV record exceeds the supported size of {MAX_CSV_RECORD_BYTES} bytes; reduce long fields and retry"
             )));
         }
+        has_record_content = true;
         match state {
             FieldState::Start => match byte {
                 b'"' => {
@@ -341,7 +375,6 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
                     quoted_field_line = Some(line);
                 }
                 b',' => {}
-                b'\n' | b'\r' => record_bytes = 0,
                 _ => state = FieldState::Unquoted,
             },
             FieldState::Unquoted => match byte {
@@ -351,10 +384,6 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
                     )));
                 }
                 b',' => state = FieldState::Start,
-                b'\n' | b'\r' => {
-                    state = FieldState::Start;
-                    record_bytes = 0;
-                }
                 _ => {}
             },
             FieldState::Quoted => {
@@ -375,10 +404,6 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
             }
             FieldState::AfterQuote => match byte {
                 b',' => state = FieldState::Start,
-                b'\n' | b'\r' => {
-                    state = FieldState::Start;
-                    record_bytes = 0;
-                }
                 b' ' | b'\t' => {}
                 _ => {
                     return Err(CatalogError(format!(
@@ -386,17 +411,6 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
                     )));
                 }
             },
-        }
-        if byte == b'\r' {
-            line += 1;
-            previous_was_cr = true;
-        } else if byte == b'\n' {
-            if !previous_was_cr {
-                line += 1;
-            }
-            previous_was_cr = false;
-        } else {
-            previous_was_cr = false;
         }
         index += 1;
     }
@@ -406,50 +420,20 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
             quoted_field_line.unwrap_or(line)
         )));
     }
-    Ok(())
-}
-
-struct CsvSourceLines<'a> {
-    input: &'a [u8],
-    offset: usize,
-    line: usize,
-}
-
-impl<'a> CsvSourceLines<'a> {
-    fn new(input: &'a [u8]) -> Self {
-        Self {
-            input,
-            offset: 0,
-            line: 1,
-        }
+    if has_record_content && record_lines.len() < MAX_CATALOG_ROWS + 2 {
+        record_lines.push(record_start_line);
     }
+    Ok(record_lines)
+}
 
-    /// Resolve monotonically increasing CSV byte positions in one pass. This
-    /// counts LF, CRLF and CR-only line endings without allocating a line map.
-    fn line(&mut self, position: Option<&csv::Position>, fallback: usize) -> usize {
-        let Some(target) = position
-            .and_then(|position| usize::try_from(position.byte()).ok())
-            .map(|offset| offset.min(self.input.len()))
-        else {
-            return fallback;
-        };
-        while self.offset < target {
-            match self.input[self.offset] {
-                b'\r' => {
-                    self.line += 1;
-                    self.offset += 1;
-                    if self.input.get(self.offset) == Some(&b'\n') {
-                        self.offset += 1;
-                    }
-                }
-                b'\n' => {
-                    self.line += 1;
-                    self.offset += 1;
-                }
-                _ => self.offset += 1,
-            }
-        }
-        self.line
+fn csv_record_error_detail(error: &csv::Error) -> String {
+    match error.kind() {
+        csv::ErrorKind::Io(error) => format!("I/O error: {error}"),
+        csv::ErrorKind::Utf8 { err, .. } => format!("invalid UTF-8: {err}"),
+        csv::ErrorKind::UnequalLengths {
+            expected_len, len, ..
+        } => format!("found {len} fields, expected {expected_len}"),
+        _ => "invalid CSV record".to_string(),
     }
 }
 
@@ -880,6 +864,27 @@ mod tests {
             assert!(
                 error.0.contains("line 3"),
                 "expected physical source line 3 for {contents:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_record_errors_use_one_physical_line_for_crlf_and_cr_only() {
+        for contents in [
+            "ra,dec,mag\n\n0,1\n",
+            "ra,dec,mag\r\n\r\n0,1\r\n",
+            "ra,dec,mag\r\r0,1\r",
+        ] {
+            let error = catalog(contents).unwrap_err();
+            assert!(
+                error
+                    .0
+                    .starts_with("malformed CSV record on line 3: found 2 fields, expected 3"),
+                "expected one consistent physical source line for {contents:?}, got {error}"
+            );
+            assert!(
+                !error.0.contains("line:"),
+                "CSV library line metadata must not contradict the physical line: {error}"
             );
         }
     }
