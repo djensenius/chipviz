@@ -86,6 +86,21 @@ class HomebrewArtifactTests(unittest.TestCase):
       self.assertEqual(set(status["sdkRequired"]), {"genesis"})
       self.assertEqual(status["generated"]["genesisFallback"]["artifact"], "chipviz-genesis.md")
 
+  def test_cli_excludes_snes_but_keeps_other_sdk_status(self) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+      output = pathlib.Path(temp_dir)
+      with mock.patch.object(sys, "argv", ["build_homebrew.py", "--output", temp_dir, "--exclude-target", "snes"]):
+        with mock.patch.object(build_homebrew, "build_snes_sfc", side_effect=AssertionError("SNES generated")):
+          with mock.patch.object(build_homebrew, "build_c64_prg", return_value=b"c64"):
+            with mock.patch.object(build_homebrew, "build_genesis_md", return_value=b"genesis"):
+              with mock.patch.object(build_homebrew, "build_nes_nrom", return_value=b"nes"):
+                with mock.patch.object(build_homebrew, "build_sms_rom", return_value=b"sms"):
+                  self.assertEqual(build_homebrew.main(), 0)
+      status = json.loads((output / "homebrew-status.json").read_text(encoding="utf-8"))
+      self.assertEqual(set(status["sdkRequired"]), set(build_homebrew.SDK_REQUIRED_STATUS) - {"snes"})
+      self.assertEqual(set(status["generated"]), {"c64Fallback", "genesisFallback", "nesFallback", "smsFallback"})
+      self.assertFalse((output / "chipviz-snes.sfc").exists())
+
   def test_generated_genesis_rom_has_header_and_reset_vector(self) -> None:
     rom = build_homebrew.build_genesis_md()
 
