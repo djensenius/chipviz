@@ -2,6 +2,9 @@
 
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 
@@ -12,6 +15,27 @@ SPEC.loader.exec_module(assets)
 
 
 class SmsFieldAssetsTests(unittest.TestCase):
+  def test_generated_files_are_deterministic(self):
+    expected = {
+      "field-patterns.bin": assets.patterns(),
+      "field-maps.bin": b"".join(assets.name_map(i) for i in range(4)),
+      "field-cram-levels.bin": assets.cram_levels(),
+      "field-combos.bin": assets.combos(),
+      "field-pad-edges.bin": assets.pad_edges(),
+      "field-procedural.bin": assets.procedural_inputs(),
+      "field-spectral-initial.bin": assets.spectral_initial_levels(),
+      "field-spectral-next.bin": assets.spectral_next_levels(),
+      "field-cut-actions.bin": assets.cut_actions(),
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+      for name in ("first", "second"):
+        output = Path(tmp) / name
+        subprocess.run([sys.executable, str(ROOT / "cores/sms/homebrew/field_assets.py"), str(output)],
+                       check=True)
+        self.assertEqual({path.name for path in output.iterdir()}, set(expected))
+        for filename, data in expected.items():
+          self.assertEqual((output / filename).read_bytes(), data, (name, filename))
+
   def test_patterns_are_solid_palette_indices(self):
     data = assets.patterns()
     self.assertEqual(len(data), 128)

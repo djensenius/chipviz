@@ -257,6 +257,17 @@ PSG tone/noise and tile-phase values for host simulation.
 `cores/sms/homebrew` normally generates `chipviz-sms.sms` through the shared
 SDK-free homebrew artifact builder; the candidate is an explicit separate build.
 
+## Host-only field assets
+
+`homebrew/field_assets.py` generates deterministic candidate field patterns,
+maps and lookup tables into a supplied directory. These files are not used by
+the static seed ROM. Python host-model tests are discovered by
+`just python-test`; `just sms-procedural-test` generates the assets in a
+temporary directory and compares all 65,536 procedural frames against the
+shared C control-frame implementation. It also runs as part of `just c-test`.
+These checks do not execute SMS code or establish visualization or hardware
+coverage.
+
 ## Connection path
 
 Start with baked/procedural playback and controller input. A later hardware
