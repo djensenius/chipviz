@@ -1,5 +1,6 @@
 #include <stdint.h>
 
+#include "colour_field.h"
 #include "input.h"
 
 #define REG_DISPCNT (*(volatile uint16_t *)0x04000000)
@@ -18,6 +19,7 @@
 #define BLOCK_SIZE 4
 #define BLOCK_COLUMNS (SCREEN_WIDTH / BLOCK_SIZE)
 #define BLOCK_ROWS (SCREEN_HEIGHT / BLOCK_SIZE)
+#define NATIVE_ROWS_PER_STEP 10
 
 static volatile uint16_t *const frontbuffer = (volatile uint16_t *)0x06000000;
 static volatile uint16_t *const backbuffer = (volatile uint16_t *)0x0600A000;
@@ -63,16 +65,16 @@ static void make_demo_state(uint16_t frame, uint8_t scene_override, uint8_t pale
   }
 }
 
-static void write_palette(uint16_t frame, const demo_state_t *state) {
+static void make_palette(uint16_t *palette, uint16_t frame, const demo_state_t *state) {
   uint16_t i;
   uint8_t warm = (uint8_t)((state->palette * 3u + (frame >> 3)) & 7u);
   for (i = 0; i < 256; i++) {
     uint8_t r = (uint8_t)((((i & 7u) * 4u) + warm) & 31u);
     uint8_t g = (uint8_t)(((((i >> 3) & 7u) * 4u) + state->scene * 3u) & 31u);
     uint8_t b = (uint8_t)(((((i >> 6) & 3u) * 10u) + (state->energy >> 4)) & 31u);
-    palette_ram[i] = rgb15(r, g, b);
+    palette[i] = rgb15(r, g, b);
   }
-  palette_ram[color_index(31, 31, 31)] = rgb15(31, 31, 31);
+  palette[color_index(31, 31, 31)] = rgb15(31, 31, 31);
 }
 
 static void fill_rect(volatile uint16_t *target, int x, int y, int width, int height, uint8_t color) {
@@ -169,11 +171,12 @@ static uint8_t block_color(int bx, int by, uint16_t frame, const demo_state_t *s
   return color_index(r, g, b);
 }
 
-static void render_background(volatile uint16_t *target, uint16_t frame, const demo_state_t *state) {
+static void render_background_rows(volatile uint16_t *target, uint16_t frame, const demo_state_t *state,
+                                   int first, int end) {
   int by;
   int bx;
 
-  for (by = 0; by < BLOCK_ROWS; by++) {
+  for (by = first; by < end; by++) {
     for (bx = 0; bx < BLOCK_COLUMNS; bx++) {
       fill_block4(target, bx, by, block_color(bx, by, frame, state));
     }
@@ -215,32 +218,102 @@ static void render_overlay(volatile uint16_t *target, uint16_t frame, const demo
 }
 
 static void render_frame(volatile uint16_t *target, uint16_t frame, const demo_state_t *state, uint16_t keys) {
-  render_background(target, frame, state);
+  render_background_rows(target, frame, state, 0, BLOCK_ROWS);
   render_overlay(target, frame, state, keys);
+}
+
+static void make_field_palette(uint16_t *palette, const gba_cf_view_t *view) {
+  uint8_t i;
+  for (i = 0; i < 16u; ++i) {
+    palette[i] = gba_cf_index_colour(view, i);
+  }
+}
+
+static void present_palette(const uint16_t *palette, unsigned count) {
+  unsigned i;
+  for (i = 0; i < count; ++i) {
+    palette_ram[i] = palette[i];
+  }
 }
 
 int main(void) {
   uint16_t frame = 0;
   uint8_t scene = 0;
+  uint8_t native_scene = 0;
   uint8_t palette = 0;
   uint8_t display_page = 0;
+  uint8_t displaying_field = 0;
+  int native_row = 0;
   uint16_t prev_keys = 0;
+  uint16_t native_keys = 0;
+  uint16_t staged_palette[256];
+  demo_state_t native_state;
+  gba_cf_t field;
 
+  gba_cf_init(&field);
   REG_DISPCNT = MODE4 | BG2_ENABLE;
+  /* Do not take a pre-VBlank boot sample in addition to the frame samples. */
+  wait_vblank();
   for (;;) {
     uint16_t keys = (uint16_t)(~REG_KEYINPUT & 0x03FF);
+    uint8_t show_field;
+    volatile uint16_t *draw_target;
     update_input(keys, &prev_keys, &scene, &palette);
-    {
-      demo_state_t state;
-      volatile uint16_t *draw_target;
-      make_demo_state(frame, scene, palette, &state);
-      draw_target = display_page ? frontbuffer : backbuffer;
-      render_frame(draw_target, frame, &state, keys);
+    if (scene != 7u) {
+      native_scene = scene;
+    }
+    show_field = gba_cf_step(&field, scene, palette, keys);
+    draw_target = display_page ? frontbuffer : backbuffer;
+    if (show_field) {
+      if (!displaying_field) {
+        /* Four x and four y classes encode all layout boundaries; only the
+         * 16 palette entries change while this prepared page is shown. */
+        gba_cf_render_bitmap(draw_target);
+      }
+      make_field_palette(staged_palette, &field.view);
       wait_vblank();
-      write_palette(frame, &state);
+      present_palette(staged_palette, 16u);
+      if (!displaying_field) {
+        display_page ^= 1u;
+        REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
+        displaying_field = 1u;
+        native_row = 0;
+      }
+    } else if (displaying_field) {
+      /* Prepare a complete native page before restoring its palette and
+       * flipping away from the field. No partially rendered page is shown. */
+      make_demo_state(frame, native_scene, palette, &native_state);
+      render_frame(draw_target, frame, &native_state, keys);
+      make_palette(staged_palette, frame, &native_state);
+      wait_vblank();
+      present_palette(staged_palette, 256u);
       display_page ^= 1u;
       REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
+      displaying_field = 0u;
+      native_row = 0;
+      frame++;
+    } else {
+      /* The old full native redraw spans several VBlanks. Build it in
+       * bounded chunks so input and the scene gate are polled in between,
+       * while retaining the same page-flipped native image and controls. */
+      if (native_row == 0) {
+        make_demo_state(frame, native_scene, palette, &native_state);
+        native_keys = keys;
+      }
+      render_background_rows(draw_target, frame, &native_state, native_row, native_row + NATIVE_ROWS_PER_STEP);
+      native_row += NATIVE_ROWS_PER_STEP;
+      if (native_row == BLOCK_ROWS) {
+        render_overlay(draw_target, frame, &native_state, native_keys);
+        make_palette(staged_palette, frame, &native_state);
+        wait_vblank();
+        present_palette(staged_palette, 256u);
+        display_page ^= 1u;
+        REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
+        native_row = 0;
+        frame++;
+      } else {
+        wait_vblank();
+      }
     }
-    frame++;
   }
 }

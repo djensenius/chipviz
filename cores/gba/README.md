@@ -32,6 +32,18 @@ control path. The Pi maps `control-frame-v0` state down to scene, palette,
 intensity, and trigger buttons. See
 [`../../shared/specs/usb-hid-transport-v0.md`](../../shared/specs/usb-hid-transport-v0.md).
 
+The homebrew scene ring is 0, 1, 2, 3, 7: D-pad up/down selects the next or
+previous scene and left/right selects the palette. Scene 7 is the colour field.
+The default data role debounces scene 7 and palette changes; palettes 3 and 7
+run as hard cuts, never flash. South and East produce beat/bar edges and the
+left shoulder selects the high energy bucket. The digital-only path has no
+separate bands, notes, drop or silence input.
+
+The current host HID encoder emits absolute scene and palette as keyboard
+keys; it does **not** synthesize the gamepad D-pad pulses. Consequently it
+does not currently stream scene or palette selections to this GBA receiver.
+No keyboard or richer control-frame input is implemented by this ROM.
+
 ## Constraints
 
 GBA is ideal for fast 2D motion and palette work. Keep scenes stylized and data-light so they can be shared with Pocket and cartridge/flashcart workflows.

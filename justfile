@@ -115,6 +115,8 @@ c-test:
     @${CC:-cc} {{ cflags }} tests/interface_tests.c shared/src/control_frame.c shared/src/interface.c -o build/tests/interface_tests
     @${CC:-cc} {{ cflags }} -Ifirmware/pico/include tests/pico_joybus_tests.c firmware/pico/src/joybus_bridge.c -o build/tests/pico_joybus_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_input_tests.c -o build/tests/gba_input_tests
+    @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_colour_field_tests.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_colour_field_tests
+    @${CC:-cc} {{ cflags }} tests/gba_colour_field_oracle_tests.c cores/gba/homebrew/source/colour_field.c cores/c64/homebrew/src/colour_field.c -o build/tests/gba_colour_field_oracle_tests
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_visual_tests.c -o build/tests/n64_visual_tests
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_joybus_link_tests.c -o build/tests/n64_joybus_link_tests
     @${CC:-cc} {{ cflags }} -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_tests
@@ -124,6 +126,8 @@ c-test:
     @build/tests/interface_tests
     @build/tests/pico_joybus_tests
     @build/tests/gba_input_tests
+    @build/tests/gba_colour_field_tests
+    @build/tests/gba_colour_field_oracle_tests
     @build/tests/n64_visual_tests
     @build/tests/n64_joybus_link_tests
     @build/tests/c64_colour_field_tests
