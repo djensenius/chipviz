@@ -1,4 +1,5 @@
 #include "scene_catalog_v1.h"
+#include "../shared/include/chipviz/scene_catalog_v1_pairs.h"
 
 #include <string.h>
 
@@ -51,7 +52,6 @@ static int any_nonzero(const uint8_t *bytes, size_t length) {
 
 ChipvizCatalogV1Status chipviz_catalog_v1_validate(
     const uint8_t *input, size_t length, ChipvizCatalogV1Record *output) {
-  static const uint8_t max_variant[] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0};
   const int64_t min_epoch = INT64_C(946684800000);
   const int64_t max_epoch = INT64_C(4102444799999);
   ChipvizCatalogV1Record result;
@@ -79,7 +79,7 @@ ChipvizCatalogV1Status chipviz_catalog_v1_validate(
       result.envelope[25] != 0 || checksum != 0 ||
       read_le(result.envelope + 26, 2) != (result.sequence & UINT64_C(0xffff)) ||
       (result.envelope[46] & 0xe0u) != 0 || result.envelope[47] > 4 ||
-      result.family >= sizeof(max_variant) || result.variant > max_variant[result.family]) {
+      !chipviz_catalog_v1_pair_valid(result.family, result.variant)) {
     return CHIPVIZ_CATALOG_V1_INVALID;
   }
   for (i = 0; i < result.envelope[47]; i++) {

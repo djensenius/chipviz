@@ -116,7 +116,12 @@ scene-catalog-v1-c-test:
     @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_tests.c host/scene_catalog_v1.c -o build/tests/scene_catalog_v1_tests
     @build/tests/scene_catalog_v1_tests
 
-c-test: sms-procedural-test scene-catalog-v1-c-test
+scene-catalog-v1-ring-test:
+    @mkdir -p build/tests
+    @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_ring_tests.c shared/src/scene_catalog_v1_ring.c -o build/tests/scene_catalog_v1_ring_tests
+    @build/tests/scene_catalog_v1_ring_tests
+
+c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test
     @mkdir -p build/tests
     @${CC:-cc} {{ cflags }} tests/control_frame_tests.c shared/src/control_frame.c -o build/tests/control_frame_tests
     @${CC:-cc} {{ cflags }} tests/connection_tests.c {{ shared_srcs }} -o build/tests/connection_tests
