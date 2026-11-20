@@ -1034,7 +1034,7 @@ fn one_second_change_counts_a_rise_and_fall_within_the_second() {
 /// | procedural | pixels | 0.026 (0.013) | 0.288 (0.295) | 1 (1) |
 /// | live (beat every 30) | glyphs | 0.046 (0.042) | 0.136 (0.143) | 1 (0) |
 /// | live | pixels | 0.026 (0.013) | 0.296 (0.295) | 1 (1) |
-/// | racing (beat every frame, 255 bpm) | glyphs | 0.064 (0.052) | 0.141 (0.140) | 1 (0) |
+/// | racing (beat every frame, 255 bpm) | glyphs | 0.064 (0.052) | 0.141 (0.136) | 1 (0) |
 /// | racing | pixels | 0.055 (0.013) | 0.295 (0.295) | 1 (1) |
 ///
 /// A step is over two frames in glyph sections and one in pixel sections.
