@@ -88,11 +88,25 @@ pub struct StarfieldOptions {
     pub follow_time: bool,
 }
 
-/// Combined opt-in settings for captures that explicitly enable Starfield.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Combined capture and Starfield settings.
+#[derive(Clone, Debug, PartialEq)]
 pub struct StarfieldCaptureOptions {
     pub capture: CaptureOptions,
     pub starfield: StarfieldOptions,
+    /// Whether this capture opts into Starfield. Public CLI parsing records
+    /// the exact opt-in here so parse/runner round trips preserve dispatch.
+    pub starfield_enabled: bool,
+}
+
+impl Default for StarfieldCaptureOptions {
+    fn default() -> Self {
+        Self {
+            capture: CaptureOptions::default(),
+            starfield: StarfieldOptions::default(),
+            // Calling the Starfield-specific API directly is itself opt-in.
+            starfield_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -137,24 +151,21 @@ pub fn parse_args_with_options(
 pub fn parse_args_with_starfield_options(
     args: impl IntoIterator<Item = String>,
 ) -> Result<StarfieldConfiguredCommand, String> {
-    parse_cli_args(args).map(|(command, _)| command)
-}
-
-fn parse_cli_args(
-    args: impl IntoIterator<Item = String>,
-) -> Result<(StarfieldConfiguredCommand, bool), String> {
     let (parsed, starfield, explicit_starfield) = parse_args_internal(args, true, true)?;
-    let command = match parsed {
+    Ok(match parsed {
         ConfiguredCommand::Help => StarfieldConfiguredCommand::Help,
-        ConfiguredCommand::Capture(args, capture_options) => StarfieldConfiguredCommand::Capture(
-            args,
-            StarfieldCaptureOptions {
-                capture: capture_options,
-                starfield,
-            },
-        ),
-    };
-    Ok((command, explicit_starfield))
+        ConfiguredCommand::Capture(args, capture_options) => {
+            let starfield_enabled = cli_starfield_opt_in(&args, &starfield, explicit_starfield);
+            StarfieldConfiguredCommand::Capture(
+                args,
+                StarfieldCaptureOptions {
+                    capture: capture_options,
+                    starfield,
+                    starfield_enabled,
+                },
+            )
+        }
+    })
 }
 
 fn parse_args_internal(
@@ -495,7 +506,12 @@ pub fn run_with_starfield_options(
     args: &CaptureArgs,
     options: &StarfieldCaptureOptions,
 ) -> Result<(), String> {
-    run_internal(args, options.capture, &options.starfield, true)
+    run_internal(
+        args,
+        options.capture,
+        &options.starfield,
+        options.starfield_enabled,
+    )
 }
 
 fn cli_starfield_opt_in(
@@ -828,18 +844,13 @@ fn json_string(text: &str) -> String {
 }
 
 pub fn main() -> ExitCode {
-    match parse_cli_args(std::env::args().skip(1)) {
-        Ok((StarfieldConfiguredCommand::Help, _)) => {
+    match parse_args_with_starfield_options(std::env::args().skip(1)) {
+        Ok(StarfieldConfiguredCommand::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Ok((StarfieldConfiguredCommand::Capture(args, options), explicit_starfield)) => {
-            match run_internal(
-                &args,
-                options.capture,
-                &options.starfield,
-                cli_starfield_opt_in(&args, &options.starfield, explicit_starfield),
-            ) {
+        Ok(StarfieldConfiguredCommand::Capture(args, options)) => {
+            match run_with_starfield_options(&args, &options) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("chipviz-capture: {error}");
@@ -869,18 +880,6 @@ mod tests {
     fn parse_configured(args: &[&str]) -> Result<(CaptureArgs, StarfieldCaptureOptions), String> {
         match parse_args_with_starfield_options(args.iter().map(|arg| arg.to_string()))? {
             StarfieldConfiguredCommand::Capture(args, options) => Ok((args, options)),
-            StarfieldConfiguredCommand::Help => Err("help".into()),
-        }
-    }
-
-    fn parse_cli_configured(
-        args: &[&str],
-    ) -> Result<(CaptureArgs, StarfieldCaptureOptions, bool), String> {
-        let (command, explicit_starfield) = parse_cli_args(args.iter().map(|arg| arg.to_string()))?;
-        match command {
-            StarfieldConfiguredCommand::Capture(args, options) => {
-                Ok((args, options, explicit_starfield))
-            }
             StarfieldConfiguredCommand::Help => Err("help".into()),
         }
     }
@@ -945,18 +944,18 @@ mod tests {
     fn capture_cli_preserves_legacy_scene_six_and_supports_explicit_opt_in() {
         let legacy_wrapped = parse(&["--out", "shots", "--scene", "13"]).unwrap();
         assert_eq!(legacy_wrapped.scene, Some(13));
-        let (legacy_six, legacy_options, explicit) =
-            parse_cli_configured(&["--out", "shots", "--scene", "6"]).unwrap();
+        let (legacy_six, legacy_options) =
+            parse_configured(&["--out", "shots", "--scene", "6"]).unwrap();
         assert_eq!(legacy_six.scene, Some(6));
-        assert!(!explicit);
+        assert!(!legacy_options.starfield_enabled);
         assert!(!cli_starfield_opt_in(
             &legacy_six,
             &legacy_options.starfield,
-            explicit
+            false
         ));
         assert_eq!(scenes::dispatch_configured(6, false).name(), "SignalField");
 
-        let (paired_args, paired, explicit) = parse_cli_configured(&[
+        let (paired_args, paired) = parse_configured(&[
             "--out",
             "shots",
             "--scene",
@@ -969,12 +968,8 @@ mod tests {
             "946728000",
         ])
         .unwrap();
-        assert!(!explicit);
-        assert!(cli_starfield_opt_in(
-            &paired_args,
-            &paired.starfield,
-            explicit
-        ));
+        assert!(paired.starfield_enabled);
+        assert!(cli_starfield_opt_in(&paired_args, &paired.starfield, false));
         let starfield = paired;
         assert_eq!(
             starfield.starfield.catalog_path.as_deref(),
@@ -984,7 +979,7 @@ mod tests {
         assert_eq!(starfield.starfield.unix_seconds, Some(946_728_000.0));
         assert!(!starfield.starfield.follow_time);
 
-        let (recorded_args, recorded, explicit) = parse_cli_configured(&[
+        let (recorded_args, recorded) = parse_configured(&[
             "--out",
             "shots",
             "--starfield",
@@ -995,17 +990,28 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(recorded_args.scene, None);
-        assert!(explicit);
+        assert!(recorded.starfield_enabled);
         assert!(cli_starfield_opt_in(
             &recorded_args,
             &recorded.starfield,
-            explicit
+            true
         ));
-        let error = parse_cli_configured(&["--out", "shots", "--starfield"]).unwrap_err();
+        let error = parse_configured(&["--out", "shots", "--starfield"]).unwrap_err();
         assert!(
             error.contains("--starfield requires --star-catalog PATH and --location LAT,LON"),
             "{error}"
         );
+
+        let (_, catalog_only) = parse_configured(&[
+            "--out",
+            "shots",
+            "--star-catalog",
+            "stars.csv",
+            "--location",
+            "45,-73",
+        ])
+        .unwrap();
+        assert!(!catalog_only.starfield_enabled);
 
         let (_, advancing) = parse_configured(&[
             "--out",
@@ -1466,6 +1472,7 @@ mod tests {
                 unix_seconds: Some(946_728_000.0),
                 follow_time: true,
             },
+            starfield_enabled: true,
         };
         run_with_starfield_options(&args, &options).unwrap();
         let args = CaptureArgs {
@@ -1524,25 +1531,27 @@ mod tests {
         let catalog_path = root.join("synthetic-stars.csv");
         std::fs::write(&catalog_path, "ra,dec,mag\n18.7,45,-2\n").unwrap();
 
-        let args = CaptureArgs {
-            profile: RenderProfile::pi5(),
-            scene: None,
-            frames: vec![0, 1, 2],
-            input: Input::File(input),
-            size: (160, 90),
-            out: root.join("opt-in"),
-            mic_layers: mic_layers::Mode::Off,
-            lines_drop_cuts: false,
-        };
-        let options = StarfieldCaptureOptions {
-            capture: CaptureOptions::default(),
-            starfield: StarfieldOptions {
-                catalog_path: Some(catalog_path),
-                location: Some((45.0, 0.0)),
-                unix_seconds: Some(946_728_000.0),
-                follow_time: false,
-            },
-        };
+        let (args, options) = parse_configured(&[
+            "--profile",
+            "pi5",
+            "--frames",
+            "0,1,2",
+            "--input",
+            input.to_str().unwrap(),
+            "--size",
+            "160x90",
+            "--out",
+            root.join("opt-in").to_str().unwrap(),
+            "--starfield",
+            "--star-catalog",
+            catalog_path.to_str().unwrap(),
+            "--location",
+            "45,0",
+            "--time",
+            "946728000",
+        ])
+        .unwrap();
+        assert!(options.starfield_enabled);
         run_with_starfield_options(&args, &options).unwrap();
         assert!(
             root.join("opt-in/frame000001-Starfield.png").exists(),

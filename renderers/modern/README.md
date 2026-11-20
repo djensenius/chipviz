@@ -391,7 +391,7 @@ wrapped bytes or by a catalog option alone.
 | 3, 9, 15, ... | `Lines` | `ScreenSpace` |
 | 4, 10, 16, ... | `Static` | `ScreenSpace` |
 | 5, 11, 17, ... | `Object` | `ScreenSpace` |
-| explicit `--scene 6` only | `Starfield` | `ScreenSpace` |
+| `--scene 6` with catalog/location, or `--starfield` | `Starfield` | `ScreenSpace` |
 
 - `ColourField` (scene 7, `src/scenes/colour_field/`): two or three large
   regions of flat colour, meant to be projected onto performers in the dark.
@@ -419,7 +419,9 @@ wrapped bytes or by a catalog option alone.
   and mic frames never arm, and unarmed 3 and 7 run as hard cuts (2 and 6).
 - `Starfield` (scene 6, `src/scenes/starfield.rs`): reads a user-supplied CSV
   with HYG-compatible `ra` hours, `dec` degrees, and `mag` columns (optional
-  `ci` and quoted `proper` name). No catalog is distributed while the data
+  `ci` and quoted `proper` name). Select it with `--scene 6` plus both catalog
+  and location options, or with `--starfield` plus those options to preserve
+  recorded scene transitions. No catalog is distributed while the data
   licensing research is unresolved. The coordinates are treated as HYG-style
   J2000; a UTC timestamp and east-positive longitude feed an approximate GMST
   rotation and local horizon conversion. Visible stars are mapped to a
@@ -439,7 +441,8 @@ wrapped bytes or by a catalog option alone.
   scanning remains bounded by the row limit, with wholly below-horizon bins
   skipped; benchmark the largest catalogs on target hardware.
   Each star's linear-RGB channel is capped at
-  0.05; stars are opaque and drawn faintest-first, brightest-last, so a
+  0.05; stars are opaque and drawn in ascending brightness (faintest first,
+  brightest last), so a
   coincident faint star cannot overwrite a brighter one. Changing membership
   or overlap changes a Starfield pixel by at most 0.05 linear luminance.
   Transitions into or out of Starfield are separately gated to at most two
@@ -449,8 +452,9 @@ wrapped bytes or by a catalog option alone.
   scanout timestamps, so this is not a physical presentation-time guarantee.
   While the gate is full, it continues showing the last committed scene and
   retries the latest request; native-to-native changes are immediate.
-  Optional mic overlays are not composited over Starfield. The gate survives
-  resize and capture replay uses deterministic frame time.
+  Mic-layer overlays are suppressed while Starfield is displayed, then resume
+  on other eligible scenes. The gate survives resize and capture replay uses
+  deterministic frame time.
   This bounds Starfield crossings, not native-to-native or ColourField-internal
   flashing, which remain separate safety work (#119/#124); it is not
   independent photosensitivity certification.
@@ -672,7 +676,8 @@ The capture CLI preserves legacy mapping by default: bare `--scene 6` remains
 `SignalField`, and raw/wrapped scene bytes keep their existing mappings. To
 force Starfield in every captured frame, use the paired form
 `--scene 6 --catalog PATH --location LAT,LON`; this preserves the original
-personal-bundle invocation. Alternatively, `--starfield --catalog PATH
+personal-bundle invocation. Catalog/location options without either `--scene
+6` or `--starfield` do not enable Starfield. Alternatively, `--starfield --catalog PATH
 --location LAT,LON` opts in to Starfield for recorded scene-6 frames without
 forcing the scene, and is useful for replaying recordings with scene
 transitions. `--starfield` requires both catalog and location before output or

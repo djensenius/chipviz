@@ -169,7 +169,8 @@ impl StarCatalog {
         validate_csv_quotes(&input)?;
         let mut reader = csv::ReaderBuilder::new()
             .flexible(false)
-            .from_reader(Cursor::new(input));
+            .from_reader(Cursor::new(input.as_slice()));
+        let mut source_lines = CsvSourceLines::new(&input);
         let headers = reader
             .headers()
             .map_err(|error| CatalogError(format!("could not read CSV header row: {error}")))?;
@@ -199,11 +200,16 @@ impl StarCatalog {
         let mut stars = Vec::new();
         for (record_index, result) in reader.records().enumerate() {
             let fallback_line = record_index + 2;
-            let record = result.map_err(|error| {
-                let line = source_line(error.position(), fallback_line);
-                CatalogError(format!("malformed CSV record on line {line}: {error}"))
-            })?;
-            let line = source_line(record.position(), fallback_line);
+            let record = match result {
+                Ok(record) => record,
+                Err(error) => {
+                    let line = source_lines.line(error.position(), fallback_line);
+                    return Err(CatalogError(format!(
+                        "malformed CSV record on line {line}: {error}"
+                    )));
+                }
+            };
+            let line = source_lines.line(record.position(), fallback_line);
             if record_index >= MAX_CATALOG_ROWS {
                 return Err(CatalogError(format!(
                     "catalog exceeds the supported limit of {MAX_CATALOG_ROWS} CSV data rows; reduce the catalog and retry"
@@ -317,6 +323,9 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
     let mut state = FieldState::Start;
     let mut record_bytes = 0usize;
     let mut index = 0usize;
+    let mut line = 1usize;
+    let mut quoted_field_line = None;
+    let mut previous_was_cr = false;
     while index < input.len() {
         let byte = input[index];
         record_bytes += 1;
@@ -327,16 +336,19 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
         }
         match state {
             FieldState::Start => match byte {
-                b'"' => state = FieldState::Quoted,
+                b'"' => {
+                    state = FieldState::Quoted;
+                    quoted_field_line = Some(line);
+                }
                 b',' => {}
                 b'\n' | b'\r' => record_bytes = 0,
                 _ => state = FieldState::Unquoted,
             },
             FieldState::Unquoted => match byte {
                 b'"' => {
-                    return Err(CatalogError(
-                        "malformed CSV: quote found inside an unquoted field".to_string(),
-                    ));
+                    return Err(CatalogError(format!(
+                        "malformed CSV: quote found inside an unquoted field on line {line}"
+                    )));
                 }
                 b',' => state = FieldState::Start,
                 b'\n' | b'\r' => {
@@ -357,6 +369,7 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
                         index += 1;
                     } else {
                         state = FieldState::AfterQuote;
+                        quoted_field_line = None;
                     }
                 }
             }
@@ -368,26 +381,76 @@ fn validate_csv_quotes(input: &[u8]) -> Result<(), CatalogError> {
                 }
                 b' ' | b'\t' => {}
                 _ => {
-                    return Err(CatalogError(
-                        "malformed CSV: unexpected data after a quoted field".to_string(),
-                    ));
+                    return Err(CatalogError(format!(
+                        "malformed CSV: unexpected data after a quoted field on line {line}"
+                    )));
                 }
             },
+        }
+        if byte == b'\r' {
+            line += 1;
+            previous_was_cr = true;
+        } else if byte == b'\n' {
+            if !previous_was_cr {
+                line += 1;
+            }
+            previous_was_cr = false;
+        } else {
+            previous_was_cr = false;
         }
         index += 1;
     }
     if matches!(state, FieldState::Quoted) {
-        return Err(CatalogError(
-            "malformed CSV: quoted field is not terminated before end of file".to_string(),
-        ));
+        return Err(CatalogError(format!(
+            "malformed CSV: quoted field is not terminated before end of file (opened on line {})",
+            quoted_field_line.unwrap_or(line)
+        )));
     }
     Ok(())
 }
 
-fn source_line(position: Option<&csv::Position>, fallback: usize) -> usize {
-    position
-        .and_then(|position| usize::try_from(position.line()).ok())
-        .unwrap_or(fallback)
+struct CsvSourceLines<'a> {
+    input: &'a [u8],
+    offset: usize,
+    line: usize,
+}
+
+impl<'a> CsvSourceLines<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            offset: 0,
+            line: 1,
+        }
+    }
+
+    /// Resolve monotonically increasing CSV byte positions in one pass. This
+    /// counts LF, CRLF and CR-only line endings without allocating a line map.
+    fn line(&mut self, position: Option<&csv::Position>, fallback: usize) -> usize {
+        let Some(target) = position
+            .and_then(|position| usize::try_from(position.byte()).ok())
+            .map(|offset| offset.min(self.input.len()))
+        else {
+            return fallback;
+        };
+        while self.offset < target {
+            match self.input[self.offset] {
+                b'\r' => {
+                    self.line += 1;
+                    self.offset += 1;
+                    if self.input.get(self.offset) == Some(&b'\n') {
+                        self.offset += 1;
+                    }
+                }
+                b'\n' => {
+                    self.line += 1;
+                    self.offset += 1;
+                }
+                _ => self.offset += 1,
+            }
+        }
+        self.line
+    }
 }
 
 fn parse_field(
@@ -782,6 +845,10 @@ mod tests {
             error.0.contains("quoted field is not terminated"),
             "{error}"
         );
+        assert!(
+            error.0.contains("opened on line 2"),
+            "expected the opening quote's physical line, got {error}"
+        );
 
         let valid =
             catalog("ra,dec,mag,proper\n0,0,1,\"A \"\"bright\"\" star\"\n6,0,2,\"Two\nlines\"\n")
@@ -800,6 +867,36 @@ mod tests {
             error.0.contains("line 4"),
             "expected physical source line 4, got {error}"
         );
+    }
+
+    #[test]
+    fn reports_physical_lines_for_blank_lf_crlf_and_cr_only_records() {
+        for contents in [
+            "ra,dec,mag\n\nnot-a-number,0,2\n",
+            "ra,dec,mag\r\n\r\nnot-a-number,0,2\r\n",
+            "ra,dec,mag\r\rnot-a-number,0,2\r",
+        ] {
+            let error = catalog(contents).unwrap_err();
+            assert!(
+                error.0.contains("line 3"),
+                "expected physical source line 3 for {contents:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_quote_diagnostics_include_physical_source_line() {
+        for (contents, expected_line) in [
+            ("ra,dec,mag\n\n0,0,1,bad\"quote\n", "line 3"),
+            ("ra,dec,mag\r\n\r\n0,0,1,\"value\"tail\r\n", "line 3"),
+            ("ra,dec,mag\r\r0,0,1,\"unfinished", "opened on line 3"),
+        ] {
+            let error = catalog(contents).unwrap_err();
+            assert!(
+                error.0.contains(expected_line),
+                "expected {expected_line} for {contents:?}, got {error}"
+            );
+        }
     }
 
     #[test]
