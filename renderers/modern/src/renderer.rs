@@ -1622,6 +1622,96 @@ mod tests {
         }
     }
 
+    /// Checks independently calculated sRGB code bounds for mixed-colour
+    /// stars on both attachment formats. The bright pair's close luminances
+    /// can tie or invert after 8-bit encoding, so only their individual
+    /// colours are bounded; the distinguishable faint pair must remain
+    /// ordered after readback.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn mixed_colour_star_readback_allows_bright_quantization_inversion() {
+        let csv = b"ra,dec,mag,ci\n\
+                    18.7,0,-1.9,-0.07700189271005747\n\
+                    16.7,0,-1.4,1.0179712403282242\n\
+                    20.7,0,5.5,100\n\
+                    21.7,0,6.5,\n";
+        let catalog =
+            Arc::new(scenes::starfield::StarCatalog::from_reader(csv.as_slice()).unwrap());
+        let config = scenes::starfield::StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        let frame = ControlFrame {
+            scene: scenes::starfield::SCENE,
+            ..ControlFrame::procedural(0)
+        };
+
+        // Independently calculated center-pixel sRGB codes, with a ±3-code
+        // tolerance for rasterization and attachment quantization.
+        let samples = [
+            ((80, 45), [36, 38, 42]),
+            ((97, 52), [41, 38, 35]),
+            ((62, 52), [34, 14, 0]),
+            ((55, 60), [16, 16, 16]),
+        ];
+        let decode_srgb = |code: u8| {
+            let value = f32::from(code) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = |pixel: [u8; 3]| {
+            0.2126 * decode_srgb(pixel[0])
+                + 0.7152 * decode_srgb(pixel[1])
+                + 0.0722 * decode_srgb(pixel[2])
+        };
+
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                160,
+                90,
+                format,
+            ))
+            .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(config.clone()));
+            renderer.pipeline_mut().enable_starfield_dispatch(true);
+            let pixels = renderer.render(frame, 0.0).unwrap();
+            let read_pixel = |(x, y): (usize, usize)| {
+                let offset = (y * 160 + x) * 3;
+                [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+            };
+
+            for (position, expected) in samples {
+                let actual = read_pixel(position);
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(&actual, expected)| actual.abs_diff(expected) <= 3),
+                    "{format:?} at {position:?}: expected sRGB codes near {expected:?}, got {actual:?}"
+                );
+            }
+
+            let brighter_faint = luminance(read_pixel((62, 52)));
+            let fainter_white = luminance(read_pixel((55, 60)));
+            assert!(
+                brighter_faint > fainter_white,
+                "{format:?}: distinguishable faint stars should retain readback luminance order ({brighter_faint} <= {fainter_white})"
+            );
+        }
+    }
+
     #[test]
     fn readback_rows_are_padded_to_copy_alignment() {
         assert_eq!(padded_row_bytes(64), 256);

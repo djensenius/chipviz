@@ -434,7 +434,7 @@ frames. Bare or wrapped wire bytes and catalog options alone do not select it.
   refraction are not modeled, so this is a useful sky view rather than a
   precision planetarium. Magnitude controls compressed, monotonically ordered
   brightness and point size; colour index controls approximate hue. A
-  existing square-root linear-light magnitude scalar `B` preserves the
+  The existing square-root linear-light magnitude scalar `B` preserves the
   point-size response; emitted luminance is `L = 0.02 * tanh(B / 0.02)`.
   A neutral magnitude-6.5 star stays near 0.00514 linear luminance (about 16
   sRGB codes), while very bright white stars top out near 0.01974 (about 38
@@ -445,8 +445,10 @@ frames. Bare or wrapped wire bytes and catalog options alone do not select it.
   below `0.01974 / 0.403 < 0.049`, leaving margin under the 0.05 linear
   per-channel cap even with rounding. The tint values are linear RGB, not
   sRGB-encoded inputs. This is deliberate tone shaping, not an sRGB correction;
-  the renderer's output encoding is unchanged. Very close magnitudes can
-  quantize to equal 8-bit codes; ordering is defined before that quantization.
+  the renderer's output encoding is unchanged. Magnitude ordering holds for
+  the pre-quantization luminance, but output encoding and 8-bit quantization
+  can tie or slightly invert displayed luminance across hues for close
+  magnitudes, particularly in the compressed bright range.
   Point footprints retain the
   existing approximately 2.8–3.5 output-pixel curve over the rendered
   magnitude range. At most
