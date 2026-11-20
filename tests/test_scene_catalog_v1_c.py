@@ -175,6 +175,26 @@ class CConformanceTests(unittest.TestCase):
     wire[141] ^= 1
     self.check_record(bytes(wire), 1)
 
+  def test_synthetic_valid_starfield_corpus(self) -> None:
+    randomizer = random.Random(16306)
+    min_epoch, max_epoch = 946_684_800_000, 4_102_444_799_999
+    for index in range(400):
+      if index % 4 == 0:
+        epoch = max_epoch - randomizer.randrange(2_000_000)
+      else:
+        epoch = randomizer.randint(min_epoch, max_epoch)
+      lat = randomizer.randint(0, 900_000_000) * (-1 if index & 1 else 1)
+      lon = randomizer.randint(0, 1_800_000_000) * (-1 if index & 2 else 1)
+      elev = (randomizer.randint(-12_000_000, -1) if index & 1
+              else randomizer.randint(0, 100_000_000))
+      # Exact rational upper bound from the published sky-time requirement.
+      max_tick = (max_epoch - epoch) * 60 // 1000
+      ticks = {0, max_tick, randomizer.randint(0, max_tick)}
+      ticks.update(tick for tick in (65535, 65536, 2**32) if tick <= max_tick)
+      for tick in ticks:
+        with self.subTest(index=index, epoch=epoch, tick=tick):
+          self.check_record(make_record(tick, 6, metadata=star(epoch, lat, lon, elev)), 2)
+
   def test_synthetic_mutation_corpus(self) -> None:
     randomizer = random.Random(163)
     for _ in range(500):
