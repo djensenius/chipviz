@@ -23,7 +23,7 @@ import stat
 import struct
 import tempfile
 import zlib
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import BinaryIO
 
 
@@ -34,6 +34,7 @@ MAX_FILE_SIZE = HEADER_SIZE + RECORD_SIZE * MAX_RECORDS
 _MIN_EPOCH = 946_684_800_000
 _MAX_EPOCH = 4_102_444_799_999
 _MAX_VARIANT = (0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0)
+_VALIDATED = object()
 
 
 class UnavailableSceneError(ValueError):
@@ -46,7 +47,7 @@ def _crc(data: bytes) -> int:
 
 @dataclass(frozen=True)
 class Record:
-  """An intact extended envelope; renderer availability is not established."""
+  """An intact extended envelope obtained from a validated catalog."""
 
   envelope: bytes
   sequence: int
@@ -54,6 +55,11 @@ class Record:
   family: int
   variant: int
   metadata: bytes
+  _capability: InitVar[object] = None
+
+  def __post_init__(self, _capability: object) -> None:
+    if _capability is not _VALIDATED:
+      raise TypeError("records must come from open_catalog")
 
   @property
   def renderer_availability(self) -> str:
@@ -115,9 +121,12 @@ def _validate_record(wire: bytes, expected: int, star_metadata: bytes | None) ->
 
 
 class Catalog:
-  """A validated, private temporary snapshot; no renderer is implied."""
+  """A validated snapshot returned by open_catalog; no renderer is implied."""
 
-  def __init__(self, snapshot: BinaryIO, header: bytes, count: int) -> None:
+  def __init__(self, snapshot: BinaryIO, header: bytes, count: int, *,
+               _capability: object = None) -> None:
+    if _capability is not _VALIDATED:
+      raise TypeError("catalogs must come from open_catalog")
     self._snapshot = snapshot
     self.header = header
     self.count = count
@@ -128,7 +137,8 @@ class Catalog:
     self._snapshot.seek(index * RECORD_SIZE)
     wire = self._snapshot.read(RECORD_SIZE)
     sequence, tick = struct.unpack_from("<QQ", wire, 8)
-    return Record(wire, sequence, tick, wire[44], wire[6], wire[57:141])
+    return Record(wire, sequence, tick, wire[44], wire[6], wire[57:141],
+                  _capability=_VALIDATED)
 
   def close(self) -> None:
     self._snapshot.close()
@@ -204,7 +214,7 @@ def open_catalog(fd: int) -> Catalog:
       if star_metadata is not None:
         raise UnavailableSceneError("Starfield is unavailable")
       snapshot.flush()
-    return Catalog(snapshot, header, count)
+    return Catalog(snapshot, header, count, _capability=_VALIDATED)
   except BaseException:
     if snapshot is not None:
       try:

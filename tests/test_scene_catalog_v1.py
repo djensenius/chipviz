@@ -90,6 +90,52 @@ class CatalogTests(unittest.TestCase):
     with self.assertRaises(ValueError, msg=message):
       self.open_bytes(data)
 
+  def test_direct_catalog_and_record_construction_is_rejected(self) -> None:
+    for wire in (record(family=6, metadata=star_metadata()), b"malformed"):
+      with self.subTest(wire=wire):
+        stream = io.BytesIO(wire)
+        self.addCleanup(stream.close)
+        for kwargs in ({}, {"_capability": object()}):
+          with self.assertRaisesRegex(TypeError, "open_catalog"):
+            catalog.Catalog(stream, header(1), 1, **kwargs)
+          self.assertFalse(stream.closed)
+          self.assertEqual(stream.tell(), 0)
+          self.assertEqual(stream.getvalue(), wire)
+          with self.assertRaisesRegex(TypeError, "open_catalog"):
+            catalog.Record(wire, 0, 0, 6, 0, bytes(84), **kwargs)
+
+  def test_catalog_creation_failure_closes_snapshot_and_preserves_error(self) -> None:
+    failure = RuntimeError("injected construction failure")
+
+    class CloseFailingSnapshot(io.BytesIO):
+      def close(self) -> None:
+        if not self.closed:
+          super().close()
+          raise OSError(errno.EIO, "injected snapshot close failure")
+
+    snapshot = CloseFailingSnapshot()
+    copies = []
+    real_open = catalog._open_regular
+
+    def capture_input(fd: int):
+      copy = real_open(fd)
+      copies.append(copy)
+      return copy
+
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    with self.path.open("rb", buffering=0) as source:
+      with mock.patch.object(catalog, "_open_regular", side_effect=capture_input):
+        with mock.patch.object(catalog.tempfile, "TemporaryFile", return_value=snapshot):
+          with mock.patch.object(catalog, "Catalog", side_effect=failure):
+            with self.assertRaises(RuntimeError) as error:
+              catalog.open_catalog(source.fileno())
+      self.assertIs(error.exception, failure)
+      self.assertTrue(snapshot.closed)
+      self.assertEqual(len(copies), 1)
+      self.assertTrue(copies[0].closed)
+      source.seek(0)
+      self.assertEqual(source.read(4), b"CVXE")
+
   def test_normative_golden_and_crc(self) -> None:
     self.assertEqual(zlib.crc32(b"123456789"), 0xCBF43926)
     self.assertEqual(record(), GOLDEN_RECORD)
