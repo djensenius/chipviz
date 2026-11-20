@@ -19,7 +19,17 @@
 #define BLOCK_SIZE 4
 #define BLOCK_COLUMNS (SCREEN_WIDTH / BLOCK_SIZE)
 #define BLOCK_ROWS (SCREEN_HEIGHT / BLOCK_SIZE)
-#define NATIVE_ROWS_PER_STEP 10
+/* Only poll/present early in a newly reached VBlank, leaving ample time for
+ * palette writes and keeping the poll-time jitter below a frame. */
+#define NATIVE_LATEST_VBLANK_LINE 200
+
+#ifdef __arm__
+/* The block shader runs 2,400 times per native page; execute it from the
+ * GBA's fast internal RAM to leave time for VBlank input polling. */
+#define GBA_FAST_CODE __attribute__((section(".iwram"), long_call))
+#else
+#define GBA_FAST_CODE
+#endif
 
 static volatile uint16_t *const frontbuffer = (volatile uint16_t *)0x06000000;
 static volatile uint16_t *const backbuffer = (volatile uint16_t *)0x0600A000;
@@ -136,7 +146,7 @@ static void fill_block4(volatile uint16_t *target, int block_x, int block_y, uin
   row[1] = pair;
 }
 
-static uint8_t block_color(int bx, int by, uint16_t frame, const demo_state_t *state) {
+static GBA_FAST_CODE uint8_t block_color(int bx, int by, uint16_t frame, const demo_state_t *state) {
   uint8_t band = (uint8_t)(state->spectrum[((bx >> 3) + (by >> 2)) & 7] >> 5);
   uint8_t phase = (uint8_t)(((frame >> 1) + bx * 3 + by * 5 + state->palette * 7u) & 31u);
   uint8_t r = (uint8_t)((phase + band + (bx >> 1)) & 31u);
@@ -293,26 +303,48 @@ int main(void) {
       native_row = 0;
       frame++;
     } else {
-      /* The old full native redraw spans several VBlanks. Build it in
-       * bounded chunks so input and the scene gate are polled in between,
-       * while retaining the same page-flipped native image and controls. */
+      uint8_t seen_visible = 0u;
+      uint8_t reached_vblank = 0u;
+      uint16_t line;
+      /* Keep transient overlay inputs sampled anywhere during this native
+       * page. Direction edges still go through update_input once per poll. */
       if (native_row == 0) {
         make_demo_state(frame, native_scene, palette, &native_state);
-        native_keys = keys;
+        native_keys = 0u;
       }
-      render_background_rows(draw_target, frame, &native_state, native_row, native_row + NATIVE_ROWS_PER_STEP);
-      native_row += NATIVE_ROWS_PER_STEP;
+      native_keys |= keys;
+      /* Render whole block rows until the next VBlank, sampling the scanline
+       * between rows so a slow native page does not hide pad polls. */
+      do {
+        render_background_rows(draw_target, frame, &native_state, native_row, native_row + 1);
+        ++native_row;
+        line = REG_VCOUNT;
+        if (line < SCREEN_HEIGHT) {
+          seen_visible = 1u;
+        } else if (seen_visible) {
+          reached_vblank = 1u;
+        }
+      } while (native_row < BLOCK_ROWS && !reached_vblank);
       if (native_row == BLOCK_ROWS) {
+        uint16_t before_overlay = line;
         render_overlay(draw_target, frame, &native_state, native_keys);
         make_palette(staged_palette, frame, &native_state);
-        wait_vblank();
+        line = REG_VCOUNT;
+        if (seen_visible && before_overlay < SCREEN_HEIGHT && line >= SCREEN_HEIGHT) {
+          reached_vblank = 1u;
+        }
+        if (!reached_vblank || line < SCREEN_HEIGHT || line >= NATIVE_LATEST_VBLANK_LINE) {
+          wait_vblank();
+        }
         present_palette(staged_palette, 256u);
         display_page ^= 1u;
         REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
         native_row = 0;
         frame++;
       } else {
-        wait_vblank();
+        if (!reached_vblank || line >= NATIVE_LATEST_VBLANK_LINE) {
+          wait_vblank();
+        }
       }
     }
   }
