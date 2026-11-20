@@ -28,7 +28,7 @@ python3 host/bridge/chipviz_encode.py --chipsynth-log host/fixtures/chipsynth/gr
 python3 host/bridge/n64_joybus.py --input "$assets/scale.cvz" --output "$assets/scale.n64joybus"
 python3 host/bridge/usb_hid.py --input "$assets/scale.cvz" --output "$assets/scale-usb-hid.json"
 python3 shared/tools/cvz_to_c.py --input "$assets/scale.cvz" --symbol chipviz_scale_frames --output "$assets/scale_frames.h"
-python3 shared/tools/build_homebrew.py --output "$assets"
+python3 shared/tools/build_homebrew.py --output "$assets" --exclude-target snes
 
 if command -v gbafix >/dev/null 2>&1 && [ -n "${DEVKITARM:-}" ]; then
   make -C cores/gba/homebrew
@@ -49,13 +49,6 @@ if command -v cl65 >/dev/null 2>&1; then
   cp cores/c64/homebrew/chipviz-c64.prg "$assets/"
 else
   echo "Keeping generated C64 fallback; install cc65/cl65 for SDK-built chipviz-c64.prg"
-fi
-
-if [ -n "${PVSNESLIB_HOME:-}" ] && [ -f "$PVSNESLIB_HOME/devkitsnes/snes_rules" ]; then
-  make -C cores/snes/homebrew
-  cp cores/snes/homebrew/chipviz-snes.sfc "$assets/"
-else
-  echo "Keeping generated SNES fallback; install PVSnesLib and set PVSNESLIB_HOME for SDK-built chipviz-snes.sfc"
 fi
 
 if command -v rgbasm >/dev/null 2>&1 && command -v rgblink >/dev/null 2>&1 && command -v rgbfix >/dev/null 2>&1; then
@@ -91,5 +84,7 @@ with ZipFile("dist/chipviz-assets.zip", "w", ZIP_DEFLATED) as archive:
   for path in sorted(assets.iterdir()):
     archive.write(path, path.name)
 PY
+
+python3 scripts/check-release-assets.py "$assets" "$dist/chipviz-assets.zip"
 
 echo "release assets written to $dist"

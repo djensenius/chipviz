@@ -376,12 +376,23 @@ def build_parser() -> argparse.ArgumentParser:
     choices=TARGETS,
     help="Generate only the selected target. May be provided multiple times.",
   )
+  parser.add_argument(
+    "--exclude-target",
+    action="append",
+    choices=TARGETS,
+    help="Exclude a target from the default set. May be provided multiple times.",
+  )
   return parser
 
 
 def main() -> int:
   args = build_parser().parse_args()
-  build(args.output, set(args.target) if args.target else None)
+  if args.target and args.exclude_target:
+    raise SystemExit("--target and --exclude-target cannot be combined")
+  targets = set(args.target) if args.target else None
+  if args.exclude_target:
+    targets = (set(TARGETS) | set(SDK_REQUIRED_STATUS)) - set(args.exclude_target)
+  build(args.output, targets)
   return 0
 
 

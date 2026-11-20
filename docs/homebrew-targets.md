@@ -47,9 +47,13 @@ Every target now has a first-class SDK/toolchain path:
   VDP/CRAM seed until a devkitSMS/SDCC or assembly SDK path is selected.
 
 `shared/tools/build_homebrew.py` still generates SDK-free C64/SNES/Genesis/NES/SMS
-fallback artifacts for local smoke tests and packaging when full SDKs are not
-installed. Those fallbacks are not the completion target for platforms that have
-a selected SDK path.
+fallback artifacts for local smoke tests. Except for SNES, these are also used
+for packaging when full SDKs are not installed. All SNES ROMs are temporarily
+withheld from future public release assets pending
+[#109](https://github.com/djensenius/chipviz/issues/109); past releases are
+unchanged. Local builds and emulator use remain available. The generated SNES
+seed is a diagnostic, not a visualizer. These fallbacks are not the completion
+target for platforms that have a selected SDK path.
 
 ## Pinned SDK builds
 
@@ -80,7 +84,7 @@ installed SDK under `builds/` in the cache. Build outputs are not copied between
 them. The N64 ROM records that identity separately, so switching to another
 populated SDK cache also cleans the ROM's object files before compiling.
 
-Both automated SNES build paths pin PVSnesLib to
+The automated SNES CI build pins PVSnesLib to
 `d0bd46bc70c16a4cb9c8d40a90468e18a6de9b1c`, including its recorded submodules.
 For local builds, check out that revision, run
 `git submodule update --init --recursive`, and set `PVSNESLIB_HOME` to its path.
