@@ -1,6 +1,78 @@
 use super::{Snapshot, ValidationError};
+use std::ffi::OsString;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
+
+fn python_command(value: Option<OsString>) -> Command {
+    let value = value
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "python3".into());
+    // An existing literal path takes precedence, including paths with spaces.
+    // Otherwise split UTF-8 values into whitespace-separated arguments; this
+    // deliberately does not implement shell quoting, expansion, or globbing.
+    // A path containing spaces cannot be combined with arguments this way.
+    // Non-UTF-8 values remain a single executable path, without arguments.
+    if !Path::new(&value).is_file()
+        && let Some(text) = value.to_str()
+    {
+        let mut words = text.split_whitespace();
+        if let Some(program) = words.next() {
+            let mut command = Command::new(program);
+            command.args(words);
+            return command;
+        }
+    }
+    Command::new(value)
+}
+
+#[test]
+fn python_command_selects_interpreter_without_shell_evaluation() {
+    use std::ffi::OsStr;
+
+    for value in [None, Some(OsString::new())] {
+        let command = python_command(value);
+        assert_eq!(command.get_program(), OsStr::new("python3"));
+        assert_eq!(command.get_args().count(), 0);
+    }
+    let command = python_command(Some("/absolute/python -B -I".into()));
+    assert_eq!(command.get_program(), OsStr::new("/absolute/python"));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("-B"), OsStr::new("-I")]
+    );
+    let command = python_command(Some("python3 $HOME/*.py".into()));
+    assert_eq!(command.get_program(), OsStr::new("python3"));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("$HOME/*.py")]
+    );
+
+    let path = std::env::temp_dir().join(format!(
+        "chipviz python {} {}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, []).unwrap();
+    let command = python_command(Some(path.as_os_str().to_owned()));
+    assert_eq!(command.get_program(), path.as_os_str());
+    assert_eq!(command.get_args().count(), 0);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn python_command_preserves_non_utf8_executable() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = OsString::from_vec(b"/python-\xff".to_vec());
+    let command = python_command(Some(path.clone()));
+    assert_eq!(command.get_program(), path);
+    assert_eq!(command.get_args().count(), 0);
+}
 
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -340,10 +412,7 @@ fn differential_recordings_against_python_host_validator() {
         "{}/tests/catalog_v1_reference.py",
         env!("CARGO_MANIFEST_DIR")
     );
-    let python = std::env::var_os("PYTHON")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "python3".into());
-    let mut child = Command::new(python)
+    let mut child = python_command(std::env::var_os("PYTHON"))
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
