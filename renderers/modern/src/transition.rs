@@ -5,6 +5,7 @@ use bytemuck::{Pod, Zeroable};
 const OUTPUT_SLEW_PER_SECOND: f32 = 0.15;
 const MAX_SLEW_STEP_SECONDS: f64 = 0.1;
 const INITIAL_SLEW_DELTA: f32 = 0.05;
+const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -22,7 +23,8 @@ struct Targets {
 }
 
 /// Keeps the last emitted full-frame image and bounds its linear-light change
-/// while Starfield is displayed or for a short settling interval after it.
+/// while Starfield is displayed, through global settling, and per pixel until
+/// each changed pixel catches the current output.
 pub struct TransitionOutput {
     format: wgpu::TextureFormat,
     layout: wgpu::BindGroupLayout,
@@ -96,15 +98,15 @@ impl TransitionOutput {
                 multiview: None,
             })
         };
-        let color_target = || {
+        let color_target = |format| {
             Some(wgpu::ColorTargetState {
                 format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })
         };
-        let single_targets = [color_target()];
-        let dual_targets = [color_target(), color_target()];
+        let single_targets = [color_target(HISTORY_FORMAT)];
+        let dual_targets = [color_target(format), color_target(HISTORY_FORMAT)];
         let single_pipeline = make_pipeline(
             "chipviz Starfield transition history pipeline",
             "fs_single",
@@ -138,7 +140,7 @@ impl TransitionOutput {
         {
             return;
         }
-        let texture = |label, extra_usage| {
+        let texture = |label, format, extra_usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
@@ -149,7 +151,7 @@ impl TransitionOutput {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.format,
+                format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | extra_usage,
@@ -158,16 +160,19 @@ impl TransitionOutput {
         };
         let scene_texture = texture(
             "chipviz Starfield transition scene",
+            self.format,
             wgpu::TextureUsages::empty(),
         );
         let scene_view = scene_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let history_textures = [
             texture(
                 "chipviz Starfield transition history A",
+                HISTORY_FORMAT,
                 wgpu::TextureUsages::empty(),
             ),
             texture(
                 "chipviz Starfield transition history B",
+                HISTORY_FORMAT,
                 wgpu::TextureUsages::empty(),
             ),
         ];
@@ -286,14 +291,12 @@ impl TransitionOutput {
             self.settled_slew_credit = 0.0;
         }
         let limiting = starfield_involved || self.settling_after_starfield;
-        let limit_delta = if limiting {
-            if initialize_starfield_history {
-                INITIAL_SLEW_DELTA
-            } else {
-                OUTPUT_SLEW_PER_SECOND * dt as f32
-            }
+        let limit_delta = if initialize_starfield_history {
+            INITIAL_SLEW_DELTA
         } else {
-            1.0
+            // Keep the per-pixel tail bounded even after the global settling
+            // window ends. Pixels that have converged release independently.
+            OUTPUT_SLEW_PER_SECOND * dt as f32
         };
         if !starfield_involved && self.settling_after_starfield {
             self.settled_slew_credit += limit_delta;
@@ -306,7 +309,7 @@ impl TransitionOutput {
                 limit_delta,
                 if self.history_valid { 1.0 } else { 0.0 },
                 if self.format.is_srgb() { 1.0 } else { 0.0 },
-                0.0,
+                if limiting { 1.0 } else { 0.0 },
             ],
         };
         queue.write_buffer(&self.parameters, 0, bytemuck::bytes_of(&params));
@@ -376,5 +379,192 @@ fn color_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment
             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
             store: wgpu::StoreOp::Store,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linear_history_format_is_guaranteed_for_render_and_sampling() {
+        let usages = HISTORY_FORMAT
+            .guaranteed_format_features(wgpu::Features::empty())
+            .allowed_usages;
+        assert!(usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
+        assert!(usages.contains(wgpu::TextureUsages::TEXTURE_BINDING));
+    }
+
+    fn srgb_encode(value: f32) -> f32 {
+        if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    fn srgb_decode(value: f32) -> f32 {
+        if value <= 0.040_45 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn readback_code(linear: f32, surface_is_srgb: bool) -> u8 {
+        // sRGB attachments encode linear shader output on write. Unorm
+        // attachments receive the same transfer explicitly in the shader.
+        let surface_value = if surface_is_srgb {
+            linear
+        } else {
+            srgb_encode(linear)
+        };
+        let encoded = if surface_is_srgb {
+            srgb_encode(surface_value)
+        } else {
+            surface_value
+        };
+        (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    fn linear_readback(code: u8) -> f32 {
+        srgb_decode(f32::from(code) / 255.0)
+    }
+
+    #[derive(Clone, Copy)]
+    struct PixelHistory {
+        linear: f32,
+        locked: bool,
+    }
+
+    impl PixelHistory {
+        fn step(&mut self, target: f32, delta: f32, globally_limited: bool) {
+            let was_locked = self.locked;
+            if globally_limited || was_locked {
+                let bounded = target.clamp(self.linear - delta, self.linear + delta);
+                self.linear = bounded;
+                self.locked =
+                    globally_limited || (was_locked && (target - bounded).abs() > 0.000_001);
+            } else {
+                self.linear = target;
+                self.locked = false;
+            }
+        }
+    }
+
+    #[test]
+    fn linear_history_converges_through_exact_srgb_readback_at_multiple_rates() {
+        for fps in [60_u32, 120, 240, 480] {
+            for surface_is_srgb in [false, true] {
+                for (start, target) in [(1.0_f32, 0.0_f32), (0.0, 1.0)] {
+                    let mut history = PixelHistory {
+                        linear: start,
+                        locked: true,
+                    };
+                    let mut previous_readback = readback_code(start, surface_is_srgb);
+                    let frames = fps * 10;
+                    for _ in 0..frames {
+                        let previous = history.linear;
+                        history.step(target, OUTPUT_SLEW_PER_SECOND / fps as f32, true);
+                        assert!(
+                            (history.linear - previous).abs()
+                                <= OUTPUT_SLEW_PER_SECOND / fps as f32 + 0.000_001,
+                            "linear slew exceeded its bound at {fps} Hz"
+                        );
+                        let code = readback_code(history.linear, surface_is_srgb);
+                        let readback_delta =
+                            (linear_readback(code) - linear_readback(previous_readback)).abs();
+                        assert!(
+                            readback_delta < 0.02,
+                            "readback jump {readback_delta} at {fps} Hz"
+                        );
+                        previous_readback = code;
+                    }
+                    assert_eq!(
+                        previous_readback,
+                        readback_code(target, surface_is_srgb),
+                        "did not converge {start} -> {target} at {fps} Hz"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_exit_pixel_tail_survives_global_release_and_scene_reentry() {
+        for fps in [60_u32, 120, 240, 480] {
+            let delta = OUTPUT_SLEW_PER_SECOND / fps as f32;
+            let mut history = PixelHistory {
+                linear: 1.0,
+                locked: false,
+            };
+            let mut settling_credit = 0.0_f32;
+            let mut previous_readback = readback_code(history.linear, true);
+
+            // A blank Starfield is followed by a bright native target, which
+            // reverses as the global settling budget expires. The per-pixel
+            // lock must keep slewing until that new target actually converges.
+            for frame in 0..fps * 16 {
+                let in_starfield = frame < fps / 4;
+                let globally_limited = in_starfield || settling_credit < 1.0;
+                let reaches_global_release = !in_starfield && settling_credit + delta >= 1.0;
+                let target = if in_starfield || reaches_global_release {
+                    0.0
+                } else {
+                    1.0
+                };
+                let previous = history.linear;
+                history.step(target, delta, globally_limited);
+                if in_starfield {
+                    settling_credit = 0.0;
+                } else if globally_limited {
+                    settling_credit += delta;
+                }
+                assert!(
+                    (history.linear - previous).abs() <= delta + 0.000_001,
+                    "exit tail exceeded its bound at {fps} Hz"
+                );
+                let code = readback_code(history.linear, true);
+                assert!(
+                    (linear_readback(code) - linear_readback(previous_readback)).abs() < 0.02,
+                    "exit readback jump at {fps} Hz"
+                );
+                previous_readback = code;
+            }
+            assert!(
+                !history.locked,
+                "static target did not converge at {fps} Hz"
+            );
+            assert_eq!(previous_readback, readback_code(0.0, true));
+
+            // Once the current native target has converged, ordinary native
+            // scene changes remain immediate. Starfield re-entry re-arms the
+            // limiter without discarding the output history.
+            history.step(0.5, delta, false);
+            assert_eq!(history.linear, 0.5);
+            let previous = history.linear;
+            history.step(1.0, delta, true);
+            assert!((history.linear - previous).abs() <= delta + 0.000_001);
+            assert!(history.locked);
+        }
+    }
+
+    #[test]
+    fn eight_bit_surface_feedback_reproduces_the_white_stall() {
+        for fps in [60_u32, 120, 240, 480] {
+            let mut code = 255_u8;
+            for _ in 0..fps * 10 {
+                let previous_linear = linear_readback(code);
+                let next_linear = (previous_linear - OUTPUT_SLEW_PER_SECOND / fps as f32).max(0.0);
+                code = readback_code(next_linear, true);
+            }
+            assert_eq!(code, 255, "fixture no longer models 8-bit feedback");
+
+            let mut high_precision = 1.0_f32;
+            for _ in 0..fps * 10 {
+                high_precision = (high_precision - OUTPUT_SLEW_PER_SECOND / fps as f32).max(0.0);
+            }
+            assert_eq!(readback_code(high_precision, true), 0);
+        }
     }
 }

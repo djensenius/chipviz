@@ -969,7 +969,7 @@ mod tests {
             unix_seconds: 946_728_000.0,
             follow_elapsed: false,
         };
-        for fps in [60_u64, 120, 240] {
+        for fps in [60_u64, 120, 240, 480] {
             let (width, height) = (160, 90);
             let mut renderer =
                 pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
@@ -1035,6 +1035,78 @@ mod tests {
             assert!(
                 correction_change <= 0.04,
                 "fps={fps}: a Starfield epoch correction changed luminance by {correction_change}"
+            );
+        }
+    }
+
+    /// Reads back a persistent white-to-black crossing at every supported
+    /// refresh rate; 8-bit feedback history remains white for this entire
+    /// interval even though the limiter's elapsed-time credit expires.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn starfield_limiter_converges_from_white_with_exact_frame_readback() {
+        let blank_catalog =
+            starfield::StarCatalog::from_reader("ra,dec,mag\n0,-90,1\n".as_bytes()).unwrap();
+        let blank_starfield = starfield::StarfieldConfig {
+            catalog: std::sync::Arc::new(blank_catalog),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        let luminance = |pixel: &[u8]| {
+            let decode = |byte: u8| {
+                let value = f32::from(byte) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * decode(pixel[0]) + 0.7152 * decode(pixel[1]) + 0.0722 * decode(pixel[2])
+        };
+
+        for fps in [60_u64, 120, 240, 480] {
+            let (width, height) = (160, 90);
+            let mut renderer =
+                pollster::block_on(OffscreenRenderer::new(RenderProfile::pi5(), width, height))
+                    .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(blank_starfield.clone()));
+
+            let mut bright = ControlFrame::procedural(2_048);
+            bright.scene = 4;
+            bright.flags = 0;
+            let mut previous = renderer.render(bright, 0.0).unwrap();
+            assert!(
+                previous
+                    .chunks_exact(3)
+                    .filter(|pixel| luminance(pixel) > 0.5)
+                    .count()
+                    > 1_000,
+                "fps={fps}: the initial Static frame should be bright"
+            );
+
+            for step in 1..=fps * 8 {
+                let mut starfield = ControlFrame::procedural(2_048 + step);
+                starfield.scene = 6;
+                starfield.flags = 0;
+                let pixels = renderer
+                    .render(starfield, step as f64 / fps as f64)
+                    .unwrap();
+                for (left, right) in previous.chunks_exact(3).zip(pixels.chunks_exact(3)) {
+                    let change = (luminance(left) - luminance(right)).abs();
+                    assert!(
+                        change <= 0.04,
+                        "fps={fps}, step={step}: GPU readback luminance changed by {change}"
+                    );
+                }
+                previous = pixels;
+            }
+            assert!(
+                previous.iter().all(|&channel| channel == 0),
+                "fps={fps}: persistent blank Starfield did not converge to black"
             );
         }
     }

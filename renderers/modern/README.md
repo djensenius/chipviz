@@ -439,16 +439,21 @@ entry. The explicit scene-7 ColourField dispatch is unchanged.
   Starfield is displayed and until one full linear-light range of slew has
   been allowed after it (at least about 6.7 seconds at normal refresh rates).
   Its initial Starfield frame starts from black with a maximum per-channel
-  change of 0.05. This includes scene 7, fallback and optional-overlay output.
+  change of 0.05. History is kept in linear `Rgba32Float` rather than the
+  8-bit surface format, so gamma-encoded readback cannot erase sub-code slew
+  progress. Per-pixel limiting remains active after the global settling window
+  only until that pixel catches the current output. This includes scene 7,
+  fallback and optional-overlay output.
   Live wall-clock corrections are synchronized at the next ten-second
   snapshot; the full star snapshot (positions, membership, ordering and
   brightness) is held between updates.
   These output limits are conservative scene behavior, not independent
-  photosensitivity certification. The limiter keeps full-frame GPU history
-  and adds a resolve pass; verify memory and frame-time costs on target
-  adapters. Stars fainter than magnitude 6.5 are
-  excluded. Below-horizon stars are culled, brightest stars are considered
-  first, and output respects each profile's instance budget.
+  photosensitivity certification. The limiter keeps two full-frame
+  `Rgba32Float` history textures (about 253 MiB at 3840x2160) and adds a resolve
+  pass; verify memory and frame-time costs on target adapters. Stars fainter
+  than magnitude 6.5 are excluded. Below-horizon stars are culled; the
+  brightest are considered first, and output respects each profile's instance
+  budget.
 - `SignalField`: thousands of thin high-contrast data planes in a rotating 3D
   field.
 - `SpectrumVolume`: layered spectrum slices forming an audio volume.

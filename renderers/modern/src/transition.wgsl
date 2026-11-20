@@ -45,21 +45,23 @@ fn linear_to_srgb(value: vec3<f32>) -> vec3<f32> {
 fn output_pixel(position: vec4<f32>) -> vec4<f32> {
   let pixel = vec2<i32>(position.xy);
   var target = textureLoad(scene_image, pixel, 0).rgb;
-  if (parameters.values.y <= 0.5) {
-    return vec4<f32>(target, 1.0);
-  }
-  var previous = textureLoad(previous_image, pixel, 0).rgb;
   let srgb_target = parameters.values.z > 0.5;
   if (!srgb_target) {
     target = srgb_to_linear(target);
-    previous = srgb_to_linear(previous);
   }
-  let delta = vec3<f32>(parameters.values.x);
-  target = clamp(target, previous - delta, previous + delta);
-  if (!srgb_target) {
-    target = linear_to_srgb(target);
+  var locked = parameters.values.w > 0.5;
+  if (parameters.values.y > 0.5) {
+    let previous = textureLoad(previous_image, pixel, 0);
+    if (locked || previous.a > 0.5) {
+      let delta = vec3<f32>(parameters.values.x);
+      let bounded = clamp(target, previous.rgb - delta, previous.rgb + delta);
+      if (locked || any(abs(target - bounded) > vec3<f32>(0.000001))) {
+        target = bounded;
+        locked = true;
+      }
+    }
   }
-  return vec4<f32>(target, 1.0);
+  return vec4<f32>(target, select(0.0, 1.0, locked));
 }
 
 @fragment
@@ -69,6 +71,10 @@ fn fs_single(input: VertexOutput) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_dual(input: VertexOutput) -> DualOutput {
-  let pixel = output_pixel(input.position);
-  return DualOutput(pixel, pixel);
+  let history = output_pixel(input.position);
+  var surface = history.rgb;
+  if (parameters.values.z <= 0.5) {
+    surface = linear_to_srgb(surface);
+  }
+  return DualOutput(vec4<f32>(surface, 1.0), history);
 }
