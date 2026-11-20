@@ -99,6 +99,8 @@ this is a precaution, not a legal determination. Restoring releases awaits a
 clean-source or permission resolution and symbol-scan safeguard in
 [#109](https://github.com/djensenius/chipviz/issues/109). Local builds and
 emulator use remain available; the generated seed is not a visualizer.
+The release guard allows only known asset names; adding a new release asset
+requires updating `scripts/check-release-assets.py` after policy review.
 
 ## Current scaffold
 
