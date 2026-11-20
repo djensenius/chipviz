@@ -19,6 +19,9 @@
 #define BLOCK_SIZE 4
 #define BLOCK_COLUMNS (SCREEN_WIDTH / BLOCK_SIZE)
 #define BLOCK_ROWS (SCREEN_HEIGHT / BLOCK_SIZE)
+/* The original native demo presents approximately once per four VBlanks.
+ * IWRAM rendering is faster, so retain that animation cadence separately. */
+#define NATIVE_PRESENT_POLLS 4u
 /* Only poll/present early in a newly reached VBlank, leaving ample time for
  * palette writes and keeping the poll-time jitter below a frame. */
 #define NATIVE_LATEST_VBLANK_LINE 200
@@ -253,6 +256,7 @@ int main(void) {
   uint8_t palette = 0;
   uint8_t display_page = 0;
   uint8_t displaying_field = 0;
+  uint8_t native_polls = 0;
   int native_row = 0;
   uint16_t prev_keys = 0;
   uint16_t native_keys = 0;
@@ -288,6 +292,7 @@ int main(void) {
         REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
         displaying_field = 1u;
         native_row = 0;
+        native_polls = 0u;
       }
     } else if (displaying_field) {
       /* Prepare a complete native page before restoring its palette and
@@ -301,11 +306,12 @@ int main(void) {
       REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
       displaying_field = 0u;
       native_row = 0;
+      native_polls = 0u;
       frame++;
     } else {
       uint8_t seen_visible = 0u;
       uint8_t reached_vblank = 0u;
-      uint16_t line;
+      uint16_t line = REG_VCOUNT;
       /* Keep transient overlay inputs sampled anywhere during this native
        * page. Direction edges still go through update_input once per poll. */
       if (native_row == 0) {
@@ -313,9 +319,12 @@ int main(void) {
         native_keys = 0u;
       }
       native_keys |= keys;
+      if (native_polls < NATIVE_PRESENT_POLLS) {
+        ++native_polls;
+      }
       /* Render whole block rows until the next VBlank, sampling the scanline
        * between rows so a slow native page does not hide pad polls. */
-      do {
+      while (native_row < BLOCK_ROWS && !reached_vblank) {
         render_background_rows(draw_target, frame, &native_state, native_row, native_row + 1);
         ++native_row;
         line = REG_VCOUNT;
@@ -324,8 +333,8 @@ int main(void) {
         } else if (seen_visible) {
           reached_vblank = 1u;
         }
-      } while (native_row < BLOCK_ROWS && !reached_vblank);
-      if (native_row == BLOCK_ROWS) {
+      }
+      if (native_row == BLOCK_ROWS && native_polls >= NATIVE_PRESENT_POLLS) {
         uint16_t before_overlay = line;
         render_overlay(draw_target, frame, &native_state, native_keys);
         make_palette(staged_palette, frame, &native_state);
@@ -340,6 +349,7 @@ int main(void) {
         display_page ^= 1u;
         REG_DISPCNT = (uint16_t)(MODE4 | BG2_ENABLE | (display_page ? DISPLAY_PAGE : 0u));
         native_row = 0;
+        native_polls = 0u;
         frame++;
       } else {
         if (!reached_vblank || line >= NATIVE_LATEST_VBLANK_LINE) {

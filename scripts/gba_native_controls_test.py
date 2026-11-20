@@ -66,13 +66,64 @@ def native_sequence(rom, core, count=300):
     gba.close()
 
 
+def native_timeline(rom, core, warmup=120, count=900):
+  """Record displayed native-page changes, not merely generated host frames."""
+  gba = GbaCore(rom, core)
+  try:
+    for _ in range(warmup):
+      gba.run_frame()
+    previous = gba.pixels()
+    events = []
+    for step in range(count):
+      gba.run_frame()
+      pixels = gba.pixels()
+      if pixels != previous:
+        events.append((step, pixels))
+      previous = pixels
+    return events
+  finally:
+    gba.close()
+
+
+def check_cadence(rom, baseline_rom, core):
+  baseline = native_timeline(baseline_rom, core)
+  actual = native_timeline(rom, core)
+  if abs(len(actual) - len(baseline)) > 1:
+    raise AssertionError(f"native cadence: {len(actual)} changes vs baseline {len(baseline)} over 900 VBlanks")
+  # Initial startup and mGBA frame boundaries can shift the first visible
+  # page. Align by actual image, then compare the complete overlapping
+  # sequence and relative presentation times, allowing one VBlank of jitter.
+  matches = []
+  for i in range(min(4, len(baseline))):
+    for j in range(min(4, len(actual))):
+      n = min(len(baseline) - i, len(actual) - j)
+      if n < min(len(baseline), len(actual)) - 4:
+        continue
+      if all(baseline[i + k][1] == actual[j + k][1] for k in range(n)):
+        base_start, actual_start = baseline[i][0], actual[j][0]
+        drift = max(abs((baseline[i + k][0] - base_start) - (actual[j + k][0] - actual_start))
+                    for k in range(n))
+        matches.append((drift, n))
+  if not matches:
+    raise AssertionError("native cadence: no matching baseline page sequence after startup")
+  drift, compared = min(matches, key=lambda match: (match[0], -match[1]))
+  if drift > 1:
+    raise AssertionError(f"native cadence: {drift} VBlanks of relative drift across {compared} pages")
+  print(f"native cadence: {len(actual)} vs baseline {len(baseline)} changes over 900 VBlanks; "
+        f"{compared} matching pages, max drift {drift}")
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--rom", type=pathlib.Path, required=True)
   parser.add_argument("--core", type=pathlib.Path, required=True)
   parser.add_argument("--reference-rom", type=pathlib.Path,
                       help="also compare 300 complete native pages with this prior ROM")
+  parser.add_argument("--cadence-baseline", type=pathlib.Path,
+                      help="compare 900 native VBlanks with the original baseline ROM")
   args = parser.parse_args()
+  if args.cadence_baseline:
+    check_cadence(args.rom, args.cadence_baseline, args.core)
   if args.reference_rom:
     reference = native_sequence(args.reference_rom, args.core)
     actual = native_sequence(args.rom, args.core)
