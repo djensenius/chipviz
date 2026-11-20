@@ -18,13 +18,20 @@ fn cells(profile: &RenderProfile, frame: ControlFrame, source: &dyn TextSource) 
     target(section, grid, source)
         .into_iter()
         .enumerate()
-        .map(|(index, target)| cell(index, target, section, noise))
+        .map(|(index, target)| cell(index, target, None, section, noise))
         .collect()
 }
 
 fn build_frame(profile: &RenderProfile, frame: ControlFrame, aspect: f32) -> Vec<Instance> {
     let mut instances = Vec::new();
-    build(profile, frame, 0.0, aspect, &mut instances);
+    build(
+        profile,
+        frame,
+        0.0,
+        aspect,
+        &SceneState::default(),
+        &mut instances,
+    );
     instances
 }
 
@@ -93,7 +100,14 @@ fn grid_and_instances_stay_within_the_instance_budget() {
         // Builders append: existing instances shrink what Static may add.
         let mut instances =
             vec![build_frame(&profile, at(40), WIDE)[0]; profile.instance_count - 5];
-        build(&profile, at(40), 0.0, WIDE, &mut instances);
+        build(
+            &profile,
+            at(40),
+            0.0,
+            WIDE,
+            &SceneState::default(),
+            &mut instances,
+        );
         assert_eq!(instances.len(), profile.instance_count);
     }
     // The m1 budget draws smaller glyphs than the Pi 5 budget.
@@ -512,4 +526,728 @@ fn fingerprint() -> u64 {
 #[test]
 fn instances_match_recorded_golden() {
     assert_eq!(fingerprint(), 0xe30c_b1b8_9d4f_14dd);
+}
+
+/// Frames sampled by `observed_fingerprint`: glyph text (300 resolved after
+/// a flip, 332 mid-flip under a reframe), constant, knot (1430 reframed),
+/// noise, then pixel text, constant (on white at 2400 and 2700), knot and
+/// noise.
+const OBSERVED_FRAMES: [u16; 10] = [0, 300, 332, 900, 1430, 1800, 2400, 2700, 3300, 3900];
+
+/// FNV-1a over Static's instances on `OBSERVED_FRAMES` of a replay from
+/// frame 0 through one observed state per profile, as the renderer and
+/// `chipviz-capture` run it: the beat-synced path, which `fingerprint`
+/// (built before any frame is observed) does not reach.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn observed_fingerprint(input: fn(u16) -> ControlFrame) -> u64 {
+    let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+    for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+        let mut state = SceneState::default();
+        for index in 0..=OBSERVED_FRAMES[OBSERVED_FRAMES.len() - 1] {
+            let frame = input(index);
+            state.observe(&frame);
+            if !OBSERVED_FRAMES.contains(&index) {
+                continue;
+            }
+            let mut instances = Vec::new();
+            build(&profile, frame, 0.0, WIDE, &state, &mut instances);
+            for byte in bytemuck::cast_slice::<Instance, u8>(&instances) {
+                fingerprint ^= u64::from(*byte);
+                fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    fingerprint
+}
+
+/// The sampled frames reach what the beat drives: a flip under way, a
+/// reframe, and every section type.
+#[test]
+fn observed_frames_cover_flips_reframes_and_sections() {
+    let mut state = SceneState::default();
+    let (mut flipping, mut reframed, mut indices) = (false, false, Vec::new());
+    for index in 0..=OBSERVED_FRAMES[OBSERVED_FRAMES.len() - 1] {
+        let frame = at(index);
+        state.observe(&frame);
+        if OBSERVED_FRAMES.contains(&index) {
+            let clock = state.static_noise.clock(frame);
+            flipping |= section_at(clock).before_flip().is_some();
+            reframed |= clock.framing != REST;
+            indices.push(clock.index);
+        }
+    }
+    assert!(flipping && reframed);
+    assert_eq!(indices, [0, 0, 0, 1, 2, 3, 4, 5, 6, 7]);
+}
+
+// The frame-timed golden above covers the schedule before any frame is
+// observed (tests and the first frame); these cover the beat-synced replay,
+// with procedural beats (every 16 frames) and live-like ones (every 30).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn observed_instances_match_recorded_golden() {
+    assert_eq!(observed_fingerprint(at), 0x7fe5_40ec_1237_8bf6);
+    let live = |index: u16| ControlFrame {
+        beat_count: index / 30,
+        ..at(index)
+    };
+    assert_eq!(observed_fingerprint(live), 0xa717_d95b_5b72_b0b5);
+}
+
+/// CPU stand-in for the GPU pass at `RASTER_W` x `RASTER_H`, like Lines'
+/// `rasterise`: point-samples each quad at pixel centres (glyph bitmaps as
+/// `glyph_lit` decodes them, noise strips through `gpu_reference::pixel`),
+/// alpha-blending its linear colour over black in draw order. Returns each
+/// pixel's relative luminance (Rec. 709 weights on linear light, as WCAG
+/// uses). Static never rotates its quads.
+const RASTER_W: usize = 320;
+const RASTER_H: usize = 180;
+
+fn rasterise(instances: &[Instance]) -> Vec<f32> {
+    let mut rgb = vec![[0.0f32; 3]; RASTER_W * RASTER_H];
+    for instance in instances {
+        let [cx, cy, _] = instance.center;
+        let [w, h] = instance.size;
+        let to_pixel = |ndc: f32, size: usize| ((ndc + 1.0) * 0.5 * size as f32).floor();
+        let x_range = to_pixel(cx - w.abs() * 0.5, RASTER_W).max(0.0) as usize
+            ..(to_pixel(cx + w.abs() * 0.5, RASTER_W) + 1.0).clamp(0.0, RASTER_W as f32) as usize;
+        // Rows count down from the top, as in the shader.
+        let y_range = to_pixel(-cy - h.abs() * 0.5, RASTER_H).max(0.0) as usize
+            ..(to_pixel(-cy + h.abs() * 0.5, RASTER_H) + 1.0).clamp(0.0, RASTER_H as f32) as usize;
+        let [low, high] = instance.pattern;
+        let bits = (low > 0.0 || high > 0.0).then_some(low as u64 | (high as u64) << 20);
+        for y in y_range {
+            let ny = 1.0 - (y as f32 + 0.5) / RASTER_H as f32 * 2.0;
+            for x in x_range.clone() {
+                let nx = (x as f32 + 0.5) / RASTER_W as f32 * 2.0 - 1.0;
+                let local = [(nx - cx) / w, (ny - cy) / h];
+                if local[0].abs() > 0.5 || local[1].abs() > 0.5 {
+                    continue;
+                }
+                let color = if low < -0.5 {
+                    match gpu_reference::pixel(x as u32, y as u32, instance.color, instance.pattern)
+                    {
+                        Some(color) => color,
+                        None => continue,
+                    }
+                } else if let Some(bits) = bits {
+                    let column = ((local[0] + 0.5) * 5.0).floor().clamp(0.0, 4.0) as u64;
+                    let row = ((0.5 - local[1]) * 8.0).floor().clamp(0.0, 7.0) as u64;
+                    if bits >> (row * 5 + column) & 1 == 0 {
+                        continue;
+                    }
+                    instance.color
+                } else {
+                    instance.color
+                };
+                let pixel = &mut rgb[y * RASTER_W + x];
+                for (value, source) in pixel.iter_mut().zip(color) {
+                    *value = source * color[3] + *value * (1.0 - color[3]);
+                }
+            }
+        }
+    }
+    rgb.iter().copied().map(luminance).collect()
+}
+
+/// Mean luminance of each tile of a `TILES_X` x `TILES_Y` grid: large areas
+/// (each about 6 % of the screen, under WCAG's 25 % of the central 10
+/// degrees once smaller tiles are averaged in) whose joint brightening or
+/// darkening would read as a flash, rather than single glyph pixels, which
+/// the noise flips every frame by design.
+const TILES_X: usize = 4;
+const TILES_Y: usize = 4;
+
+fn tiles(image: &[f32]) -> [f32; TILES_X * TILES_Y] {
+    let mut sums = [0.0f32; TILES_X * TILES_Y];
+    for (y, row) in image.chunks_exact(RASTER_W).enumerate() {
+        let sums = &mut sums[y * TILES_Y / RASTER_H * TILES_X..][..TILES_X];
+        for (sum, part) in sums.iter_mut().zip(row.chunks_exact(RASTER_W / TILES_X)) {
+            *sum += part.iter().sum::<f32>();
+        }
+    }
+    let area = (RASTER_W * RASTER_H / (TILES_X * TILES_Y)) as f32;
+    sums.map(|sum| sum / area)
+}
+
+/// Rec. 709 relative luminance of linear RGB, as WCAG uses.
+fn luminance([r, g, b]: [f32; 3]) -> f32 {
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// Mean luminance of a rainbow noise pixel's hue (or its inverse), which
+/// `gpu_reference::pixel` draws uniformly at random.
+/// `[plain, inverted]`, for `tile_estimate`.
+fn rainbow_luminance() -> [f32; 2] {
+    const SAMPLES: usize = 4096;
+    [false, true].map(|inverted| {
+        (0..SAMPLES)
+            .map(|sample| {
+                let rgb = hue((sample as f32 + 0.5) / SAMPLES as f32);
+                luminance(if inverted {
+                    rgb.map(|channel| 1.0 - channel)
+                } else {
+                    rgb
+                })
+            })
+            .sum::<f32>()
+            / SAMPLES as f32
+    })
+}
+
+/// `tiles(&rasterise(instances))` in expectation, without decoding glyph
+/// bits or hashing noise per pixel, so the flash test can afford every
+/// frame of all eight section types. Each quad blends in draw order over
+/// only the pixels of the `RASTER_W` x `RASTER_H` grid it overlaps, each
+/// weighted by the share of that pixel it covers, so disjoint quads never
+/// dim each other beyond a shared edge pixel. A glyph blends by its lit
+/// bits (out of 40), a noise strip by the chance a pixel is drawn
+/// (1 - blank) and its mean alpha (`unit` is uniform, so half the colour's),
+/// with rainbow pixels at the mean hue luminance. The pixel noise hashes
+/// every output pixel independently and each tile holds 3600 of them, so
+/// its tile mean sits within about 0.01 of this expectation;
+/// `tile_estimate_matches_the_rasteriser` checks that against `rasterise`.
+fn tile_estimate(instances: &[Instance], rainbow: [f32; 2]) -> [f32; TILES_X * TILES_Y] {
+    const TILE_W: usize = RASTER_W / TILES_X;
+    let mut pixels = vec![0.0f32; RASTER_W * RASTER_H];
+    // Tile sums, kept up to date as pixels blend.
+    let mut sums = [0.0f32; TILES_X * TILES_Y];
+    // Share of pixel `index` inside `low..high`.
+    let overlap = |low: f32, high: f32, index: usize| {
+        (high.min(index as f32 + 1.0) - low.max(index as f32)).max(0.0)
+    };
+    let span = |low: f32, high: f32, size: usize| {
+        low.floor().clamp(0.0, size as f32) as usize..high.ceil().clamp(0.0, size as f32) as usize
+    };
+    for instance in instances {
+        let [cx, cy, _] = instance.center;
+        let [w, h] = instance.size.map(f32::abs);
+        let [low, high] = instance.pattern;
+        let rgb = [instance.color[0], instance.color[1], instance.color[2]];
+        let (alpha, light) = if low < -0.5 {
+            let flags = -low - 1.0;
+            let inverted = flags >= 4.0;
+            let code = flags - if inverted { 4.0 } else { 0.0 };
+            let blank = code - if code >= 2.0 { 2.0 } else { 0.0 };
+            let light = if code >= 2.0 {
+                rainbow[usize::from(inverted)]
+            } else {
+                luminance(rgb)
+            };
+            ((1.0 - blank) * 0.5 * instance.color[3], light)
+        } else if low > 0.5 || high > 0.5 {
+            let lit = (low as u64 | (high as u64) << 20).count_ones();
+            (lit as f32 / 40.0 * instance.color[3], luminance(rgb))
+        } else {
+            (instance.color[3], luminance(rgb))
+        };
+        // The quad in pixels, rows counting down from the top.
+        let left = (cx - w * 0.5 + 1.0) * 0.5 * RASTER_W as f32;
+        let right = (cx + w * 0.5 + 1.0) * 0.5 * RASTER_W as f32;
+        let top = (-cy - h * 0.5 + 1.0) * 0.5 * RASTER_H as f32;
+        let bottom = (-cy + h * 0.5 + 1.0) * 0.5 * RASTER_H as f32;
+        let columns = span(left, right, RASTER_W);
+        if columns.is_empty() {
+            continue;
+        }
+        // Partly covered edge columns; the ones between are covered whole.
+        let (first, last) = (columns.start, columns.end - 1);
+        let edges = [overlap(left, right, first), overlap(left, right, last)];
+        for y in span(top, bottom, RASTER_H) {
+            let weight = overlap(top, bottom, y) * alpha;
+            let row = &mut pixels[y * RASTER_W..][..RASTER_W];
+            let sums = &mut sums[y * TILES_Y / RASTER_H * TILES_X..][..TILES_X];
+            for (x, edge) in [(first, edges[0]), (last, edges[1])] {
+                let change = edge.min(right - left) * weight * (light - row[x]);
+                row[x] += change;
+                sums[x / TILE_W] += change;
+                if first == last {
+                    break;
+                }
+            }
+            // Whole pixels, a tile at a time.
+            let mut x = first + 1;
+            while x < last {
+                let end = last.min((x / TILE_W + 1) * TILE_W);
+                let mut change = 0.0;
+                for pixel in &mut row[x..end] {
+                    let step = weight * (light - *pixel);
+                    *pixel += step;
+                    change += step;
+                }
+                sums[x / TILE_W] += change;
+                x = end;
+            }
+        }
+    }
+    let area = (RASTER_W * RASTER_H / (TILES_X * TILES_Y)) as f32;
+    sums.map(|sum| sum / area)
+}
+
+/// Frames per sample in glyph sections in the flash tests: building one
+/// costs a few milliseconds in debug, so they sample at 30 Hz; pixel
+/// sections, about five times cheaper, sample every frame. Every
+/// beat-driven change eases or staggers over at least 15 frames, and WCAG's
+/// three flashes a second are six reversals, well inside 30 samples. The
+/// blind spot: in glyph sections a pattern that alternates every frame, or
+/// a one-frame blip, can fall between samples; the beat drives neither, and
+/// the 60 Hz noise reshuffles are tile-averaged (see `tile_estimate`).
+const GLYPH_STRIDE: usize = 2;
+/// Frames in one second.
+const SECOND: usize = 60;
+
+/// A tile luminance series: per sample, its frame, its tiles' estimated
+/// luminance (see `tile_estimate`) and its section index.
+#[derive(Default)]
+struct Series {
+    frames: Vec<usize>,
+    tiles: Vec<[f32; TILES_X * TILES_Y]>,
+    sections: Vec<u16>,
+}
+
+impl Series {
+    /// Samples `start..end`.
+    fn slice(&self, range: std::ops::Range<usize>) -> Series {
+        Series {
+            frames: self.frames[range.clone()].to_vec(),
+            tiles: self.tiles[range.clone()].to_vec(),
+            sections: self.sections[range].to_vec(),
+        }
+    }
+
+    /// Samples in section `index`.
+    fn section(&self, index: u16) -> Series {
+        let first = self.sections.iter().position(|&section| section == index);
+        let last = self.sections.iter().rposition(|&section| section == index);
+        self.slice(first.unwrap()..last.unwrap() + 1)
+    }
+}
+
+/// `frames` rendered through a state stepped on every frame, or
+/// frame-timed (`observe` false): the frames of `sections` and the first
+/// second of the next (or until `frames` ends), sampled every frame in
+/// pixel sections and every `GLYPH_STRIDE`th in glyph sections.
+fn tile_series(
+    frames: impl Iterator<Item = ControlFrame>,
+    observe: bool,
+    sections: std::ops::Range<u16>,
+) -> Series {
+    let until = sections.end;
+    let profile = RenderProfile::pi5();
+    let rainbow = rainbow_luminance();
+    let mut state = SceneState::default();
+    let mut series = Series::default();
+    let mut instances = Vec::new();
+    let mut reached = None;
+    for (index, frame) in frames.enumerate() {
+        if observe {
+            state.observe(&frame);
+        }
+        let clock = state.static_noise.clock(frame);
+        if clock.index == until {
+            let reached = *reached.get_or_insert(index);
+            if index >= reached + SECOND {
+                break;
+            }
+        }
+        let pixels = section_at(clock).style == Style::Pixels;
+        if clock.index < sections.start || !pixels && index % GLYPH_STRIDE != 0 {
+            continue;
+        }
+        instances.clear();
+        build(&profile, frame, 0.0, WIDE, &state, &mut instances);
+        series.frames.push(index);
+        series.tiles.push(tile_estimate(&instances, rainbow));
+        series.sections.push(clock.index);
+    }
+    series
+}
+
+/// WCAG 2.3.1 general flashes, as the colour field's `wcag_flashes` counts
+/// them, for one luminance series (`values`, sampled on `frames` at 60
+/// frames per second): opposing changes of at least 0.1 with the darker
+/// state below 0.8, paired, most in any one-second window.
+fn most_flashes(frames: &[usize], values: &[f32]) -> usize {
+    let mut opposing: Vec<usize> = Vec::new();
+    let mut last = None;
+    // Changes accumulate between reversals, so a slow ramp counts too.
+    let (mut low, mut high) = (values[0], values[0]);
+    for (&frame, &value) in frames.iter().zip(values) {
+        low = low.min(value);
+        high = high.max(value);
+        let up = if value - low >= 0.1 && low < 0.8 {
+            Some(true)
+        } else if high - value >= 0.1 && value < 0.8 {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(up) = up {
+            if last != Some(up) {
+                opposing.push(frame);
+                last = Some(up);
+            }
+            (low, high) = (value, value);
+        }
+    }
+    (0..opposing.len())
+        .map(|start| {
+            opposing[start..]
+                .iter()
+                .take_while(|&&frame| frame < opposing[start] + SECOND)
+                .count()
+                / 2
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Largest change of any tile's mean luminance between consecutive samples
+/// and between any two samples at most one second apart (a rise and fall
+/// within the second counts, not just its endpoints), never across a
+/// section start (`sections` changes), and the most WCAG flashes in any
+/// tile.
+fn luminance_report(series: &Series) -> (f32, f32, usize) {
+    let Series {
+        frames,
+        tiles,
+        sections,
+    } = series;
+    let starts: Vec<bool> = (0..sections.len())
+        .map(|sample| sample > 0 && sections[sample] != sections[sample - 1])
+        .collect();
+    let mut per_sample = 0.0f32;
+    let mut per_second = 0.0f32;
+    // The window: samples `earliest..=sample`, at most one second apart and
+    // in one section. Per tile, the window's samples in increasing (`lows`)
+    // and decreasing (`highs`) order of value, so each front is the
+    // window's minimum or maximum.
+    let mut earliest = 0;
+    let mut lows = vec![std::collections::VecDeque::new(); TILES_X * TILES_Y];
+    let mut highs = lows.clone();
+    for sample in 0..tiles.len() {
+        if starts[sample] {
+            earliest = sample;
+        } else if sample > 0 {
+            for (now, then) in tiles[sample].iter().zip(&tiles[sample - 1]) {
+                per_sample = per_sample.max((now - then).abs());
+            }
+        }
+        while frames[earliest] + SECOND < frames[sample] {
+            earliest += 1;
+        }
+        for (tile, (lows, highs)) in lows.iter_mut().zip(&mut highs).enumerate() {
+            let value = tiles[sample][tile];
+            while lows
+                .back()
+                .is_some_and(|&low: &usize| tiles[low][tile] >= value)
+            {
+                lows.pop_back();
+            }
+            while highs
+                .back()
+                .is_some_and(|&high: &usize| tiles[high][tile] <= value)
+            {
+                highs.pop_back();
+            }
+            lows.push_back(sample);
+            highs.push_back(sample);
+            while lows.front().is_some_and(|&low| low < earliest) {
+                lows.pop_front();
+            }
+            while highs.front().is_some_and(|&high| high < earliest) {
+                highs.pop_front();
+            }
+            per_second = per_second.max(tiles[highs[0]][tile] - tiles[lows[0]][tile]);
+        }
+    }
+    let flashes = (0..TILES_X * TILES_Y)
+        .map(|tile| {
+            most_flashes(
+                frames,
+                &tiles.iter().map(|tiles| tiles[tile]).collect::<Vec<_>>(),
+            )
+        })
+        .max()
+        .unwrap_or(0);
+    (per_sample, per_second, flashes)
+}
+
+/// Steady energy and palette, so the only large-area changes are the
+/// schedule's: Static's noise density follows energy by design, and
+/// procedural energy's 15-frame sawtooth swings pixel noise far more than
+/// anything the beat does (see the flash test).
+fn steady(frame: ControlFrame) -> ControlFrame {
+    ControlFrame {
+        energy: 160,
+        palette: 0,
+        ..frame
+    }
+}
+
+/// A tile that rises to 0.4 and falls back within every second has a 1 s
+/// change of 0.4, over the flash test's 0.35, though samples exactly one
+/// second apart never differ; across a section start it does not count.
+#[test]
+fn one_second_change_counts_a_rise_and_fall_within_the_second() {
+    let pulse = |frame: usize| 0.4 * (1.0 - (frame as f32 % 60.0 - 30.0).abs() / 30.0);
+    let frames: Vec<usize> = (0..=180).collect();
+    let series = Series {
+        tiles: frames
+            .iter()
+            .map(|&frame| {
+                let mut tiles = [0.0; TILES_X * TILES_Y];
+                tiles[5] = pulse(frame);
+                tiles
+            })
+            .collect(),
+        sections: vec![0; frames.len()],
+        frames: frames.clone(),
+    };
+    let endpoints = (SECOND..frames.len())
+        .map(|frame| (pulse(frame) - pulse(frame - SECOND)).abs())
+        .fold(0.0f32, f32::max);
+    assert_eq!(endpoints, 0.0);
+    let (_, second, _) = luminance_report(&series);
+    assert!((second - 0.4).abs() < 1e-6 && second >= 0.35, "{second}");
+    // A new section every 20 frames: each holds only a third of a pulse.
+    let cut = Series {
+        sections: frames.iter().map(|&frame| (frame / 20) as u16).collect(),
+        ..series
+    };
+    let (_, second, _) = luminance_report(&cut);
+    assert!(second < 0.3, "{second}");
+}
+
+/// Flash policy for the beat-synced changes, measured with `tile_estimate`
+/// (`pi5` profile, 4x4 tiles of mean luminance, steady energy; sampled
+/// every frame in pixel sections and every `GLYPH_STRIDE` frames in glyph
+/// sections) over all eight section types (index 0..8: text, constant,
+/// knot and noise, in glyphs then pixels) and the cut into the ninth, for
+/// three beat inputs. Each cell is the worst over the four glyph or four
+/// pixel sections, with the frame-timed schedule on the same frames in
+/// brackets:
+///
+/// | input | sections | worst tile step per sample | worst swing within 1 s | flashes in 1 s |
+/// | --- | --- | --- | --- | --- |
+/// | procedural (beat every 16) | glyphs | 0.050 (timed 0.041) | 0.140 (0.140) | 1 (0) |
+/// | procedural | pixels | 0.026 (0.013) | 0.288 (0.295) | 1 (1) |
+/// | live (beat every 30) | glyphs | 0.046 (0.042) | 0.136 (0.143) | 1 (0) |
+/// | live | pixels | 0.026 (0.013) | 0.296 (0.295) | 1 (1) |
+/// | racing (beat every frame, 255 bpm) | glyphs | 0.064 (0.052) | 0.141 (0.136) | 1 (0) |
+/// | racing | pixels | 0.055 (0.013) | 0.295 (0.295) | 1 (1) |
+///
+/// A step is over two frames in glyph sections and one in pixel sections.
+/// Steps skip the samples where a section starts (the white background
+/// cuts in or out there, as before: sections stay at least 512 frames
+/// apart, see `beat.rs`); flashes count them. The worst 1 s change (content
+/// resolving and dissolving, largest in the pixel sections) matches the
+/// frame-timed schedule's. Racing beats reshuffling the noise and reframes
+/// moving it raise the step: in pixel sections a reframe's 15-frame ease
+/// moves up to 0.1 in two frames, which is why they are sampled every
+/// frame (0.055). The one flash the beat adds in glyph sections is a
+/// resolve darkening a tile and a split-flap flip to a larger phrase or a
+/// reframe brightening it again within a second: one pair, under WCAG
+/// 2.3.1's three. (A one-off release run sampling every frame in all
+/// sections measured glyph steps up to 0.068 and 1 s changes up to 0.154,
+/// with the same flash counts.)
+///
+/// Supporting evidence only, not a substitute for PEAT or a Harding check.
+/// With procedural energy (not steady) pixel noise flashes in both
+/// schedules, because energy drives noise density (#116);
+/// `beat_sync_adds_no_flashes_to_energy_driven_noise` keeps beat sync from
+/// making that worse.
+#[test]
+fn beat_changes_keep_luminance_flashes_bounded() {
+    type Input = (&'static str, fn(u64) -> ControlFrame);
+    let inputs: [Input; 3] = [
+        ("procedural", |index| {
+            steady(ControlFrame::procedural(index))
+        }),
+        ("live", |index| ControlFrame {
+            beat_count: (index / 30) as u16,
+            ..steady(ControlFrame::procedural(index))
+        }),
+        ("racing", |index| ControlFrame {
+            bpm: 255,
+            beat_count: index as u16,
+            ..steady(ControlFrame::procedural(index))
+        }),
+    ];
+    // Every section type (index 0..8) and the first second of the ninth;
+    // live sections start every 600 frames. One thread per input and half
+    // (glyph sections, then pixel sections, each with the cut after it).
+    let runs: Vec<_> = std::thread::scope(|scope| {
+        let runs: Vec<_> = inputs
+            .iter()
+            .flat_map(|&(name, input)| {
+                [0..4, 4..8].map(|half| {
+                    scope.spawn(move || {
+                        let series = tile_series((0..).map(input), true, half.clone());
+                        (name, half, series)
+                    })
+                })
+            })
+            .collect();
+        runs.into_iter().map(|run| run.join().unwrap()).collect()
+    });
+    for (name, half, series) in runs {
+        assert!(series.sections.contains(&half.end), "{name} {half:?}");
+        for section in half {
+            let (step, second, flashes) = luminance_report(&series.section(section));
+            let case = format!("{name} section {section}");
+            assert!(step < 0.1, "{case}: step {step}");
+            assert!(second < 0.35, "{case}: {second} in 1 s");
+            assert!(flashes <= 1, "{case}: {flashes} flashes");
+        }
+        // Across the section cuts too.
+        let (_, _, flashes) = luminance_report(&series);
+        assert!(flashes <= 1, "{name}: {flashes} flashes");
+    }
+}
+
+/// #116 non-regression: with procedural energy (not steady) the noise
+/// already flashes in the frame-timed schedule (4 flashes in 1 s in one tile
+/// by `tile_estimate`, sampled as in the flash test); beat sync must not add
+/// to it (it also measures 4) over all eight section types.
+#[test]
+fn beat_sync_adds_no_flashes_to_energy_driven_noise() {
+    // One thread per schedule and half, as in the flash test.
+    let [timed, synced] = std::thread::scope(|scope| {
+        [false, true]
+            .map(|observe| {
+                [0..4, 4..8].map(|half| {
+                    scope.spawn(move || {
+                        let frames = (0..4096).map(ControlFrame::procedural);
+                        luminance_report(&tile_series(frames, observe, half)).2
+                    })
+                })
+            })
+            .map(|halves| {
+                halves
+                    .map(|run| run.join().unwrap())
+                    .into_iter()
+                    .max()
+                    .unwrap()
+            })
+    });
+    assert!(synced <= timed, "synced {synced} timed {timed}");
+}
+
+/// A solid white quad over pixels `x` x `y` of the `RASTER_W` x
+/// `RASTER_H` grid, at `alpha`.
+fn solid(x: [f32; 2], y: [f32; 2], alpha: f32) -> Instance {
+    let ndc = |pixels: [f32; 2], size: usize| pixels.map(|pixel| pixel / size as f32 * 2.0 - 1.0);
+    let ([left, right], [top, bottom]) = (ndc(x, RASTER_W), ndc(y, RASTER_H));
+    Instance {
+        center: [(left + right) * 0.5, -(top + bottom) * 0.5, 0.0],
+        size: [right - left, bottom - top],
+        color: [1.0, 1.0, 1.0, alpha],
+        ..bytemuck::Zeroable::zeroed()
+    }
+}
+
+/// Quads that do not overlap must not dim each other (four quarter-tile
+/// quads at 0.4 cover their tile at 0.4, not 0.3439), and overlapping ones
+/// composite only where they overlap, as `rasterise` does.
+#[test]
+fn tile_estimate_keeps_quads_where_they_are() {
+    let (width, height) = ((RASTER_W / TILES_X) as f32, (RASTER_H / TILES_Y) as f32);
+    // Four disjoint quarter-tile strips, on whole pixels so `rasterise`
+    // samples them exactly too.
+    let quarters: Vec<_> = (0..4)
+        .map(|quarter| {
+            let x = quarter as f32 * width * 0.25;
+            solid([x, x + width * 0.25], [0.0, height], 0.4)
+        })
+        .collect();
+    // Half-transparent: the left half, then the right three quarters, of
+    // the first tile. They overlap in its second quarter (0.75); the
+    // other quarters get one (0.5): 0.5 + 0.75 + 0.5 + 0.5 over four.
+    let overlapping = [
+        solid([0.0, width * 0.5], [0.0, height], 0.5),
+        solid([width * 0.25, width], [0.0, height], 0.5),
+    ];
+    for (instances, expected) in [(&quarters[..], 0.4), (&overlapping[..], 0.5625)] {
+        let estimate = tile_estimate(instances, rainbow_luminance());
+        let exact = tiles(&rasterise(instances));
+        assert!((estimate[0] - expected).abs() < 1e-4, "{estimate:?}");
+        assert!((exact[0] - expected).abs() < 1e-4, "{exact:?}");
+        assert!(
+            estimate[1..]
+                .iter()
+                .chain(&exact[1..])
+                .all(|&mean| mean == 0.0)
+        );
+    }
+}
+
+/// `tile_estimate` against the point-sampled `rasterise` on pairs of
+/// frames `GLYPH_STRIDE` apart every 128 frames across all eight
+/// section types, with the procedural palettes and with random hues
+/// (palette 3, the rainbow branch): both each tile's level and its change
+/// between the two samples, which the flash test bounds (worst measured
+/// 0.010 and 0.013).
+#[test]
+fn tile_estimate_matches_the_rasteriser() {
+    let profile = RenderProfile::pi5();
+    let rainbow = rainbow_luminance();
+    let (mut level, mut change) = (0.0f32, 0.0f32);
+    for palette in [None, Some(3)] {
+        let mut state = SceneState::default();
+        let mut last: Option<([f32; TILES_X * TILES_Y], [f32; TILES_X * TILES_Y])> = None;
+        for index in 0..4096u64 {
+            let procedural = ControlFrame::procedural(index);
+            let frame = ControlFrame {
+                palette: palette.unwrap_or(procedural.palette),
+                ..procedural
+            };
+            state.observe(&frame);
+            let offset = index % 128;
+            if offset != 100 && offset != 100 + GLYPH_STRIDE as u64 {
+                continue;
+            }
+            let mut instances = Vec::new();
+            build(&profile, frame, 0.0, WIDE, &state, &mut instances);
+            let exact = tiles(&rasterise(&instances));
+            let estimate = tile_estimate(&instances, rainbow);
+            for (exact, estimate) in exact.iter().zip(estimate) {
+                level = level.max((exact - estimate).abs());
+            }
+            if let Some((last_exact, last_estimate)) = last.take() {
+                for tile in 0..TILES_X * TILES_Y {
+                    let exact: f32 = exact[tile] - last_exact[tile];
+                    let estimate: f32 = estimate[tile] - last_estimate[tile];
+                    change = change.max((exact - estimate).abs());
+                }
+            } else {
+                last = Some((exact, estimate));
+            }
+        }
+    }
+    assert!(level < 0.02, "level {level}");
+    assert!(change < 0.02, "change {change}");
+}
+
+#[test]
+fn beat_synced_instances_are_deterministic() {
+    let profile = RenderProfile::m1();
+    let render = || {
+        let mut state = SceneState::default();
+        let mut bytes = Vec::new();
+        for index in 0..1400 {
+            let frame = ControlFrame {
+                beat_count: (index / 30) as u16,
+                ..ControlFrame::procedural(index)
+            };
+            state.observe(&frame);
+            if index % 50 == 0 {
+                let mut instances = Vec::new();
+                build(&profile, frame, 0.0, WIDE, &state, &mut instances);
+                bytes.extend_from_slice(bytemuck::cast_slice::<Instance, u8>(&instances));
+            }
+        }
+        bytes
+    };
+    assert_eq!(render(), render());
 }

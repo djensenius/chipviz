@@ -9,32 +9,78 @@
 //! In "pixel" sections the plane is instead covered by a few strips whose
 //! shader draws hashed noise at every output pixel (`pixel_noise`).
 //!
-//! Timing follows the monotonic `frame` counter like Lines, so the scene is
-//! stateless and captures are reproducible. Every 512 frames (about 8.5 s at
-//! 60 fps) a section starts. Its index picks the content (text, constant,
-//! knot, or pure noise), the style (glyph or pixel noise, alternating every
-//! four sections), the camera move (flat, zoom out, orbit) and the background
+//! A section's index picks the content (text, constant, knot, or pure
+//! noise), the style (glyph or pixel noise, alternating every four
+//! sections), the camera move (flat, zoom out, orbit) and the background
 //! (white every fifth section). Within a section each content cell first
 //! cycles through random glyphs, lands on its target at a random frame in
 //! 160..256, holds, then leaves at a random frame in 400..496 and cycles back
-//! into noise. Beat-synced sections are a follow-up.
+//! into noise.
+//!
+//! Sections follow the beat. [`StaticState`] (`beat.rs`) keeps the schedule
+//! between frames, stepping only on observed frames like Lines, so captures
+//! replayed from frame 0 are reproducible:
+//!
+//! - A section runs its whole 512-frame timeline (about 8.5 s at 60 fps),
+//!   then the next starts on the first bar line, when `beat_count` crosses a
+//!   multiple of 4. Sections are therefore at least 512 frames apart, so the
+//!   white background still cuts in or out at most once per 8.5 s. With
+//!   procedural input (a beat every 16 frames) that is exactly every 512
+//!   frames, as before; at 120 bpm live it is every 600. At slow tempos a
+//!   section waits longer for its bar: at 30 bpm (a bar every 480 frames)
+//!   it can run up to about 480 frames past its 512.
+//! - Every bar line at least 60 frames (1 s) after the last one also
+//!   reframes the camera: it eases over one beat (15 to 30 frames) to the
+//!   next of six framings (head on, either side, closer, from above and
+//!   pulled back), on top of the section's move. Head on comes every other
+//!   bar, so text stays readable.
+//! - In a text section, such a bar during the hold (frames 256 to 364)
+//!   flips the phrase to another language like a split-flap board: each
+//!   cell keeps its old character until its own frame in the next 24, cycles
+//!   random glyphs for 12, then lands on the new phrase, so the change
+//!   spreads over 36 frames and finishes before the dissolve.
+//! - A backward or large jump in `beat_count` (a restart, loop or source
+//!   handover) is no bar. If the counter stalls for 4 s, sections free-run
+//!   every 512 frames and the camera holds its framing.
+//! - Before the state has seen a frame, the schedule is the frame counter's
+//!   (`frame / 512`, head on), and a state joins that schedule on its first
+//!   frame.
+//!
+//! Two sets of recorded golden fingerprints in `tests.rs` cover the two
+//! paths: `instances_match_recorded_golden` builds each frame before any
+//! frame is observed (the frame-timed path, unchanged from before beat
+//! sync), and `observed_instances_match_recorded_golden` replays from frame
+//! 0 through an observed state, as the renderer and `chipviz-capture` do,
+//! with procedural and live-like beats (the beat-synced path, including a
+//! reframe and a flip under way).
+//!
+//! Flash safety: the beat changes only geometry and characters, never the
+//! background or brightness, and every change eases or staggers over at
+//! least 15 frames. `beat_changes_keep_luminance_flashes_bounded` in
+//! `tests.rs` measures large-area luminance over all eight section types
+//! under procedural, live and racing beats: at most one flash in any
+//! second, under WCAG 2.3.1's three (see its table).
 //!
 //! Audio drives the noise: energy shortens each cell's change period (1 to
 //! 12 frames) and lowers the chance of a blank cell (80% when silent, 20% at
 //! full energy); every beat reshuffles the field. `palette % 4` picks the
 //! colour (0..2 tint the field like the other scenes, 3 is random hues).
 //!
-//! The camera mostly faces the plane head on. Some sections zoom out or orbit
-//! a full turn (passing behind the plane, where text reads mirrored); the
-//! scene projects cell centres on the CPU as Lines does.
+//! The camera mostly faces the plane head on, reframed on bars as above.
+//! Some sections zoom out or orbit a full turn (passing behind the plane,
+//! where text reads mirrored); the scene projects cell centres on the CPU as
+//! Lines does.
 
+mod beat;
 pub(super) mod font;
 mod text;
 
-use super::{CameraMode, SceneBuild, SceneEntry, palette, sin_cos};
+use super::{CameraMode, SceneBuild, SceneEntry, SceneState, palette, sin_cos};
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
 use crate::scene::Instance;
+pub use beat::StaticState;
+use beat::{Clock, FLIP_CYCLE, FLIP_SPREAD, Framing, REST};
 use font::{ALPHABET, FULL, glyph};
 use std::f32::consts::{PI, TAU};
 use text::{Embedded, TextSource};
@@ -42,7 +88,7 @@ use text::{Embedded, TextSource};
 pub const ENTRY: SceneEntry = SceneEntry {
     name: "Static",
     camera: CameraMode::ScreenSpace,
-    build: SceneBuild::Stateless(build),
+    build: SceneBuild::Stateful(build),
 };
 
 /// Divides the u16 frame counter's wrap.
@@ -51,7 +97,6 @@ const SECTION_FRAMES: u16 = 512;
 const RESOLVE_START: u16 = 160;
 const SPREAD: u16 = 96;
 /// Every content cell has landed from here until `DISSOLVE_START`.
-#[cfg(test)]
 const HOLD_START: u16 = RESOLVE_START + SPREAD;
 /// Cells leave their target at a random frame in `DISSOLVE_START..+SPREAD`.
 const DISSOLVE_START: u16 = 400;
@@ -77,6 +122,9 @@ const FOCAL: f32 = 1.732_050_8;
 const SCENE_MIX: f32 = 4.0;
 /// Largest font-pixel block, in cells, for resolved text.
 const MAX_SCALE: usize = 3;
+/// Each text flip moves this many phrases on (coprime with the 18 embedded
+/// phrases, so flips visit them all).
+const FLIP_STRIDE: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Content {
@@ -107,14 +155,23 @@ struct Section {
     style: Style,
     camera: Move,
     white: bool,
+    /// Text flips so far, and the `local` frame the last one started.
+    flips: u16,
+    flip_at: u16,
 }
 
+/// The frame-timed section for `frame` (the clock before any frame is seen).
+#[cfg(test)]
 fn section(frame: ControlFrame) -> Section {
-    let index = frame.frame / SECTION_FRAMES;
+    section_at(Clock::frame_timed(frame))
+}
+
+fn section_at(clock: Clock) -> Section {
+    let index = clock.index;
     let cycle = usize::from(index / 4);
     Section {
         index,
-        local: frame.frame % SECTION_FRAMES,
+        local: clock.local,
         content: match index % 4 {
             0 => Content::Text(cycle),
             1 => Content::Constant(cycle),
@@ -132,6 +189,19 @@ fn section(frame: ControlFrame) -> Section {
             _ => Move::Orbit,
         },
         white: index % 5 == 4,
+        flips: clock.flips,
+        flip_at: clock.flip_at,
+    }
+}
+
+impl Section {
+    /// While a text flip is animating, the section as it was before it.
+    fn before_flip(self) -> Option<Self> {
+        let animating = self.local < self.flip_at + FLIP_SPREAD + FLIP_CYCLE;
+        (self.flips > 0 && animating).then(|| Self {
+            flips: self.flips - 1,
+            ..self
+        })
     }
 }
 
@@ -170,7 +240,10 @@ fn target(section: Section, grid: Grid, source: &dyn TextSource) -> Vec<Option<c
     match section.content {
         Content::Noise => vec![None; grid.len()],
         Content::Text(_) if source.len() == 0 => vec![None; grid.len()],
-        Content::Text(index) => lay_out(&[source.phrase(index)], grid),
+        Content::Text(cycle) => {
+            let index = cycle + usize::from(section.flips) * FLIP_STRIDE;
+            lay_out(&[source.phrase(index)], grid)
+        }
         Content::Constant(index) => {
             let [name, value] = text::constant(index);
             lay_out(&[name.as_str(), value.as_str()], grid)
@@ -338,30 +411,53 @@ impl Noise {
     }
 }
 
-fn cell(index: usize, target: Option<char>, section: Section, noise: Noise) -> Cell {
+/// Cell `index` of `section`. `before` is its target before the latest
+/// text flip, while that flip is animating (see [`Section::before_flip`]).
+fn cell(
+    index: usize,
+    target: Option<char>,
+    before: Option<Option<char>>,
+    section: Section,
+    noise: Noise,
+) -> Cell {
     let seed = mix(index as u32 ^ mix(u32::from(section.index)));
     let land = RESOLVE_START + (unit(mix(seed ^ 1)) * f32::from(SPREAD)) as u16;
     let leave = DISSOLVE_START + (unit(mix(seed ^ 2)) * f32::from(SPREAD)) as u16;
     let local = section.local;
     let active = section.content != Content::Noise;
-    if active && (land..leave).contains(&local) {
-        return match target {
-            Some(character) => Cell {
-                glyph: glyph_or_noise(character),
-                role: Role::Target,
-                tone: seed,
-            },
-            None => blank(seed),
-        };
-    }
-    if active && target.is_some() && local + CYCLE_FRAMES >= land && local < leave + CYCLE_FRAMES {
-        // A fresh random glyph every other frame until it lands.
+    let landed = |target: Option<char>| match target {
+        Some(character) => Cell {
+            glyph: glyph_or_noise(character),
+            role: Role::Target,
+            tone: seed,
+        },
+        None => blank(seed),
+    };
+    // A fresh random glyph every other frame until it lands.
+    let cycling = || {
         let pick = mix(seed ^ mix(u32::from(local / 2) + 3));
-        return Cell {
+        Cell {
             glyph: glyph_or_noise(ALPHABET[pick as usize % ALPHABET.len()]),
             role: Role::Cycling,
             tone: pick,
-        };
+        }
+    };
+    if active && (land..leave).contains(&local) {
+        // A flip works like a split-flap board: each cell keeps its old
+        // character until its own staggered switch, cycles, then lands.
+        if let Some(before) = before.filter(|&before| before != target) {
+            let switch = section.flip_at + (unit(mix(seed ^ 3)) * f32::from(FLIP_SPREAD)) as u16;
+            if local < switch {
+                return landed(before);
+            }
+            if local < switch + FLIP_CYCLE {
+                return cycling();
+            }
+        }
+        return landed(target);
+    }
+    if active && target.is_some() && local + CYCLE_FRAMES >= land && local < leave + CYCLE_FRAMES {
+        return cycling();
     }
     match section.style {
         Style::Pixels => blank(seed),
@@ -510,27 +606,44 @@ impl View {
     }
 }
 
+/// The section's camera pose with a bar framing on top. Head on adds
+/// nothing, so the frame-timed schedule's poses are unchanged bit for bit.
+fn framed(pose: (f32, f32, f32), framing: Framing) -> (f32, f32, f32) {
+    if framing == REST {
+        return pose;
+    }
+    let (yaw, pitch, distance) = pose;
+    (
+        yaw + framing.yaw,
+        pitch + framing.pitch,
+        distance * framing.zoom,
+    )
+}
+
 fn build(
     profile: &RenderProfile,
     frame: ControlFrame,
     _elapsed: f32,
     aspect: f32,
+    state: &SceneState,
     instances: &mut Vec<Instance>,
 ) {
-    build_with(profile, frame, aspect, &Embedded, instances);
+    let clock = state.static_noise.clock(frame);
+    build_with(profile, frame, aspect, clock, &Embedded, instances);
 }
 
 fn build_with(
     profile: &RenderProfile,
     frame: ControlFrame,
     aspect: f32,
+    clock: Clock,
     source: &dyn TextSource,
     instances: &mut Vec<Instance>,
 ) {
     let aspect = aspect.max(0.01);
-    let section = section(frame);
+    let section = section_at(clock);
     let grid = Grid::new(profile, aspect);
-    let view = View::new(camera_pose(section), aspect);
+    let view = View::new(framed(camera_pose(section), clock.framing), aspect);
     let noise = Noise::new(frame);
     let energy = f32::from(frame.energy) / 255.0;
     let rainbow = frame.palette % 4 == 3;
@@ -574,8 +687,12 @@ fn build_with(
         }
     }
     let targets = target(section, grid, source);
+    let before = section
+        .before_flip()
+        .map(|before| target(before, grid, source));
     for (index, &target) in targets.iter().enumerate() {
-        let cell = cell(index, target, section, noise);
+        let before = before.as_ref().map(|before| before[index]);
+        let cell = cell(index, target, before, section, noise);
         if cell.glyph == 0 {
             continue;
         }

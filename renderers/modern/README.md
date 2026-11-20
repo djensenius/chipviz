@@ -385,8 +385,8 @@ the colour field, whatever the registry length; every other byte selects
   1 to 12 frames, faster when loud) and the chance of "nothing" (blank cells,
   80% when quiet down to 20% when loud); each beat reshuffles the field.
   Palettes 0 to 2 tint the field, palette 3 uses random hues, and every fifth
-  section swaps to a white background with inverted colours. Every 512 control
-  frames a section resolves into content and dissolves back: an embedded
+  section swaps to a white background with inverted colours. Each section
+  resolves into content and dissolves back over 512 control frames: an embedded
   multilingual phrase, a constant (π, e, φ or √2 to 15 places), or a rotating
   3D torus knot traced in the digits of its own coordinates. Cells cycle
   through random glyphs for 40 frames before landing (frames 160 to 256 of a
@@ -395,17 +395,41 @@ the colour field, whatever the registry length; every other byte selects
   the fragment shader gives each screen pixel its own value. Within a section
   the camera stays flat, slowly zooms out and tilts, or orbits once around the
   plane, showing mirrored text from behind; it is projected on the CPU, so the
-  scene uses `ScreenSpace`. Procedural input never selects it; use
+  scene uses `ScreenSpace`. Sections follow the beat: the scene keeps its
+  schedule between frames, and once a section's 512 frames have run the next
+  starts on the first bar line (`beat_count` crossing a multiple of 4), so
+  sections stay at least 512 frames apart (every 600 at 120 bpm live; at
+  slow tempos, about 30 bpm, a section can run up to about 480 extra frames
+  while it waits for a bar). Every
+  bar line at least 60 frames after the last one reframes the camera, easing
+  over one beat (15 to 30 frames) to the next of six framings (head on every
+  other bar, either side, closer, from above, pulled back). In a text
+  section, such a bar during the hold flips the phrase to another language
+  like a split-flap board: cells switch at staggered frames over 24 frames,
+  cycle for 12, then land. Backward or large `beat_count` jumps are not bars;
+  if the counter stalls for 4 s, sections free-run every 512 frames. Before
+  any frame is observed the schedule is the frame counter's (`frame / 512`,
+  head on), and a state joins it on its first frame, so with procedural
+  input sections start on the same frames as before. Flash safety: beats
+  change only geometry and characters, never the background or brightness,
+  and each change eases or staggers over at least 15 frames; a CPU luminance
+  test over all eight section types, up to racing beats, finds at most one
+  flash in any second. Recorded golden fingerprints cover both the
+  frame-timed path (frames built before any is observed) and the
+  beat-synced replay from frame 0 that the renderer and captures use.
+  Procedural input never selects it; use
   `--scene 4` (frames 100, 200 and 300 show glyph noise, a mid-transition and
   resolved text; 3604 shows pixel noise, 4908 a constant on white, 3422 the
-  knot and 4366 the orbit).
+  knot and 4366 the orbit; captures replay from frame 0, so these are the
+  beat-synced frames, reframed on bars).
   Limitations: the text is a small embedded phrase list written for chipviz,
   with no live headlines yet (a `TextSource` trait is the seam for them); the
   glyphs are a hand-drawn 5x8 uppercase font covering Latin with accents
   (one-row accents, no cedilla), Greek, Cyrillic, digits and some symbols, and
   characters it lacks (CJK, emoji) render as glyph-like noise. One quad draws
   each cell, so glyph density is limited by the instance budget (about 208x78
-  cells on `m1`, 104x39 on `pi5`). Sections are frame-timed, not beat-synced.
+  cells on `m1`, 104x39 on `pi5`). The glyph grid density does not change
+  with the beat.
 - `Object`: an object in space, presented like a 1980s/90s infomercial or
   camcorder tape. Eleven original procedural models (a CRT television, a VHS
   tape, a CD with a rainbow sheen, a sunglasses-wearing sun, a tree, a beige
