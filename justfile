@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py scripts/c64_colour_field_capture.py cores/sms/homebrew/field_assets.py tests/test_sms_field_assets.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/sms_procedural_test.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py cores/sms/homebrew/field_assets.py tests/test_sms_field_assets.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/sms_procedural_test.py"
 
 default:
     just --list
@@ -111,7 +111,12 @@ simulate: build-sim
 sms-procedural-test:
     @${PYTHON:-python3} tests/sms_procedural_test.py ${CC:-cc} {{ cflags }}
 
-c-test: sms-procedural-test
+scene-catalog-v1-c-test:
+    @mkdir -p build/tests
+    @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_tests.c host/scene_catalog_v1.c -o build/tests/scene_catalog_v1_tests
+    @build/tests/scene_catalog_v1_tests
+
+c-test: sms-procedural-test scene-catalog-v1-c-test
     @mkdir -p build/tests
     @${CC:-cc} {{ cflags }} tests/control_frame_tests.c shared/src/control_frame.c -o build/tests/control_frame_tests
     @${CC:-cc} {{ cflags }} tests/connection_tests.c {{ shared_srcs }} -o build/tests/connection_tests
