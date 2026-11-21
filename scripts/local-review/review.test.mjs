@@ -35,6 +35,7 @@ test('timestamped references only contain validated identity and declared revisi
   assert.match(text, /Declared source revision \(unverified\): b{40}/);
   assert.match(text, /Time: 65 seconds/);
   assert.match(text, /Review-only draft; not human-reviewed\. Do not publish\./);
+  assert.match(text, /Normal-speed human review and safety\/flash assessment remain required\./);
   assert.doesNotMatch(text, /127\.0\.0\.1|capability|\/Users|private\.mp4|token=secret|https?:/);
   assert.match(reference({ ...value, source_revision: null }, 0), /revision \(unverified\): unknown/);
   assert.throws(() => reference({ ...value, id: 'capability' }, 0));
@@ -53,6 +54,8 @@ test('references describe all recognized draft combinations as inferred', () => 
             ? 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware'
             : 'M1 profile rendered on Mac GPU' };
         const text = reference(value, 12);
+        assert.match(text, /Review-only draft; not human-reviewed\. Do not publish\./);
+        assert.match(text, /Normal-speed human review and safety\/flash assessment remain required\./);
         assert.ok(text.includes(`Visualization (inferred): ${family}`));
         assert.ok(text.includes(`Variant (inferred): ${value.variant}`));
         assert.ok(text.includes(`Scenario (inferred): ${scenario}`));
@@ -67,7 +70,7 @@ test('references describe all recognized draft combinations as inferred', () => 
   assert.doesNotMatch(unknownCapture, /Mac GPU/);
   const libraryCapture = reference({ ...clip(), collection: 'library',
     capture: 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware' }, 0);
-  assert.doesNotMatch(libraryCapture, /Mac GPU|Review-only draft|not human-reviewed|Do not publish/);
+  assert.doesNotMatch(libraryCapture, /Mac GPU|Review-only draft|not human-reviewed|Do not publish|safety\/flash/);
   const otherCollection = reference({ ...clip(), collection: 'draft\npassword=secret' }, 0);
   assert.doesNotMatch(otherCollection, /Review-only draft|password=secret/);
 });
@@ -134,6 +137,17 @@ test('arbitrary metadata never leaks through any optional reference field', () =
       }
     }
   }
+});
+
+test('surrogate-escaped catalog labels validate and never enter references', () => {
+  const value = { ...clip(), collection: 'library', title: 'capture-\udcff',
+    family: 'family-\udcff', platform: 'platform-\udcfe', variant: 'variant-\udcff',
+    scenario: 'scenario-\udcff', capture: 'Unknown capture' };
+  assert.equal(validateCatalog({ schema_version: 1, clips: [value] }).clips[0], value);
+  assert.doesNotThrow(() => value.title.toLocaleLowerCase());
+  assert.doesNotThrow(() => value.family.localeCompare('Unknown'));
+  const text = reference(value, 1);
+  assert.doesNotMatch(text, /\udcff|\udcfe|capture-|family-|platform-|variant-|scenario-/);
 });
 
 class Element {

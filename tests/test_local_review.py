@@ -1,3 +1,5 @@
+import errno
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -181,6 +183,56 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual({clip["platform"] for clip in clips}, {"Pi 5 profile", "Mac / M1 profile", "NES"})
         for clip in clips:
             self.assertEqual(clip["capture"], "Unknown capture")
+
+    def test_surrogate_path_identity_and_catalog_are_portable(self):
+        relative = "modern/p\udcfe/ColourField/clip-\udcff.mp4"
+        original_open = gallery.open_file
+
+        def redirected_open(fd, name):
+            return original_open(fd, self.relative if name == relative else name)
+
+        with mock.patch.object(gallery, "scan", return_value=[relative]), \
+                mock.patch.object(gallery, "open_file", side_effect=redirected_open), \
+                mock.patch.object(gallery, "read_small", side_effect=FileNotFoundError(errno.ENOENT, "absent")):
+            catalog, media = gallery.local_catalog({"library": self.fds[0]})
+        clip = catalog["clips"][0]
+        content_hash = hashlib.sha256(b"0123456789").digest()
+        identity = b"library\0modern/p\xfe/ColourField/clip-\xff.mp4\0" + content_hash
+        self.assertEqual(clip["id"], "clip-" + hashlib.sha256(identity).hexdigest()[:20])
+        self.assertEqual(media[clip["id"]][1].encode("utf-8", "surrogateescape"),
+                         b"modern/p\xfe/ColourField/clip-\xff.mp4")
+        rendered = json.dumps(catalog, ensure_ascii=True).encode("utf-8")
+        self.assertEqual(json.loads(rendered)["clips"][0]["title"], "clip-\udcff")
+        self.assertEqual(json.loads(rendered)["clips"][0]["platform"], "p\udcfe")
+        ordinary, _, _ = gallery.digest_file(self.fds[0], self.relative, "library")
+        legacy = b"library\0" + self.relative.encode("utf-8") + b"\0" + content_hash
+        self.assertEqual(ordinary, "clip-" + hashlib.sha256(legacy).hexdigest()[:20])
+        unicode_name = "modern/m1/Lines/caf\u00e9.mp4"
+        self.write(self.root, unicode_name, b"unicode")
+        unicode_id, _, _ = gallery.digest_file(self.fds[0], unicode_name, "library")
+        legacy = b"library\0" + unicode_name.encode("utf-8") + b"\0" + hashlib.sha256(b"unicode").digest()
+        self.assertEqual(unicode_id, "clip-" + hashlib.sha256(legacy).hexdigest()[:20])
+
+    def test_invalid_byte_filename_when_supported_by_filesystem(self):
+        name = b"clip-\xff.mp4"
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fds[0])
+        except OSError as exc:
+            # Some filesystems reject non-UTF-8 names; the portable synthetic case still runs.
+            self.assertIn(exc.errno, (errno.EILSEQ, errno.EINVAL, errno.ENOTSUP))
+            return
+        try:
+            os.write(fd, b"invalid-byte video")
+        finally:
+            os.close(fd)
+        server = self.serve()
+        clips = self.catalog(server)["clips"]
+        clip = next(clip for clip in clips if clip["title"] == "clip-\udcff")
+        self.assertEqual(len(clips), 2)
+        self.assertEqual(self.catalog(server)["clips"], clips)
+        status, headers, data = self.request(server, f"/{server.token}/media/{clip['id']}",
+                                             headers={"Range": "bytes=0-6"})
+        self.assertEqual((status, headers["Content-Range"], data), (206, "bytes 0-6/18", b"invalid"))
 
     def test_scenario_grouping_and_near_misses(self):
         cases = (
@@ -869,6 +921,92 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual(len(clips), 2)
         self.assertNotEqual(next(c for c in clips if c["family"] == "Colour Field")["id"], clip["id"])
         self.assertEqual(self.request(server, path)[0], 404)
+
+    def test_stream_failures_never_append_a_second_response(self):
+        server = self.serve()
+        clip = self.catalog(server)["clips"][0]
+        path = f"/{server.token}/media/{clip['id']}"
+        original_open = gallery.open_file
+        original_send_header = gallery.Handler.send_header
+
+        def raw_request(range_header):
+            request = f"GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{server.server_port}\r\n"
+            if range_header:
+                request += f"Range: {range_header}\r\n"
+            request += "Connection: close\r\n\r\n"
+            with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as conn:
+                conn.sendall(request.encode("ascii"))
+                chunks = []
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            return b"".join(chunks)
+
+        class FailingStream:
+            def __init__(self, stream, eof):
+                self.stream, self.eof, self.reads = stream, eof, 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.stream.close()
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def seek(self, offset):
+                return self.stream.seek(offset)
+
+            def read(self, length):
+                self.reads += 1
+                if self.reads == 1:
+                    return self.stream.read(min(length, 3))
+                if self.eof:
+                    return b""
+                raise OSError("synthetic read failure")
+
+        for range_header, status, expected in ((None, b"200", b"012"), ("bytes=2-8", b"206", b"234")):
+            with self.subTest(range_header=range_header, phase="open"):
+                with mock.patch.object(gallery, "open_file", side_effect=OSError("synthetic open failure")):
+                    raw = raw_request(range_header)
+                self.assertTrue(raw.startswith(b"HTTP/1.0 404 "), raw)
+                self.assertEqual(raw.count(b"HTTP/1.0"), 1)
+
+            def bad_header(handler, key, value):
+                original_send_header(handler, key, value)
+                if key == "Content-Type" and value == "video/mp4":
+                    raise OSError("synthetic buffered header failure")
+
+            with self.subTest(range_header=range_header, phase="buffered headers"):
+                with mock.patch.object(gallery.Handler, "send_header", bad_header):
+                    raw = raw_request(range_header)
+                self.assertTrue(raw.startswith(b"HTTP/1.0 404 "), raw)
+                self.assertEqual(raw.count(b"HTTP/1.0"), 1)
+
+            def partial_headers(handler):
+                handler.wfile.write(handler._headers_buffer[0][:12])
+                raise OSError("synthetic partial header write")
+
+            with self.subTest(range_header=range_header, phase="partial headers"):
+                with mock.patch.object(gallery.Handler, "end_headers", partial_headers):
+                    raw = raw_request(range_header)
+                self.assertEqual(raw, b"HTTP/1.0 " + status)
+
+            for eof in (False, True):
+                with self.subTest(range_header=range_header, phase="body", eof=eof):
+                    def broken_open(fd, name):
+                        return FailingStream(original_open(fd, name), eof)
+
+                    with mock.patch.object(gallery, "open_file", side_effect=broken_open):
+                        raw = raw_request(range_header)
+                    head, separator, body = raw.partition(b"\r\n\r\n")
+                    self.assertTrue(head.startswith(b"HTTP/1.0 " + status + b" "), head)
+                    self.assertEqual(separator, b"\r\n\r\n")
+                    self.assertEqual(body, expected)
+                    self.assertEqual(raw.count(b"HTTP/1.0"), 1)
 
     def test_replacing_catalogued_file_with_symlink_cannot_escape(self):
         outside = self.base / "outside.mp4"

@@ -64,8 +64,9 @@ video. Use **Copy reference** to copy the identity, content hash, declared
 revision and timestamp without a URL, token or file path. Recognized
 visualization, platform, variant and scenario
 labels are included only from a strict allowlist and are marked as inferred;
-draft references also include a fixed review-only, not-human-reviewed,
-do-not-publish warning. Other free-form metadata is omitted. The stable identity
+draft references also include fixed review-only, not-human-reviewed,
+do-not-publish and normal-speed human review and safety/flash assessment
+warnings. Other free-form metadata is omitted. The stable identity
 incorporates the collection, relative name and video bytes; renames or changed
 bytes produce a new identity. A revision from a labelled library README or a draft
 `source_commit` is a declaration, not independent proof. Other labels are

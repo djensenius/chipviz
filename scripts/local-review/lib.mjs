@@ -91,6 +91,7 @@ export function reference(clip, seconds) {
   }
   if (clip.collection === 'draft') {
     context.push('Review-only draft; not human-reviewed. Do not publish.');
+    context.push('Normal-speed human review and safety/flash assessment remain required.');
   }
   return [...context, `Clip ID: ${clip.id}`, `SHA-256: ${clip.sha256}`,
     `Declared source revision (unverified): ${clip.source_revision || 'unknown'}`,

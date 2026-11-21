@@ -126,7 +126,7 @@ def digest_file(root_fd, relative, namespace, budget=None):
         if before != fingerprint(os.fstat(stream.fileno())):
             raise ValueError("file changed while hashing")
     raw = digest.digest()
-    identity = namespace.encode() + b"\0" + relative.encode("utf-8") + b"\0" + raw
+    identity = namespace.encode() + b"\0" + relative.encode("utf-8", "surrogateescape") + b"\0" + raw
     return "clip-" + hashlib.sha256(identity).hexdigest()[:20], raw.hex(), before
 
 
@@ -502,6 +502,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
         for key, value in extra:
             self.send_header(key, value)
+        # end_headers may write a partial header before raising.
+        self.response_started = True
         self.end_headers()
 
     def fail(self, status=404, extra=()):
@@ -514,6 +516,7 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(True)
 
     def respond(self, body):
+        self.response_started = False
         try:
             if self.headers.get_all("Host") != [f"127.0.0.1:{self.server.server_port}"]:
                 return self.fail()
@@ -599,11 +602,15 @@ class Handler(BaseHTTPRequestHandler):
                     while length:
                         chunk = stream.read(min(length, 1024 * 1024))
                         if not chunk:
-                            break
+                            raise OSError("file truncated while streaming")
                         self.wfile.write(chunk)
                         length -= len(chunk)
         except (OSError, ValueError, UnicodeError, RecursionError):
-            self.fail()
+            if self.response_started:
+                self.close_connection = True
+            else:
+                self._headers_buffer = []
+                self.fail()
 
 
 def main():
