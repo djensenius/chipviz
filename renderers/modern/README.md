@@ -54,6 +54,24 @@ With UDP, it consumes `control-frame-v0` packets from the host bridge:
 python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
 ```
 
+### Experimental DMG preview
+
+For development only, `just modern-m1 -- --dmg-preview` or
+`just modern-pi5 -- --dmg-preview` opens a self-running DMG Tile Scroll
+preview. It is not audio reactive and is not a catalog or wire scene. Only
+`--fullscreen` and `--monitor` may accompany it; live UDP, microphone,
+listing, scene and overlay options are rejected, and `L` and `M` do nothing.
+No live inputs are opened. The native LCD is integer-scaled where it fits;
+smaller windows use fractional scaling.
+
+The first successfully acquired surface ticks the model once; subsequent
+ticks use the monotonic DMG VBlank period (70,224 / 4,194,304 seconds), not
+redraw counts. Failed acquisitions and zero-sized windows do not tick; on
+resume, at most one tick runs and missed intervals are dropped. Resize does
+not reset the clock. Submission and `present()` do not prove display timing.
+This preview has not had physical Pi validation or visual-safety certification;
+presented-output flash assessment and normal-speed human review remain needed.
+
 ## Controls
 
 The renderer starts windowed by default.

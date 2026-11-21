@@ -7,6 +7,7 @@ use winit::dpi::PhysicalSize;
 
 use crate::audio::scope::ScopeSnapshot;
 use crate::control_frame::ControlFrame;
+use crate::dmg_preview::{DmgPreview, acquired_dmg_frame};
 use crate::phosphor;
 use crate::profile::RenderProfile;
 use crate::scene::{
@@ -75,6 +76,7 @@ pub struct Renderer {
     /// timestamp is sampled after `present()` returns, not by the caller
     /// before surface acquisition.
     presentation_clock: Instant,
+    dmg_preview: Option<scenes::dmg_tile_scroll_render::DmgTileRenderer>,
 }
 
 /// Shared live observation path, independent of GPU presentation.
@@ -1062,6 +1064,7 @@ impl Renderer {
             config,
             pipeline,
             presentation_clock: Instant::now(),
+            dmg_preview: None,
         })
     }
 
@@ -1077,6 +1080,38 @@ impl Renderer {
 
     pub fn pipeline_mut(&mut self) -> &mut ScenePipeline {
         &mut self.pipeline
+    }
+
+    pub(crate) fn enable_dmg_preview(&mut self) {
+        self.dmg_preview = Some(scenes::dmg_tile_scroll_render::DmgTileRenderer::new(
+            &self.pipeline.device,
+            self.config.format,
+        ));
+    }
+
+    /// Acquire before stepping; each upload is submitted before the next encode.
+    pub(crate) fn render_dmg_preview(
+        &mut self,
+        preview: &mut DmgPreview,
+    ) -> Result<(), RendererError> {
+        let (output, display) =
+            acquired_dmg_frame(self.surface.get_current_texture(), preview, Instant::now)?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.pipeline.command_encoder();
+        self.dmg_preview.as_ref().expect("preview enabled").encode(
+            &self.pipeline.queue,
+            &mut encoder,
+            &view,
+            (self.config.width, self.config.height),
+            display,
+        );
+        self.pipeline
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
     }
 
     pub fn resize_to_current_window(&mut self) {
@@ -1305,6 +1340,32 @@ fn size_aspect((width, height): (u32, u32)) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_dmg_acquisition_does_not_start_or_advance_the_model() {
+        let mut preview = DmgPreview::default();
+        let start = Instant::now();
+        let failed = acquired_dmg_frame::<(), _>(Err("lost"), &mut preview, || {
+            panic!("clock must not be sampled on failure")
+        });
+        assert_eq!(failed, Err("lost"));
+        let (_, first) = acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start).unwrap();
+        let failed = acquired_dmg_frame::<(), _>(Err("timeout"), &mut preview, || {
+            panic!("clock must not be sampled on failure")
+        });
+        assert_eq!(failed, Err("timeout"));
+        let (_, held) = acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start).unwrap();
+        assert_eq!(held, first);
+        let (_, next) =
+            acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start + Duration::from_secs(10))
+                .unwrap();
+        assert_eq!(next.scx, 128);
+        assert_eq!(next.scy, 1);
+        let (_, held) =
+            acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start + Duration::from_secs(10))
+                .unwrap();
+        assert_eq!(held, next);
+    }
 
     #[test]
     fn target_size_check_follows_device_limits() {

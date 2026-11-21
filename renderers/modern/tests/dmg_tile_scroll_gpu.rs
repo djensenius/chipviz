@@ -24,9 +24,15 @@
 mod dmg_tile_scroll;
 #[path = "../src/scenes/dmg_tile_scroll_render.rs"]
 mod dmg_tile_scroll_render;
+// Compile the same preview acquisition/clock seam used by the window path.
+use crate as scenes;
+#[path = "../src/dmg_preview.rs"]
+mod dmg_preview;
 
+use dmg_preview::{DmgPreview, acquired_dmg_frame};
 use dmg_tile_scroll::{Display, DmgTileScroll};
 use dmg_tile_scroll_render::DmgTileRenderer;
+use std::time::{Duration, Instant};
 
 // Independently decoded from cores/gb/homebrew/main.asm's Tiles: each ASCII
 // digit is a DMG colour number in left-to-right order, not a byte plane or a
@@ -341,6 +347,59 @@ fn directional_diagnostic_counts_thresholds_and_cyclic_windows() {
     transitions[1] = (0, 26);
     transitions[2] = (25, 25); // exactly 25% is not greater than 25%
     assert_eq!(max_large_transitions(&transitions, 100), (1, 1, 2));
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn preview_acquisition_clock_and_offscreen_renderer_match_native_oracle() {
+    let gpu = Offscreen::new();
+    for format in [
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ] {
+        let renderer = DmgTileRenderer::new(&gpu.device, format);
+        let start = Instant::now();
+        let mut preview = DmgPreview::default();
+        // Simulate acquisition: failure must not sample time, and neither a
+        // repeated redraw nor a long stall replays missed model steps.
+        assert_eq!(
+            acquired_dmg_frame::<(), _>(Err("lost"), &mut preview, || {
+                panic!("failed acquisition sampled time")
+            }),
+            Err("lost")
+        );
+        for (elapsed, step, size, scale) in [
+            (Duration::ZERO, 0, (160, 144), 1),
+            (Duration::from_nanos(16_742_706), 0, (320, 288), 2),
+            (Duration::from_nanos(16_742_707), 1, (160, 144), 1),
+            (Duration::from_secs(10), 2, (320, 288), 2),
+            (Duration::from_secs(10), 2, (160, 144), 1),
+        ] {
+            let (_, display) =
+                acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start + elapsed).unwrap();
+            let rgba = gpu.render(&renderer, format, size, display, false);
+            let example = cycle_example(step);
+            for y in 0..size.1 {
+                for x in 0..size.0 {
+                    let expected = expected_pixel(example, x / scale, y / scale);
+                    let offset = ((y * size.0 + x) * 4) as usize;
+                    let pixel = &rgba[offset..offset + 4];
+                    let tolerance = if expected == 0 || expected == 255 {
+                        0
+                    } else {
+                        1
+                    };
+                    for &channel in &pixel[..3] {
+                        assert!(
+                            channel.abs_diff(expected) <= tolerance,
+                            "{format:?} step={step} size={size:?} ({x},{y}) expected {expected}, got {pixel:?}"
+                        );
+                    }
+                    assert_eq!(pixel[3], 255);
+                }
+            }
+        }
+    }
 }
 
 #[test]

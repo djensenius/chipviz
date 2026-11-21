@@ -17,6 +17,12 @@
 //! other bytes retain their original mapping.
 
 pub mod colour_field;
+#[expect(
+    dead_code,
+    reason = "standalone parity fixtures use the model inspection API"
+)]
+pub(crate) mod dmg_tile_scroll;
+pub(crate) mod dmg_tile_scroll_render;
 mod lines;
 pub mod mic_layers;
 mod object;

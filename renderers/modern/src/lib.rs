@@ -3,6 +3,7 @@ mod audio;
 pub mod capture;
 pub mod catalog_v1;
 mod control_frame;
+mod dmg_preview;
 mod phosphor;
 mod profile;
 mod renderer;

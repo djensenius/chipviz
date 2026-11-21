@@ -11,6 +11,7 @@ use winit::window::{Fullscreen, Window, WindowBuilder};
 
 use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
+use crate::dmg_preview::DmgPreview;
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
 use crate::scenes::{SceneConfig, TunnelVariant, colour_field, mic_layers, starfield};
@@ -121,6 +122,10 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         }
         None => None,
     };
+
+    if args.dmg_preview {
+        return run_dmg_preview(profile, &args, event_loop, target_monitor);
+    }
 
     if args.allow_flash {
         eprintln!("{}", colour_field::allow_flash_notice());
@@ -289,6 +294,84 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     Ok(())
 }
 
+fn run_dmg_preview(
+    profile: RenderProfile,
+    args: &AppArgs,
+    event_loop: EventLoop<()>,
+    target_monitor: Option<MonitorHandle>,
+) -> Result<(), AppError> {
+    eprintln!(
+        "Experimental DMG preview: not audio reactive; presented-output safety and physical Pi behavior are unvalidated."
+    );
+    let mut builder = WindowBuilder::new()
+        .with_title(profile.window_title)
+        .with_inner_size(LogicalSize::new(
+            profile.target_width,
+            profile.target_height,
+        ));
+    if let Some(monitor) = &target_monitor {
+        builder = builder.with_position(monitor.position());
+    }
+    if args.fullscreen {
+        builder = builder.with_fullscreen(Some(Fullscreen::Borderless(
+            target_monitor.or_else(|| event_loop.primary_monitor()),
+        )));
+    }
+    let window = Arc::new(builder.build(&event_loop)?);
+    window.set_cursor_visible(cursor_visible(args.fullscreen));
+    let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
+    renderer.enable_dmg_preview();
+    let mut preview = DmgPreview::default();
+    let size = window.inner_size();
+    let mut drawable = preview_drawable(size.width, size.height);
+    let mut modifiers = ModifiersState::empty();
+    event_loop.run(move |event, target| match event {
+        Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
+            WindowEvent::CloseRequested => target.exit(),
+            WindowEvent::Resized(size) => {
+                window.set_cursor_visible(cursor_visible(window.fullscreen().is_some()));
+                drawable = preview_drawable(size.width, size.height);
+                renderer.resize(size.width, size.height);
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => modifiers = new_modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                let input = KeyInput::from_winit(&event.logical_key, event.physical_key);
+                let mods = KeyModifiers {
+                    command: modifiers.super_key(),
+                    control: modifiers.control_key(),
+                    alt: modifiers.alt_key(),
+                };
+                let fullscreen = window.fullscreen().is_some();
+                match preview_key_action(input, mods, fullscreen) {
+                    Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
+                    Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
+                    _ => {}
+                }
+            }
+            WindowEvent::RedrawRequested if drawable => {
+                match renderer.render_dmg_preview(&mut preview) {
+                    Ok(()) => {}
+                    Err(RendererError::Surface(
+                        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
+                    )) => renderer.resize_to_current_window(),
+                    Err(RendererError::Surface(wgpu::SurfaceError::OutOfMemory)) => target.exit(),
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+            _ => {}
+        },
+        Event::AboutToWait => window.request_redraw(),
+        _ => {}
+    })?;
+    Ok(())
+}
+
+fn preview_drawable(width: u32, height: u32) -> bool {
+    width != 0 && height != 0
+}
+
 fn set_fullscreen(window: &Window, fullscreen: bool) {
     if fullscreen {
         window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
@@ -325,12 +408,15 @@ fn system_utc_seconds() -> f64 {
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
+       [--dmg-preview]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
        [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
        [--scene N]
        {program} --list-monitors | --list-audio-devices
 
 Options:
+  --dmg-preview           experimental self-running DMG preview; no audio or overlays,
+                          incompatible with source and scene options
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
   --star-catalog PATH     HYG-compatible star CSV for scene 6 (not bundled)
   --catalog FILE          alias for --star-catalog
@@ -540,6 +626,13 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
     }
 }
 
+fn preview_key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
+    match key_action(input, mods, fullscreen) {
+        action @ (Some(KeyAction::ToggleFullscreen) | Some(KeyAction::ExitFullscreen)) => action,
+        _ => None,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ArgsCommand {
     Run(AppArgs),
@@ -548,6 +641,7 @@ enum ArgsCommand {
 
 #[derive(Debug, Default, PartialEq)]
 struct AppArgs {
+    dmg_preview: bool,
     udp_endpoint: Option<String>,
     fullscreen: bool,
     monitor: Option<DeviceSelector>,
@@ -623,11 +717,34 @@ impl AppArgs {
     fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<ArgsCommand, AppError> {
         let mut parsed = Self::default();
         let mut args = args.into_iter();
+        let mut preview_conflict = None;
 
         let mut first = true;
         while let Some(arg) = args.next() {
             let is_first = std::mem::replace(&mut first, false);
+            if matches!(
+                arg.as_str(),
+                "--udp"
+                    | "--mic"
+                    | "--audio-device"
+                    | "--list-audio-devices"
+                    | "--list-monitors"
+                    | "--mic-layers"
+                    | "--scene"
+                    | "--layout"
+                    | "--allow-flash"
+                    | "--lines-drop-cuts"
+                    | "--tunnel-variant"
+                    | "--catalog"
+                    | "--star-catalog"
+                    | "--location"
+                    | "--time"
+            ) && preview_conflict.is_none()
+            {
+                preview_conflict = Some(arg.clone());
+            }
             match arg.as_str() {
+                "--dmg-preview" => parsed.dmg_preview = true,
                 "--udp" => {
                     parsed.udp_endpoint =
                         Some(required_value(&mut args, "--udp", "LISTEN_ADDR:PORT")?)
@@ -705,6 +822,13 @@ impl AppArgs {
             }
         }
 
+        if parsed.dmg_preview
+            && let Some(conflict) = preview_conflict
+        {
+            return Err(invalid_input(format!(
+                "--dmg-preview cannot be combined with {conflict}"
+            )));
+        }
         if parsed.audio_device.is_some() && !parsed.mic && !parsed.list_audio_devices {
             return Err(invalid_input("--audio-device requires --mic".to_string()));
         }
@@ -1073,6 +1197,95 @@ mod tests {
         assert_eq!(parse_run(&[]), AppArgs::default());
         assert!(!AppArgs::default().fullscreen);
         assert_eq!(AppArgs::default().scene, None);
+    }
+
+    #[test]
+    fn preview_rejects_explicit_source_scene_and_overlay_options_in_either_order() {
+        let conflicts: &[&[&str]] = &[
+            &["--udp", "127.0.0.1:6464"],
+            &["--mic"],
+            &["--audio-device", "0"],
+            &["--list-audio-devices"],
+            &["--list-monitors"],
+            &["--mic-layers", "off"],
+            &["--mic-layers", "both"],
+            &["--scene", "7"],
+            &["--scene", "6"],
+            &["--layout", "auto"],
+            &["--allow-flash"],
+            &["--lines-drop-cuts"],
+            &["--tunnel-variant", "original"],
+            &["--catalog", "stars.csv"],
+            &["--star-catalog", "stars.csv"],
+            &["--location", "0,0"],
+            &["--time", "0"],
+        ];
+        for conflict in conflicts {
+            for preview_first in [true, false] {
+                let mut args = conflict.to_vec();
+                if preview_first {
+                    args.insert(0, "--dmg-preview");
+                } else {
+                    args.push("--dmg-preview");
+                }
+                let error = parse(&args).unwrap_err().to_string();
+                assert!(
+                    error.contains("--dmg-preview cannot be combined with"),
+                    "{error}"
+                );
+                assert!(error.contains(conflict[0]), "{error}");
+            }
+        }
+        let args = parse_run(&["--dmg-preview", "--fullscreen", "--monitor", "1"]);
+        assert!(args.dmg_preview);
+        assert!(!args.mic);
+        assert!(args.udp_endpoint.is_none());
+    }
+
+    #[test]
+    fn preview_keys_cannot_toggle_overlays_or_layout_and_legacy_keys_are_unchanged() {
+        let mods = KeyModifiers::default();
+        for (key, action) in [
+            ('m', KeyAction::CycleMicLayers),
+            ('l', KeyAction::CycleLayoutPin),
+        ] {
+            assert_eq!(
+                key_action(KeyInput::Character(key), mods, false),
+                Some(action)
+            );
+            assert_eq!(
+                preview_key_action(KeyInput::Character(key), mods, false),
+                None
+            );
+        }
+        assert_eq!(
+            preview_key_action(KeyInput::Character('f'), mods, false),
+            Some(KeyAction::ToggleFullscreen)
+        );
+        assert_eq!(
+            preview_key_action(KeyInput::Escape, mods, true),
+            Some(KeyAction::ExitFullscreen)
+        );
+        assert!(
+            !parse_run(&["--udp", "127.0.0.1:6464", "--mic", "--mic-layers", "both"]).dmg_preview
+        );
+        assert_eq!(parse_run(&["--scene", "7"]).scene, Some(7));
+    }
+
+    #[test]
+    fn preview_zero_size_skips_acquisition_and_resize_keeps_clock() {
+        let start = Instant::now();
+        let mut preview = DmgPreview::default();
+        let mut frame = None;
+        for (size, millis) in [((160, 144), 0), ((0, 144), 100), ((320, 288), 200)] {
+            if preview_drawable(size.0, size.1) {
+                frame = Some(preview.acquired(start + Duration::from_millis(millis)));
+            }
+        }
+        let frame = frame.unwrap();
+        assert_eq!((frame.scx, frame.scy), (128, 1));
+        assert!(!preview_drawable(160, 0));
+        assert_eq!(preview.acquired(start + Duration::from_millis(200)), frame);
     }
 
     #[test]
