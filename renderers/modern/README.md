@@ -858,6 +858,8 @@ treats `--house` in a value position as a literal, not a selection: for example,
 `--out --house` names an output path. Select House with a standalone flag, as in
 `--out shots --house`. Once selected, recognized options cannot be used as
 values; prefix a literal path with `./` (for example `--house --out ./--house`).
+Live catalog paths and device selectors likewise retain `--house` as a value
+unless a separate House flag is present.
 Without a standalone House flag, legacy `--house` and `--dmg-preview` path
 values remain valid even with `--exclusive-output` or `--catalog-v1`;
 `--dmg-preview` is not a capture flag. Other strict option-value checks remain

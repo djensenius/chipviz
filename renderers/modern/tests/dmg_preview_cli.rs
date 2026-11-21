@@ -50,3 +50,62 @@ fn conflicting_preview_and_house_exit_before_display_or_capture_setup() {
         }
     }
 }
+
+#[test]
+fn live_literal_house_catalog_and_selector_allow_help() {
+    for binary in [
+        env!("CARGO_BIN_EXE_chipviz-m1"),
+        env!("CARGO_BIN_EXE_chipviz-pi5"),
+    ] {
+        for args in [
+            &[
+                "--star-catalog",
+                "--house",
+                "--location",
+                "0,0",
+                "--scene",
+                "6",
+                "--help",
+            ][..],
+            &[
+                "--catalog",
+                "--house",
+                "--location",
+                "0,0",
+                "--scene",
+                "6",
+                "--help",
+            ][..],
+            &["--monitor", "--house", "--help"][..],
+        ] {
+            let output = std::process::Command::new(binary)
+                .args(args)
+                .output()
+                .expect("run renderer help");
+            assert!(output.status.success(), "{binary} {args:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("usage:"),
+                "{binary} {args:?}: {output:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "dmg-preview", feature = "unmeasured-flash"))]
+#[test]
+fn combined_features_allow_preview_help() {
+    for binary in [
+        env!("CARGO_BIN_EXE_chipviz-m1"),
+        env!("CARGO_BIN_EXE_chipviz-pi5"),
+    ] {
+        let output = std::process::Command::new(binary)
+            .args(["--dmg-preview", "--help"])
+            .output()
+            .expect("run preview help");
+        assert!(output.status.success(), "{binary}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("usage:"),
+            "{binary}: {output:?}"
+        );
+    }
+}
