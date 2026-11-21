@@ -1,8 +1,17 @@
 import contextlib
 import io
+import logging
+import sys
 import unittest
 from unittest import mock
 
+import google.auth.credentials
+import google.auth.exceptions
+from google.auth.transport.requests import AuthorizedSession
+import requests
+from requests.adapters import HTTPAdapter
+
+from scripts import youtube_auth
 from scripts import youtube_transport as transport
 
 
@@ -27,6 +36,8 @@ class Response:
 
 
 class Session:
+  __youtube_transport_test_double__ = True
+
   def __init__(self, *responses):
     self.responses = list(responses)
     self.calls = []
@@ -135,10 +146,11 @@ class YouTubeTransportTests(unittest.TestCase):
                      Session(Response(308, {"Range": f"bytes=0-{UNIT}"})),
                      URI, UNIT + 1, 0, b"x" * UNIT)
     for body in (None, {}, {"id": "too-short"}, {"id": "abcdefgh!12"},
-                 {"id": 123}, ValueError(URI)):
+                 {"id": 123}, ValueError(URI), RuntimeError(URI)):
       with self.subTest(body=body):
-        self.assert_kind("uncertain", transport.query_status,
-                         Session(Response(200, body=body)), URI, 10)
+        error = self.assert_kind("uncertain", transport.query_status,
+                                 Session(Response(200, body=body)), URI, 10)
+        self.assertIsNone(error.__context__)
     self.assert_kind("uncertain", transport.upload_chunk,
                      Session(Response(200, body={"id": VIDEO_ID})), URI, UNIT + 1, 0,
                      b"x" * UNIT)
@@ -210,6 +222,11 @@ class YouTubeTransportTests(unittest.TestCase):
           function(*args)
     self.assertEqual(session.calls, [])
 
+  def test_unmarked_duck_session_is_rejected(self):
+    session = mock.Mock()
+    self.assert_kind("uncertain", transport.query_status, session, URI, 1)
+    session.put.assert_not_called()
+
   def test_error_traceback_does_not_expose_underlying_exception(self):
     session = Session(RuntimeError("token and " + URI))
     with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
@@ -220,6 +237,167 @@ class YouTubeTransportTests(unittest.TestCase):
         traceback.print_exc()
     self.assertNotIn(URI, stderr.getvalue())
     self.assertNotIn("token", stderr.getvalue())
+
+
+class OfflineCredentials(google.auth.credentials.Credentials):
+  def __init__(self, refresh_error=None):
+    super().__init__()
+    self.token = "synthetic-token" if refresh_error is None else None
+    self.refresh_error = refresh_error
+    self.refreshes = 0
+
+  def refresh(self, request):
+    self.refreshes += 1
+    if self.refresh_error:
+      raise self.refresh_error
+    self.token = "synthetic-token"
+
+
+class OfflineAdapter(HTTPAdapter):
+  def __init__(self, status=308, error=None, response_url=None):
+    super().__init__(max_retries=0)
+    self.status = status
+    self.error = error
+    self.response_url = response_url
+    self.calls = []
+
+  def send(self, request, **kwargs):
+    self.calls.append(request)
+    logging.getLogger("urllib3.connectionpool").debug(
+      'PUT %s Authorization %s', request.url, request.headers.get("Authorization"))
+    print("wire debug " + request.url + " " + request.headers.get("Authorization", ""))
+    print("wire error " + request.url, file=sys.stderr)
+    if self.error:
+      raise self.error
+    response = requests.Response()
+    response.status_code = self.status
+    response.url = self.response_url or request.url
+    response.request = request
+    response._content = b"{}"
+    return response
+
+
+class RealLibraryOfflineTests(unittest.TestCase):
+  def setUp(self):
+    self.credentials = OfflineCredentials()
+    self.session = transport.make_session(self.credentials)
+    self.addCleanup(self.session.close)
+    self.adapter = OfflineAdapter()
+    self.session.mount("https://", self.adapter)
+
+  def test_factory_disables_replays_and_401_is_sent_once(self):
+    self.assertEqual(self.session._max_refresh_attempts, 0)
+    self.assertEqual(self.session.get_adapter(URI).max_retries.total, 0)
+    self.assertEqual(
+      self.session._auth_request_session.get_adapter("https://oauth2.googleapis.com/").max_retries.total,
+      0,
+    )
+    self.adapter.status = 401
+    with self.assertRaises(transport.TransportError) as caught:
+      transport.upload_chunk(self.session, URI, 1, 0, b"x")
+    self.assertEqual(caught.exception.kind, "auth_required")
+    self.assertEqual(len(self.adapter.calls), 1)
+    self.assertEqual(self.credentials.refreshes, 0)
+
+  def test_logging_wire_debug_and_exceptions_never_expose_secrets(self):
+    logged = io.StringIO()
+    handler = logging.StreamHandler(logged)
+    logger = logging.getLogger("urllib3.connectionpool")
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    self.addCleanup(logger.removeHandler, handler)
+    self.addCleanup(logger.setLevel, old_level)
+    original_disable = logging.root.manager.disable
+    output, errors = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+      self.assertEqual(transport.query_status(self.session, URI, 1), (0, None))
+      self.adapter.error = requests.exceptions.ConnectionError("failed " + URI + " synthetic-token")
+      with self.assertRaises(transport.TransportError) as caught:
+        transport.query_status(self.session, URI, 1)
+      import traceback
+      traceback.print_exception(caught.exception)
+    self.assertEqual(caught.exception.kind, "uncertain")
+    self.assertIsNone(caught.exception.__context__)
+    for text in (logged.getvalue(), output.getvalue(), errors.getvalue()):
+      self.assertNotIn("secret-session", text)
+      self.assertNotIn("synthetic-token", text)
+    self.assertEqual(logging.root.manager.disable, original_disable)
+
+  def test_auth_quiet_context_preserves_stronger_transport_suppression(self):
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    logger = logging.getLogger("youtube-transport-nested-test")
+    logger.addHandler(handler)
+    self.addCleanup(logger.removeHandler, handler)
+    with transport._quiet_request():
+      with youtube_auth._quiet_google():
+        logger.log(logging.CRITICAL + 1, "secret " + URI)
+    self.assertEqual(output.getvalue(), "")
+
+  def test_auth_refresh_failures_are_sanitized_without_upload(self):
+    for error in (youtube_auth.AuthError("secret " + URI),
+                  google.auth.exceptions.RefreshError("secret " + URI)):
+      with self.subTest(error=type(error)):
+        credentials = OfflineCredentials(error)
+        session = transport.make_session(credentials)
+        self.addCleanup(session.close)
+        adapter = OfflineAdapter()
+        session.mount("https://", adapter)
+        with self.assertRaises(transport.TransportError) as caught:
+          transport.query_status(session, URI, 1)
+        self.assertEqual(caught.exception.kind, "auth_required")
+        self.assertNotIn("secret-session", str(caught.exception))
+        self.assertIsNone(caught.exception.__context__)
+        self.assertEqual(credentials.refreshes, 1)
+        self.assertEqual(adapter.calls, [])
+
+  def test_normalized_response_url_matches_requests_preparation(self):
+    uri = URI + "%7E"
+    self.assertEqual(transport.query_status(self.session, uri, 1), (0, None))
+    expected = requests.Request("PUT", uri).prepare().url
+    self.assertTrue(expected.endswith("secret-session~"))
+    self.assertEqual(self.adapter.calls[0].url, expected)
+    self.adapter.response_url = OTHER_URI
+    with self.assertRaises(transport.TransportError) as caught:
+      transport.query_status(self.session, uri, 1)
+    self.assertEqual(caught.exception.kind, "uncertain")
+    self.adapter.response_url = "https://evil.example/upload/youtube/v3/videos?upload_id=bad"
+    with self.assertRaises(transport.TransportError):
+      transport.query_status(self.session, uri, 1)
+
+  def test_initiation_response_must_match_prepared_request_url(self):
+    self.adapter.response_url = "https://www.googleapis.com/upload/youtube/v3/videos?changed=1"
+    with self.assertRaises(transport.TransportError) as caught:
+      transport.create_session(self.session, {"snippet": {}}, 1)
+    self.assertEqual(caught.exception.kind, "uncertain")
+    self.assertEqual(len(self.adapter.calls), 1)
+
+  def test_unsafe_real_session_configuration_is_rejected_before_send(self):
+    cases = (
+      lambda session: setattr(session, "_max_refresh_attempts", 1),
+      lambda session: setattr(session, "trust_env", True),
+      lambda session: session.hooks["response"].append(lambda response, *args, **kwargs: response),
+      lambda session: setattr(session.credentials, "_use_non_blocking_refresh", True),
+      lambda session: setattr(session.get_adapter(URI).max_retries, "total", 3),
+      lambda session: setattr(session._auth_request_session.get_adapter(URI).max_retries, "total", 3),
+      lambda session: setattr(session._auth_request, "session", None),
+    )
+    for mutate in cases:
+      with self.subTest(mutate=mutate):
+        session = transport.make_session(OfflineCredentials())
+        self.addCleanup(session.close)
+        adapter = OfflineAdapter()
+        session.mount("https://", adapter)
+        mutate(session)
+        with self.assertRaises(transport.TransportError) as caught:
+          transport.query_status(session, URI, 1)
+        self.assertEqual(caught.exception.kind, "uncertain")
+        self.assertEqual(adapter.calls, [])
+    ordinary = AuthorizedSession(OfflineCredentials())
+    self.addCleanup(ordinary.close)
+    with self.assertRaises(transport.TransportError):
+      transport.query_status(ordinary, URI, 1)
 
 
 if __name__ == "__main__":

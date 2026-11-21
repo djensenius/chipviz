@@ -44,7 +44,7 @@ class AuthError(Exception):
 def _quiet_google():
   # Library handlers may point to the original streams, not redirected ones.
   previous = logging.root.manager.disable
-  logging.disable(logging.CRITICAL)
+  logging.disable(max(previous, logging.CRITICAL))
   try:
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
       yield

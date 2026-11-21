@@ -6,6 +6,13 @@ below; this module never creates a replacement session or retries requests.
 Metadata is a JSON object with snippet and optional status; the caller is
 responsible for excluding local paths and secrets.
 
+make_session(credentials) constructs the supported Google AuthorizedSession
+with upload and credential-refresh adapter retries and 401 replays disabled.
+Requests sessions not satisfying this contract are rejected. Test doubles must
+set __youtube_transport_test_double__ = True and perform one request without
+redirects or retries. They are for offline tests only. Do not mutate the session,
+install hooks, use proxies, or enable background credential refresh.
+
 upload_chunk(session, uri, total, offset, data, content_type="video/mp4") sends
 one bytes object. Non-final chunks must be multiples of 256 KiB; chunks are
 limited to 8 MiB. query_status(session, uri, total) probes the same session.
@@ -15,12 +22,29 @@ An offset equal to total without a video_id is not completion; query status.
 An expired/lost session or unresolved completion requires quarantine, not a
 new upload. TransportError.kind is "uncertain", "auth_required", or "quota".
 No exception includes a URI, server body, or underlying exception message.
+
+During each request, Python logging is process-wide disabled and stdout/stderr
+are redirected, including HTTP wire-debug output. This affects other threads.
+Run in an isolated process, or serialize all network operations and logging
+configuration, including youtube_auth operations; external tracing, custom
+adapters/credentials, proxies, native output, and traceback-local capture are
+not supported. Never log the returned URI or inspect/log library exceptions.
 """
 
+import contextlib
+import io
 import json
+import logging
 import re
+import sys
+import threading
 from typing import NamedTuple
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
+
+if __package__:
+  from .youtube_auth import AuthError
+else:
+  from youtube_auth import AuthError
 
 
 _ENDPOINT = "https://www.googleapis.com/upload/youtube/v3/videos"
@@ -30,6 +54,7 @@ _CHUNK_UNIT = 256 * 1024
 _MAX_CHUNK = 8 * 1024 * 1024
 _ID = re.compile(r"[A-Za-z0-9_-]{11}\Z")
 _RANGE = re.compile(r"bytes=0-([0-9]{1,20})\Z")
+_QUIET_LOCK = threading.RLock()
 
 
 class TransportError(Exception):
@@ -43,6 +68,91 @@ class TransportError(Exception):
 class Progress(NamedTuple):
   offset: int
   video_id: str | None
+
+
+def make_session(credentials):
+  """Construct a no-replay AuthorizedSession for use by these operations."""
+  from google.auth.transport.requests import AuthorizedSession
+  from requests.adapters import HTTPAdapter
+
+  session = AuthorizedSession(credentials, max_refresh_attempts=0)
+  session.trust_env = False
+  for scheme in ("http://", "https://"):
+    session.mount(scheme, HTTPAdapter(max_retries=0))
+    session._auth_request_session.mount(scheme, HTTPAdapter(max_retries=0))
+  session._auth_request_session.trust_env = False
+  return session
+
+
+@contextlib.contextmanager
+def _quiet_request():
+  # Handlers can retain original streams; wire-debug output uses print instead.
+  with _QUIET_LOCK:
+    previous = logging.root.manager.disable
+    logging.disable(max(previous, sys.maxsize))
+    try:
+      with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        yield
+    finally:
+      logging.disable(previous)
+
+
+def _check_session(session, uri):
+  # Explicit offline test doubles are responsible for honoring the contract.
+  def test_double():
+    if getattr(session, "__youtube_transport_test_double__", False) is not True:
+      raise TransportError("uncertain", "Unsafe upload session configuration")
+    return False
+
+  try:
+    from requests import Session
+    from requests.adapters import HTTPAdapter
+  except ImportError:
+    return test_double()
+  if not isinstance(session, Session):
+    return test_double()
+  try:
+    from google.auth.transport.requests import AuthorizedSession
+  except ImportError:
+    raise TransportError("uncertain", "Unsafe upload session configuration") from None
+  try:
+    auth_session = session._auth_request_session
+    adapters = (session.get_adapter(uri),
+                auth_session.get_adapter("https://oauth2.googleapis.com/"))
+    valid = (
+      isinstance(session, AuthorizedSession)
+      and session._max_refresh_attempts == 0
+      and session._auth_request.session is auth_session
+      and not session.trust_env and not auth_session.trust_env
+      and not session.proxies and not auth_session.proxies
+      and not session.params and not session.auth and session.verify is not False
+      and not auth_session.params and not auth_session.auth and auth_session.verify is not False
+      and not any(session.hooks.values()) and not any(auth_session.hooks.values())
+      and not getattr(session.credentials, "_use_non_blocking_refresh", False)
+      and all(isinstance(adapter, HTTPAdapter) and adapter.max_retries.total == 0
+              for adapter in adapters)
+    )
+  except (AttributeError, TypeError, ValueError):
+    valid = False
+  if not valid:
+    raise TransportError("uncertain", "Unsafe upload session configuration")
+  return True
+
+
+def _prepared_uri(method, uri, params):
+  # Use the actual Requests preparation rules when Requests is installed.
+  try:
+    from requests import Request
+  except ImportError:
+    if params:
+      uri += ("&" if "?" in uri else "?") + urlencode(params)
+    unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    def unquote_unreserved(match):
+      char = chr(int(match.group()[1:], 16))
+      return char if char in unreserved else match.group()
+    return quote(re.sub(r"%[0-9a-fA-F]{2}", unquote_unreserved, uri),
+                 safe="!#$%&'()*+,/:;=?@[]~")
+  return Request(method, uri, params=params).prepare().url
 
 
 def _uri(value, *, session_uri):
@@ -80,18 +190,36 @@ def _content_type(content_type):
 
 
 def _request(session, method, uri, **kwargs):
+  real_session = _check_session(session, uri)
   try:
-    response = getattr(session, method)(
-      uri, timeout=_TIMEOUT, allow_redirects=False, **kwargs
-    )
+    expected = _prepared_uri(method.upper(), uri, kwargs.get("params"))
   except Exception:
-    raise TransportError("uncertain", "Upload request failed; check session status") from None
+    raise TransportError("uncertain", "Invalid upload URI") from None
+  failure = None
+  try:
+    with _quiet_request():
+      response = getattr(session, method)(
+        uri, timeout=_TIMEOUT, allow_redirects=False, **kwargs
+      )
+  except Exception as error:
+    try:
+      from google.auth.exceptions import RefreshError
+      auth_errors = (AuthError, RefreshError)
+    except ImportError:
+      auth_errors = (AuthError,)
+    failure = "auth_required" if isinstance(error, auth_errors) else "uncertain"
+  if failure:
+    message = ("YouTube authorization required" if failure == "auth_required"
+               else "Upload request failed; check session status")
+    raise TransportError(failure, message)
   if getattr(response, "history", None):
     raise TransportError("uncertain", "Unexpected redirect")
   response_url = getattr(response, "url", None)
+  if real_session and response_url is None:
+    raise TransportError("uncertain", "Missing response URI")
   if response_url is not None:
     _uri(response_url, session_uri=method == "put")
-    if method == "put" and response_url != uri:
+    if response_url != expected:
       raise TransportError("uncertain", "Unexpected response URI")
   return response
 
@@ -105,7 +233,7 @@ def _failure(response):
       body = response.json()
       errors = body.get("error", {}).get("errors", [])
       reasons = {item.get("reason") for item in errors if isinstance(item, dict)}
-    except (ValueError, TypeError, AttributeError):
+    except Exception:
       reasons = set()
     if reasons & {"quotaExceeded", "dailyLimitExceeded", "uploadLimitExceeded"}:
       raise TransportError("quota", "YouTube upload quota exceeded") from None
@@ -165,8 +293,8 @@ def _progress(response, total, minimum, maximum, final_allowed):
       raise TransportError("uncertain", "Unexpected upload completion")
     try:
       video_id = response.json()["id"]
-    except (ValueError, TypeError, KeyError):
-      raise TransportError("uncertain", "Invalid upload completion") from None
+    except Exception:
+      video_id = None
     if not isinstance(video_id, str) or not _ID.fullmatch(video_id):
       raise TransportError("uncertain", "Invalid upload completion")
     return Progress(total, video_id)
