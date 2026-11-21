@@ -24,7 +24,9 @@ service PID and rechecks the socket and service around the single bounded
 `GET /v1.48/info`. Systemd socket activation may cause `SO_PEERCRED` to name
 the activator rather than dockerd; that ambiguity fails closed even when the
 runner would otherwise be usable. The response has bounded framing, size and
-time, and only fixed allowlisted fields are printed.
+time, and only fixed allowlisted fields are printed. On failure, a fixed
+allowlisted stage identifies the failed gate without printing its values,
+paths, raw errors or response; it does not necessarily establish a root cause.
 
 The 5 GiB free-space threshold on `/` and the expected daemon root is merely
 a preflight minimum, not a proven build budget. A GitHub-hosted job is a fresh

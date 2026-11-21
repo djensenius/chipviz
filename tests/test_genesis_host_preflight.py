@@ -242,6 +242,65 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(preflight.Rejected):
           preflight.Host().snapshot()
 
+  def test_production_snapshot_failure_stages_use_fake_os_data(self):
+    directory = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+    endpoint = types.SimpleNamespace(
+      st_mode=stat.S_IFSOCK | 0o660, st_uid=0, st_gid=999, st_dev=10, st_ino=20)
+    service = types.SimpleNamespace(
+      stdout=b"MainPID=123\nActiveState=active\nSubState=running\n")
+    net = (
+      b"Num RefCount Protocol Flags Type St Inode Path\n"
+      b"00: 00000002 00000000 00010000 0001 01 42 /run/docker.sock\n"
+    )
+    sensitive = "secret-password /private/path"
+    for stage in ("socket filesystem", "daemon service", "daemon process", "daemon cgroup",
+                  "socket listener", "daemon listener fd"):
+      def fail_here(name):
+        if stage == name:
+          raise OSError(sensitive)
+
+      def fake_lstat(path):
+        fail_here("socket filesystem")
+        return endpoint if path == preflight.SOCKET_PATH else directory
+
+      def fake_run(*_args, **_kwargs):
+        fail_here("daemon service")
+        return service
+
+      def fake_link(path):
+        if path.endswith("/exe"):
+          fail_here("daemon process")
+          return "/usr/bin/dockerd"
+        return "socket:[42]"
+
+      def fake_open(path, mode):
+        self.assertEqual(mode, "rb")
+        fail_here("daemon cgroup" if path.endswith("/cgroup") else "socket listener")
+        return io.BytesIO({"/proc/123/cgroup": b"0::/system.slice/docker.service\n",
+                           "/proc/net/unix": net}[path])
+
+      def fake_listdir(_path):
+        fail_here("daemon listener fd")
+        return ["7"]
+
+      fake = FakeHost()
+      fake.snapshot = preflight.Host().snapshot
+      with self.subTest(stage=stage), \
+           mock.patch.object(preflight.os, "lstat", side_effect=fake_lstat), \
+           mock.patch.object(preflight.subprocess, "run", side_effect=fake_run), \
+           mock.patch.object(preflight.os, "readlink", side_effect=fake_link), \
+           mock.patch.object(preflight.os, "listdir", side_effect=fake_listdir), \
+           mock.patch("builtins.open", side_effect=fake_open), \
+           mock.patch.object(preflight, "Host", return_value=fake):
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+          self.assertEqual(preflight.main(), 1)
+        self.assertIn(f"failure stage: {stage}\n", output.getvalue())
+        self.assertNotIn(sensitive, output.getvalue())
+        self.assertEqual(error.getvalue(), "")
+        self.assertNotIn(("connect",), fake.calls)
+        self.assertNotIn(("response",), fake.calls)
+
   def test_service_identity_and_listener_parse(self):
     self.assertEqual(preflight.parse_service(
       b"MainPID=123\nActiveState=active\nSubState=running\n"), 123)
@@ -287,10 +346,73 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(preflight.main(), 1)
     self.assertEqual(output.getvalue(), (
       "host metadata: UNAVAILABLE\n"
+      "failure stage: daemon response\n"
       "builder isolation: UNVERIFIED\n"
       "mount isolation: UNVERIFIED\n"
       "toolchain builds authorized: NO\n"
     ))
+
+  def test_failure_stages_are_fixed_and_sanitized(self):
+    sensitive = "secret-password /private/path"
+    cases = []
+    fake = FakeHost()
+    fake.env["GITHUB_ACTIONS"] = sensitive
+    cases.append(("hosted environment", fake))
+    fake = FakeHost()
+    fake.disk = 0
+    cases.append(("host resources", fake))
+    fake = FakeHost()
+    fake.daemon_disk = 0
+    cases.append(("daemon resources", fake))
+    fake = FakeHost()
+    fake.snapshots[0] = OSError(sensitive)
+    cases.append(("socket snapshot", fake))
+    fake = FakeHost()
+    fake.connect = mock.Mock(side_effect=OSError(sensitive))
+    cases.append(("socket connect", fake))
+    fake = FakeHost()
+    fake.peer_info = (1, 0, 0)
+    cases.append(("socket peer", fake))
+    fake = FakeHost()
+    fake.snapshots[1] = (123, 10, 21, 0o140660, 0, 999, "42")
+    cases.append(("socket recheck", fake))
+    fake = FakeHost()
+    fake.snapshots[1] = preflight.StageError("daemon service")
+    cases.append(("daemon service", fake))
+    fake = FakeHost()
+    fake.data = OSError(sensitive)
+    cases.append(("daemon response", fake))
+    fake = FakeHost()
+    fake.data = frame(sensitive.encode())
+    cases.append(("daemon metadata", fake))
+    fake = FakeHost()
+    fake.free = mock.Mock(side_effect=[preflight.MIN_FREE, preflight.MIN_FREE, OSError(sensitive)])
+    cases.append(("resource recheck", fake))
+    for stage, fake in cases:
+      with self.subTest(stage=stage), mock.patch.object(preflight, "Host", return_value=fake):
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+          self.assertEqual(preflight.main(), 1)
+        self.assertEqual(output.getvalue(), (
+          "host metadata: UNAVAILABLE\n"
+          f"failure stage: {stage}\n"
+          "builder isolation: UNVERIFIED\n"
+          "mount isolation: UNVERIFIED\n"
+          "toolchain builds authorized: NO\n"
+        ))
+        self.assertEqual(error.getvalue(), "")
+        expected_requests = int(stage in ("daemon response", "daemon metadata", "resource recheck"))
+        self.assertEqual(fake.calls.count(("response",)), expected_requests)
+
+  def test_unknown_failure_stage_is_not_printed(self):
+    for error in (preflight.StageError("secret-password /private/path"),
+                  OSError("secret-password /private/path")):
+      with self.subTest(error=type(error)), mock.patch.object(preflight, "Host", side_effect=error):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+          self.assertEqual(preflight.main(), 1)
+      self.assertIn("failure stage: internal\n", output.getvalue())
+      self.assertNotIn("secret-password", output.getvalue())
+      self.assertNotIn("/private/path", output.getvalue())
 
   def test_response_sends_only_one_fixed_request(self):
     class FakeSocket:

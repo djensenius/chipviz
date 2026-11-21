@@ -1,5 +1,6 @@
 """Hosted metadata collection only; never authorizes a toolchain build."""
 
+import contextlib
 import json
 import os
 import platform
@@ -21,6 +22,31 @@ REQUEST = b"GET /v1.48/info HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n
 
 class Rejected(Exception):
   """Untrusted or incomplete evidence; never print its contents."""
+
+
+STAGES = frozenset((
+  "hosted environment", "host resources", "daemon resources",
+  "socket filesystem", "daemon service", "daemon process", "daemon cgroup",
+  "socket listener", "daemon listener fd", "socket snapshot", "socket connect",
+  "socket peer", "socket recheck", "daemon response", "daemon metadata",
+  "resource recheck", "internal",
+))
+
+
+class StageError(Rejected):
+  def __init__(self, stage):
+    self.stage = stage if isinstance(stage, str) and stage in STAGES else "internal"
+    super().__init__()
+
+
+@contextlib.contextmanager
+def check_stage(stage):
+  try:
+    yield
+  except StageError:
+    raise
+  except Exception:
+    raise StageError(stage) from None
 
 
 def require(condition):
@@ -120,35 +146,41 @@ class Host:
     return info.f_bavail * info.f_frsize
 
   def snapshot(self):
-    for path in ("/", "/run"):
-      item = os.lstat(path)
-      require(stat.S_ISDIR(item.st_mode) and item.st_uid == 0 and not item.st_mode & 0o022)
-    item = os.lstat(SOCKET_PATH)
-    require(stat.S_ISSOCK(item.st_mode) and item.st_uid == 0 and not item.st_mode & 0o002)
-    result = subprocess.run(
-      ["/usr/bin/systemctl", "show", "docker.service",
-       "--property=MainPID,ActiveState,SubState"],
-      check=True, capture_output=True, timeout=3,
-      env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-    )
-    pid = parse_service(result.stdout)
-    require(os.readlink(f"/proc/{pid}/exe") == "/usr/bin/dockerd")
-    with open(f"/proc/{pid}/cgroup", "rb") as stream:
-      cgroup = stream.read(4097)
-    require(len(cgroup) <= 4096 and any(
-      line.split(b":")[-1] == b"/system.slice/docker.service"
-      for line in cgroup.splitlines()
-    ))
-    with open("/proc/net/unix", "rb") as stream:
-      inode = listener_inode(stream.read(MAX_RESPONSE + 1))
-    fd_dir = f"/proc/{pid}/fd"
-    links = []
-    for name in os.listdir(fd_dir):
-      try:
-        links.append(os.readlink(f"{fd_dir}/{name}"))
-      except FileNotFoundError:
-        continue
-    require(f"socket:[{inode}]" in links)
+    with check_stage("socket filesystem"):
+      for path in ("/", "/run"):
+        item = os.lstat(path)
+        require(stat.S_ISDIR(item.st_mode) and item.st_uid == 0 and not item.st_mode & 0o022)
+      item = os.lstat(SOCKET_PATH)
+      require(stat.S_ISSOCK(item.st_mode) and item.st_uid == 0 and not item.st_mode & 0o002)
+    with check_stage("daemon service"):
+      result = subprocess.run(
+        ["/usr/bin/systemctl", "show", "docker.service",
+         "--property=MainPID,ActiveState,SubState"],
+        check=True, capture_output=True, timeout=3,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+      )
+      pid = parse_service(result.stdout)
+    with check_stage("daemon process"):
+      require(os.readlink(f"/proc/{pid}/exe") == "/usr/bin/dockerd")
+    with check_stage("daemon cgroup"):
+      with open(f"/proc/{pid}/cgroup", "rb") as stream:
+        cgroup = stream.read(4097)
+      require(len(cgroup) <= 4096 and any(
+        line.split(b":")[-1] == b"/system.slice/docker.service"
+        for line in cgroup.splitlines()
+      ))
+    with check_stage("socket listener"):
+      with open("/proc/net/unix", "rb") as stream:
+        inode = listener_inode(stream.read(MAX_RESPONSE + 1))
+    with check_stage("daemon listener fd"):
+      fd_dir = f"/proc/{pid}/fd"
+      links = []
+      for name in os.listdir(fd_dir):
+        try:
+          links.append(os.readlink(f"{fd_dir}/{name}"))
+        except FileNotFoundError:
+          continue
+      require(f"socket:[{inode}]" in links)
     return pid, item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid, inode
 
   def connect(self):
@@ -181,31 +213,45 @@ class Host:
 
 
 def collect(host):
-  env = host.environment()
-  require(env.get("GITHUB_ACTIONS") == "true")
-  require(env.get("RUNNER_ENVIRONMENT") == "github-hosted")
-  require(env.get("RUNNER_ARCH") == "ARM64" and host.machine() == "aarch64")
-  require(env.get("GITHUB_REPOSITORY") == "djensenius/chipviz")
-  require(env.get("GITHUB_EVENT_NAME") == "pull_request")
-  require(not any(key in env for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")))
-  require(host.free("/") >= MIN_FREE)
-  require(host.free("/var/lib/docker") >= MIN_FREE)
-  before = host.snapshot()
-  with host.connect() as client:
-    pid, uid, _gid = host.peer(client)
-    require(uid == 0 and pid == before[0])
-    require(host.snapshot() == before)
-    version = parse_info(host.response(client))
-    require(host.snapshot() == before)
-  require(host.free("/var/lib/docker") >= MIN_FREE)
+  with check_stage("hosted environment"):
+    env = host.environment()
+    require(env.get("GITHUB_ACTIONS") == "true")
+    require(env.get("RUNNER_ENVIRONMENT") == "github-hosted")
+    require(env.get("RUNNER_ARCH") == "ARM64" and host.machine() == "aarch64")
+    require(env.get("GITHUB_REPOSITORY") == "djensenius/chipviz")
+    require(env.get("GITHUB_EVENT_NAME") == "pull_request")
+    require(not any(key in env for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")))
+  with check_stage("host resources"):
+    require(host.free("/") >= MIN_FREE)
+  with check_stage("daemon resources"):
+    require(host.free("/var/lib/docker") >= MIN_FREE)
+  with check_stage("socket snapshot"):
+    before = host.snapshot()
+  with check_stage("socket connect"):
+    with host.connect() as client:
+      with check_stage("socket peer"):
+        pid, uid, _gid = host.peer(client)
+        require(uid == 0 and pid == before[0])
+      with check_stage("socket recheck"):
+        require(host.snapshot() == before)
+      with check_stage("daemon response"):
+        response = host.response(client)
+      with check_stage("daemon metadata"):
+        version = parse_info(response)
+      with check_stage("socket recheck"):
+        require(host.snapshot() == before)
+  with check_stage("resource recheck"):
+    require(host.free("/var/lib/docker") >= MIN_FREE)
   return version
 
 
 def main():
   try:
     version = collect(Host())
-  except Exception:
+  except Exception as error:
     print("host metadata: UNAVAILABLE")
+    stage = getattr(error, "stage", None) if isinstance(error, StageError) else None
+    print("failure stage: " + (stage if isinstance(stage, str) and stage in STAGES else "internal"))
     result = 1
   else:
     print("host metadata: COLLECTED")
