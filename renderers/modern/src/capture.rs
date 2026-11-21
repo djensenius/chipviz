@@ -418,6 +418,7 @@ fn is_cli_option(value: &str) -> bool {
             | "--follow-time"
             | "--starfield"
             | "--house"
+            | "--dmg-preview"
     )
 }
 
@@ -1041,12 +1042,20 @@ fn cli_house_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), String> 
         "--time",
     ];
     for pair in tokens.windows(2) {
-        if value_options.contains(&pair[0].as_str()) && pair[1] == "--house" {
+        if value_options.contains(&pair[0].as_str()) && is_cli_option(&pair[1]) {
             return Err(format!(
-                "{} requires a value; --house is an option",
-                pair[0]
+                "{} requires a value; {} is an option",
+                pair[0], pair[1]
             ));
         }
+    }
+    if let Some(flag) = tokens.last()
+        && value_options.contains(&flag.as_str())
+    {
+        return Err(format!("{flag} requires a value"));
+    }
+    if tokens.iter().any(|token| token == "--dmg-preview") {
+        return Err("--house is incompatible with --dmg-preview".into());
     }
     if tokens.iter().any(|token| {
         matches!(
@@ -1364,6 +1373,7 @@ mod tests {
             "--follow-time",
             "--starfield",
             "--house",
+            "--dmg-preview",
         ];
         for value_option in value_options {
             for token in option_tokens {
@@ -1788,6 +1798,7 @@ mod tests {
             "--location",
             "--time",
             "--follow-time",
+            "--dmg-preview",
         ] {
             for tokens in [
                 vec!["--out", "shots", "--house", conflict],
@@ -1799,6 +1810,49 @@ mod tests {
             }
         }
         assert!(cli_house_tokens(["--out", "--house"].map(str::to_string).to_vec()).is_err());
+    }
+
+    #[test]
+    fn integration_selectors_capture_house_rejects_preview_and_missing_values() {
+        for args in [
+            vec!["--out", "shots", "--house", "--dmg-preview"],
+            vec!["--out", "shots", "--dmg-preview", "--house"],
+        ] {
+            let error =
+                cli_house_tokens(args.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(error.contains("incompatible with --dmg-preview"), "{error}");
+        }
+        for flag in [
+            "--profile",
+            "--scene",
+            "--frames",
+            "--input",
+            "--size",
+            "--out",
+            "--mic-layers",
+            "--tunnel-variant",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+        ] {
+            for option in ["--house", "--dmg-preview", "--out", "--help"] {
+                for args in [vec!["--house", flag, option], vec![flag, option, "--house"]] {
+                    let error = cli_house_tokens(args.into_iter().map(str::to_string).collect())
+                        .unwrap_err();
+                    assert!(
+                        error.contains(&format!("{flag} requires a value; {option} is an option")),
+                        "{error}"
+                    );
+                }
+            }
+            let error =
+                cli_house_tokens(["--house", flag].map(str::to_string).to_vec()).unwrap_err();
+            assert!(
+                error.contains(&format!("{flag} requires a value")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

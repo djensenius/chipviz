@@ -69,11 +69,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/check-release-assets.py dist/assets dist/chipviz-assets.zip
+          python3 scripts/check-release-assets.py --require-x86-64-renderers dist/assets dist/chipviz-assets.zip
           gh release upload "${{ github.event.release.tag_name }}" dist/assets/* --clobber
       - name: Upload combined zip
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/check-release-assets.py dist/assets dist/chipviz-assets.zip
+          python3 scripts/check-release-assets.py --require-x86-64-renderers dist/assets dist/chipviz-assets.zip
           gh release upload "${{ github.event.release.tag_name }}" dist/chipviz-assets.zip --clobber

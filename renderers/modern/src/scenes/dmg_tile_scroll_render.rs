@@ -1,7 +1,8 @@
 //! Unregistered rendering prototype for the native DMG tile model.
 //!
-//! This owns a fixed-size shade texture and a separate fullscreen pipeline;
-//! it is not wired into the window, capture, scene selection, or safety gates.
+//! This owns a fixed-size shade texture and a separate fullscreen pipeline.
+//! The window can use it in the isolated development preview, not as a scene
+//! selection, capture option, or safety gate.
 //! The caller advances the autonomous model explicitly and supplies its shown
 //! display. The grayscale palette is illustrative; offscreen readback is not
 //! emulator parity or timed presented output. Profile performance, physical

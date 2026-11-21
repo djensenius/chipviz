@@ -10,6 +10,13 @@ different quality budgets:
 | `chipviz-pi5` | Raspberry Pi 5 HDMI output | 4K-capable, lower instance count, simpler layering. |
 | `chipviz-m1` | Apple Silicon Mac with large memory/GPU headroom | 4K60-oriented, denser 3D fields, deeper layering. |
 
+These names select quality profiles, not operating systems or CPU architectures.
+The current GitHub release workflow builds both assets for x86-64 Linux, so
+neither is a native macOS or ARM64 Pi download. The commands below build from
+source on the host; native release artifacts are tracked in
+[#215](https://github.com/djensenius/chipviz/issues/215) and
+[#216](https://github.com/djensenius/chipviz/issues/216).
+
 The visual language should match the retro targets at the signal level: beat,
 energy, palette, scene, flags, and spectrum all map to recognizable behavior.
 Each platform then renders those controls using its native strengths.
@@ -54,6 +61,48 @@ With UDP, it consumes `control-frame-v0` packets from the host bridge:
 python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
 ```
 
+### Experimental DMG preview
+
+**Do not use or distribute this preview** pending independent assessment of
+presented-output flashing and normal-speed human review under the existing
+safety gates. Offscreen tests do not establish visual safety.
+
+For development only, the non-default `dmg-preview` Cargo feature and the
+explicit flag are both required. Do not enable this feature in release
+artifacts. Default and `unmeasured-flash`-only builds reject the flag.
+The commands below describe the opt-in; the prohibition above still applies.
+
+```sh
+cargo run --manifest-path renderers/modern/Cargo.toml --features dmg-preview --bin chipviz-m1 -- --dmg-preview
+cargo run --manifest-path renderers/modern/Cargo.toml --features dmg-preview --bin chipviz-pi5 -- --dmg-preview
+```
+
+The self-running DMG Tile Scroll preview is not audio reactive and is not a
+catalog or wire scene. Only
+`--fullscreen` and `--monitor` may accompany it; live UDP, microphone,
+listing, House, scene and overlay options are rejected, and `L` and `M` do nothing.
+No live inputs are opened. The native LCD is integer-scaled where it fits;
+smaller windows use fractional scaling.
+
+The first successfully acquired surface ticks the model once. The clock
+starts after its submission and `present()` return, holding that initial state
+for one native VBlank period (70,224 / 4,194,304 seconds). Subsequent ticks
+follow that monotonic clock at acquisition, not redraw counts. After encoding
+and command-buffer finalization,
+the preview thread sleeps if needed (requesting at most 16 ms, without busy
+waiting; the OS can oversleep) before submitting a changed frame, so its
+timestamp sampled just before submission is at least 16 ms after the previous
+changed submission's timestamp.
+This minimum is below the 16.667 ms 60 Hz refresh period; jitter and work that
+exceeds the available cadence can still drop steps.
+A redraw can hold a frame or miss a clock interval; rates below native
+VBlank cannot keep up. Failed acquisitions and zero-sized windows do not
+tick; on resume, at most one tick runs and missed intervals are dropped.
+Resize does not reset the clock. Submission and `present()` do not prove
+display timing.
+This preview has not had physical Pi validation or visual-safety certification;
+presented-output flash assessment and normal-speed human review remain needed.
+
 ## Controls
 
 The renderer starts windowed by default.
@@ -72,7 +121,7 @@ The renderer starts windowed by default.
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
 | `--tunnel-variant original\|hallway\|abstract\|surface-hallway` | Choose the PulseTunnel look at startup, for every scene byte selecting it. Default `original` preserves the orbiting tunnel; the existing `hallway` and `abstract` looks are unchanged. Also supported by `chipviz-capture`. |
-| `--house` | Opt into the local House on native displays. Scene 7 still follows ColourField gating. Incompatible with `--scene`, `--tunnel-variant`, and Starfield options. Also supported by `chipviz-capture`. |
+| `--house` | Opt into the local House on native displays. Scene 7 still follows ColourField gating. Incompatible with `--dmg-preview`, `--scene`, `--tunnel-variant`, and Starfield options. Also supported by `chipviz-capture`. |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -803,10 +852,13 @@ just modern-capture --out build/house --house --input synth-mic --frames 60,120
 
 House is a local override of native displays, including those from recordings;
 it never assigns a wire byte. Scene 7 remains governed by ColourField's gates.
-`--house` rejects any `--scene` or `--tunnel-variant`, Starfield setup/opt-in,
-and capture's strict `--catalog-v1` replay. It is CLI-only: existing capture
-API structs and `run`/`run_with_options` semantics remain unchanged and their
-parsers reject `--house`. The public `TunnelVariant` enum gains
+`--house` rejects `--dmg-preview`, any `--scene` or `--tunnel-variant`,
+Starfield setup/opt-in, and capture's strict `--catalog-v1` replay. With
+capture `--house`, recognized options cannot be used as values; prefix a
+literal path with `./` (for example `./--house`). House is CLI-only: existing
+capture API structs and `run`/`run_with_options` semantics remain unchanged.
+Their parsers reject `--house` as a flag but retain legacy literal path values.
+The public `TunnelVariant` enum gains
 `SurfaceHallway`, so downstream exhaustive matches must add that variant.
 House capture entries retain the requested wire byte
 in `scene`, set `displayed_scene` to null, and mark `local_mode: "house"`;

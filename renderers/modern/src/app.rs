@@ -122,6 +122,11 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         None => None,
     };
 
+    #[cfg(feature = "dmg-preview")]
+    if args.dmg_preview {
+        return run_dmg_preview(profile, &args, event_loop, target_monitor);
+    }
+
     if args.allow_flash {
         eprintln!("{}", colour_field::allow_flash_notice());
     }
@@ -290,6 +295,92 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(feature = "dmg-preview")]
+fn run_dmg_preview(
+    profile: RenderProfile,
+    args: &AppArgs,
+    event_loop: EventLoop<()>,
+    target_monitor: Option<MonitorHandle>,
+) -> Result<(), AppError> {
+    eprintln!(
+        "Experimental DMG preview: not audio reactive; presented-output safety and physical Pi behavior are unvalidated."
+    );
+    let mut builder = WindowBuilder::new()
+        .with_title(profile.window_title)
+        .with_inner_size(LogicalSize::new(
+            profile.target_width,
+            profile.target_height,
+        ));
+    if let Some(monitor) = &target_monitor {
+        builder = builder.with_position(monitor.position());
+    }
+    if args.fullscreen {
+        builder = builder.with_fullscreen(Some(Fullscreen::Borderless(
+            target_monitor.or_else(|| event_loop.primary_monitor()),
+        )));
+    }
+    let window = Arc::new(builder.build(&event_loop)?);
+    window.set_cursor_visible(cursor_visible(args.fullscreen));
+    let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
+    renderer.enable_dmg_preview();
+    let size = window.inner_size();
+    let mut drawable = preview_drawable(size.width, size.height);
+    let mut modifiers = ModifiersState::empty();
+    // A resize wakes Wait; the next AboutToWait resumes redraws if drawable.
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+    event_loop.run(move |event, target| match event {
+        Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
+            WindowEvent::CloseRequested => target.exit(),
+            WindowEvent::Resized(size) => {
+                window.set_cursor_visible(cursor_visible(window.fullscreen().is_some()));
+                drawable = preview_drawable(size.width, size.height);
+                renderer.resize(size.width, size.height);
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => modifiers = new_modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                let input = KeyInput::from_winit(&event.logical_key, event.physical_key);
+                let mods = KeyModifiers {
+                    command: modifiers.super_key(),
+                    control: modifiers.control_key(),
+                    alt: modifiers.alt_key(),
+                };
+                let fullscreen = window.fullscreen().is_some();
+                match preview_key_action(input, mods, fullscreen) {
+                    Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
+                    Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
+                    _ => {}
+                }
+            }
+            WindowEvent::RedrawRequested if drawable => match renderer.render_dmg_preview() {
+                Ok(()) => {}
+                Err(RendererError::Surface(
+                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
+                )) => renderer.resize_to_current_window(),
+                Err(RendererError::Surface(wgpu::SurfaceError::OutOfMemory)) => target.exit(),
+                Err(error) => eprintln!("{error}"),
+            },
+            _ => {}
+        },
+        Event::AboutToWait => request_preview_redraw(drawable, || window.request_redraw()),
+        _ => {}
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "dmg-preview")]
+fn preview_drawable(width: u32, height: u32) -> bool {
+    width != 0 && height != 0
+}
+
+#[cfg(feature = "dmg-preview")]
+fn request_preview_redraw(drawable: bool, request: impl FnOnce()) {
+    if drawable {
+        request();
+    }
+}
+
 fn set_fullscreen(window: &Window, fullscreen: bool) {
     if fullscreen {
         window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
@@ -326,12 +417,15 @@ fn system_utc_seconds() -> f64 {
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
+       [--dmg-preview]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
        [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract|surface-hallway] [--house]
        [--scene N]
        {program} --list-monitors | --list-audio-devices
 
 Options:
+  --dmg-preview           development-only; requires the dmg-preview Cargo feature,
+                          no audio or overlays, incompatible with source and scene options
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
   --star-catalog PATH     HYG-compatible star CSV for scene 6 (not bundled)
   --catalog FILE          alias for --star-catalog
@@ -364,7 +458,7 @@ Options:
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
   --tunnel-variant MODE   PulseTunnel look: original (default), hallway, abstract or surface-hallway
-  --house                 local House for native displays; incompatible with --scene and --tunnel-variant
+  --house                 local House for native displays; incompatible with --dmg-preview, --scene and --tunnel-variant
   Scene 6 requires both --star-catalog and --location; scene 7 remains ColourField
   -h, --help              print this help
 
@@ -542,6 +636,14 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
     }
 }
 
+#[cfg(feature = "dmg-preview")]
+fn preview_key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
+    match key_action(input, mods, fullscreen) {
+        action @ (Some(KeyAction::ToggleFullscreen) | Some(KeyAction::ExitFullscreen)) => action,
+        _ => None,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ArgsCommand {
     Run(AppArgs),
@@ -550,6 +652,7 @@ enum ArgsCommand {
 
 #[derive(Debug, Default, PartialEq)]
 struct AppArgs {
+    dmg_preview: bool,
     udp_endpoint: Option<String>,
     fullscreen: bool,
     monitor: Option<DeviceSelector>,
@@ -625,36 +728,94 @@ impl AppArgs {
 
     fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<ArgsCommand, AppError> {
         let mut parsed = Self::default();
+        let args: Vec<String> = args.into_iter().collect();
+        let preview_requested = args.iter().any(|arg| arg == "--dmg-preview");
+        let house_requested = args.iter().any(|arg| arg == "--house");
         let mut args = args.into_iter();
         let mut tunnel_variant_supplied = false;
+        let mut preview_conflict = None;
 
         let mut first = true;
         while let Some(arg) = args.next() {
             let is_first = std::mem::replace(&mut first, false);
+            if matches!(
+                arg.as_str(),
+                "--udp"
+                    | "--mic"
+                    | "--audio-device"
+                    | "--list-audio-devices"
+                    | "--list-monitors"
+                    | "--mic-layers"
+                    | "--scene"
+                    | "--layout"
+                    | "--allow-flash"
+                    | "--lines-drop-cuts"
+                    | "--tunnel-variant"
+                    | "--house"
+                    | "--catalog"
+                    | "--star-catalog"
+                    | "--location"
+                    | "--time"
+            ) && preview_conflict.is_none()
+            {
+                preview_conflict = Some(arg.clone());
+            }
             match arg.as_str() {
+                "--dmg-preview" => {
+                    #[cfg(feature = "dmg-preview")]
+                    {
+                        parsed.dmg_preview = true;
+                    }
+                    #[cfg(not(feature = "dmg-preview"))]
+                    {
+                        return Err(invalid_input(
+                            "--dmg-preview requires the dmg-preview Cargo feature".to_string(),
+                        ));
+                    }
+                }
                 "--udp" => {
-                    parsed.udp_endpoint =
-                        Some(required_value(&mut args, "--udp", "LISTEN_ADDR:PORT")?)
+                    parsed.udp_endpoint = Some(required_value(
+                        &mut args,
+                        "--udp",
+                        "LISTEN_ADDR:PORT",
+                        preview_requested,
+                    )?)
                 }
                 "--fullscreen" => parsed.fullscreen = true,
                 "--monitor" => {
-                    let value = required_value(&mut args, "--monitor", "INDEX or NAME")?;
+                    let value =
+                        required_value(&mut args, "--monitor", "INDEX or NAME", preview_requested)?;
                     parsed.monitor = Some(DeviceSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
                 "--mic" => parsed.mic = true,
                 "--audio-device" => {
-                    let value = required_value(&mut args, "--audio-device", "INDEX or NAME")?;
+                    let value = required_value(
+                        &mut args,
+                        "--audio-device",
+                        "INDEX or NAME",
+                        preview_requested,
+                    )?;
                     parsed.audio_device = Some(DeviceSelector::parse(&value));
                 }
                 "--list-audio-devices" => parsed.list_audio_devices = true,
                 "--layout" => {
-                    let value = required_value(&mut args, "--layout", "auto|v2|h2|v3|h3")?;
+                    let value = required_value(
+                        &mut args,
+                        "--layout",
+                        "auto|v2|h2|v3|h3",
+                        preview_requested,
+                    )?;
                     parsed.layout = parse_layout(&value)?;
                 }
                 "--allow-flash" => parsed.allow_flash = true,
                 "--mic-layers" => {
-                    let value = required_value(&mut args, "--mic-layers", "off|scope|bursts|both")?;
+                    let value = required_value(
+                        &mut args,
+                        "--mic-layers",
+                        "off|scope|bursts|both",
+                        preview_requested,
+                    )?;
                     parsed.mic_layers = mic_layers::Mode::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
                             "--mic-layers expects off|scope|bursts|both, got {value}"
@@ -663,7 +824,7 @@ impl AppArgs {
                 }
                 "--lines-drop-cuts" => parsed.lines_drop_cuts = true,
                 "--scene" => {
-                    let value = required_value(&mut args, "--scene", "0-255")?;
+                    let value = required_value(&mut args, "--scene", "0-255", preview_requested)?;
                     parsed.scene = Some(value.parse::<u8>().map_err(|_| {
                         invalid_input(format!("--scene expects 0-255, got {value}"))
                     })?);
@@ -673,14 +834,17 @@ impl AppArgs {
                         &mut args,
                         arg.as_str(),
                         "PATH",
+                        preview_requested,
                     )?));
                 }
                 "--location" => {
-                    let value = required_value(&mut args, "--location", "LAT,LON")?;
+                    let value =
+                        required_value(&mut args, "--location", "LAT,LON", preview_requested)?;
                     parsed.location = Some(parse_location(&value)?);
                 }
                 "--time" => {
-                    let value = required_value(&mut args, "--time", "UNIX_SECONDS")?;
+                    let value =
+                        required_value(&mut args, "--time", "UNIX_SECONDS", preview_requested)?;
                     let seconds = value.parse::<f64>().map_err(|_| {
                         invalid_input(format!("--time must be finite UNIX seconds, got {value}"))
                     })?;
@@ -699,6 +863,7 @@ impl AppArgs {
                         &mut args,
                         "--tunnel-variant",
                         "original|hallway|abstract|surface-hallway",
+                        preview_requested,
                     )?;
                     parsed.tunnel_variant = TunnelVariant::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
@@ -709,11 +874,23 @@ impl AppArgs {
                 "--house" => parsed.house = true,
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
+                "--help" | "-h" if preview_requested && house_requested => {
+                    return Err(invalid_input(
+                        "--dmg-preview cannot be combined with --house".to_string(),
+                    ));
+                }
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
                 _ => return Err(invalid_input(format!("unknown argument: {arg}"))),
             }
         }
 
+        if parsed.dmg_preview
+            && let Some(conflict) = preview_conflict
+        {
+            return Err(invalid_input(format!(
+                "--dmg-preview cannot be combined with {conflict}"
+            )));
+        }
         if parsed.house
             && (parsed.scene.is_some()
                 || tunnel_variant_supplied
@@ -815,16 +992,49 @@ fn required_value(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
     expected: &str,
+    preview_requested: bool,
 ) -> Result<String, AppError> {
-    let value = args
-        .next()
-        .ok_or_else(|| invalid_input(format!("{flag} requires {expected}")))?;
-    if value == "--house" {
-        return Err(invalid_input(format!(
-            "{flag} requires {expected}; --house is an option"
-        )));
+    match args.next() {
+        Some(value) if value == "--dmg-preview" => Err(invalid_input(format!(
+            "{flag} requires {expected}; --dmg-preview is not a value"
+        ))),
+        Some(value) if value == "--house" => Err(invalid_input(format!(
+            "{flag} requires {expected}; --house is an option, not a value"
+        ))),
+        Some(value) if preview_requested && is_app_option(&value) => Err(invalid_input(format!(
+            "{flag} requires {expected}; {value} is an option, not a value"
+        ))),
+        Some(value) => Ok(value),
+        None => Err(invalid_input(format!("{flag} requires {expected}"))),
     }
-    Ok(value)
+}
+
+fn is_app_option(value: &str) -> bool {
+    matches!(
+        value,
+        "--udp"
+            | "--fullscreen"
+            | "--monitor"
+            | "--list-monitors"
+            | "--mic"
+            | "--audio-device"
+            | "--list-audio-devices"
+            | "--layout"
+            | "--allow-flash"
+            | "--mic-layers"
+            | "--lines-drop-cuts"
+            | "--scene"
+            | "--catalog"
+            | "--star-catalog"
+            | "--location"
+            | "--time"
+            | "--tunnel-variant"
+            | "--house"
+            | "--dmg-preview"
+            | "--help"
+            | "-h"
+            | "--"
+    )
 }
 
 fn invalid_input(message: String) -> AppError {
@@ -1079,6 +1289,8 @@ impl FrameSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dmg-preview")]
+    use crate::dmg_preview::DmgPreview;
     use crate::scenes;
 
     fn parse(args: &[&str]) -> Result<ArgsCommand, AppError> {
@@ -1101,6 +1313,284 @@ mod tests {
         assert_eq!(parse_run(&[]), AppArgs::default());
         assert!(!AppArgs::default().fullscreen);
         assert_eq!(AppArgs::default().scene, None);
+    }
+
+    #[test]
+    fn integration_selectors_remain_explicit_and_exclusive() {
+        let defaults = parse_run(&[]);
+        assert!(!defaults.dmg_preview);
+        assert!(!defaults.house);
+        assert_eq!(defaults.tunnel_variant, TunnelVariant::Original);
+        assert!(parse_run(&["--house"]).house);
+        for (name, variant) in [
+            ("original", TunnelVariant::Original),
+            ("hallway", TunnelVariant::Hallway),
+            ("abstract", TunnelVariant::Abstract),
+            ("surface-hallway", TunnelVariant::SurfaceHallway),
+        ] {
+            let args = parse_run(&["--tunnel-variant", name]);
+            assert_eq!(args.tunnel_variant, variant);
+            assert!(!args.house && !args.dmg_preview);
+        }
+        for args in [
+            &["--house", "--dmg-preview"][..],
+            &["--dmg-preview", "--house"][..],
+            &["--help", "--house", "--dmg-preview"][..],
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            if cfg!(feature = "dmg-preview") || args[0] == "--help" {
+                assert!(error.contains("cannot be combined with --house"), "{error}");
+            } else {
+                assert!(
+                    error.contains("requires the dmg-preview Cargo feature"),
+                    "{error}"
+                );
+            }
+        }
+        if cfg!(feature = "dmg-preview") {
+            assert!(parse_run(&["--dmg-preview"]).dmg_preview);
+        }
+    }
+
+    #[cfg(not(feature = "dmg-preview"))]
+    #[test]
+    fn preview_flag_requires_feature_before_input_or_window_setup() {
+        for args in [
+            &["--dmg-preview"][..],
+            &["--dmg-preview", "--mic"][..],
+            &["--mic", "--dmg-preview"][..],
+            &["--dmg-preview", "--list-monitors"][..],
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            assert!(
+                error.contains("--dmg-preview requires the dmg-preview Cargo feature"),
+                "{args:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_run(&["--monitor", "--mic"]).monitor,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+        assert_eq!(parse_run(&["--scene", "7"]).scene, Some(7));
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_rejects_explicit_source_scene_and_overlay_options_in_either_order() {
+        let conflicts: &[&[&str]] = &[
+            &["--udp", "127.0.0.1:6464"],
+            &["--mic"],
+            &["--audio-device", "0"],
+            &["--list-audio-devices"],
+            &["--list-monitors"],
+            &["--mic-layers", "off"],
+            &["--mic-layers", "both"],
+            &["--scene", "7"],
+            &["--scene", "6"],
+            &["--layout", "auto"],
+            &["--allow-flash"],
+            &["--lines-drop-cuts"],
+            &["--tunnel-variant", "original"],
+            &["--house"],
+            &["--catalog", "stars.csv"],
+            &["--star-catalog", "stars.csv"],
+            &["--location", "0,0"],
+            &["--time", "0"],
+        ];
+        for conflict in conflicts {
+            for preview_first in [true, false] {
+                let mut args = conflict.to_vec();
+                if preview_first {
+                    args.insert(0, "--dmg-preview");
+                } else {
+                    args.push("--dmg-preview");
+                }
+
+                let error = parse(&args).unwrap_err().to_string();
+                assert!(
+                    error.contains("--dmg-preview cannot be combined with"),
+                    "{error}"
+                );
+                assert!(error.contains(conflict[0]), "{error}");
+            }
+        }
+        let args = parse_run(&["--dmg-preview", "--fullscreen", "--monitor", "1"]);
+        assert!(args.dmg_preview);
+        assert!(!args.mic);
+        assert!(args.udp_endpoint.is_none());
+    }
+
+    #[test]
+    fn preview_token_cannot_be_consumed_as_a_value_before_input_setup() {
+        for flag in [
+            "--udp",
+            "--monitor",
+            "--audio-device",
+            "--layout",
+            "--mic-layers",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+        ] {
+            let error = parse(&[flag, "--dmg-preview"]).unwrap_err().to_string();
+            assert!(error.contains(&format!("{flag} requires")), "{error}");
+            assert!(error.contains("--dmg-preview is not a value"), "{error}");
+            let error = parse(&[flag, "--house"]).unwrap_err().to_string();
+            assert!(error.contains(&format!("{flag} requires")), "{error}");
+            assert!(error.contains("--house is an option"), "{error}");
+        }
+        let error = parse(&["--mic", "--audio-device", "--dmg-preview"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--audio-device requires"), "{error}");
+        // Other flag-like legacy values retain their old parsing behavior.
+        assert_eq!(
+            parse_run(&["--mic", "--audio-device", "--mic"]).audio_device,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_rejects_recognized_options_as_missing_values_in_either_order() {
+        let flags = [
+            "--udp",
+            "--monitor",
+            "--audio-device",
+            "--layout",
+            "--mic-layers",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+        ];
+        let options = [
+            "--udp",
+            "--fullscreen",
+            "--monitor",
+            "--list-monitors",
+            "--mic",
+            "--audio-device",
+            "--list-audio-devices",
+            "--layout",
+            "--allow-flash",
+            "--mic-layers",
+            "--lines-drop-cuts",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+            "--house",
+            "--help",
+            "-h",
+            "--",
+        ];
+        for flag in flags {
+            for option in options {
+                for args in [
+                    vec!["--dmg-preview", flag, option],
+                    vec![flag, option, "--dmg-preview"],
+                ] {
+                    let error = parse(&args).unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("{flag} requires")),
+                        "{args:?}: {error}"
+                    );
+                    assert!(
+                        error.contains("is an option, not a value"),
+                        "{args:?}: {error}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            parse_run(&["--monitor", "--mic"]).monitor,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+        assert_eq!(
+            parse_run(&["--mic", "--audio-device", "--mic"]).audio_device,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_keys_cannot_toggle_overlays_or_layout_and_legacy_keys_are_unchanged() {
+        let mods = KeyModifiers::default();
+        for (key, action) in [
+            ('m', KeyAction::CycleMicLayers),
+            ('l', KeyAction::CycleLayoutPin),
+        ] {
+            assert_eq!(
+                key_action(KeyInput::Character(key), mods, false),
+                Some(action)
+            );
+            assert_eq!(
+                preview_key_action(KeyInput::Character(key), mods, false),
+                None
+            );
+        }
+        assert_eq!(
+            preview_key_action(KeyInput::Character('f'), mods, false),
+            Some(KeyAction::ToggleFullscreen)
+        );
+        assert_eq!(
+            preview_key_action(KeyInput::Escape, mods, true),
+            Some(KeyAction::ExitFullscreen)
+        );
+        assert!(
+            !parse_run(&["--udp", "127.0.0.1:6464", "--mic", "--mic-layers", "both"]).dmg_preview
+        );
+        assert_eq!(parse_run(&["--scene", "7"]).scene, Some(7));
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_zero_size_skips_acquisition_and_resize_keeps_clock() {
+        let start = Instant::now();
+        let mut preview = DmgPreview::default();
+        let mut frame = None;
+        for (size, millis) in [((160, 144), 0), ((0, 144), 100), ((320, 288), 200)] {
+            if preview_drawable(size.0, size.1) {
+                let now = start + Duration::from_millis(millis);
+                frame = Some(preview.acquired(now));
+                preview.submitted(now);
+                preview.presented(now);
+            }
+        }
+        let frame = frame.unwrap();
+        assert_eq!((frame.scx, frame.scy), (128, 1));
+        assert!(!preview_drawable(160, 0));
+        assert_eq!(preview.acquired(start + Duration::from_millis(200)), frame);
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_waits_without_redraws_at_zero_size_and_resumes_after_resize() {
+        let mut redraws = 0;
+        let mut drawable = preview_drawable(160, 144);
+        request_preview_redraw(drawable, || redraws += 1);
+        assert_eq!(redraws, 1);
+
+        for size in [(0, 144), (160, 0), (0, 0)] {
+            drawable = preview_drawable(size.0, size.1);
+            for _ in 0..3 {
+                request_preview_redraw(drawable, || redraws += 1);
+            }
+        }
+        assert_eq!(redraws, 1);
+
+        drawable = preview_drawable(320, 288);
+        request_preview_redraw(drawable, || redraws += 1);
+        request_preview_redraw(drawable, || redraws += 1);
+        assert_eq!(redraws, 3);
     }
 
     #[test]

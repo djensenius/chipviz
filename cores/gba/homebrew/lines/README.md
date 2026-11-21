@@ -44,7 +44,55 @@ Tests cover deterministic replay, beat edges and fallback, frozen snapshots,
 bounded writes, cancellation and restart. The scalar pixel oracle shares the
 renderer's formula; it is not an independent golden image.
 
-This subset provides no target fixtures or restore model. It does not prove
-page/palette ownership, a hardware handoff, cadence, presented pixels, visual
-quality, accessibility, flash safety or physical hardware behavior. The GBA
-Mode 4 palette is global to both pages; staging it is not a presentation.
+## Isolated raw-page fixture (test only)
+
+`fixture/` links this model into a separate ARM ROM, not the production ROM.
+Its regular and stalled synthetic inputs produce the original 13 ordered
+checkpoints, including a partial render, cancellation and restart. Each record
+includes the entire rendered page, adjacent canaries, state, render progress,
+batch counts and the complete staged palette. An independent Python scalar
+oracle compares all records and bytes, including the unfinished sentinel
+portion. The host tests also exercise phase 48 and steps 65535/65536, render
+polling, and failure cases in the trace protocol.
+
+Page 1 is the render destination; page 0 carries the trace in three chunks
+per checkpoint (two raw page chunks and one palette chunk). The global hardware
+palette encodes byte values as RGB565 transport colors, **not displayed scene
+colors**. Headers are invalidated during copying; the harness requires two
+identical fresh non-NULL observations on consecutive libretro runs per ordered
+chunk and a completion record. A run with a NULL or absent video callback
+resets stability and counts toward the timeout. Only a byte-identical repeat of
+the latest accepted chunk is allowed; older replays and corrupt repeats fail.
+A missing, corrupt or incomplete trace, or a timeout, is a failure, not a
+successful comparison. The libretro core must expose 240x160 RGB565 frames.
+
+`just gba-lines-fixture-test` runs the focused host checks; they also run as
+part of `just python-test`. With a C99 compiler, the equivalent direct checks
+from the repository root are:
+
+```sh
+mkdir -p build/lines-fixture
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -shared -fPIC cores/gba/homebrew/lines/fixture/fixture.c cores/gba/homebrew/lines/lines.c -o build/lines-fixture/fixture.so
+python3 cores/gba/homebrew/lines/fixture/host_tests.py build/lines-fixture/fixture.so
+cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only cores/gba/homebrew/lines/fixture/main.c cores/gba/homebrew/lines/fixture/fixture.c cores/gba/homebrew/lines/lines.c
+```
+
+With devkitARM configured (`DEVKITARM`, its `bin` on `PATH`, and `gbafix`)
+and a local mGBA libretro core, build and run the matching fixture:
+
+```sh
+make -C cores/gba/homebrew/lines/fixture
+python3 cores/gba/homebrew/lines/fixture/harness.py --rom cores/gba/homebrew/lines/fixture/build/gba-lines-fixture.gba --core /absolute/path/to/mgba_libretro.dylib --max-frames 12000
+```
+
+Use the platform's core extension as appropriate. Record the exact head,
+tool versions, results and any earlier failures. The old #167 mGBA trace
+used the pre-#195 model and is not evidence for this corrected model; this
+migration requires a fresh build and run.
+
+The fixture does not install the staged scene palette or present the rendered
+scene. Synthetic steps are independent of VBlank, and transport copies and
+waits dominate its frame count. It proves neither live page/palette ownership
+or atomicity, production VBlank timing, hardware behavior, visual quality,
+accessibility nor photosensitivity/flash safety. The GBA Mode 4 palette is
+global to both pages; staging it is not a presentation.
