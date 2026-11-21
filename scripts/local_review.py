@@ -219,6 +219,39 @@ def local_catalog(roots):
     return {"schema_version": 1, "clips": clips}, media
 
 
+def directory_identity(fd):
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def directory_contains(ancestor_fd, child_fd):
+    """Compare opened directory identities while walking towards the filesystem root."""
+    ancestor = directory_identity(ancestor_fd)
+    fd = os.dup(child_fd)
+    seen = set()
+    try:
+        while True:
+            current = directory_identity(fd)
+            if current == ancestor:
+                return True
+            if current in seen:
+                raise ValueError("directory ancestry cycle")
+            seen.add(current)
+            parent_fd = os.open("..", FLAGS | os.O_DIRECTORY, dir_fd=fd)
+            try:
+                parent = directory_identity(parent_fd)
+            except BaseException:
+                os.close(parent_fd)
+                raise
+            if parent == current:
+                os.close(parent_fd)
+                return False
+            os.close(fd)
+            fd = parent_fd
+    finally:
+        os.close(fd)
+
+
 class ReviewServer(HTTPServer):
     def __init__(self, roots, site_fd, port=0):
         self.roots, self.site_fd = roots, site_fd
@@ -345,9 +378,9 @@ def main():
                 fds.append(fd)
                 roots[namespace] = fd
         if "draft" in roots:
-            library_stat, draft_stat = os.fstat(roots["library"]), os.fstat(roots["draft"])
-            if (library_stat.st_dev, library_stat.st_ino) == (draft_stat.st_dev, draft_stat.st_ino):
-                raise ValueError("draft root must be separate from the library")
+            if (directory_contains(roots["library"], roots["draft"])
+                    or directory_contains(roots["draft"], roots["library"])):
+                raise ValueError("library and draft roots must be separate and non-overlapping")
         site_fd = os.open(SITE, FLAGS | os.O_DIRECTORY)
         fds.append(site_fd)
         with ReviewServer(roots, site_fd, args.port) as server:

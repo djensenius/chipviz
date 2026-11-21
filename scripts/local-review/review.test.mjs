@@ -5,7 +5,8 @@ import { validateCatalog, parseTime, reference } from './lib.mjs';
 const clip = () => ({
   id: 'clip-0123456789abcdef0123', sha256: 'a'.repeat(64),
   title: '<img src=x onerror=alert(1)>', family: 'Hallway', platform: 'Pi 5 profile',
-  variant: 'Hallway surface', scenario: 'quiet', capture: 'Mac GPU simulation',
+  variant: 'Hallway surface', scenario: 'quiet',
+  capture: 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware',
   source_revision: 'b'.repeat(40), collection: 'draft',
   notes: ['Review-only draft; not human-reviewed'],
 });
@@ -36,7 +37,51 @@ test('timestamped references only contain validated identity and declared revisi
   assert.doesNotMatch(text, /127\.0\.0\.1|capability|\/Users|private\.mp4|token=secret|https?:/);
   assert.match(reference({ ...value, source_revision: null }, 0), /revision \(unverified\): unknown/);
   assert.throws(() => reference({ ...value, id: 'capability' }, 0));
+  assert.throws(() => reference({ ...value, sha256: 'token=secret' }, 0));
+  assert.throws(() => reference({ ...value, source_revision: '/private/path' }, 0));
   assert.throws(() => reference(value, -1));
+});
+
+test('references describe all recognized draft combinations as inferred', () => {
+  for (const family of ['Hallway', 'House']) {
+    for (const scenario of ['quiet', 'energetic']) {
+      for (const platform of ['Mac / M1 profile', 'Pi 5 profile']) {
+        const value = { ...clip(), family, scenario, platform,
+          variant: family === 'Hallway' ? 'Hallway surface' : 'House',
+          capture: platform === 'Pi 5 profile'
+            ? 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware'
+            : 'M1 profile rendered on Mac GPU' };
+        const text = reference(value, 12);
+        assert.ok(text.includes(`Visualization (inferred): ${family}`));
+        assert.ok(text.includes(`Variant (inferred): ${value.variant}`));
+        assert.ok(text.includes(`Scenario (inferred): ${scenario}`));
+        assert.ok(text.includes(platform === 'Pi 5 profile'
+          ? 'Platform (inferred): Pi 5 profile on Mac GPU (not physical Pi hardware)'
+          : 'Platform (inferred): Mac / M1 profile'));
+      }
+    }
+  }
+  const unknownCapture = reference({ ...clip(), capture: 'unverified' }, 0);
+  assert.match(unknownCapture, /Platform \(inferred\): Pi 5 profile\n/);
+  assert.doesNotMatch(unknownCapture, /Mac GPU/);
+  const libraryCapture = reference({ ...clip(),
+    capture: 'Pi 5 profile simulated on Mac GPU; not physical Pi hardware' }, 0);
+  assert.match(libraryCapture, /Pi 5 profile on Mac GPU \(not physical Pi hardware\)/);
+});
+
+test('arbitrary metadata never leaks through any optional reference field', () => {
+  for (const field of ['title', 'family', 'platform', 'variant', 'scenario', 'capture']) {
+    for (const payload of ['Hallway\npassword=secret', '/Users/person/video.mp4',
+      'http://127.0.0.1:8000/capability/', 'token=secret', '__proto__']) {
+      const text = reference({ ...clip(), [field]: payload, notes: [payload] }, 0);
+      assert.equal(text.includes(payload), false, `${field}: ${payload}`);
+      if (['family', 'platform', 'variant', 'scenario'].includes(field)) {
+        const label = { family: 'Visualization', platform: 'Platform',
+          variant: 'Variant', scenario: 'Scenario' }[field];
+        assert.equal(text.includes(`${label} (inferred):`), false);
+      }
+    }
+  }
 });
 
 class Element {
@@ -101,5 +146,7 @@ test('filters, text-only rendering, embedded seeking and copy fallback', async (
   const fallback = descendants(detail).find(item => item.tagName === 'textarea');
   assert.equal(fallback.hidden, false);
   assert.match(fallback.value, /Time: 72 seconds/);
+  assert.match(fallback.value, /Visualization \(inferred\): Hallway/);
+  assert.match(fallback.value, /Pi 5 profile on Mac GPU \(not physical Pi hardware\)/);
   assert.doesNotMatch(fallback.value, /capability|127\.0\.0\.1|<img/);
 });

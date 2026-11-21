@@ -1,4 +1,4 @@
-# Latest stable versions checked with `mise ls-remote` on 2026-06-21.
+# Existing tool versions other than Node were checked with `mise ls-remote` on 2026-06-21.
 [tools]
 cmake = "4.3.4"
 # The default vfox registry does not list this compiler release.

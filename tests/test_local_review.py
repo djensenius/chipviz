@@ -207,6 +207,43 @@ class GalleryTests(unittest.TestCase):
             process.terminate()
             process.communicate(timeout=5)
 
+    def test_command_line_rejects_overlapping_roots(self):
+        nested_library = self.root / "nested"
+        nested_draft = self.draft / "nested"
+        nested_library.mkdir()
+        nested_draft.mkdir()
+        alias = self.base / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        for library, draft in (
+            (self.root, self.root), (self.root, nested_library),
+            (nested_library, self.root), (self.draft, nested_draft),
+            (nested_draft, self.draft), (self.root, alias / "nested"),
+            (alias / "nested", self.root),
+        ):
+            with self.subTest(library=library, draft=draft):
+                result = subprocess.run(
+                    [sys.executable, str(Path(gallery.__file__)), "--root", str(library),
+                     "--draft-root", str(draft)], capture_output=True, text=True, timeout=5
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("separate and non-overlapping", result.stderr)
+
+    def test_directory_ancestry_uses_identity_not_string_prefix(self):
+        sibling = self.base / "library-other"
+        sibling.mkdir()
+        fd = os.open(sibling, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self.assertFalse(gallery.directory_contains(self.fds[0], fd))
+            self.assertFalse(gallery.directory_contains(fd, self.fds[0]))
+        finally:
+            os.close(fd)
+
+    def test_directory_ancestry_errors_fail_closed(self):
+        with mock.patch.object(gallery.os, "open", side_effect=PermissionError("unavailable")):
+            with self.assertRaises(PermissionError):
+                gallery.directory_contains(self.fds[0], self.fds[1])
+
     def test_changed_during_hash_rejected(self):
         original = gallery.fingerprint
         count = 0

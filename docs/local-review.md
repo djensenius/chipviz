@@ -18,7 +18,10 @@ To select an existing library and add a separate draft root:
 python3 scripts/local_review.py --root /path/to/library --draft-root /path/to/drafts
 ```
 
-The directories must exist and must not themselves be symlinks. `--port 0`
+The directories must exist, must not themselves be symlinks, and must not
+overlap: neither may contain the other. The check compares opened directory
+identities and ancestry; use trusted, stable directories. Bind-mount aliases
+and moves after startup may not be detected. `--port 0`
 is the default and chooses an available port; `--port 8000` requests a
 particular port. Open the printed URL on the same machine and stop the server
 with Ctrl-C. Refresh the page to rescan both roots. Scanning hashes every MP4
@@ -38,13 +41,16 @@ not in use.
 Select a capture, open its embedded video, and seek using the player or the
 time field. Use **Use current playback time** and **Copy reference** to copy
 the identity, content hash, declared revision and timestamp without a URL,
-token or file path. The stable identity incorporates the collection, relative
-name and video bytes; renames or changed bytes produce a new identity. A
-revision from a labelled library README or a draft `source_commit` is a
-declaration, not independent proof. Other labels are inferred from filenames;
-unknown information remains unknown. File changes detected between scanning
-and playback are rejected until refresh. Changes during an active transfer
-cannot be excluded, so do not edit footage while browsing.
+token or file path. Recognized visualization, platform, variant and scenario
+labels are included only from a strict allowlist and are marked as inferred;
+other free-form metadata is omitted. The stable identity incorporates the
+collection, relative name and video bytes; renames or changed bytes produce a
+new identity. A revision from a labelled library README or a draft
+`source_commit` is a declaration, not independent proof. Other labels are
+inferred from filenames; unknown information remains unknown. File changes
+detected between scanning and playback are rejected until refresh. Changes
+during an active transfer cannot be excluded, so do not edit footage while
+browsing.
 
 Drafts are review-only and not human-reviewed. Hallway/House draft names identify
 quiet or energetic scenarios and M1 or Pi 5 profiles; Pi-profile captures are
