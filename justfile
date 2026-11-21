@@ -133,6 +133,7 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test
     @${CC:-cc} {{ cflags }} tests/interface_tests.c shared/src/control_frame.c shared/src/interface.c -o build/tests/interface_tests
     @${CC:-cc} {{ cflags }} -Ifirmware/pico/include tests/pico_joybus_tests.c firmware/pico/src/joybus_bridge.c -o build/tests/pico_joybus_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_input_tests.c -o build/tests/gba_input_tests
+    @${CC:-cc} {{ cflags }} cores/gba/homebrew/lines/lines_tests.c cores/gba/homebrew/lines/lines.c -o build/tests/gba_lines_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_native_prefetch_tests.c cores/gba/homebrew/source/native_prefetch.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_native_prefetch_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_native_render_tests.c cores/gba/homebrew/source/native_prefetch.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_native_render_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_colour_field_tests.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_colour_field_tests
@@ -146,6 +147,7 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test
     @build/tests/interface_tests
     @build/tests/pico_joybus_tests
     @build/tests/gba_input_tests
+    @build/tests/gba_lines_tests
     @build/tests/gba_native_prefetch_tests
     @build/tests/gba_native_render_tests
     @build/tests/gba_colour_field_tests
