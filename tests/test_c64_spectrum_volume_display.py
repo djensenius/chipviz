@@ -34,11 +34,18 @@ def put(data, x, y, rgb, pitch=PITCH):
   data[pos:pos + 4] = bytes((rgb[2], rgb[1], rgb[0], 0))
 
 
+def draw_calibration(data, origin, pitch):
+  # Independent full-cell specification, not read from the fixture/oracle.
+  for x, y, rgb in ((0, 0, (255, 255, 255)), (312, 0, (111, 61, 134)),
+                    (0, 192, (88, 141, 67)), (312, 192, (53, 40, 121))):
+    for yy in range(y, y + 8):
+      for xx in range(x, x + 8):
+        put(data, xx + origin[0], yy + origin[1], rgb, pitch)
+
+
 def calibration():
   data = frame(blank=True)
-  for x, y, colour in ((0, 0, (255, 0, 0)), (319, 0, (0, 255, 0)),
-                       (0, 199, (0, 0, 255)), (319, 199, (255, 255, 0))):
-    put(data, x + ORIGIN[0], y + ORIGIN[1], colour)
+  draw_calibration(data, ORIGIN, PITCH)
   return W, H, PITCH, bytes(data)
 
 
@@ -52,10 +59,48 @@ def native_callback(callback, *args):
 
 
 class DisplayTests(unittest.TestCase):
-  def test_real_observation_is_blocked_without_calibration_producer(self):
-    with self.assertRaisesRegex(RuntimeError, "hardware-producible calibration"):
+  def test_real_observation_is_blocked_without_verified_adapter(self):
+    with self.assertRaisesRegex(RuntimeError, "trusted real adapter"):
       display.observe(None, None, blank=False, model="pal", model_flag=1, raster_lines=312,
                       calibration=calibration(), limit=2)
+
+  def test_calibration_fixture_host_surfaces(self):
+    with tempfile.TemporaryDirectory() as directory:
+      library = pathlib.Path(directory) / "calibration.so"
+      subprocess.run([os.environ.get("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror",
+                      "-pedantic", "-shared", "-fPIC", "-DSV_CALIBRATION_HOST_TEST",
+                      str(ROOT / "tests/c64_spectrum_volume_calibration.c"), "-o", str(library)],
+                     check=True, capture_output=True)
+      fixture = ctypes.CDLL(str(library))
+      ptr = ctypes.POINTER(ctypes.c_uint8)
+      fixture.sv_calibration_prepare.argtypes = [ptr, ptr]
+      screen = (ctypes.c_uint8 * 1032)(*([0xa5] * 1032))
+      colour = (ctypes.c_uint8 * 1032)(*([0x5a] * 1032))
+      fixture.sv_calibration_prepare(ctypes.cast(ctypes.byref(screen, 16), ptr),
+                                     ctypes.cast(ctypes.byref(colour, 16), ptr))
+      want_screen = bytearray([32] * 1000)
+      want_colour = bytearray(1000)
+      for pos, ink in ((0, 1), (39, 4), (960, 5), (999, 6)):
+        want_screen[pos] = 160
+        want_colour[pos] = ink
+      self.assertEqual(bytes(screen), bytes([0xa5] * 16) + want_screen + bytes([0xa5] * 16))
+      self.assertEqual(bytes(colour), bytes([0x5a] * 16) + want_colour + bytes([0x5a] * 16))
+      rgb = {0: (0, 0, 0), 1: (255, 255, 255), 4: (111, 61, 134),
+             5: (88, 141, 67), 6: (53, 40, 121)}
+      fake = frame(blank=True)
+      for y in range(200):
+        for x in range(320):
+          index = 16 + (y // 8) * 40 + x // 8
+          ink = colour[index] if screen[index] == 160 else 0
+          put(fake, x + ORIGIN[0], y + ORIGIN[1], rgb[ink])
+      self.assertEqual(bytes(fake), calibration()[3])
+      self.assertEqual(display.calibrate((W, H, PITCH, bytes(fake))), ORIGIN)
+
+  def test_palette_options_and_pinned_rgb(self):
+    self.assertEqual(display.CALIBRATION_READY, b"SVC1")
+    self.assertEqual(display.PALETTE_OPTIONS, {"vice_external_palette": "pepto-pal", "vice_gfx_colors": "24bit"})
+    self.assertEqual(display.PEPTO, {0: (0, 0, 0), 1: (255, 255, 255), 4: (111, 61, 134),
+                                     5: (88, 141, 67), 6: (53, 40, 121)})
 
   def test_callback_faults_are_permanent_even_when_callback_exception_is_swallowed(self):
     for kind in ("stale", "invalid", "extra", "duplicate-only", "ambiguous"):
@@ -190,10 +235,19 @@ class DisplayTests(unittest.TestCase):
     width, height, pitch = 640, 200, 640 * 4
     data = bytearray(pitch * height)
     for x0 in (0, 320):
-      for x, y, colour in display.FIDUCIALS:
-        put(data, x0 + x, y, colour, pitch)
+      draw_calibration(data, (x0, 0), pitch)
     with self.assertRaisesRegex(ValueError, "ambiguous calibration"):
       display.calibrate((width, height, pitch, bytes(data)))
+    for x, y, rgb in ((1, 1, (0, 0, 0)), (20, 20, (255, 255, 255)),
+                      (318, 1, (88, 141, 67))):
+      data = bytearray(calibration()[3])
+      put(data, x + ORIGIN[0], y + ORIGIN[1], rgb)
+      with self.subTest(x=x, y=y), self.assertRaisesRegex(ValueError, "calibration pixel"):
+        display.calibrate((W, H, PITCH, bytes(data)))
+    data = bytearray(calibration()[3])
+    put(data, ORIGIN[0], ORIGIN[1], (0, 0, 0))
+    with self.assertRaisesRegex(ValueError, "missing calibration"):
+      display.calibrate((W, H, PITCH, bytes(data)))
 
   def test_callback_identity_and_malformed_frames(self):
     boundary = display.Observation()

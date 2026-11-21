@@ -248,15 +248,32 @@ emulator frontend. Its independent pixel oracle specifies black plus four
 (22,5,5). It compares all 320x200 pixels using explicit Pepto PAL RGB:
 black `#000000`, purple `#6F3D86`, green `#588D43`, blue `#352879`.
 It accepts only little-endian libretro XRGB8888 with valid dimensions and
-pitch, including padding. The current saturated RGB corner fiducials are
-**synthetic only**: they are not established as producible by a C64 with the
-Pepto palette, and there is no target calibration producer. `observe` fails
-closed unless explicitly invoked with `synthetic_only=True`; that opt-in is
-for fake tests, not evidence of emulator readiness. A future target reference
-must use independently specified, hardware-producible fiducials and be
-independently produced and observed, not derived from either scene image.
-Matching a reference and exact pixel colours does not itself prove the
-emulator palette configuration.
+pitch, including padding.
+
+`tests/c64_spectrum_volume_calibration.c` is a separate, unlinked static
+calibration fixture source with the same VIC setup and ROM assumptions. It
+clears the display to code 32/black, then puts solid code 160 at the corner cells:
+top-left white (VIC 1), top-right purple (4), bottom-left green (5), and
+bottom-right blue (6). It writes `SVC1` to `sv_calibration_ready` only after
+the screen and VIC setup, then holds. A future adapter must observe that
+marker absent before boot and stable across calibration frames. The fixture
+needs its own matched labels and map and proof of memory/interrupt isolation.
+The independent host oracle searches for one corner set and checks every
+pixel of the 320x200 reference: exactly
+four 8x8 coloured cells and black elsewhere. Missing, partial, extra and
+ambiguous references fail.
+
+The required VICE x64sc libretro options are `vice_external_palette=pepto-pal`
+and `vice_gfx_colors=24bit` (as in `scripts/c64_colour_field_capture.py`);
+the future adapter must set and verify these, not just assume them. The
+RGB values are taken from the pinned upstream
+[VICE Pepto PAL palette](https://github.com/VICE-Team/svn-mirror/blob/eef05c0f438bb65e81677840fa64ce81b49e60e5/vice/data/C64/pepto-pal.vpl):
+black `#000000`, white `#FFFFFF`, purple `#6F3D86`, green `#588D43`, and
+blue `#352879`. These modeled RGB values do not prove physical colors.
+`observe` remains blocked for real use; `synthetic_only=True` is for fake
+tests, not evidence of emulator readiness. A reference must be independently
+observed from this separate fixture, not derived from the scene image.
+Matching a reference does not itself prove palette configuration.
 
 Any future emulator adapter must prove reference provenance, pixel format and
 Pepto palette configuration; provide a fresh callback per `retro_run` with
@@ -271,10 +288,11 @@ prove callbacks are quiescent before completion; a callback after return
 cannot invalidate an already returned result. It is not wired to the older
 capture seam, which cannot establish this callback identity. A future adapter
 also needs a separate wall-clock watchdog and trusted process cleanup: the
-frame budget cannot interrupt a hung `retro_run`. No calibration PRG, independent
-raster measurement, safe lifecycle, target build or emulator execution is
-provided here; all require separately approved build/emulator ownership and
-cleanup. No PAL/NTSC display, production integration, live timing, flash
+frame budget cannot interrupt a hung `retro_run`. No independent raster
+measurement, safe lifecycle, target build or emulator execution is provided
+here; all require separately approved build/emulator ownership and cleanup.
+The calibration fixture has not been built with cc65 or run. No PAL/NTSC
+display, production integration, live timing, flash
 safety or publishing claim follows from these host-only checks.
 
 ## Connection path
