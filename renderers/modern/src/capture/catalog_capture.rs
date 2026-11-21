@@ -697,6 +697,62 @@ mod tests {
     }
 
     #[test]
+    fn catalog_cli_preserves_literal_house_paths_but_rejects_a_standalone_flag() {
+        for (tokens, expected_out, expected_input, expected_exclusive) in [
+            (
+                vec!["--catalog-v1", "--input", "recording", "--out", "--house"],
+                "--house",
+                "recording",
+                false,
+            ),
+            (
+                vec!["--catalog-v1", "--out", "shots", "--input", "--house"],
+                "shots",
+                "--house",
+                false,
+            ),
+            (
+                vec![
+                    "--catalog-v1",
+                    "--exclusive-output",
+                    "--out",
+                    "--house",
+                    "--input",
+                    "--house",
+                ],
+                "--house",
+                "--house",
+                true,
+            ),
+        ] {
+            let (tokens, catalog) =
+                cli_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(catalog);
+            let (tokens, house) = cli_house_tokens(tokens).unwrap();
+            assert!(!house);
+            let (StarfieldConfiguredCommand::Capture(args, _), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert_eq!(args.out, PathBuf::from(expected_out));
+            assert_eq!(args.input, Input::File(expected_input.into()));
+            assert_eq!(exclusive, expected_exclusive);
+        }
+        for tokens in [
+            vec!["--catalog-v1", "--input", "recording", "--house"],
+            vec!["--house", "--catalog-v1", "--input", "recording"],
+            vec!["--catalog-v1", "--input", "--house", "--house"],
+        ] {
+            let error = cli_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(
+                error.contains("--house is incompatible with --catalog-v1"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     #[ignore = "requires an allocated GPU adapter"]
     fn sparse_catalog_stills_match_independent_sequential_renderer() {

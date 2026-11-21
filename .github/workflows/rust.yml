@@ -18,3 +18,4 @@ jobs:
         run: mise exec -- rustup component add rustfmt clippy
       - run: mise exec -- just modern-check
       - run: mise exec -- just rust-test
+      - run: mise exec -- cargo test --manifest-path renderers/modern/Cargo.toml --test dmg_preview_cli --features dmg-preview,unmeasured-flash

@@ -396,6 +396,8 @@ fn parse_args_internal(
 }
 
 fn is_cli_option(value: &str) -> bool {
+    // `--house` was a literal value before the local opt-in existed. When a
+    // standalone House flag is present, cli_house_tokens checks it separately.
     matches!(
         value,
         "--help"
@@ -417,7 +419,6 @@ fn is_cli_option(value: &str) -> bool {
             | "--time"
             | "--follow-time"
             | "--starfield"
-            | "--house"
             | "--dmg-preview"
     )
 }
@@ -1024,9 +1025,6 @@ fn json_string(text: &str) -> String {
 }
 
 fn cli_house_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), String> {
-    if !tokens.iter().any(|token| token == "--house") {
-        return Ok((tokens, false));
-    }
     let value_options = [
         "--profile",
         "--scene",
@@ -1041,8 +1039,24 @@ fn cli_house_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), String> 
         "--location",
         "--time",
     ];
+    // A token in a value position is not a House flag, even if it is named
+    // `--house`. Preserve legacy literal paths unless a separate flag appears.
+    let mut args = tokens.iter();
+    let mut house = false;
+    while let Some(token) = args.next() {
+        if value_options.contains(&token.as_str()) {
+            let _ = args.next();
+        } else if token == "--house" {
+            house = true;
+        }
+    }
+    if !house {
+        return Ok((tokens, false));
+    }
     for pair in tokens.windows(2) {
-        if value_options.contains(&pair[0].as_str()) && is_cli_option(&pair[1]) {
+        if value_options.contains(&pair[0].as_str())
+            && (pair[1] == "--house" || is_cli_option(&pair[1]))
+        {
             return Err(format!(
                 "{} requires a value; {} is an option",
                 pair[0], pair[1]
@@ -1372,7 +1386,6 @@ mod tests {
             "--time",
             "--follow-time",
             "--starfield",
-            "--house",
             "--dmg-preview",
         ];
         for value_option in value_options {
@@ -1790,26 +1803,30 @@ mod tests {
             parse_args_with_options(["--out", "shots", "--house"].map(str::to_string)).is_err()
         );
         for conflict in [
-            "--scene",
-            "--tunnel-variant",
-            "--starfield",
-            "--catalog-v1",
-            "--catalog",
-            "--location",
-            "--time",
-            "--follow-time",
-            "--dmg-preview",
+            &["--scene", "2"][..],
+            &["--tunnel-variant", "original"][..],
+            &["--starfield"][..],
+            &["--catalog-v1"][..],
+            &["--catalog", "stars.csv"][..],
+            &["--location", "0,0"][..],
+            &["--time", "0"][..],
+            &["--follow-time"][..],
+            &["--dmg-preview"][..],
         ] {
-            for tokens in [
-                vec!["--out", "shots", "--house", conflict],
-                vec![conflict, "--house", "--out", "shots"],
-            ] {
+            for house_first in [true, false] {
+                let mut tokens = vec!["--out", "shots"];
+                if house_first {
+                    tokens.push("--house");
+                }
+                tokens.extend_from_slice(conflict);
+                if !house_first {
+                    tokens.push("--house");
+                }
                 assert!(
                     cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).is_err()
                 );
             }
         }
-        assert!(cli_house_tokens(["--out", "--house"].map(str::to_string).to_vec()).is_err());
     }
 
     #[test]
@@ -1836,7 +1853,29 @@ mod tests {
             "--location",
             "--time",
         ] {
-            for option in ["--house", "--dmg-preview", "--out", "--help"] {
+            for option in [
+                "--help",
+                "-h",
+                "--profile",
+                "--scene",
+                "--frames",
+                "--input",
+                "--size",
+                "--out",
+                "--mic-layers",
+                "--lines-drop-cuts",
+                "--exclusive-output",
+                "--catalog-v1",
+                "--tunnel-variant",
+                "--catalog",
+                "--star-catalog",
+                "--location",
+                "--time",
+                "--follow-time",
+                "--starfield",
+                "--house",
+                "--dmg-preview",
+            ] {
                 for args in [vec!["--house", flag, option], vec![flag, option, "--house"]] {
                     let error = cli_house_tokens(args.into_iter().map(str::to_string).collect())
                         .unwrap_err();
@@ -1914,15 +1953,101 @@ mod tests {
 
         for tokens in [
             vec!["--out", "--house"],
+            vec!["--out", "--house", "--help"],
+            vec!["--out", "shots", "--input", "--house", "--help"],
+            vec!["--out", "shots", "--star-catalog", "--house", "--help"],
+        ] {
+            let tokens: Vec<String> = tokens.into_iter().map(str::to_string).collect();
+            let (processed, house) = cli_house_tokens(tokens.clone()).unwrap();
+            assert!(!house);
+            assert_eq!(processed, tokens);
+        }
+        let (tokens, house) =
+            cli_house_tokens(["--out", "--house"].map(str::to_string).to_vec()).unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, _), _) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.out, PathBuf::from("--house"));
+        let (tokens, house) = cli_house_tokens(
+            ["--out", "shots", "--input", "--house"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, _), _) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.input, Input::File(PathBuf::from("--house")));
+        for tokens in [
             vec!["--exclusive-output", "--out", "--house"],
             vec!["--out", "--house", "--exclusive-output"],
+        ] {
+            let (tokens, house) =
+                cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(!house);
+            let (StarfieldConfiguredCommand::Capture(args, _), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert!(exclusive);
+            assert_eq!(args.out, PathBuf::from("--house"));
+        }
+        let tokens = [
+            "--exclusive-output",
+            "--out",
+            "--house",
+            "--input",
+            "--house",
+            "--star-catalog",
+            "--house",
+            "--location",
+            "0,0",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let (tokens, house) = cli_house_tokens(tokens).unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, options), exclusive) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert!(exclusive);
+        assert_eq!(args.out, PathBuf::from("--house"));
+        assert_eq!(args.input, Input::File("--house".into()));
+        assert_eq!(options.starfield.catalog_path, Some("--house".into()));
+        for tokens in [
+            vec!["--out", "--house", "--house"],
+            vec!["--house", "--out", "--house"],
+            vec!["--input", "--house", "--out", "shots", "--house"],
         ] {
             let error =
                 cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap_err();
             assert!(
-                error.contains("--out requires a value; --house is an option"),
+                error.contains("requires a value; --house is an option"),
                 "{error}"
             );
+        }
+        for tokens in [
+            vec!["--house", "--out", "./--house"],
+            vec!["--out", "./--house", "--house"],
+        ] {
+            let (tokens, house) =
+                cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(house);
+            let (StarfieldConfiguredCommand::Capture(args, _), _) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert_eq!(args.out, PathBuf::from("./--house"));
         }
         let tokens = ["--out", "shots", "--house", "--scene", "2"].map(str::to_string);
         assert!(

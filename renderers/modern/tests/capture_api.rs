@@ -110,6 +110,107 @@ fn public_app_error_still_supports_an_external_exhaustive_match() {
 }
 
 #[test]
+fn capture_cli_legacy_house_literal_paths_allow_help_without_outputs() {
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-capture-house-literal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    for args in [
+        &["--out", "--house", "--help"][..],
+        &["--out", "shots", "--input", "--house", "--help"][..],
+        &[
+            "--catalog-v1",
+            "--input",
+            "recording",
+            "--out",
+            "--house",
+            "--help",
+        ][..],
+        &[
+            "--catalog-v1",
+            "--out",
+            "shots",
+            "--input",
+            "--house",
+            "--help",
+        ][..],
+        &[
+            "--catalog-v1",
+            "--exclusive-output",
+            "--out",
+            "--house",
+            "--input",
+            "--house",
+            "--help",
+        ][..],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("usage: chipviz-capture"),
+            "{args:?}: {output:?}"
+        );
+        assert!(!root.join("--house").exists());
+        assert!(!root.join("shots").exists());
+    }
+    std::fs::remove_dir(&root).unwrap();
+}
+
+#[test]
+fn capture_cli_catalog_rejects_standalone_house_before_outputs() {
+    for args in [
+        &["--catalog-v1", "--input", "recording", "--house", "--help"][..],
+        &["--house", "--catalog-v1", "--input", "recording", "--help"][..],
+        &["--catalog-v1", "--input", "--house", "--house", "--help"][..],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--house is incompatible with --catalog-v1"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn capture_cli_standalone_house_rejects_preview_and_option_values_before_outputs() {
+    for args in [
+        &["--out", "shots", "--house", "--dmg-preview", "--help"][..],
+        &["--out", "shots", "--dmg-preview", "--house", "--help"][..],
+        &["--house", "--out", "--dmg-preview", "--help"][..],
+        &["--out", "--dmg-preview", "--house", "--help"][..],
+        &["--house", "--out", "--help", "--help"][..],
+        &["--out", "--help", "--house", "--help"][..],
+        &["--out", "--house", "--house", "--help"][..],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("incompatible with --dmg-preview")
+                || stderr.contains("--out requires a value"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn capture_cli_rejects_explicit_starfield_without_catalog_or_location() {
     let output_dir = std::env::temp_dir().join(format!(
         "chipviz-starfield-missing-{}-{}",
