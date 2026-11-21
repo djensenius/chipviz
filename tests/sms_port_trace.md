@@ -24,6 +24,20 @@ wrap correction. A decrease within a frame fails. The shim is a singleton and
 only one trace can be active. Cleanup is owner-checked and preserves replaced
 slots; a further exception during cleanup is reported on the original error,
 and an existing trace object can retry `close()`.
+
+The manager retains active owners and both library handles. If construction
+fails and cleanup is interrupted, the original exception normally exposes
+`trace_owner`; call `trace_owner.retry_cleanup()` after the interruption.
+If that attribute is unavailable, inspect `retained_traces()` to identify the
+failed owner. That list also contains healthy active traces: never blindly
+clean up another owner's trace. Do not unload or run a core with unresolved
+ownership. Repeated interruptions can interrupt retries; retry until cleanup
+succeeds. Interrupted frame transitions permanently invalidate the trace:
+do not use its events, and close it to restore hooks.
+
+The shim uses the matching upstream GX Z80 slot types: byte-valued port reads
+and byte-valued write data, with an unsigned-int port. The fake tests exercise
+these C signatures, not the ABI or behavior of a live GX library.
 The core file must remain immutable between hashing and loading, and the
 process must not already have a different image loaded under the same path;
 the file hash is not an attestation of the in-memory image.

@@ -1,13 +1,5 @@
 /* Single-threaded host test shim; not part of a ROM or a libretro core. */
-#include <stddef.h>
-#include <stdint.h>
-
-typedef unsigned int (*read_port)(unsigned int);
-typedef void (*write_port)(unsigned int, unsigned int);
-
-struct event {
-  uint32_t frame, cycle, port, value, kind;
-};
+#include "sms_port_trace.h"
 
 enum { CAPACITY = 4096, READ = 0, WRITE = 1 };
 static struct event events[CAPACITY];
@@ -19,8 +11,8 @@ static read_port *read_slot, original_read;
 static write_port *write_slot, original_write;
 static const void *owner;
 
-static unsigned int trace_read(unsigned int port);
-static void trace_write(unsigned int port, unsigned int value);
+static unsigned char trace_read(unsigned int port);
+static void trace_write(unsigned int port, unsigned char value);
 
 int sms_trace_healthy(void) {
   return active && *read_slot == trace_read && *write_slot == trace_write &&
@@ -42,14 +34,14 @@ static struct event *reserve(unsigned int port, uint32_t kind) {
   return event;
 }
 
-static unsigned int trace_read(unsigned int port) {
+static unsigned char trace_read(unsigned int port) {
   struct event *event = reserve(port, READ);
-  unsigned int value = original_read(port);
+  unsigned char value = original_read(port);
   if (event != NULL) event->value = value;
   return value;
 }
 
-static void trace_write(unsigned int port, unsigned int value) {
+static void trace_write(unsigned int port, unsigned char value) {
   struct event *event = reserve(port, WRITE);
   if (event != NULL) event->value = value;
   original_write(port, value);

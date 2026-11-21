@@ -21,6 +21,13 @@ class Layout:
 # No GX layout is registered: the Z80 symbol's actual extent is not yet vetted.
 # Tests register their own compiled fake's known layout temporarily.
 _VETTED_LAYOUTS = {}
+# Retain both libraries and owner tokens until native ownership is released.
+_RETAINED = {}
+
+
+def retained_traces():
+  """Return retained owners, including active traces and failed constructions."""
+  return tuple(_RETAINED.values())
 
 
 def _layout_for_hash(digest):
@@ -69,13 +76,20 @@ class Trace:
     self._keys = (ctypes.byref(self._owner), ctypes.byref(self.read_slot), ctypes.byref(self.write_slot))
     self.active = False
     self.in_frame = False
+    self._invalid = False
     self.last_frame = -1
+    _RETAINED[id(self)] = self
+    self.active = True
     try:
       if self._install(read, write, capacity):
         raise RuntimeError("trace installation failed")
-      self.active = True
     except BaseException as error:
-      self._recover(error)
+      if not self._recover(error):
+        try:
+          error.trace_owner = self
+        except BaseException:
+          pass
+        BaseException.add_note(error, "trace retained: retry trace_owner.retry_cleanup() or inspect retained_traces()")
       raise
 
   def _bind(self):
@@ -108,36 +122,56 @@ class Trace:
   def _uninstall(self):
     return self._native_uninstall(*self._keys)
 
+  def retry_cleanup(self):
+    """Release only this token's native ownership; retry after interruption."""
+    status = 0
+    if self.shim.sms_trace_owned(*self._keys):
+      status = self._native_uninstall(*self._keys)
+    self.active = False
+    _RETAINED.pop(id(self), None)
+    if status:
+      raise RuntimeError("port pointer changed while tracing")
+
   def _recover(self, error):
     try:
-      if self.shim.sms_trace_owned(*self._keys) and self._native_uninstall(*self._keys):
-        error.add_note("trace cleanup: port pointer changed while tracing")
+      self.retry_cleanup()
       return True
     except BaseException as cleanup_error:
-      error.add_note(f"trace cleanup failed: {cleanup_error!r}")
-      return False
+      try:
+        BaseException.add_note(error, f"trace cleanup failed: {cleanup_error!r}")
+      except BaseException:
+        pass
+      return id(self) not in _RETAINED
 
   def begin_frame(self, frame):
-    if (not self.active or self.in_frame or not 0 <= frame <= 0xffffffff or
+    if (not self.active or self.in_frame or self._invalid or not 0 <= frame <= 0xffffffff or
         (self.last_frame >= 0 and frame != self.last_frame + 1)):
       raise RuntimeError("invalid frame boundary")
+    self._invalid = True
     if self.shim.sms_trace_begin(frame):
       raise RuntimeError("cannot begin frame (trace loss, pointer or cycle ratio mismatch)")
     self.in_frame = True
     self.last_frame = frame
+    self._invalid = False
 
   def end_frame(self):
-    if not self.active or not self.in_frame:
+    if not self.active or not self.in_frame or self._invalid:
       raise RuntimeError("no active frame")
-    self.in_frame = False
+    self._invalid = True
     if self.shim.sms_trace_end():
       raise RuntimeError("trace loss, pointer or cycle ratio mismatch")
+    self.in_frame = False
+    self._invalid = False
 
   def events(self):
-    if not self.active or self.in_frame:
+    if not self.active:
       raise RuntimeError("trace unavailable during frame or after close")
     if not self.shim.sms_trace_healthy():
       raise RuntimeError("trace loss, pointer or cycle ratio mismatch")
+    if self._invalid:
+      raise RuntimeError("trace loss or interrupted frame transition")
+    if self.in_frame:
+      raise RuntimeError("trace unavailable during frame or after close")
     result = []
     for index in range(self.shim.sms_trace_count()):
       event = Event()
@@ -152,16 +186,19 @@ class Trace:
   def close(self):
     if self.active:
       try:
+        if not self.shim.sms_trace_owned(*self._keys):
+          self.retry_cleanup()
+          return
         healthy = self.shim.sms_trace_healthy()
-        incomplete = self.in_frame
+        incomplete = self.in_frame or self._invalid
         if self._uninstall():
           raise RuntimeError("port pointer changed while tracing")
         self.active = False
+        _RETAINED.pop(id(self), None)
         if not healthy or incomplete:
-          raise RuntimeError("trace loss, pointer or cycle ratio mismatch, or unfinished frame")
+          raise RuntimeError("trace loss, pointer or cycle ratio mismatch, unfinished frame or interrupted transition")
       except BaseException as error:
-        if self._recover(error):
-          self.active = False
+        self._recover(error)
         raise
 
   def __enter__(self):
@@ -173,9 +210,9 @@ class Trace:
     except BaseException as error:
       if exc is None:
         raise
-      exc.add_note(f"trace cleanup: {error}")
+      BaseException.add_note(exc, f"trace cleanup: {error}")
       for note in getattr(error, "__notes__", ()):
-        exc.add_note(note)
+        BaseException.add_note(exc, note)
 
 
 def check_seed(events):
