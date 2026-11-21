@@ -58,7 +58,7 @@ fn world_line(surface: Surface, surface_index: usize, row: usize, across: bool) 
     if across {
         [surface.point(-extent, z), surface.point(extent, z + 1.4)]
     } else {
-        let u = extent * if row % 2 == 0 { -0.38 } else { 0.38 };
+        let u = extent * if row.is_multiple_of(2) { -0.38 } else { 0.38 };
         [surface.point(u, z + 0.3), surface.point(u, z + 2.3)]
     }
 }
