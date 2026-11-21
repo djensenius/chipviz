@@ -1,7 +1,7 @@
 //! Offscreen prototype regression; this does not register a selectable scene.
 //!
 //! Once the serialized heavy slot is available, run from the repository root:
-//! `cargo test --manifest-path renderers/modern/Cargo.toml --test dmg_tile_scroll_gpu -- --ignored --nocapture`
+//! `cargo test --manifest-path renderers/modern/Cargo.toml --features dmg-preview --test dmg_tile_scroll_gpu -- --ignored --nocapture`
 //! It requires a headless WGPU PRIMARY adapter (e.g. Metal on M1 or Vulkan on
 //! Pi) supporting R8Unorm texture binding and RGBA8 UNORM and sRGB render
 //! attachments. It prints the actual adapter and fails if none is available.
@@ -25,14 +25,19 @@ mod dmg_tile_scroll;
 #[path = "../src/scenes/dmg_tile_scroll_render.rs"]
 mod dmg_tile_scroll_render;
 // Compile the same preview acquisition/clock seam used by the window path.
+#[cfg(feature = "dmg-preview")]
 use crate as scenes;
+#[cfg(feature = "dmg-preview")]
 #[path = "../src/dmg_preview.rs"]
 mod dmg_preview;
 
+#[cfg(feature = "dmg-preview")]
 use dmg_preview::{DmgPresenter, DmgTarget};
 use dmg_tile_scroll::{Display, DmgTileScroll};
 use dmg_tile_scroll_render::DmgTileRenderer;
+#[cfg(feature = "dmg-preview")]
 use std::cell::Cell;
+#[cfg(feature = "dmg-preview")]
 use std::time::{Duration, Instant};
 
 // Independently decoded from cores/gb/homebrew/main.asm's Tiles: each ASCII
@@ -208,6 +213,7 @@ impl Offscreen {
         self.read_texture(&texture, size, encoder)
     }
 
+    #[cfg(feature = "dmg-preview")]
     fn render_preview(
         &self,
         presenter: &mut DmgPresenter,
@@ -427,6 +433,7 @@ fn directional_diagnostic_counts_thresholds_and_cyclic_windows() {
     assert_eq!(max_large_transitions(&transitions, 100), (1, 1, 2));
 }
 
+#[cfg(feature = "dmg-preview")]
 #[test]
 #[ignore = "requires a GPU adapter"]
 fn preview_acquisition_clock_and_offscreen_renderer_match_native_oracle() {

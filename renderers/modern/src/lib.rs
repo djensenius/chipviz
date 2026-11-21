@@ -3,6 +3,7 @@ mod audio;
 pub mod capture;
 pub mod catalog_v1;
 mod control_frame;
+#[cfg(feature = "dmg-preview")]
 mod dmg_preview;
 mod phosphor;
 mod profile;

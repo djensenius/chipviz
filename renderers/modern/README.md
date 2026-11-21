@@ -60,9 +60,18 @@ python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
 presented-output flashing and normal-speed human review under the existing
 safety gates. Offscreen tests do not establish visual safety.
 
-For development only, `just modern-m1 -- --dmg-preview` or
-`just modern-pi5 -- --dmg-preview` opens a self-running DMG Tile Scroll
-preview. It is not audio reactive and is not a catalog or wire scene. Only
+For development only, the non-default `dmg-preview` Cargo feature and the
+explicit flag are both required. Do not enable this feature in release
+artifacts. Default and `unmeasured-flash`-only builds reject the flag.
+The commands below describe the opt-in; the prohibition above still applies.
+
+```sh
+cargo run --manifest-path renderers/modern/Cargo.toml --features dmg-preview --bin chipviz-m1 -- --dmg-preview
+cargo run --manifest-path renderers/modern/Cargo.toml --features dmg-preview --bin chipviz-pi5 -- --dmg-preview
+```
+
+The self-running DMG Tile Scroll preview is not audio reactive and is not a
+catalog or wire scene. Only
 `--fullscreen` and `--monitor` may accompany it; live UDP, microphone,
 listing, scene and overlay options are rejected, and `L` and `M` do nothing.
 No live inputs are opened. The native LCD is integer-scaled where it fits;

@@ -7,6 +7,7 @@ use winit::dpi::PhysicalSize;
 
 use crate::audio::scope::ScopeSnapshot;
 use crate::control_frame::ControlFrame;
+#[cfg(feature = "dmg-preview")]
 use crate::dmg_preview::{DmgPresenter, DmgTarget};
 use crate::phosphor;
 use crate::profile::RenderProfile;
@@ -76,6 +77,7 @@ pub struct Renderer {
     /// timestamp is sampled after `present()` returns, not by the caller
     /// before surface acquisition.
     presentation_clock: Instant,
+    #[cfg(feature = "dmg-preview")]
     dmg_preview: Option<DmgPresenter>,
 }
 
@@ -1064,6 +1066,7 @@ impl Renderer {
             config,
             pipeline,
             presentation_clock: Instant::now(),
+            #[cfg(feature = "dmg-preview")]
             dmg_preview: None,
         })
     }
@@ -1082,11 +1085,13 @@ impl Renderer {
         &mut self.pipeline
     }
 
+    #[cfg(feature = "dmg-preview")]
     pub(crate) fn enable_dmg_preview(&mut self) {
         self.dmg_preview = Some(DmgPresenter::new(&self.pipeline.device, self.config.format));
     }
 
     /// Acquire before stepping; each upload is submitted before the next encode.
+    #[cfg(feature = "dmg-preview")]
     pub(crate) fn render_dmg_preview(&mut self) -> Result<(), RendererError> {
         self.dmg_preview
             .as_mut()
@@ -1337,8 +1342,10 @@ fn size_aspect((width, height): (u32, u32)) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dmg-preview")]
     use crate::dmg_preview::{DmgPreview, acquired_dmg_frame};
 
+    #[cfg(feature = "dmg-preview")]
     #[test]
     fn failed_dmg_acquisition_does_not_start_or_advance_the_model() {
         let mut preview = DmgPreview::default();

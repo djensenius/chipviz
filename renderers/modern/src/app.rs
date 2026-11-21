@@ -122,6 +122,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         None => None,
     };
 
+    #[cfg(feature = "dmg-preview")]
     if args.dmg_preview {
         return run_dmg_preview(profile, &args, event_loop, target_monitor);
     }
@@ -293,6 +294,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(feature = "dmg-preview")]
 fn run_dmg_preview(
     profile: RenderProfile,
     args: &AppArgs,
@@ -364,6 +366,7 @@ fn run_dmg_preview(
     Ok(())
 }
 
+#[cfg(feature = "dmg-preview")]
 fn preview_drawable(width: u32, height: u32) -> bool {
     width != 0 && height != 0
 }
@@ -411,8 +414,8 @@ fn usage(program: &str) -> String {
        {program} --list-monitors | --list-audio-devices
 
 Options:
-  --dmg-preview           experimental self-running DMG preview; no audio or overlays,
-                          incompatible with source and scene options
+  --dmg-preview           development-only; requires the dmg-preview Cargo feature,
+                          no audio or overlays, incompatible with source and scene options
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
   --star-catalog PATH     HYG-compatible star CSV for scene 6 (not bundled)
   --catalog FILE          alias for --star-catalog
@@ -622,6 +625,7 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
     }
 }
 
+#[cfg(feature = "dmg-preview")]
 fn preview_key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
     match key_action(input, mods, fullscreen) {
         action @ (Some(KeyAction::ToggleFullscreen) | Some(KeyAction::ExitFullscreen)) => action,
@@ -742,7 +746,18 @@ impl AppArgs {
                 preview_conflict = Some(arg.clone());
             }
             match arg.as_str() {
-                "--dmg-preview" => parsed.dmg_preview = true,
+                "--dmg-preview" => {
+                    #[cfg(feature = "dmg-preview")]
+                    {
+                        parsed.dmg_preview = true;
+                    }
+                    #[cfg(not(feature = "dmg-preview"))]
+                    {
+                        return Err(invalid_input(
+                            "--dmg-preview requires the dmg-preview Cargo feature".to_string(),
+                        ));
+                    }
+                }
                 "--udp" => {
                     parsed.udp_endpoint = Some(required_value(
                         &mut args,
@@ -1236,6 +1251,7 @@ impl FrameSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dmg-preview")]
     use crate::dmg_preview::DmgPreview;
     use crate::scenes;
 
@@ -1261,6 +1277,29 @@ mod tests {
         assert_eq!(AppArgs::default().scene, None);
     }
 
+    #[cfg(not(feature = "dmg-preview"))]
+    #[test]
+    fn preview_flag_requires_feature_before_input_or_window_setup() {
+        for args in [
+            &["--dmg-preview"][..],
+            &["--dmg-preview", "--mic"][..],
+            &["--mic", "--dmg-preview"][..],
+            &["--dmg-preview", "--list-monitors"][..],
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            assert!(
+                error.contains("--dmg-preview requires the dmg-preview Cargo feature"),
+                "{args:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_run(&["--monitor", "--mic"]).monitor,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+        assert_eq!(parse_run(&["--scene", "7"]).scene, Some(7));
+    }
+
+    #[cfg(feature = "dmg-preview")]
     #[test]
     fn preview_rejects_explicit_source_scene_and_overlay_options_in_either_order() {
         let conflicts: &[&[&str]] = &[
@@ -1335,6 +1374,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dmg-preview")]
     #[test]
     fn preview_rejects_recognized_options_as_missing_values_in_either_order() {
         let flags = [
@@ -1400,6 +1440,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dmg-preview")]
     #[test]
     fn preview_keys_cannot_toggle_overlays_or_layout_and_legacy_keys_are_unchanged() {
         let mods = KeyModifiers::default();
@@ -1430,6 +1471,7 @@ mod tests {
         assert_eq!(parse_run(&["--scene", "7"]).scene, Some(7));
     }
 
+    #[cfg(feature = "dmg-preview")]
     #[test]
     fn preview_zero_size_skips_acquisition_and_resize_keeps_clock() {
         let start = Instant::now();
