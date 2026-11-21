@@ -357,8 +357,8 @@ rust-lint:
     @echo "chipviz Rust lint OK"
 
 rust-test:
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --features unmeasured-flash
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
