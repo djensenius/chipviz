@@ -206,6 +206,23 @@ impl LinesState {
         }
     }
 
+    /// Live observations retain DROP edges even when the frame counter repeats.
+    /// A duplicate only updates flag history and may cut; its beat and frame
+    /// counters do not advance the section clock.
+    pub(crate) fn observe_live(&mut self, frame: &ControlFrame) {
+        if let Some(last) = &mut self.last
+            && last.frame == frame.frame
+        {
+            let drop = self.drop_cuts && frame.flags & !last.flags & DROP_FLAG != 0;
+            last.flags = frame.flags;
+            if drop && (!self.changed || self.frames as f32 >= self.bar) {
+                self.start_section(frame.bpm, true);
+            }
+            return;
+        }
+        self.observe(frame);
+    }
+
     fn start_section(&mut self, bpm: u8, cut: bool) {
         self.from = self.morph();
         self.section = self.section.wrapping_add(1);

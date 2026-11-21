@@ -179,6 +179,12 @@ impl SceneState {
         self.static_noise.observe_at(frame, elapsed);
     }
 
+    /// Live receive path: Lines also sees DROP edges on duplicate counters.
+    pub(crate) fn observe_live_at(&mut self, frame: &ControlFrame, elapsed: f64) {
+        self.lines.observe_live(frame);
+        self.static_noise.observe_at(frame, elapsed);
+    }
+
     /// Smooth the displayed frame once per redraw or capture replay step.
     /// Fresh packet observations do not advance this envelope.
     pub(crate) fn advance_tunnel(&mut self, frame: &ControlFrame, elapsed: f64) {

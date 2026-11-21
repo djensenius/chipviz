@@ -77,6 +77,17 @@ pub struct Renderer {
     presentation_clock: Instant,
 }
 
+/// Shared live observation path, independent of GPU presentation.
+pub(crate) fn observe_live_states(
+    field: &mut colour_field::ColourField,
+    scenes: &mut SceneState,
+    frame: &ControlFrame,
+    elapsed: f64,
+) {
+    field.observe(frame);
+    scenes.observe_live_at(frame, elapsed);
+}
+
 /// Renders the same pipeline into a texture and reads it back as RGB8.
 pub struct OffscreenRenderer {
     pipeline: ScenePipeline,
@@ -567,6 +578,16 @@ impl ScenePipeline {
     pub fn observe(&mut self, frame: &ControlFrame, elapsed: f64) {
         self.colour_field.observe(frame);
         self.scene_state.observe_at(frame, elapsed);
+    }
+
+    /// Observe a live input, retaining Lines DROP edges on duplicate counters.
+    pub(crate) fn observe_live(&mut self, frame: &ControlFrame, elapsed: f64) {
+        observe_live_states(
+            &mut self.colour_field,
+            &mut self.scene_state,
+            frame,
+            elapsed,
+        );
     }
 
     /// Previews dispatch without consuming a fallback or recording a
