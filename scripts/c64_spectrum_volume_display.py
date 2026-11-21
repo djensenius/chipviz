@@ -12,8 +12,8 @@ READY = {False: b"SVD1", True: b"SVB1"}
 MODELS = {"pal": (1, 312), "ntsc": (0, 263), "ntsc-old": (0, 262)}
 PEPTO = {0: (0x00, 0x00, 0x00), 4: (0x6f, 0x3d, 0x86),
          5: (0x58, 0x8d, 0x43), 6: (0x35, 0x28, 0x79)}
-# Calibration must be a separate, independently generated reference image,
-# not the scene or its blank control. These are RGB corner fiducials.
+# Synthetic-only corner fiducials. These saturated RGB values are not known
+# to be reproducible by the C64 Pepto palette; no target producer exists.
 FIDUCIALS = ((0, 0, (255, 0, 0)), (319, 0, (0, 255, 0)),
              (0, 199, (0, 0, 255)), (319, 199, (255, 255, 0)))
 
@@ -39,7 +39,7 @@ def expected_rgb(blank: bool) -> bytes:
 
 
 class Observation:
-  """One retro_run boundary; callbacks cannot reuse a previous run's frame."""
+  """Sticky-failure boundary; callbacks cannot reuse a previous run's frame."""
 
   def __init__(self) -> None:
     self.active = False
@@ -48,52 +48,66 @@ class Observation:
     self.events = []
     self.error = None
 
+  def latch(self, message: str) -> None:
+    if self.error is None:
+      self.error = message
+
+  def check(self) -> None:
+    if self.error is not None:
+      raise ValueError(self.error)
+
   def begin(self):
+    self.check()
     if self.active:
-      raise ValueError("ambiguous nested run")
+      self.latch("ambiguous nested run")
+      self.check()
     self.active = True
     self.generation += 1
     generation = self.generation
     self.events = []
-    self.error = None
     return lambda data, width, height, pitch, pixel_format: self.video(
       generation, data, width, height, pitch, pixel_format)
 
   def video(self, generation: int, data: bytes | None, width: int, height: int, pitch: int,
             pixel_format: str) -> None:
     if not self.active or generation != self.generation:
-      if self.active:
-        self.error = "stale callback"
-      raise ValueError("stale callback")
+      self.latch("stale callback")
+      return
+    if self.error is not None:
+      return
     self.serial += 1
     if data is None:
       self.events.append((self.serial, None))
-      return
-    try:
-      if pixel_format != "XRGB8888-LE":
-        raise ValueError("unsupported pixel format")
-      check_frame((width, height, pitch, data))
-    except ValueError as error:
-      self.error = str(error)
-      raise
-    self.events.append((self.serial, (width, height, pitch, bytes(data))))
+    else:
+      try:
+        if pixel_format != "XRGB8888-LE":
+          raise ValueError("unsupported pixel format")
+        check_frame((width, height, pitch, data))
+        self.events.append((self.serial, (width, height, pitch, bytes(data))))
+      except (ValueError, TypeError, OverflowError) as error:
+        self.latch(str(error))
+        return
+    if len(self.events) > 1:
+      fresh = sum(event[1] is not None for event in self.events)
+      self.latch("extra fresh frames" if fresh == 2 else
+                 "duplicate-only callbacks" if fresh == 0 else "ambiguous fresh and duplicate callbacks")
 
   def end(self) -> tuple[int, tuple[int, int, int, bytes]]:
+    if self.error is not None:
+      self.active = False
+      self.check()
     if not self.active:
-      raise ValueError("no active run")
+      self.latch("no active run")
+      self.check()
     self.active = False
     events, self.events = self.events, []
-    if self.error:
-      raise ValueError(self.error)
     if not events:
-      raise ValueError("missing callback")
+      self.latch("missing callback")
+      self.check()
     fresh = [event for event in events if event[1] is not None]
     if not fresh:
-      raise ValueError("duplicate-only callbacks")
-    if len(fresh) > 1:
-      raise ValueError("extra fresh frames")
-    if len(events) != 1:
-      raise ValueError("ambiguous fresh and duplicate callbacks")
+      self.latch("duplicate-only callbacks")
+      self.check()
     return fresh[0]
 
 
@@ -137,12 +151,14 @@ def validate(frame: tuple[int, int, int, bytes], origin: tuple[int, int], blank:
 
 
 def observe(run, read_ready, *, blank: bool, model: str, model_flag: int, raster_lines: int,
-            calibration: tuple[int, int, int, bytes], limit: int) -> int:
-  """Bounded fake-friendly boundary. run() returns the callback events for one run.
+            calibration: tuple[int, int, int, bytes], limit: int, synthetic_only: bool = False) -> int:
+  """Synthetic-only bounded boundary. run() invokes callbacks for one run.
 
   Model flag and raster lines must be measured independently by a future
   adapter; the requested model option is not evidence of either measurement.
   """
+  if synthetic_only is not True:
+    raise RuntimeError("real adapter and hardware-producible calibration are not available")
   if model not in MODELS or (model_flag, raster_lines) != MODELS[model]:
     raise ValueError("model marker or independent raster geometry mismatch")
   if not 1 <= limit <= 16000:
@@ -150,18 +166,25 @@ def observe(run, read_ready, *, blank: bool, model: str, model_flag: int, raster
   origin = calibrate(calibration)
   boundary = Observation()
   settled = False
-  if read_ready() == READY[blank]:
+
+  def marker():
+    value = read_ready()
+    boundary.check()
+    return value
+
+  if marker() == READY[blank]:
     raise ValueError("ready marker was already present before boot")
   for count in range(1, limit + 1):
-    if read_ready() != READY[blank]:
+    if marker() != READY[blank]:
       if settled:
         raise ValueError("ready marker changed")
       run(None)  # boot only; no observation can be reused
+      boundary.check()
       continue
     callback = boundary.begin()
     run(callback)
     _, frame = boundary.end()
-    if read_ready() != READY[blank]:
+    if marker() != READY[blank]:
       raise ValueError("ready marker changed")
     if frame[:2] != calibration[:2]:
       raise ValueError("frame geometry changed after calibration")
@@ -170,5 +193,7 @@ def observe(run, read_ready, *, blank: bool, model: str, model_flag: int, raster
       settled = True
       continue
     validate(frame, origin, blank)
+    boundary.check()
     return count
+  boundary.check()
   raise TimeoutError(f"fixture not ready and settled in {limit} runs")

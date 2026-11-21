@@ -1,5 +1,6 @@
 """Synthetic-only tests: no emulator, BIOS, capture, or target execution."""
 import ctypes
+import functools
 import os
 import pathlib
 import subprocess
@@ -13,6 +14,7 @@ import c64_spectrum_volume_display as display  # noqa: E402
 
 W, H, PITCH = 336, 216, 336 * 4 + 8
 ORIGIN = (7, 9)
+observe = functools.partial(display.observe, synthetic_only=True)
 
 
 def frame(blank=False):
@@ -44,7 +46,86 @@ def callback_args(data):
   return (bytes(data), W, H, PITCH, "XRGB8888-LE")
 
 
+def native_callback(callback, *args):
+  # ctypes swallows exceptions crossing this callback boundary.
+  ctypes.CFUNCTYPE(None)(lambda: callback(*args))()
+
+
 class DisplayTests(unittest.TestCase):
+  def test_real_observation_is_blocked_without_calibration_producer(self):
+    with self.assertRaisesRegex(RuntimeError, "hardware-producible calibration"):
+      display.observe(None, None, blank=False, model="pal", model_flag=1, raster_lines=312,
+                      calibration=calibration(), limit=2)
+
+  def test_callback_faults_are_permanent_even_when_callback_exception_is_swallowed(self):
+    for kind in ("stale", "invalid", "extra", "duplicate-only", "ambiguous"):
+      with self.subTest(kind=kind):
+        boundary = display.Observation()
+        callback = boundary.begin()
+        if kind == "stale":
+          callback(*callback_args(frame()))
+          boundary.end()
+          native_callback(callback, *callback_args(frame()))
+        else:
+          if kind == "invalid":
+            events = [(bytes(4), 1, 1, 4, "RGB565"), callback_args(frame())]
+          elif kind == "extra":
+            events = [callback_args(frame())] * 2
+          elif kind == "duplicate-only":
+            events = [(None, 0, 0, 0, "")]
+          else:
+            events = [callback_args(frame()), (None, 0, 0, 0, "")]
+          for event in events:
+            native_callback(callback, *event)
+          with self.assertRaises(ValueError):
+            boundary.end()
+        with self.assertRaises(ValueError):
+          boundary.begin()
+        with self.assertRaises(ValueError):
+          boundary.end()
+
+  def test_observe_rejects_stale_callback_from_ready_reads(self):
+    for trigger in (3, 5):  # after the discarded frame; after the final frame
+      with self.subTest(trigger=trigger):
+        saved = []
+        reads = []
+
+        def run(callback):
+          saved.append(callback)
+          callback(*callback_args(frame()))
+
+        def ready():
+          reads.append(1)
+          if len(reads) == trigger:
+            native_callback(saved[-1], *callback_args(frame()))
+          return b"" if len(reads) == 1 else b"SVD1"
+
+        with self.assertRaisesRegex(ValueError, "stale"):
+          observe(run, ready, blank=False, model="pal", model_flag=1, raster_lines=312,
+                  calibration=calibration(), limit=3)
+
+  def test_observe_rejects_swallowed_invalid_and_duplicate_events(self):
+    bad_format = (bytes(4), 1, 1, 4, "RGB565")
+    duplicate = (None, 0, 0, 0, "")
+    fresh = callback_args(frame())
+    for events, message in (([bad_format, fresh], "unsupported"),
+                            ([duplicate], "duplicate-only"),
+                            ([fresh, fresh], "extra"),
+                            ([fresh, duplicate], "ambiguous")):
+      with self.subTest(message=message):
+        calls = []
+        markers = iter((b"", b"SVD1"))
+
+        def run(callback):
+          calls.append(1)
+          for event in events:
+            native_callback(callback, *event)
+
+        with self.assertRaisesRegex(ValueError, message):
+          observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
+                  raster_lines=312, calibration=calibration(), limit=3)
+        self.assertEqual(len(calls), 1)
+
   def test_host_model_complete_surface_against_pixel_oracle(self):
     class State(ctypes.Structure):
       _fields_ = [("height", ctypes.c_uint8 * 8), ("palette", ctypes.c_uint8 * 8),
@@ -120,20 +201,29 @@ class DisplayTests(unittest.TestCase):
     old(*callback_args(frame()))
     first, _ = boundary.end()
     current = boundary.begin()
-    with self.assertRaisesRegex(ValueError, "stale"):
-      old(*callback_args(frame()))
-    current(*callback_args(frame()))
-    with self.assertRaisesRegex(ValueError, "stale"):
-      boundary.end()
-    current = boundary.begin()
     current(*callback_args(frame()))
     second, _ = boundary.end()
     self.assertGreater(second, first)
+    native_callback(old, *callback_args(frame()))
     with self.assertRaisesRegex(ValueError, "stale"):
-      current(*callback_args(frame()))
+      boundary.begin()
+    with self.assertRaisesRegex(ValueError, "stale"):
+      boundary.end()
+    boundary = display.Observation()
+    old = boundary.begin()
+    old(*callback_args(frame()))
+    boundary.end()
+    current = boundary.begin()
+    native_callback(old, *callback_args(frame()))
+    current(*callback_args(frame()))
+    with self.assertRaisesRegex(ValueError, "stale"):
+      boundary.end()
+    with self.assertRaisesRegex(ValueError, "stale"):
+      boundary.begin()
     for events, message in (([], "missing"), ([(None, 0, 0, 0, "")], "duplicate-only"),
                             ([callback_args(frame())] * 2, "extra"),
                             ([callback_args(frame()), (None, 0, 0, 0, "")], "ambiguous")):
+      boundary = display.Observation()
       callback = boundary.begin()
       for event in events:
         callback(*event)
@@ -145,8 +235,7 @@ class DisplayTests(unittest.TestCase):
                           ((bytes(3), 1, 1, 4, "XRGB8888-LE"), "pitch")):
       boundary = display.Observation()
       callback = boundary.begin()
-      with self.assertRaisesRegex(ValueError, message):
-        callback(*args)
+      native_callback(callback, *args)
       callback(*callback_args(frame()))
       with self.assertRaisesRegex(ValueError, message):
         boundary.end()
@@ -165,31 +254,31 @@ class DisplayTests(unittest.TestCase):
             marker[0] = display.READY[blank]
 
         ready = lambda: marker[0]
-        self.assertEqual(display.observe(run, ready, blank=blank, model=model, model_flag=flag,
-                                         raster_lines=lines, calibration=calibration(), limit=3), 3)
+        self.assertEqual(observe(run, ready, blank=blank, model=model, model_flag=flag,
+                                 raster_lines=lines, calibration=calibration(), limit=3), 3)
         self.assertEqual(calls, [False, True, True])
         for bad_flag, bad_lines in ((1 - flag, lines), (flag, lines + 1)):
           with self.assertRaisesRegex(ValueError, "model marker"):
-            display.observe(run, ready, blank=blank, model=model, model_flag=bad_flag,
-                            raster_lines=bad_lines, calibration=calibration(), limit=2)
+            observe(run, ready, blank=blank, model=model, model_flag=bad_flag,
+                    raster_lines=bad_lines, calibration=calibration(), limit=2)
     with self.assertRaisesRegex(TimeoutError, "not ready"):
-      display.observe(lambda cb: None, lambda: b"", blank=False, model="pal", model_flag=1,
-                      raster_lines=312, calibration=calibration(), limit=3)
+      observe(lambda cb: None, lambda: b"", blank=False, model="pal", model_flag=1,
+              raster_lines=312, calibration=calibration(), limit=3)
     markers = iter((b"", b"SVD1", b"SVD1"))
     with self.assertRaisesRegex(TimeoutError, "settled"):
-      display.observe(lambda cb: cb(*callback_args(frame())), lambda: next(markers), blank=False,
-                      model="pal", model_flag=1, raster_lines=312, calibration=calibration(), limit=1)
+      observe(lambda cb: cb(*callback_args(frame())), lambda: next(markers), blank=False,
+              model="pal", model_flag=1, raster_lines=312, calibration=calibration(), limit=1)
     markers = iter((b"", b"SVD1", b"bad!"))
     with self.assertRaisesRegex(ValueError, "marker changed"):
-      display.observe(lambda cb: cb(*callback_args(frame())), lambda: next(markers), blank=False,
-                      model="pal", model_flag=1, raster_lines=312, calibration=calibration(), limit=2)
+      observe(lambda cb: cb(*callback_args(frame())), lambda: next(markers), blank=False,
+              model="pal", model_flag=1, raster_lines=312, calibration=calibration(), limit=2)
     markers = iter((b"", b"SVD1"))
     with self.assertRaisesRegex(ValueError, "missing callback"):
-      display.observe(lambda cb: None, lambda: next(markers), blank=False, model="pal", model_flag=1,
-                      raster_lines=312, calibration=calibration(), limit=2)
+      observe(lambda cb: None, lambda: next(markers), blank=False, model="pal", model_flag=1,
+              raster_lines=312, calibration=calibration(), limit=2)
     with self.assertRaisesRegex(ValueError, "already present"):
-      display.observe(lambda cb: None, lambda: b"SVD1", blank=False, model="pal", model_flag=1,
-                      raster_lines=312, calibration=calibration(), limit=2)
+      observe(lambda cb: None, lambda: b"SVD1", blank=False, model="pal", model_flag=1,
+              raster_lines=312, calibration=calibration(), limit=2)
 
   def test_observation_rejects_bad_frame_within_budget(self):
     for kind in ("shifted", "missing", "extra", "wrong-colour", "blank"):
@@ -213,8 +302,8 @@ class DisplayTests(unittest.TestCase):
         callback(*callback_args(data))
 
       with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "pixel"):
-        display.observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
-                        raster_lines=312, calibration=calibration(), limit=10)
+        observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
+                raster_lines=312, calibration=calibration(), limit=10)
       self.assertEqual(len(calls), 2)
 
 

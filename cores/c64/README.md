@@ -248,12 +248,15 @@ emulator frontend. Its independent pixel oracle specifies black plus four
 (22,5,5). It compares all 320x200 pixels using explicit Pepto PAL RGB:
 black `#000000`, purple `#6F3D86`, green `#588D43`, blue `#352879`.
 It accepts only little-endian libretro XRGB8888 with valid dimensions and
-pitch, including padding. A separate reference frame must contain the four
-documented fiducials at the display window corners; exactly one such window
-calibrates the origin. This reference must be independently produced and
-observed, not derived from either scene image. Matching the reference and
-exact pixel colours does not itself prove the emulator palette configuration.
-The host tests use synthetic frames only.
+pitch, including padding. The current saturated RGB corner fiducials are
+**synthetic only**: they are not established as producible by a C64 with the
+Pepto palette, and there is no target calibration producer. `observe` fails
+closed unless explicitly invoked with `synthetic_only=True`; that opt-in is
+for fake tests, not evidence of emulator readiness. A future target reference
+must use independently specified, hardware-producible fiducials and be
+independently produced and observed, not derived from either scene image.
+Matching a reference and exact pixel colours does not itself prove the
+emulator palette configuration.
 
 Any future emulator adapter must prove reference provenance, pixel format and
 Pepto palette configuration; provide a fresh callback per `retro_run` with
@@ -261,11 +264,14 @@ copied pixels; observe the fixture marker absent before boot and stable
 thereafter; and independently measure both KERNAL `$02A6` and raster lines
 (PAL 1/312, NTSC 0/263, early NTSC 0/262). A requested model option is not a
 measurement. The observation discards the first complete frame after ready,
-rejects missing, duplicate-only, extra, ambiguous and stale callbacks, and
-has a bounded frame budget. It is not wired to the older capture seam, which
-cannot establish this callback identity. A future adapter also needs a
-separate wall-clock watchdog and trusted process cleanup: the frame budget
-cannot interrupt a hung `retro_run`. No calibration PRG, independent
+rejects missing, duplicate-only, extra, ambiguous and stale callbacks, latching
+errors across runs even when a native callback swallows exceptions, and has a
+bounded frame budget. A future adapter must serialize callback delivery and
+prove callbacks are quiescent before completion; a callback after return
+cannot invalidate an already returned result. It is not wired to the older
+capture seam, which cannot establish this callback identity. A future adapter
+also needs a separate wall-clock watchdog and trusted process cleanup: the
+frame budget cannot interrupt a hung `retro_run`. No calibration PRG, independent
 raster measurement, safe lifecycle, target build or emulator execution is
 provided here; all require separately approved build/emulator ownership and
 cleanup. No PAL/NTSC display, production integration, live timing, flash
