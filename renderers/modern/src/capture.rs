@@ -2537,6 +2537,210 @@ mod tests {
         0.2126 * decode(pixel[0]) + 0.7152 * decode(pixel[1]) + 0.0722 * decode(pixel[2])
     }
 
+    fn projected_test_frame(index: u64, level: u8) -> ControlFrame {
+        ControlFrame {
+            scene: 2,
+            palette: 1,
+            energy: level,
+            bass: level,
+            treble: level,
+            ..ControlFrame::procedural(index)
+        }
+    }
+
+    fn configure_projected_test(renderer: &mut OffscreenRenderer, house: bool) {
+        renderer.pipeline_mut().configure_scenes(SceneConfig {
+            tunnel_variant: if house {
+                TunnelVariant::Original
+            } else {
+                TunnelVariant::SurfaceHallway
+            },
+            ..SceneConfig::default()
+        });
+        renderer.pipeline_mut().enable_local_house(house);
+    }
+
+    fn projected_test_still(renderer: &mut OffscreenRenderer, index: u64, level: u8) -> Vec<u8> {
+        let size = renderer.size();
+        renderer.pipeline_mut().reset_state();
+        for previous in 0..index {
+            renderer.pipeline_mut().advance_state(
+                projected_test_frame(previous, level),
+                elapsed(previous),
+                size,
+            );
+        }
+        renderer
+            .render(projected_test_frame(index, level), elapsed(index))
+            .unwrap()
+    }
+
+    /// Runs each still from frame zero, as capture does. The luminance bounds
+    /// are regression evidence, not a photosensitivity assessment.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn projected_modes_offscreen_stills_are_bounded_and_repeatable() {
+        const HOUSE: [(&str, u64); 6] = [
+            ("forward", 3),
+            ("left", 11),
+            ("right", 19),
+            ("back", 27),
+            ("up", 35),
+            ("down", 43),
+        ];
+        const HALLWAY: [(&str, u64); 6] = [
+            ("near", 1),
+            ("early", 3),
+            ("middle", 7),
+            ("later", 11),
+            ("farther", 19),
+            ("long", 27),
+        ];
+        let (width, height) = (320, 180);
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for house in [false, true] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                configure_projected_test(&mut renderer, house);
+                for level in [0, 255] {
+                    for (cue, seconds) in if house { HOUSE } else { HALLWAY } {
+                        let index = seconds * CAPTURE_FPS as u64;
+                        let rgb = projected_test_still(&mut renderer, index, level);
+                        let repeated = projected_test_still(&mut renderer, index, level);
+                        let context = format!("{} house={house} level={level} {cue}", profile.name);
+                        assert_eq!(rgb, repeated, "{context}: replay differs");
+                        assert_eq!(rgb.len(), (width * height * 3) as usize, "{context}");
+                        assert!(rgb.iter().any(|&value| value > 16), "{context}: blank");
+                        assert!(
+                            rgb.iter().any(|&value| value < 16),
+                            "{context}: no dark pixels"
+                        );
+                        let mean = rgb.chunks_exact(3).map(luminance_srgb).sum::<f32>()
+                            / (width * height) as f32;
+                        assert!(mean < 0.5, "{context}: mean luminance {mean}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same whole-frame luminance convention as the existing tunnel test;
+    /// sampled readback is supporting evidence, not safety certification.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn projected_modes_offscreen_bound_abrupt_input_luminance_changes() {
+        let (width, height) = (320, 180);
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for house in [false, true] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                configure_projected_test(&mut renderer, house);
+                renderer.pipeline_mut().reset_state();
+                let mut previous: Option<Vec<f32>> = None;
+                let mut max_changed = 0.0_f32;
+                let mut max_mean_delta = 0.0_f32;
+                for index in 0..120_u64 {
+                    let high = index.is_multiple_of(2);
+                    let frame = ControlFrame {
+                        palette: if high { 0 } else { 2 },
+                        ..projected_test_frame(index, if high { 255 } else { 0 })
+                    };
+                    let rgb = renderer.render(frame, elapsed(index)).unwrap();
+                    let current: Vec<_> = rgb.chunks_exact(3).map(luminance_srgb).collect();
+                    if let Some(before) = &previous {
+                        let count = current.len() as f32;
+                        let changed = before
+                            .iter()
+                            .zip(&current)
+                            .filter(|(a, b)| (*a - *b).abs() >= 0.1)
+                            .count() as f32
+                            / count;
+                        let mean_delta = (before.iter().sum::<f32>() - current.iter().sum::<f32>())
+                            .abs()
+                            / count;
+                        max_changed = max_changed.max(changed);
+                        max_mean_delta = max_mean_delta.max(mean_delta);
+                    }
+                    previous = Some(current);
+                }
+                println!(
+                    "{} house={house}: max changed={max_changed:.4}, max mean delta={max_mean_delta:.4}",
+                    profile.name
+                );
+                assert!(max_changed < 0.12);
+                assert!(max_mean_delta < 0.08);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn house_offscreen_preserves_colour_field_gate() {
+        let (width, height) = (160, 90);
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let mut house =
+                pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height)).unwrap();
+            let mut baseline =
+                pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height)).unwrap();
+            configure_projected_test(&mut house, true);
+            let mut field_frames = 0;
+            let mut returned_native = false;
+            for index in 0..240_u64 {
+                let scene = if (30..150).contains(&index) {
+                    colour_field::SCENE
+                } else {
+                    2
+                };
+                let frame = ControlFrame {
+                    scene,
+                    ..projected_test_frame(index, 128)
+                };
+                if index.is_multiple_of(5) {
+                    let actual = house.render(frame, elapsed(index)).unwrap();
+                    let expected = baseline.render(frame, elapsed(index)).unwrap();
+                    let displayed = house.pipeline_mut().committed_displayed_scene();
+                    assert_eq!(
+                        displayed,
+                        baseline.pipeline_mut().committed_displayed_scene()
+                    );
+                    if displayed == colour_field::SCENE {
+                        assert_eq!(actual, expected, "{} frame {index}", profile.name);
+                        field_frames += 1;
+                    }
+                } else {
+                    house
+                        .pipeline_mut()
+                        .advance_state(frame, elapsed(index), (width, height));
+                    baseline
+                        .pipeline_mut()
+                        .advance_state(frame, elapsed(index), (width, height));
+                    assert_eq!(
+                        house.pipeline_mut().committed_displayed_scene(),
+                        baseline.pipeline_mut().committed_displayed_scene()
+                    );
+                }
+                let displayed = house.pipeline_mut().committed_displayed_scene();
+                if (30..59).contains(&index) {
+                    assert_ne!(displayed, colour_field::SCENE, "premature entry at {index}");
+                }
+                if (150..179).contains(&index) {
+                    assert_eq!(displayed, colour_field::SCENE, "premature exit at {index}");
+                }
+                if index >= 150 && displayed != colour_field::SCENE {
+                    returned_native = true;
+                }
+            }
+            assert!(
+                field_frames > 0,
+                "{} never entered ColourField",
+                profile.name
+            );
+            assert!(returned_native, "{} never returned to native", profile.name);
+        }
+    }
+
     #[test]
     #[ignore = "requires a GPU adapter"]
     fn tunnel_variants_render_synthetic_input_at_representative_aspects() {
