@@ -14,6 +14,8 @@ use crate::profile::RenderProfile;
 use crate::renderer::{OffscreenRenderer, ScenePipeline};
 use crate::scenes::{self, CameraMode, SceneConfig, colour_field, mic_layers, starfield};
 
+mod catalog_capture;
+
 pub use crate::scenes::TunnelVariant;
 
 /// Capture time base: frame `N` is rendered at `elapsed = N / CAPTURE_FPS`.
@@ -25,7 +27,7 @@ const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scen
                        [--catalog FILE --location LAT,LON]
                        [--time UNIX_SECONDS] [--follow-time]
                        [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
-                       [--exclusive-output]
+                       [--exclusive-output] [--catalog-v1]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --profile  render budget (default m1)
@@ -59,6 +61,8 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
              create PNGs and manifest exclusively; fail on existing leaves or
              duplicate frames. Requires a trusted, non-mutable output directory;
              newly created files (including partial files) may remain on failure.
+  --catalog-v1
+             explicitly replay an extended catalog-v1 recording from --input FILE
   With --exclusive-output, prefix a literal path named like an option with ./
   (for example ./--out).";
 
@@ -403,6 +407,7 @@ fn is_cli_option(value: &str) -> bool {
             | "--mic-layers"
             | "--lines-drop-cuts"
             | "--exclusive-output"
+            | "--catalog-v1"
             | "--tunnel-variant"
             | "--catalog"
             | "--star-catalog"
@@ -979,19 +984,32 @@ fn json_string(text: &str) -> String {
 }
 
 pub fn main() -> ExitCode {
-    match parse_starfield_args(std::env::args().skip(1), true) {
+    let tokens: Vec<String> = std::env::args().skip(1).collect();
+    let (tokens, catalog) = match catalog_capture::cli_tokens(tokens) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("chipviz-capture: {error}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    match parse_starfield_args(tokens, true) {
         Ok((StarfieldConfiguredCommand::Help, _)) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
         Ok((StarfieldConfiguredCommand::Capture(args, options), exclusive)) => {
-            match run_internal(
-                &args,
-                options.capture,
-                &options.starfield,
-                options.starfield_enabled,
-                exclusive,
-            ) {
+            let result = if catalog {
+                catalog_capture::run(&args, exclusive)
+            } else {
+                run_internal(
+                    &args,
+                    options.capture,
+                    &options.starfield,
+                    options.starfield_enabled,
+                    exclusive,
+                )
+            };
+            match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("chipviz-capture: {error}");
@@ -1239,6 +1257,7 @@ mod tests {
             "--mic-layers",
             "--lines-drop-cuts",
             "--exclusive-output",
+            "--catalog-v1",
             "--tunnel-variant",
             "--catalog",
             "--star-catalog",

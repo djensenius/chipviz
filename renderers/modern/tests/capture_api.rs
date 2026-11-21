@@ -158,6 +158,160 @@ fn capture_cli_rejects_exclusive_duplicate_frames_before_gpu_setup() {
 }
 
 #[test]
+#[cfg(unix)]
+fn catalog_cli_preflights_late_unavailable_records_and_conflicts() {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-catalog-cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let input = root.join("in.cvxe");
+    let out = root.join("out");
+    let mut bytes = b"CVXE\x01\x01\0\0".to_vec();
+    bytes.extend_from_slice(&2u64.to_le_bytes());
+    bytes.extend_from_slice(&crc32(&bytes).to_le_bytes());
+    for (index, family) in [0u8, 7].into_iter().enumerate() {
+        let mut record = [0u8; 145];
+        record[..6].copy_from_slice(b"CVX1\x01\x01");
+        record[8..16].copy_from_slice(&(index as u64).to_le_bytes());
+        record[16..24].copy_from_slice(&(index as u64).to_le_bytes());
+        record[24] = 0xc7;
+        record[26..28].copy_from_slice(&(index as u16).to_le_bytes());
+        record[44] = family;
+        record[56] = record[24..56].iter().fold(0, |a, b| a ^ b);
+        let crc = crc32(&record[..141]);
+        record[141..].copy_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&record);
+    }
+    std::fs::write(&input, &bytes).unwrap();
+    for first in [true, false] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"));
+        if first {
+            command.arg("--catalog-v1");
+        }
+        command
+            .arg("--input")
+            .arg(&input)
+            .arg("--frames")
+            .arg("0")
+            .arg("--out")
+            .arg(&out);
+        if !first {
+            command.arg("--catalog-v1");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("record 1: unavailable"));
+        assert!(!out.exists());
+    }
+    for option in ["--input", "--out"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+            .arg(option)
+            .arg("--catalog-v1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires a value"));
+        assert!(!out.exists());
+    }
+    for source in ["procedural", "synth-mic"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+            .args(["--catalog-v1", "--input", source, "--out"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires --input FILE"));
+        assert!(!out.exists());
+    }
+    for conflict in ["--scene", "--tunnel-variant", "--starfield"] {
+        for first in [true, false] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"));
+            if first {
+                command.arg("--catalog-v1");
+            }
+            command
+                .arg("--input")
+                .arg(&input)
+                .arg("--out")
+                .arg(&out)
+                .arg(conflict);
+            if !first {
+                command.arg("--catalog-v1");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(!out.exists());
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn catalog_cli_rejects_fifo_without_blocking() {
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-catalog-fifo-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let fifo = root.join("input");
+    let out = root.join("out");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
+        .arg("--catalog-v1")
+        .arg("--input")
+        .arg(&fifo)
+        .arg("--out")
+        .arg(&out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("capture blocked opening FIFO");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a regular file"));
+    assert!(!out.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn capture_cli_rejects_exclusive_flag_as_a_missing_path_value() {
     let root = std::env::temp_dir().join(format!(
         "chipviz-capture-missing-path-{}-{}",
@@ -265,6 +419,103 @@ fn capture_cli_rejects_known_flags_as_path_values_in_any_order() {
     assert!(stderr.contains("--frames expects indices"), "{stderr}");
     assert_eq!(std::fs::read(&manifest).unwrap(), b"preserve me");
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "requires a GPU adapter"]
+fn catalog_cli_preserves_input_when_later_png_aliases_it() {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    let mut recording = b"CVXE\x01\x01\0\0".to_vec();
+    recording.extend_from_slice(&2u64.to_le_bytes());
+    recording.extend_from_slice(&crc32(&recording).to_le_bytes());
+    for index in 0..2u64 {
+        let mut record = [0u8; 145];
+        record[..6].copy_from_slice(b"CVX1\x01\x01");
+        record[8..16].copy_from_slice(&index.to_le_bytes());
+        record[16..24].copy_from_slice(&index.to_le_bytes());
+        record[24] = 0xc7;
+        record[26..28].copy_from_slice(&(index as u16).to_le_bytes());
+        record[56] = record[24..56].iter().fold(0, |a, b| a ^ b);
+        let crc = crc32(&record[..141]);
+        record[141..].copy_from_slice(&crc.to_le_bytes());
+        recording.extend_from_slice(&record);
+    }
+    let root = std::env::temp_dir().join(format!(
+        "chipviz-catalog-png-alias-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    for alias in ["direct", "hardlink"] {
+        for exclusive in [false, true] {
+            let case = root.join(format!("{alias}-{exclusive}"));
+            let out = case.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            let collision = out.join("frame000001-SignalField.png");
+            let input = if alias == "direct" {
+                collision.clone()
+            } else {
+                case.join("recording.cvxe")
+            };
+            std::fs::write(&input, &recording).unwrap();
+            if alias == "hardlink" {
+                std::fs::hard_link(&input, &collision).unwrap();
+            }
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"));
+            command
+                .args(["--catalog-v1", "--profile", "pi5", "--input"])
+                .arg(&input)
+                .args(["--frames", "0,1", "--size", "160x90", "--out"])
+                .arg(&out);
+            if exclusive {
+                command.arg("--exclusive-output");
+            }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{alias} {exclusive}: {stderr}"
+            );
+            assert!(
+                stderr.contains("output aliases catalog-v1 input"),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains(&collision.display().to_string()),
+                "{stderr}"
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), recording);
+            assert_eq!(std::fs::read(&collision).unwrap(), recording);
+
+            // The first PNG was already written; a later collision does not
+            // roll it back, and the manifest has not yet been created.
+            let first = std::fs::read(out.join("frame000000-SignalField.png")).unwrap();
+            assert!(first.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert!(!out.join("manifest.json").exists());
+            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+        }
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
