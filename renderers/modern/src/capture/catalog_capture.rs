@@ -637,17 +637,19 @@ mod tests {
         std::fs::write(&input, &bytes).unwrap();
         let snapshot = Snapshot::validate(&bytes).unwrap();
         let mut case_images = Vec::new();
-        for (case, mode) in [
-            ("off", mic_layers::Mode::Off),
-            ("both", mic_layers::Mode::Both),
+        for (profile, case, mode) in [
+            (RenderProfile::m1(), "off", mic_layers::Mode::Off),
+            (RenderProfile::m1(), "both", mic_layers::Mode::Both),
+            (RenderProfile::pi5(), "off", mic_layers::Mode::Off),
+            (RenderProfile::pi5(), "both", mic_layers::Mode::Both),
         ] {
             let args = CaptureArgs {
-                profile: RenderProfile::pi5(),
+                profile: profile.clone(),
                 scene: None,
                 frames: vec![0, 13, 29, 36, 48, 71],
                 input: Input::File(input.clone()),
                 size: (160, 90),
-                out: root.join(case),
+                out: root.join(format!("{}-{case}", profile.name)),
                 mic_layers: mode,
                 lines_drop_cuts: true,
             };
@@ -689,6 +691,7 @@ mod tests {
             }
             let manifest = std::fs::read(args.out.join("manifest.json")).unwrap();
             let manifest_text = std::str::from_utf8(&manifest).unwrap();
+            assert!(manifest_text.contains(&format!("\"profile\": \"{}\"", profile.name)));
             let entries: Vec<_> = manifest_text
                 .lines()
                 .filter(|line| line.contains("\"frame_index\":"))
@@ -726,7 +729,7 @@ mod tests {
                 std::fs::read(args.out.join("manifest.json")).unwrap(),
                 manifest
             );
-            let collision_dir = root.join(format!("manifest-collision-{case}"));
+            let collision_dir = root.join(format!("manifest-collision-{}-{case}", profile.name));
             std::fs::create_dir(&collision_dir).unwrap();
             std::fs::write(collision_dir.join("manifest.json"), b"keep").unwrap();
             let collision_args = CaptureArgs {
@@ -742,16 +745,18 @@ mod tests {
             assert_eq!(std::fs::read_dir(collision_dir).unwrap().count(), 2);
             case_images.push(images);
         }
-        if mic_layers::LAYERS_BUILD {
-            assert_ne!(
-                case_images[0], case_images[1],
-                "enabled layers must affect output"
-            );
-        } else {
-            assert_eq!(
-                case_images[0], case_images[1],
-                "default build must gate layers off"
-            );
+        for (profile, images) in ["m1", "pi5"].into_iter().zip(case_images.chunks_exact(2)) {
+            if mic_layers::LAYERS_BUILD {
+                assert_ne!(
+                    images[0], images[1],
+                    "{profile}: enabled layers must affect output"
+                );
+            } else {
+                assert_eq!(
+                    images[0], images[1],
+                    "{profile}: default build must gate layers off"
+                );
+            }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
