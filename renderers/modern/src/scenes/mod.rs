@@ -17,6 +17,14 @@
 //! other bytes retain their original mapping.
 
 pub mod colour_field;
+#[cfg(feature = "dmg-preview")]
+#[expect(
+    dead_code,
+    reason = "standalone parity fixtures use the model inspection API"
+)]
+pub(crate) mod dmg_tile_scroll;
+#[cfg(feature = "dmg-preview")]
+pub(crate) mod dmg_tile_scroll_render;
 mod lines;
 pub mod mic_layers;
 mod object;

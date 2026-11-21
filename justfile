@@ -377,11 +377,13 @@ rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check
     @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests -- -D warnings
     @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests --features unmeasured-flash -- -D warnings
+    @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests --features dmg-preview -- -D warnings
     @echo "chipviz Rust lint OK"
 
 rust-test:
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --features dmg-preview
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
