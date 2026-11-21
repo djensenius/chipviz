@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/catalog_music_source.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gb_dmg_parity_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py scripts/package-macos-arm64.py scripts/personal-starfield-bundle.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_macos_arm64_packaging.py tests/test_personal_starfield_bundle.py tests/personal_starfield_capture_smoke.py tests/test_personal_starfield_capture_smoke.py tests/test_host_bridge.py tests/test_catalog_music_source.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_gb_dmg_parity_helpers.py tests/test_gb_lines.py tests/test_gb_lines_execution.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py scripts/c64_spectrum_volume_fixture.py tests/test_c64_spectrum_volume_fixture.py cores/sms/homebrew/field_assets.py tests/test_sms_field_assets.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/sms_procedural_test.py renderers/modern/tests/catalog_v1_reference.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/catalog_music_source.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gb_dmg_parity_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py scripts/package-macos-arm64.py scripts/personal-starfield-bundle.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_macos_arm64_packaging.py tests/test_personal_starfield_bundle.py tests/personal_starfield_capture_smoke.py tests/test_personal_starfield_capture_smoke.py tests/test_host_bridge.py tests/test_catalog_music_source.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_gb_dmg_parity_helpers.py tests/test_gb_lines.py tests/test_gb_lines_execution.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py scripts/c64_spectrum_volume_fixture.py tests/test_c64_spectrum_volume_fixture.py cores/sms/homebrew/field_assets.py tests/test_sms_field_assets.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/sms_procedural_test.py renderers/modern/tests/catalog_v1_reference.py scripts/local_review.py tests/test_local_review.py"
 
 default:
     just --list
@@ -15,10 +15,10 @@ default:
 check: lint test
     @echo "chipviz check OK"
 
-lint: scaffold-check c-lint python-lint docs-lint rust-lint third-party-notices-check
+lint: scaffold-check c-lint python-lint local-review-js-lint docs-lint rust-lint third-party-notices-check
     @echo "chipviz lint OK"
 
-test: c-test python-test rust-test build-sim simulate host-sample target-arrays homebrew-artifacts
+test: c-test python-test local-review-js-test rust-test build-sim simulate host-sample target-arrays homebrew-artifacts
     @just host-fixtures
     @echo "chipviz tests OK"
 
@@ -175,6 +175,16 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test s
 python-lint:
     @${PYTHON:-python3} -m py_compile {{ python_files }} tests/sms_port_trace.py tests/test_sms_port_trace.py cores/gba/homebrew/lines/fixture/harness.py cores/gba/homebrew/lines/fixture/host_tests.py
     @echo "chipviz Python lint OK"
+
+local-review-js-lint:
+    @node --check scripts/local-review/app.mjs
+    @node --check scripts/local-review/lib.mjs
+    @node --check scripts/local-review/review.test.mjs
+    @echo "chipviz local review JavaScript syntax OK"
+
+local-review-js-test:
+    @node --test scripts/local-review/review.test.mjs
+    @echo "chipviz local review JavaScript tests OK"
 
 gba-lines-fixture-test:
     @mkdir -p build/lines-fixture
