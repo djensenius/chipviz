@@ -57,9 +57,12 @@ and `Retry-After: 1`; retry after the current scan finishes. Shutdown closes
 connections and waits for active scans before releasing the library descriptors.
 
 Select a capture, open its embedded video, and seek using the player or the
-time field. Use **Use current playback time** and **Copy reference** to copy
-the identity, content hash, declared revision and timestamp without a URL,
-token or file path. Recognized visualization, platform, variant and scenario
+time field. Wait for finite video metadata before copying a typed time; times
+beyond the video duration are rejected. **Use current playback time** also
+waits for the initial seek to finish. If loading or seeking fails, reopen the
+video. Use **Copy reference** to copy the identity, content hash, declared
+revision and timestamp without a URL, token or file path. Recognized
+visualization, platform, variant and scenario
 labels are included only from a strict allowlist and are marked as inferred;
 draft references also include a fixed review-only, not-human-reviewed,
 do-not-publish warning. Other free-form metadata is omitted. The stable identity
@@ -74,6 +77,11 @@ unknown. A declaration must contain a single full SHA, optionally backticked
 and followed by punctuation. File changes detected between scanning and
 playback are rejected until refresh. Changes during an active transfer cannot
 be excluded, so do not edit footage while browsing.
+
+Scenario filters group recognized quiet/energetic filename suffixes and the
+modern library's `mellow-96` and `driving-126` tokens. Ambiguous or conflicting
+recognized scenarios are unknown; other descriptive filenames retain their
+inferred labels, which are not copied as free-form reference metadata.
 
 Drafts are review-only and not human-reviewed. Recognized Hallway/House draft
 names infer quiet or energetic scenarios and M1 or Pi 5 profiles; the Pi-profile

@@ -86,6 +86,7 @@ function selectClip(clip) {
   const player = node('div', null, 'player');
   const controls = node('div', null, 'actions');
   let video = null;
+  let state = 'unopened';
   function getTime() {
     const seconds = parseTime(input.value);
     if (seconds === null) {
@@ -93,6 +94,22 @@ function selectClip(clip) {
       input.focus();
     } else feedback.textContent = '';
     return seconds;
+  }
+  function hasDuration() {
+    if (!video) feedback.textContent = 'Open the video and wait for metadata first.';
+    else if (state === 'error') feedback.textContent = 'Video metadata or seek failed. Reopen the video and try again.';
+    else if (state === 'loading' || !Number.isFinite(video.duration) || video.duration < 0) {
+      feedback.textContent = 'Wait for valid video metadata, or reopen the video if loading failed.';
+    } else return true;
+    return false;
+  }
+  function inDuration(seconds) {
+    if (!hasDuration()) return false;
+    if (seconds > video.duration) {
+      feedback.textContent = 'Time exceeds the video duration. Enter a time within the video.';
+      return false;
+    }
+    return true;
   }
   const open = node('button', 'Open local video', 'primary');
   open.type = 'button';
@@ -102,18 +119,67 @@ function selectClip(clip) {
     player.replaceChildren();
     const openedVideo = node('video', null);
     video = openedVideo;
+    state = 'loading';
     openedVideo.controls = true;
     openedVideo.preload = 'metadata';
+    openedVideo.addEventListener('error', () => {
+      if (video !== openedVideo) return;
+      state = 'error';
+      feedback.textContent = 'Video metadata or seek failed. Reopen the video and try again.';
+    });
+    openedVideo.addEventListener('seeked', () => {
+      if (video !== openedVideo || !['seeking', 'invalid'].includes(state) || openedVideo.seeking) return;
+      if (!Number.isFinite(openedVideo.duration) || openedVideo.duration < 0 ||
+          !Number.isFinite(openedVideo.currentTime) || openedVideo.currentTime < 0 ||
+          openedVideo.currentTime > openedVideo.duration) {
+        state = 'error';
+        feedback.textContent = 'Video metadata or seek failed. Reopen the video and try again.';
+        return;
+      }
+      state = 'ready';
+      feedback.textContent = '';
+    });
+    openedVideo.addEventListener('loadedmetadata', () => {
+      if (video !== openedVideo || state !== 'loading') return;
+      if (!Number.isFinite(openedVideo.duration) || openedVideo.duration < 0) {
+        state = 'error';
+        feedback.textContent = 'Video duration is unavailable. Reopen the video and try again.';
+      } else if (seconds > openedVideo.duration) {
+        state = 'invalid';
+        feedback.textContent = 'Time exceeds the video duration. Enter a time within the video.';
+      } else if (openedVideo.currentTime === seconds && !openedVideo.seeking) {
+        state = 'ready';
+        feedback.textContent = '';
+      } else {
+        state = 'seeking';
+        try {
+          openedVideo.currentTime = seconds;
+          feedback.textContent = 'Waiting for the initial seek to finish.';
+        } catch {
+          state = 'error';
+          feedback.textContent = 'Video metadata or seek failed. Reopen the video and try again.';
+        }
+      }
+    }, { once: true });
     openedVideo.src = new URL(`media/${clip.id}`, location.href).href;
-    openedVideo.addEventListener('loadedmetadata', () => { openedVideo.currentTime = seconds; }, { once: true });
     player.append(openedVideo);
     openedVideo.focus();
+    feedback.textContent = 'Loading video metadata.';
   });
   const current = node('button', 'Use current playback time', 'secondary');
   current.type = 'button';
   current.addEventListener('click', () => {
-    if (video && Number.isFinite(video.currentTime)) input.value = String(Math.floor(video.currentTime));
-    else feedback.textContent = 'Open a video first.';
+    if (!hasDuration()) return;
+    if (state === 'invalid') {
+      feedback.textContent = 'Enter a valid time and reopen the video, or seek with the player.';
+    } else if (state !== 'ready' || video.seeking) {
+      feedback.textContent = 'Wait for the video seek to finish before using playback time.';
+    } else if (Number.isFinite(video.currentTime) && video.currentTime >= 0 && inDuration(video.currentTime)) {
+      input.value = String(Math.floor(video.currentTime));
+      feedback.textContent = '';
+    } else if (!Number.isFinite(video.currentTime) || video.currentTime < 0) {
+      feedback.textContent = 'Playback time is unavailable. Reopen the video and try again.';
+    }
   });
   const copy = node('button', 'Copy reference', 'secondary');
   copy.type = 'button';
@@ -122,8 +188,9 @@ function selectClip(clip) {
   fallback.hidden = true;
   fallback.setAttribute('aria-label', 'Reference to copy');
   copy.addEventListener('click', async () => {
+    fallback.hidden = true;
     const seconds = getTime();
-    if (seconds === null) return;
+    if (seconds === null || !inDuration(seconds)) return;
     const text = reference(clip, seconds);
     try {
       if (!navigator.clipboard || !window.isSecureContext) throw new Error('Clipboard unavailable');

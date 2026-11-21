@@ -182,6 +182,72 @@ class GalleryTests(unittest.TestCase):
         for clip in clips:
             self.assertEqual(clip["capture"], "Unknown capture")
 
+    def test_scenario_grouping_and_near_misses(self):
+        cases = (
+            ("retro/gba/blockscape-base-quiet.mp4", "quiet"),
+            ("retro/gba/blockscape-tunnel-quiet.mp4", "quiet"),
+            ("retro/gba/blockscape-base-energetic.mp4", "energetic"),
+            ("retro/gba/blockscape-base-quiet-96.mp4", "quiet-96"),
+            ("retro/gba/blockscape-base-energetic-126.mp4", "energetic-126"),
+            ("modern/m1/Lines/mellow-96.mp4", "mellow-96"),
+            ("modern/m1/Lines/prefix-mellow-96.mp4", "mellow-96"),
+            ("modern/m1/Lines/mellow-96-variant.mp4", "mellow-96"),
+            ("modern/m1/Lines/prefix_DRIVING-126_variant.mp4", "driving-126"),
+            ("modern/m1/Lines/mellow-96-driving-126.mp4", "Unknown"),
+            ("modern/m1/Lines/mellow-96-mellow-96.mp4", "Unknown"),
+            ("modern/m1/Lines/mellow-960.mp4", "Unknown"),
+            ("modern/m1/Lines/mellow-96ish.mp4", "Unknown"),
+            ("modern/m1/Lines/notmellow-96.mp4", "Unknown"),
+            ("modern/m1/Lines/quietish-quiet.mp4", "Unknown"),
+            ("modern/m1/Lines/quiet-energetic.mp4", "Unknown"),
+            ("modern/m1/Lines/quiet-96-extra.mp4", "Unknown"),
+            ("modern/m1/Lines/energetic-126x.mp4", "Unknown"),
+            ("retro/gba/mellow-96.mp4", "Unknown"),
+            ("retro/gba/driving-example.mp4", "driving-example"),
+            ("modern/m1/Lines/descriptive.mp4", "descriptive"),
+        )
+        for relative, expected in cases:
+            with self.subTest(relative=relative):
+                self.write(self.root, relative, b"synthetic")
+                clip, _ = gallery.entry(self.fds[0], relative, "library", gallery.ScanBudget())
+                self.assertEqual(clip["scenario"], expected)
+                self.assertEqual(clip["capture"], "Unknown capture")
+        relative = "modern/m1/Lines/mellow-96.mp4"
+        self.write(self.draft, relative, b"synthetic")
+        clip, _ = gallery.entry(self.fds[1], relative, "draft", gallery.ScanBudget())
+        self.assertEqual(clip["scenario"], "Unknown")
+
+    def test_whitespace_labels_produce_a_valid_mixed_catalog(self):
+        paths = (
+            "modern/ /PulseTunnel/quiet.mp4",
+            "modern/m1/ /energetic.mp4",
+            "modern/m1/PulseTunnel/ /quiet.mp4",
+            "modern/m1/Lines/  .mp4",
+            "retro/\ufeff/ /   .mp4",
+            "retro/gba/colour-field/ /clip.mp4",
+            "modern/m1/Lines/  named  .mp4",
+            "modern/m1/Lines/  spectral  /clip.mp4",
+        )
+        for relative in paths:
+            self.write(self.root, relative, b"synthetic")
+        catalog, media = gallery.local_catalog(self.roots)
+        clips = {media[clip["id"]][1]: clip for clip in catalog["clips"]}
+        self.assertEqual(len(clips), len(paths) + 1)
+        for clip in clips.values():
+            for key in ("title", "family", "platform", "variant", "scenario", "capture"):
+                self.assertTrue(any(not (c.isspace() or c == "\ufeff") for c in clip[key]), key)
+        self.assertEqual(clips[paths[0]]["platform"], "Unknown")
+        self.assertEqual(clips[paths[1]]["family"], "Unknown")
+        self.assertEqual(clips[paths[2]]["variant"], "Unknown")
+        self.assertEqual((clips[paths[3]]["title"], clips[paths[3]]["scenario"]),
+                         ("Unnamed capture", "Unknown"))
+        self.assertEqual((clips[paths[4]]["platform"], clips[paths[4]]["family"],
+                          clips[paths[4]]["title"], clips[paths[4]]["scenario"]),
+                         ("Unknown", "Unknown", "Unnamed capture", "Unknown"))
+        self.assertEqual(clips[paths[5]]["variant"], "Unknown")
+        self.assertEqual(clips[paths[6]]["title"], "  named  ")
+        self.assertEqual(clips[paths[7]]["variant"], "  spectral  ")
+
     def test_modern_variant_requires_an_explicit_directory(self):
         cases = (
             ("modern/m1/PulseTunnel/hallway-quiet.mp4", "Unknown"),

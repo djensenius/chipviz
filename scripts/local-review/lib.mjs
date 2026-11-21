@@ -29,6 +29,7 @@ const CONTEXT = [
   ['scenario', 'Scenario', new Map([
     ['quiet', 'quiet'], ['energetic', 'energetic'],
     ['quiet-96', 'quiet-96'], ['energetic-126', 'energetic-126'],
+    ['mellow-96', 'mellow-96'], ['driving-126', 'driving-126'],
   ])],
 ];
 const DRAFT_PI_MAC = 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware';

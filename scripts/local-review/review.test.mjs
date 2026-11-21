@@ -107,6 +107,20 @@ test('Blockscape variants are copied only for the Blockscape family', () => {
   }
 });
 
+test('modern synthetic scenarios use fixed, private reference labels', () => {
+  for (const scenario of ['mellow-96', 'driving-126']) {
+    const text = reference({ ...clip(), collection: 'library', family: 'Pulse Tunnel', scenario,
+      title: 'token=secret', notes: ['/private/path'], capture: 'Unknown capture' }, 9);
+    assert.ok(text.includes(`Scenario (inferred): ${scenario}\n`));
+    assert.doesNotMatch(text, /token=secret|\/private|Mac GPU|Review-only draft/);
+    for (const payload of [`${scenario}-extra`, `${scenario}\npassword=secret`,
+      `/private/${scenario}`, `https://example.invalid/${scenario}`]) {
+      const bad = reference({ ...clip(), scenario: payload }, 9);
+      assert.doesNotMatch(bad, /Scenario \(inferred\):|password=secret|\/private|https?:/);
+    }
+  }
+});
+
 test('arbitrary metadata never leaks through any optional reference field', () => {
   for (const field of ['title', 'family', 'platform', 'variant', 'scenario', 'capture']) {
     for (const payload of ['Hallway\npassword=secret', 'hallway\npassword=secret', '/Users/person/video.mp4',
@@ -129,6 +143,11 @@ class Element {
     this.events = {};
     this.textContent = '';
     this.value = '';
+    if (tag === 'video') {
+      this.currentTime = 0;
+      this.duration = NaN;
+      this.seeking = false;
+    }
   }
   set innerHTML(_) { throw new Error('HTML parsing is forbidden'); }
   append(...children) { this.children.push(...children); }
@@ -147,52 +166,172 @@ test('filters, text-only rendering, embedded seeking and copy fallback', async (
   const elements = Object.fromEntries(['count', 'message', 'detail', 'results', 'search', 'reset',
     'filter-fields'].map(id => [id, new Element('div')]));
   const value = clip();
+  const unnamed = { ...clip(), id: 'clip-11111111111111111111', title: 'Unnamed capture',
+    family: 'Unknown', platform: 'Unknown', variant: 'Unknown', scenario: 'Unknown',
+    capture: 'Unknown capture', collection: 'library' };
   globalThis.document = { getElementById: id => elements[id], createElement: tag => new Element(tag) };
   globalThis.location = { href: 'http://127.0.0.1:8000/capability/' };
   globalThis.fetch = async (url, options) => {
     assert.equal(url.href, 'http://127.0.0.1:8000/capability/catalog.json');
     assert.equal(options.referrerPolicy, 'no-referrer');
-    return { ok: true, json: async () => ({ schema_version: 1, clips: [value] }) };
+    return { ok: true, json: async () => ({ schema_version: 1, clips: [value, unnamed] }) };
   };
   globalThis.window = { isSecureContext: false };
   await import('./app.mjs');
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(elements.count.textContent, '1 capture');
+  assert.equal(elements.count.textContent, '2 captures');
   const selects = descendants(elements['filter-fields']).filter(item => item.tagName === 'select');
   assert.deepEqual(selects.map(item => item.id),
     ['filter-family', 'filter-platform', 'filter-variant', 'filter-scenario', 'filter-collection']);
+  selects[3].value = 'Unknown';
+  selects[3].events.change();
+  assert.equal(elements.count.textContent, '1 capture');
+  elements.reset.events.click();
   selects[0].value = 'House';
   selects[0].events.change();
   assert.equal(elements.count.textContent, '0 captures');
   elements.reset.events.click();
-  assert.equal(elements.count.textContent, '1 capture');
+  assert.equal(elements.count.textContent, '2 captures');
   descendants(elements.results).find(item => item.tagName === 'button').events.click();
   const detail = elements.detail;
   assert.ok(descendants(detail).some(item => item.tagName === 'h2' && item.textContent === value.title));
   assert.equal(descendants(detail).some(item => item.tagName === 'img' || item.tagName === 'iframe'), false);
   const input = descendants(detail).find(item => item.tagName === 'input');
+  const action = text => descendants(detail).find(item => item.textContent === text);
+  const feedback = descendants(detail).find(item => item.role === 'status');
+  const fallback = descendants(detail).find(item => item.tagName === 'textarea');
+  await action('Copy reference').events.click();
+  assert.match(feedback.textContent, /Open the video/);
+  assert.equal(fallback.hidden, true);
   input.value = '1:05';
-  descendants(detail).find(item => item.textContent === 'Open local video').events.click();
+  action('Open local video').events.click();
   const video = descendants(detail).find(item => item.tagName === 'video');
   assert.equal(video.src, `http://127.0.0.1:8000/capability/media/${value.id}`);
+  action('Use current playback time').events.click();
+  assert.equal(input.value, '1:05');
+  assert.match(feedback.textContent, /metadata/);
+  await action('Copy reference').events.click();
+  assert.equal(fallback.hidden, true);
+  assert.match(feedback.textContent, /metadata/);
   input.value = '1:33';
-  descendants(detail).find(item => item.textContent === 'Open local video').events.click();
+  action('Open local video').events.click();
   const secondVideo = descendants(detail).find(item => item.tagName === 'video');
   assert.notEqual(secondVideo, video);
+  video.duration = 120;
+  video.events.loadedmetadata();
+  video.events.error();
+  video.events.seeked();
+  assert.match(feedback.textContent, /Loading video metadata/);
+  secondVideo.duration = 120;
   secondVideo.events.loadedmetadata();
   assert.equal(secondVideo.currentTime, 93);
   video.events.loadedmetadata();
-  assert.equal(video.currentTime, 65);
   assert.equal(secondVideo.currentTime, 93);
+  action('Use current playback time').events.click();
+  assert.equal(input.value, '1:33');
+  assert.match(feedback.textContent, /seek/);
+  await action('Copy reference').events.click();
+  assert.match(fallback.value, /Time: 93 seconds/);
+  secondVideo.seeking = true;
+  secondVideo.events.seeked();
+  action('Use current playback time').events.click();
+  assert.equal(input.value, '1:33');
+  secondVideo.seeking = false;
+  secondVideo.events.seeked();
+  video.events.error();
+  video.events.seeked();
   secondVideo.currentTime = 72.9;
-  descendants(detail).find(item => item.textContent === 'Use current playback time').events.click();
+  action('Use current playback time').events.click();
   assert.equal(input.value, '72');
-  await descendants(detail).find(item => item.textContent === 'Copy reference').events.click();
-  const fallback = descendants(detail).find(item => item.tagName === 'textarea');
+  await action('Copy reference').events.click();
   assert.equal(fallback.hidden, false);
   assert.match(fallback.value, /Time: 72 seconds/);
   assert.match(fallback.value, /Visualization \(inferred\): Hallway/);
   assert.match(fallback.value, /Pi 5 profile on Mac GPU \(not physical Pi hardware\)/);
   assert.match(fallback.value, /Review-only draft; not human-reviewed\. Do not publish\./);
   assert.doesNotMatch(fallback.value, /capability|127\.0\.0\.1|<img/);
+
+  input.value = '7';
+  action('Open local video').events.click();
+  const short = descendants(detail).find(item => item.tagName === 'video');
+  short.duration = 6;
+  short.events.loadedmetadata();
+  assert.equal(short.currentTime, 0);
+  assert.match(feedback.textContent, /exceeds/);
+  action('Use current playback time').events.click();
+  assert.equal(input.value, '7');
+  assert.match(feedback.textContent, /reopen/);
+  await action('Copy reference').events.click();
+  assert.equal(fallback.hidden, true);
+  assert.match(feedback.textContent, /exceeds/);
+  input.value = '6';
+  await action('Copy reference').events.click();
+  assert.match(fallback.value, /Time: 6 seconds/);
+
+  input.value = '0';
+  action('Open local video').events.click();
+  const zero = descendants(detail).find(item => item.tagName === 'video');
+  zero.duration = 6;
+  zero.events.loadedmetadata();
+  input.value = '5';
+  action('Use current playback time').events.click();
+  assert.equal(input.value, '0');
+  zero.events.error();
+  await action('Copy reference').events.click();
+  assert.equal(fallback.hidden, true);
+  assert.match(feedback.textContent, /failed/);
+  input.value = '5';
+  action('Use current playback time').events.click();
+  assert.equal(input.value, '5');
+
+  input.value = '9';
+  action('Open local video').events.click();
+  const longer = descendants(detail).find(item => item.tagName === 'video');
+  longer.duration = 43;
+  longer.events.loadedmetadata();
+  longer.events.seeked();
+  for (const seconds of [9, 33, 43]) {
+    input.value = String(seconds);
+    await action('Copy reference').events.click();
+    assert.match(fallback.value, new RegExp(`Time: ${seconds} seconds`));
+  }
+  input.value = '44';
+  await action('Copy reference').events.click();
+  assert.equal(fallback.hidden, true);
+  assert.match(feedback.textContent, /exceeds/);
+
+  for (const duration of [NaN, Infinity, -1]) {
+    input.value = '0';
+    action('Open local video').events.click();
+    const invalid = descendants(detail).find(item => item.tagName === 'video');
+    invalid.duration = duration;
+    invalid.events.loadedmetadata();
+    await action('Copy reference').events.click();
+    assert.equal(fallback.hidden, true);
+    assert.match(feedback.textContent, /failed/);
+  }
+
+  input.value = '2';
+  action('Open local video').events.click();
+  const failed = descendants(detail).find(item => item.tagName === 'video');
+  failed.events.error();
+  failed.duration = 6;
+  failed.events.loadedmetadata();
+  failed.events.seeked();
+  action('Use current playback time').events.click();
+  assert.equal(input.value, '2');
+  await action('Copy reference').events.click();
+  assert.equal(fallback.hidden, true);
+  assert.match(feedback.textContent, /failed/);
+
+  action('Open local video').events.click();
+  const failedSeek = descendants(detail).find(item => item.tagName === 'video');
+  failedSeek.duration = 6;
+  Object.defineProperty(failedSeek, 'currentTime', {
+    get: () => 0, set: () => { throw new Error('seek failed'); },
+  });
+  failedSeek.events.loadedmetadata();
+  await action('Copy reference').events.click();
+  assert.equal(fallback.hidden, true);
+  assert.match(feedback.textContent, /failed/);
 });

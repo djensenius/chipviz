@@ -224,12 +224,33 @@ def draft_revision(root_fd, relative, budget=None):
     return revision
 
 
+def display_label(value, fallback="Unknown"):
+    return value if any(not (char.isspace() or char == "\ufeff") for char in value) else fallback
+
+
+def scenario_label(title, modern):
+    """Group recognized scenario tokens while retaining other descriptive labels."""
+    pattern = r"(?:^|(?<=[-_]))(quiet-96|energetic-126|quiet|energetic|mellow-96|driving-126)(?=$|[-_])"
+    matches = list(re.finditer(pattern, title, re.I))
+    if len(matches) == 1:
+        match = matches[0]
+        value = match.group().lower()
+        rest = title[:match.start()] + title[match.end():]
+        if (not re.search(r"quiet|energetic|mellow|driving", rest, re.I)
+                and (modern if value in ("mellow-96", "driving-126") else match.end() == len(title))):
+            return value
+    near_miss = r"quiet|energetic|mellow|driving" if modern else r"quiet|energetic"
+    if matches or re.search(near_miss, title, re.I):
+        return "Unknown"
+    return display_label(title)
+
+
 def entry(root_fd, relative, namespace, budget):
     clip_id, sha, stamp = digest_file(root_fd, relative, namespace, budget)
     names = parts(relative)
     title = Path(names[-1]).stem
     family = platform = variant = "Unknown"
-    scenario = title
+    scenario = scenario_label(title, namespace == "library" and len(names) >= 4 and names[0].lower() == "modern")
     capture = "Unknown capture"
     revision = None
     notes = ["Labels are inferred from filenames; provenance and review status are not verified."]
@@ -288,8 +309,9 @@ def entry(root_fd, relative, namespace, budget):
     if namespace == "draft":
         notes.append("Review-only draft; not human-reviewed. Do not publish. Normal-speed human review and safety/flash assessment remain required.")
     return ({
-        "id": clip_id, "sha256": sha, "title": title, "family": family,
-        "platform": platform, "variant": variant, "scenario": scenario,
+        "id": clip_id, "sha256": sha, "title": display_label(title, "Unnamed capture"),
+        "family": display_label(family), "platform": display_label(platform),
+        "variant": display_label(variant), "scenario": display_label(scenario),
         "capture": capture, "source_revision": revision, "collection": namespace, "notes": notes,
     }, stamp)
 
