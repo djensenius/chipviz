@@ -157,18 +157,56 @@ class GalleryTests(unittest.TestCase):
                 status, _, _ = self.request(server, f"/{server.token}/", timeout=1)
                 self.assertEqual(status, 200)
 
-    def test_header_deadline_bounds_slow_drip(self):
+    def test_header_deadline_bounds_slow_drip_with_controlled_clock(self):
+        connection = mock.Mock(spec=["settimeout", "recv_into"])
+
+        def drip(buffer):
+            buffer[:1] = b"x"
+            return 1
+
+        connection.recv_into.side_effect = drip
+        with mock.patch.object(gallery.time, "monotonic", side_effect=[100.0, 100.0, 100.3, 100.7, 100.81]):
+            reader = gallery.HeaderReader(connection, timeout=0.8, io_timeout=2)
+            for _ in range(3):
+                buffer = bytearray(4)
+                self.assertEqual(reader.readinto(buffer), 1)
+                self.assertEqual(buffer[:1], b"x")
+            with self.assertRaisesRegex(TimeoutError, "request header deadline"):
+                reader.readinto(bytearray(4))
+        self.assertEqual(connection.recv_into.call_count, 3)
+        self.assertEqual(reader.remaining, 65533)
+        for actual, expected in zip(connection.settimeout.call_args_list, (0.8, 0.5, 0.1)):
+            self.assertAlmostEqual(actual.args[0], expected)
+        self.assertEqual(connection.settimeout.call_count, 3)
+
+    def test_delayed_client_tolerates_peer_close_after_header_deadline(self):
+        closed = threading.Event()
+        original = gallery.ReviewServer.shutdown_request
+
+        def mark_closed(server, request):
+            try:
+                original(server, request)
+            finally:
+                closed.set()
+
         server = self.serve(header_timeout=0.8, io_timeout=2)
-        with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as partial:
-            partial.settimeout(2)
-            started = time.monotonic()
-            partial.sendall(b"G")
-            time.sleep(0.2)
-            partial.sendall(b"E")
-            time.sleep(0.2)
-            partial.sendall(b"T")
-            self.assertEqual(partial.recv(1), b"")
-            self.assertLess(time.monotonic() - started, 1.8)
+        with mock.patch.object(gallery.ReviewServer, "shutdown_request", mark_closed):
+            with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as partial:
+                partial.settimeout(5)
+                try:
+                    partial.sendall(b"G")
+                except ConnectionError:
+                    pass  # The scheduled client may already have missed the deadline.
+                self.assertTrue(closed.wait(10))
+                try:
+                    partial.sendall(b"E")  # Simulate the client resuming after the peer closed.
+                except ConnectionError:
+                    pass
+                try:
+                    data = partial.recv(1)
+                except ConnectionError:
+                    data = b""
+                self.assertEqual(data, b"")
         self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
 
     def test_oversized_request_headers_are_closed(self):

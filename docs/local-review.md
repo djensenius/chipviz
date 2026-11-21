@@ -5,7 +5,9 @@ separately identified review-draft root. It does not copy, publish, upload,
 register, or make external requests. Automated YouTube setup and public hosting
 remain separate future work.
 
-Run with Python 3 from the repository root. The default library is
+The Python viewer targets macOS and Linux and relies on POSIX directory and
+signal APIs; it does not support Windows. Run with Python 3 from the repository
+root. The default library is
 `~/Desktop/chipviz`:
 
 ```sh
