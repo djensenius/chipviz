@@ -28,9 +28,10 @@ set video privacy.
 The configuration lives in `~/.config/chipviz/.env.youtube` and the refresh
 token and expected channel ID in `~/.config/chipviz/youtube-token.json`,
 outside Git. The app directory must be owned by you and mode 0700, and both
-files must be owned by you and mode 0600. Existing files are never overwritten.
-Storage on macOS and Linux is supported; paths or files with access control
-lists are rejected, even if an ACL appears restrictive.
+files must be owned by you and mode 0600. Configuration is never overwritten.
+Storage on macOS and Linux is supported. On macOS, ancestor directories may
+have deny-only ACLs; other ACLs are rejected. The app directory, private files,
+and lock file must have no ACLs on either platform.
 Never commit, share, or back up these files to an untrusted location. Other
 processes running as your user, administrators, malware, and insecure backups
 can still read or alter them. This is not a hardware-backed secret store.
@@ -44,6 +45,14 @@ must stop if `load_credentials()` fails, and must verify it is operating on the
 returned expected channel before uploading. The loader refreshes with Google
 each time, so it requires network access and rejects revoked or unavailable
 authorization rather than treating stale credentials as valid.
+Refresh-token rotation is saved atomically, including subsequent automatic
+refreshes on the returned credentials. A process crash or storage failure after
+Google rotates a token but before it is saved can require reauthorization.
+Concurrent cooperating processes serialize using `.youtube.lock`; do not remove
+or replace this lock while chipviz is running. Stale credentials must be
+reloaded if another process rotates the token. A crash may leave an owner-only
+`.youtube-<random>` temporary file in the app directory; it may contain a
+secret and can be removed after all chipviz processes have stopped.
 
 The importable interface is `load_credentials() -> tuple[object, str]`: a
 refreshed Google Credentials object and the confirmed channel ID. It raises

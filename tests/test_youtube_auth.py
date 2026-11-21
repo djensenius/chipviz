@@ -1,4 +1,9 @@
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
+import ctypes
+import datetime
+import errno
+import fcntl
 import importlib.util
 import io
 import json
@@ -6,11 +11,20 @@ import logging
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
+
+try:
+  from google.oauth2.credentials import Credentials as GoogleCredentials
+  from google.oauth2 import reauth as google_reauth
+except ImportError:
+  GoogleCredentials = None
+  google_reauth = None
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "youtube_auth.py"
@@ -51,7 +65,22 @@ class YouTubeAuthTests(unittest.TestCase):
       "pageInfo": {"totalResults": 1},
     }
     build = mock.Mock(return_value=service)
-    credentials_class = mock.Mock(return_value=credentials)
+    class FakeCredentials:
+      constructed = mock.Mock()
+      refresh_mock = mock.Mock()
+
+      def __init__(self, **kwargs):
+        self.constructed(**kwargs)
+        self.refresh_token = kwargs["refresh_token"]
+        self.token = None
+        self.valid = True
+        self.granted_scopes = AUTH.SCOPES
+
+      def refresh(self, request):
+        self.refresh_mock(self, request)
+        self.token = "synthetic-access-token"
+
+    credentials_class = FakeCredentials
     request = mock.Mock()
     modules = {
       "google_auth_oauthlib": types.ModuleType("google_auth_oauthlib"),
@@ -136,6 +165,7 @@ class YouTubeAuthTests(unittest.TestCase):
       self.configure()
     self.assertEqual(stat.S_IMODE(self.app.stat().st_mode), 0o755)
     self.app.chmod(0o700)
+    (self.app / AUTH.LOCK_FILE).unlink()
     self.app.rmdir()
     self.app.symlink_to(self.home, target_is_directory=True)
     with self.assertRaises(AUTH.AuthError):
@@ -165,7 +195,7 @@ class YouTubeAuthTests(unittest.TestCase):
         contextlib.redirect_stdout(output):
       AUTH.authorize()
       loaded, channel = AUTH.load_credentials()
-    self.assertIs(loaded, credentials)
+    self.assertIsInstance(loaded, credentials_class)
     self.assertEqual(channel, CHANNEL)
     flow_class.from_client_config.assert_called_once()
     self.assertEqual(flow_class.from_client_config.call_args.kwargs["scopes"], AUTH.SCOPES)
@@ -174,10 +204,10 @@ class YouTubeAuthTests(unittest.TestCase):
     self.assertTrue(flow.run_local_server.call_args.kwargs["open_browser"])
     service.channels.return_value.list.assert_called_once_with(
       part="snippet", mine=True, maxResults=2)
-    credentials_class.assert_called_once_with(
+    credentials_class.constructed.assert_called_once_with(
       token=None, refresh_token=TOKEN, token_uri=AUTH.TOKEN_URI,
       client_id=CLIENT, client_secret=SECRET, scopes=AUTH.SCOPES)
-    credentials.refresh.assert_called_once()
+    credentials_class.refresh_mock.assert_called_once()
     state = self.app / AUTH.STATE_FILE
     self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
     self.assertEqual(json.loads(state.read_text()), {"channel_id": CHANNEL, "refresh_token": TOKEN})
@@ -211,8 +241,8 @@ class YouTubeAuthTests(unittest.TestCase):
     state = self.app / AUTH.STATE_FILE
     state.write_text(json.dumps({"channel_id": CHANNEL, "refresh_token": TOKEN}))
     state.chmod(0o600)
-    modules, credentials, *_ = self.google_modules()
-    credentials.refresh.side_effect = ValueError(TOKEN)
+    modules, _, _, _, _, credentials_class = self.google_modules()
+    credentials_class.refresh_mock.side_effect = ValueError(TOKEN)
     with mock.patch.dict(sys.modules, modules):
       with self.assertRaises(AUTH.AuthError) as error:
         AUTH.load_credentials()
@@ -261,6 +291,281 @@ class YouTubeAuthTests(unittest.TestCase):
       with self.assertRaises(AUTH.AuthError):
         AUTH.authorize()
     self.assertEqual(state.read_text(), "unchanged")
+
+  def test_atomic_no_replace_survives_interruption(self):
+    self.home.joinpath(".config").mkdir(mode=0o700)
+    self.app.mkdir(mode=0o700)
+    fd = os.open(self.app, os.O_RDONLY | os.O_DIRECTORY)
+    self.addCleanup(os.close, fd)
+    for after_rename in (False, True):
+      target = "after" if after_rename else "before"
+      pid = os.fork()
+      if pid == 0:
+        original = AUTH._rename_noreplace
+        def interrupted(*args):
+          if after_rename:
+            original(*args)
+          os._exit(47)
+        AUTH._rename_noreplace = interrupted
+        AUTH._write_once(fd, target, "synthetic-secret")
+        os._exit(48)
+      _, status = os.waitpid(pid, 0)
+      self.assertEqual(os.waitstatus_to_exitcode(status), 47)
+      path = self.app / target
+      self.assertEqual(path.exists(), after_rename)
+      if after_rename:
+        self.assertEqual(path.stat().st_nlink, 1)
+        with self.assertRaises(FileExistsError):
+          AUTH._write_once(fd, target, "replacement")
+        self.assertEqual(path.read_text(), "synthetic-secret")
+      else:
+        orphan = list(self.app.glob(".youtube-*"))
+        self.assertEqual(len(orphan), 1)
+        self.assertEqual(stat.S_IMODE(orphan[0].stat().st_mode), 0o600)
+        self.assertEqual(orphan[0].stat().st_nlink, 1)
+        AUTH._write_once(fd, target, "retry")
+        self.assertEqual(path.read_text(), "retry")
+
+  def test_rotation_persists_on_initial_and_later_refresh(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    modules, _, _, _, _, credentials_class = self.google_modules()
+    rotations = iter(["synthetic-rotation-one", "synthetic-rotation-two"])
+    def rotate(credentials, _request):
+      credentials.refresh_token = next(rotations)
+    credentials_class.refresh_mock.side_effect = rotate
+    with mock.patch.dict(sys.modules, modules):
+      credentials, channel = AUTH.load_credentials()
+      self.assertEqual(json.loads(state.read_text())["refresh_token"], "synthetic-rotation-one")
+      credentials.refresh(object())
+    self.assertEqual(channel, CHANNEL)
+    self.assertEqual(json.loads(state.read_text())["refresh_token"], "synthetic-rotation-two")
+    self.assertEqual(state.stat().st_nlink, 1)
+    self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_real_google_credentials_automatic_refresh_persists_rotation(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    expiry = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=1)
+    responses = [
+      ("synthetic-access-one", "synthetic-rotation-one", expiry, {}, None),
+      ("synthetic-access-two", "synthetic-rotation-two", expiry, {}, None),
+    ]
+    with mock.patch.object(google_reauth, "refresh_grant", side_effect=responses) as grant:
+      credentials, channel = AUTH.load_credentials()
+      self.assertIsInstance(credentials, GoogleCredentials)
+      credentials.expiry = expiry - datetime.timedelta(hours=2)
+      headers = {}
+      credentials.before_request(mock.Mock(), "GET", "https://www.googleapis.com/", headers)
+    self.assertEqual(grant.call_count, 2)
+    self.assertEqual(channel, CHANNEL)
+    self.assertEqual(headers["authorization"], "Bearer synthetic-access-two")
+    self.assertEqual(json.loads(state.read_text())["refresh_token"], "synthetic-rotation-two")
+
+  def test_rotation_serializes_and_stale_credentials_fail_closed(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    modules, _, _, _, _, credentials_class = self.google_modules()
+    with mock.patch.dict(sys.modules, modules):
+      first, _ = AUTH.load_credentials()
+      second, _ = AUTH.load_credentials()
+      started = threading.Event()
+      release = threading.Event()
+      def rotate(credentials, _request):
+        started.set()
+        if not release.wait(10):
+          raise RuntimeError("test timed out")
+        credentials.refresh_token = "synthetic-rotated-token"
+      credentials_class.refresh_mock.side_effect = rotate
+      with ThreadPoolExecutor(max_workers=2) as pool:
+        future = pool.submit(first.refresh, object())
+        self.assertTrue(started.wait(10))
+        lock_fd = os.open(self.app / AUTH.LOCK_FILE, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+          with self.assertRaises(BlockingIOError):
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+          os.close(lock_fd)
+        stale = pool.submit(second.refresh, object())
+        release.set()
+        future.result(timeout=10)
+        with self.assertRaises(AUTH.AuthError):
+          stale.result(timeout=10)
+    self.assertIsNone(second.token)
+    self.assertEqual(json.loads(state.read_text())["refresh_token"], "synthetic-rotated-token")
+
+  def test_failed_rotation_write_invalidates_credentials(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    modules, _, _, _, _, credentials_class = self.google_modules()
+    with mock.patch.dict(sys.modules, modules):
+      credentials, _ = AUTH.load_credentials()
+      def rotate(cred, _request):
+        cred.refresh_token = "synthetic-rotated-token"
+      credentials_class.refresh_mock.side_effect = rotate
+      with mock.patch.object(AUTH, "_atomic_write", side_effect=OSError(TOKEN)):
+        with self.assertRaises(AUTH.AuthError) as error:
+          credentials.refresh(object())
+      self.assertNotIn(TOKEN, str(error.exception))
+      self.assertIsNone(credentials.token)
+      self.assertEqual(json.loads(state.read_text())["refresh_token"], TOKEN)
+      with self.assertRaises(AUTH.AuthError):
+        credentials.refresh(object())
+
+  def test_unsafe_lock_is_rejected_without_touching_target(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    target = self.home / "unrelated"
+    target.write_text("unchanged")
+    lock = self.app / AUTH.LOCK_FILE
+    lock.symlink_to(target)
+    with self.assertRaises(AUTH.AuthError):
+      AUTH.load_credentials()
+    self.assertEqual(target.read_text(), "unchanged")
+    lock.unlink()
+    lock.write_text("")
+    lock.chmod(0o644)
+    with self.assertRaises(AUTH.AuthError):
+      AUTH.load_credentials()
+
+  @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACL support")
+  def test_real_darwin_deny_ancestor_and_private_acls(self):
+    def chmod_acl(path, *args):
+      subprocess.run(["/bin/chmod", *args, str(path)], check=True,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+      chmod_acl(self.home, "+a", "group:everyone deny delete")
+      self.configure()
+      chmod_acl(self.app, "+a", "group:everyone deny delete")
+      with self.assertRaises(AUTH.AuthError):
+        AUTH.load_credentials()
+      chmod_acl(self.app, "-N")
+      env = self.app / AUTH.ENV_FILE
+      chmod_acl(env, "+a", "group:everyone deny delete")
+      with self.assertRaises(AUTH.AuthError):
+        AUTH.load_credentials()
+      chmod_acl(env, "-N")
+      chmod_acl(self.home, "+a", "group:everyone allow read")
+      with self.assertRaises(AUTH.AuthError):
+        AUTH.load_credentials()
+    finally:
+      for path in (self.home, self.app, self.app / AUTH.ENV_FILE):
+        if path.exists():
+          subprocess.run(["/bin/chmod", "-N", str(path)], check=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+  def test_darwin_acl_fake_mixed_and_errors_fail_closed(self):
+    def fake_lib(tags, fail_at=None):
+      lib = mock.Mock()
+      lib.acl_get_fd_np.return_value = 1234
+      lib.acl_valid.return_value = 0
+      index = [-1]
+      def get_entry(_acl, which, pointer):
+        if fail_at == which:
+          return -1
+        if which == -2:
+          value = len(tags)
+        elif which == 0:
+          index[0] = 0
+          value = 1
+        else:
+          index[0] += 1
+          if index[0] >= len(tags):
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+          value = index[0] + 1
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = value
+        return 0
+      def get_tag(entry, pointer):
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int))[0] = tags[entry.value - 1]
+        return 0
+      lib.acl_get_entry.side_effect = get_entry
+      lib.acl_get_tag_type.side_effect = get_tag
+      return lib
+
+    with mock.patch.object(AUTH.sys, "platform", "darwin"):
+      for tags, error in [([2], False), ([2, 2], False), ([2, 1], True),
+                          ([1, 2], True), ([2, 99], True)]:
+        with self.subTest(tags=tags):
+          lib = fake_lib(tags)
+          with mock.patch.object(AUTH.ctypes, "CDLL", return_value=lib):
+            if error:
+              with self.assertRaises(AUTH.AuthError):
+                AUTH._check_acl(1, allow_denies=True)
+            else:
+              AUTH._check_acl(1, allow_denies=True)
+            lib.acl_free.assert_called_once_with(1234)
+      for failure in (-2, 0, -1):
+        lib = fake_lib([2, 2], fail_at=failure)
+        with mock.patch.object(AUTH.ctypes, "CDLL", return_value=lib):
+          with self.assertRaises(AUTH.AuthError):
+            AUTH._check_acl(1, allow_denies=True)
+          lib.acl_free.assert_called_once_with(1234)
+      lib = fake_lib([2])
+      lib.acl_valid.return_value = -1
+      with mock.patch.object(AUTH.ctypes, "CDLL", return_value=lib):
+        with self.assertRaises(AUTH.AuthError):
+          AUTH._check_acl(1, allow_denies=True)
+      lib = fake_lib([2])
+      with mock.patch.object(AUTH.ctypes, "CDLL", return_value=lib):
+        with self.assertRaises(AUTH.AuthError):
+          AUTH._check_acl(1)
+      lib = fake_lib([2, 2])
+      lib.acl_get_tag_type.return_value = -1
+      lib.acl_get_tag_type.side_effect = None
+      with mock.patch.object(AUTH.ctypes, "CDLL", return_value=lib):
+        with self.assertRaises(AUTH.AuthError):
+          AUTH._check_acl(1, allow_denies=True)
+      lib = fake_lib([2])
+      def fail_read(*_args):
+        ctypes.set_errno(errno.EACCES)
+        return None
+      lib.acl_get_fd_np.side_effect = fail_read
+      with mock.patch.object(AUTH.ctypes, "CDLL", return_value=lib):
+        with self.assertRaises(AUTH.AuthError):
+          AUTH._check_acl(1, allow_denies=True)
+      lib = fake_lib([2, 1])
+      original_get_entry = lib.acl_get_entry.side_effect
+      def aliased_last(acl, which, pointer):
+        result = original_get_entry(acl, which, pointer)
+        if which == -2:
+          ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = 1
+        return result
+      lib.acl_get_entry.side_effect = aliased_last
+      with mock.patch.object(AUTH.ctypes, "CDLL", return_value=lib):
+        with self.assertRaises(AUTH.AuthError):
+          AUTH._check_acl(1, allow_denies=True)
+
+  def test_linux_acl_and_inspection_errors_fail_closed(self):
+    with mock.patch.object(AUTH.sys, "platform", "linux"), \
+        mock.patch.object(AUTH.os, "getxattr", return_value=b"acl", create=True):
+      with self.assertRaises(AUTH.AuthError):
+        AUTH._check_acl(1, allow_denies=True)
+    with mock.patch.object(AUTH.sys, "platform", "linux"), \
+        mock.patch.object(AUTH.os, "getxattr", side_effect=OSError(errno.EACCES, "denied"),
+                          create=True):
+      with self.assertRaises(AUTH.AuthError):
+        AUTH._check_acl(1, allow_denies=True)
+    with mock.patch.object(AUTH.sys, "platform", "linux"), \
+        mock.patch.object(AUTH.os, "getxattr", side_effect=OSError(errno.ENOTSUP, "unsupported"),
+                          create=True):
+      with self.assertRaises(AUTH.AuthError):
+        AUTH._check_acl(1, allow_denies=True)
+    with mock.patch.object(AUTH.sys, "platform", "linux"), \
+        mock.patch.object(AUTH.os, "getxattr", side_effect=OSError(errno.ENODATA, "no ACL"),
+                          create=True):
+      AUTH._check_acl(1, allow_denies=True)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import ctypes
 import errno
+import fcntl
 import getpass
 import io
 import json
@@ -29,6 +30,7 @@ AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 ENV_FILE = ".env.youtube"
 STATE_FILE = "youtube-token.json"
+LOCK_FILE = ".youtube.lock"
 CLIENT_ID = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.apps\.googleusercontent\.com\Z")
 CLIENT_SECRET = re.compile(r"[A-Za-z0-9_-]{8,256}\Z")
 CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}\Z")
@@ -50,24 +52,53 @@ def _quiet_google():
     logging.disable(previous)
 
 
-def _check_acl(fd: int) -> None:
-  """Reject ACLs rather than guessing whether their extra grants are safe."""
+def _check_acl(fd: int, *, allow_denies: bool = False) -> None:
+  """Allow only verified Darwin deny entries on non-private ancestors."""
   if sys.platform == "darwin":
     libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
     libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
     libc.acl_get_fd_np.restype = ctypes.c_void_p
     libc.acl_free.argtypes = [ctypes.c_void_p]
+    libc.acl_valid.argtypes = [ctypes.c_void_p]
+    libc.acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     acl = libc.acl_get_fd_np(fd, 0x100)  # ACL_TYPE_EXTENDED
     if acl:
-      libc.acl_free(acl)
-      raise AuthError("Access control lists are not supported for private storage.")
+      try:
+        if not allow_denies or libc.acl_valid(acl) != 0:
+          raise AuthError("Unsafe access control list.")
+        entry = ctypes.c_void_p()
+        # Darwin's ACL_LAST_ENTRY is declared in sys/acl.h. Compare entry
+        # descriptors so an enumeration error cannot masquerade as end-of-ACL.
+        last = ctypes.c_void_p()
+        if libc.acl_get_entry(acl, -2, ctypes.byref(last)) != 0 or not last.value:
+          raise AuthError("Cannot verify access control list.")
+        index = 0  # ACL_FIRST_ENTRY
+        for _ in range(1024):
+          if libc.acl_get_entry(acl, index, ctypes.byref(entry)) != 0 or not entry.value:
+            raise AuthError("Cannot verify access control list.")
+          tag = ctypes.c_int()
+          if libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0 or tag.value != 2:
+            raise AuthError("Unsafe access control list.")
+          if entry.value == last.value:
+            ctypes.set_errno(0)
+            if libc.acl_get_entry(acl, -1, ctypes.byref(entry)) != -1 or ctypes.get_errno() != errno.EINVAL:
+              raise AuthError("Cannot verify access control list.")
+            break
+          index = -1  # ACL_NEXT_ENTRY
+        else:
+          raise AuthError("Cannot verify access control list.")
+      finally:
+        libc.acl_free(acl)
+      return
     if ctypes.get_errno() != errno.ENOENT:
       raise AuthError("Cannot verify private storage access controls.")
   elif sys.platform.startswith("linux"):
     try:
       os.getxattr(fd, "system.posix_acl_access")
     except OSError as error:
-      if error.errno not in (errno.ENODATA, errno.ENOTSUP):
+      if error.errno != errno.ENODATA:
         raise AuthError("Cannot verify private storage access controls.") from None
     else:
       raise AuthError("Access control lists are not supported for private storage.")
@@ -94,8 +125,8 @@ def _directory(create: bool) -> int:
       os.close(fd)
       fd = child
       info = os.fstat(fd)
-      _check_acl(fd)
       is_app = index == len(parts) - 1
+      _check_acl(fd, allow_denies=not is_app)
       is_home_or_config = index >= len(parts) - 3
       sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
       if (info.st_uid not in (0, os.getuid())
@@ -142,8 +173,28 @@ def _read(fd: int, name: str) -> str:
       os.close(file_fd)
 
 
-def _write_once(fd: int, name: str, content: str) -> None:
-  """Publish a complete file atomically, never replacing an existing entry."""
+def _rename_noreplace(fd: int, source: str, target: str) -> None:
+  """Use the platform's atomic no-replace rename, or fail closed."""
+  if sys.platform == "darwin":
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    rename = libc.renameatx_np
+    flags = 0x4  # RENAME_EXCL
+  elif sys.platform.startswith("linux"):
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = libc.renameat2
+    flags = 1  # RENAME_NOREPLACE
+  else:
+    raise AuthError("Atomic private file publication is unavailable.")
+  rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                     ctypes.c_char_p, ctypes.c_uint]
+  rename.restype = ctypes.c_int
+  if rename(fd, os.fsencode(source), fd, os.fsencode(target), flags) != 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+
+
+def _atomic_write(fd: int, name: str, content: str, *, replace: bool = False) -> None:
+  """Publish one complete, single-link private file atomically."""
   temporary = ".youtube-" + secrets.token_hex(16)
   file_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                     0o600, dir_fd=fd)
@@ -155,12 +206,49 @@ def _write_once(fd: int, name: str, content: str) -> None:
       file.write(content)
       file.flush()
       os.fsync(file.fileno())
-    os.link(temporary, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+    if replace:
+      os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
+    else:
+      _rename_noreplace(fd, temporary, name)
     os.fsync(fd)
   finally:
     if file_fd != -1:
       os.close(file_fd)
-    os.unlink(temporary, dir_fd=fd)
+    try:
+      os.unlink(temporary, dir_fd=fd)
+    except FileNotFoundError:
+      pass
+
+
+def _write_once(fd: int, name: str, content: str) -> None:
+  _atomic_write(fd, name, content)
+
+
+@contextlib.contextmanager
+def _state_lock(fd: int):
+  """A stable advisory lock shared by all cooperating state operations."""
+  try:
+    lock_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                      0o600, dir_fd=fd)
+    created = True
+  except FileExistsError:
+    lock_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    created = False
+  try:
+    if created:
+      os.fchmod(lock_fd, 0o600)
+    info = os.fstat(lock_fd)
+    _check_acl(lock_fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+      raise AuthError("Unsafe authorization lock.")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    current = os.stat(LOCK_FILE, dir_fd=fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+      raise AuthError("Authorization lock changed.")
+    yield
+  finally:
+    os.close(lock_fd)
 
 
 def _client_values(text: str) -> tuple[str, str]:
@@ -196,58 +284,79 @@ def _configure() -> None:
     os.close(fd)
 
 
+def _token_valid(token: object) -> bool:
+  return isinstance(token, str) and bool(token) and len(token) <= 8192 and token.isprintable()
+
+
+def _state_values(text: str) -> tuple[str, str]:
+  state = json.loads(text)
+  if not isinstance(state, dict) or set(state) != {"channel_id", "refresh_token"}:
+    raise AuthError("Invalid authorization state.")
+  channel_id, token = state["channel_id"], state["refresh_token"]
+  if not isinstance(channel_id, str) or not CHANNEL_ID.fullmatch(channel_id) or not _token_valid(token):
+    raise AuthError("Invalid authorization state.")
+  return channel_id, token
+
+
+def _state_text(channel_id: str, token: str) -> str:
+  return json.dumps({"channel_id": channel_id, "refresh_token": token}) + "\n"
+
+
+def _authorize_locked(fd: int) -> None:
+  client_id, client_secret = _client_values(_read(fd, ENV_FILE))
+  try:
+    os.stat(STATE_FILE, dir_fd=fd, follow_symlinks=False)
+  except FileNotFoundError:
+    pass
+  else:
+    raise AuthError("Authorization already exists.")
+  from google_auth_oauthlib.flow import InstalledAppFlow
+  from googleapiclient.discovery import build
+
+  client_config = {"installed": {
+    "client_id": client_id, "client_secret": client_secret,
+    "auth_uri": AUTH_URI, "token_uri": TOKEN_URI,
+    "redirect_uris": ["http://localhost"],
+  }}
+  print("Opening the browser for YouTube authorization.")
+  # The library can print an authorization URL or loopback request; neither
+  # belongs in terminal logs.
+  with _quiet_google():
+    flow = InstalledAppFlow.from_client_config(
+      client_config, scopes=SCOPES, autogenerate_code_verifier=True)
+    credentials = flow.run_local_server(
+      host="127.0.0.1", port=0, open_browser=True,
+      authorization_prompt_message=None, timeout_seconds=300, prompt="consent")
+    if not _token_valid(credentials.refresh_token):
+      raise AuthError("Google did not provide a durable refresh token.")
+    granted = credentials.granted_scopes
+    if granted is not None and not set(SCOPES).issubset(granted):
+      raise AuthError("Google did not grant both required scopes.")
+    response = build("youtube", "v3", credentials=credentials, cache_discovery=False).channels().list(
+      part="snippet", mine=True, maxResults=2).execute()
+  items = response.get("items", [])
+  if (not isinstance(items, list) or len(items) != 1 or response.get("nextPageToken")
+      or response.get("pageInfo", {}).get("totalResults", 1) != 1):
+    raise AuthError("YouTube channel is missing or ambiguous.")
+  channel_id = items[0].get("id")
+  title = items[0].get("snippet", {}).get("title")
+  if (not isinstance(channel_id, str) or not CHANNEL_ID.fullmatch(channel_id)
+      or not isinstance(title, str) or not title or len(title) > 200
+      or not title.isprintable()):
+    raise AuthError("YouTube channel is invalid.")
+  print(f"Resolved channel: {title} ({channel_id})")
+  if input("Type the exact channel ID to confirm: ") != channel_id:
+    raise AuthError("Channel was not confirmed.")
+  if not _token_valid(credentials.refresh_token):
+    raise AuthError("Google did not provide a durable refresh token.")
+  _write_once(fd, STATE_FILE, _state_text(channel_id, credentials.refresh_token))
+
+
 def _authorize() -> None:
-  """Obtain consent and save a refresh token only after exact channel confirmation."""
   fd = _directory(create=False)
   try:
-    client_id, client_secret = _client_values(_read(fd, ENV_FILE))
-    try:
-      os.stat(STATE_FILE, dir_fd=fd, follow_symlinks=False)
-    except FileNotFoundError:
-      pass
-    else:
-      raise AuthError("Authorization already exists.")
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-
-    client_config = {"installed": {
-      "client_id": client_id, "client_secret": client_secret,
-      "auth_uri": AUTH_URI, "token_uri": TOKEN_URI,
-      "redirect_uris": ["http://localhost"],
-    }}
-    print("Opening the browser for YouTube authorization.")
-    # The library can print an authorization URL or loopback request; neither
-    # belongs in terminal logs.
-    with _quiet_google():
-      flow = InstalledAppFlow.from_client_config(
-        client_config, scopes=SCOPES, autogenerate_code_verifier=True)
-      credentials = flow.run_local_server(
-        host="127.0.0.1", port=0, open_browser=True,
-        authorization_prompt_message=None, timeout_seconds=300, prompt="consent")
-      if (not isinstance(credentials.refresh_token, str) or not credentials.refresh_token
-          or len(credentials.refresh_token) > 8192 or not credentials.refresh_token.isprintable()):
-        raise AuthError("Google did not provide a durable refresh token.")
-      granted = credentials.granted_scopes
-      if granted is not None and not set(SCOPES).issubset(granted):
-        raise AuthError("Google did not grant both required scopes.")
-      response = build("youtube", "v3", credentials=credentials, cache_discovery=False).channels().list(
-        part="snippet", mine=True, maxResults=2).execute()
-    items = response.get("items", [])
-    if (not isinstance(items, list) or len(items) != 1 or response.get("nextPageToken")
-        or response.get("pageInfo", {}).get("totalResults", 1) != 1):
-      raise AuthError("YouTube channel is missing or ambiguous.")
-    channel_id = items[0].get("id")
-    title = items[0].get("snippet", {}).get("title")
-    if (not isinstance(channel_id, str) or not CHANNEL_ID.fullmatch(channel_id)
-        or not isinstance(title, str) or not title or len(title) > 200
-        or not title.isprintable()):
-      raise AuthError("YouTube channel is invalid.")
-    print(f"Resolved channel: {title} ({channel_id})")
-    if input("Type the exact channel ID to confirm: ") != channel_id:
-      raise AuthError("Channel was not confirmed.")
-    _write_once(fd, STATE_FILE, json.dumps({
-      "channel_id": channel_id, "refresh_token": credentials.refresh_token,
-    }) + "\n")
+    with _state_lock(fd):
+      _authorize_locked(fd)
   finally:
     os.close(fd)
 
@@ -273,29 +382,46 @@ def load_credentials() -> tuple[object, str]:
   try:
     fd = _directory(create=False)
     try:
-      client_id, client_secret = _client_values(_read(fd, ENV_FILE))
-      state = json.loads(_read(fd, STATE_FILE))
+      with _state_lock(fd):
+        client_id, client_secret = _client_values(_read(fd, ENV_FILE))
+        channel_id, token = _state_values(_read(fd, STATE_FILE))
     finally:
       os.close(fd)
-    if not isinstance(state, dict) or set(state) != {"channel_id", "refresh_token"}:
-      raise AuthError("Invalid authorization state.")
-    channel_id, token = state["channel_id"], state["refresh_token"]
-    if (not isinstance(channel_id, str) or not CHANNEL_ID.fullmatch(channel_id)
-        or not isinstance(token, str) or not token or len(token) > 8192
-        or not token.isprintable()):
-      raise AuthError("Invalid authorization state.")
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
-    credentials = Credentials(
+    class DurableCredentials(Credentials):
+      def refresh(self, request):
+        try:
+          private_fd = _directory(create=False)
+          try:
+            with _state_lock(private_fd):
+              current_client = _client_values(_read(private_fd, ENV_FILE))
+              current_channel, current_token = _state_values(_read(private_fd, STATE_FILE))
+              if (current_client != (client_id, client_secret) or current_channel != channel_id
+                  or current_token != self.refresh_token):
+                raise AuthError("Authorization changed; reload credentials.")
+              with _quiet_google():
+                super().refresh(request)
+              new_token = self.refresh_token
+              if not _token_valid(new_token):
+                raise AuthError("Google returned an invalid refresh token.")
+              if new_token != current_token:
+                _atomic_write(private_fd, STATE_FILE, _state_text(channel_id, new_token), replace=True)
+              if not self.valid:
+                raise AuthError("Authorization is invalid or revoked.")
+              if self.granted_scopes is not None and not set(SCOPES).issubset(self.granted_scopes):
+                raise AuthError("Authorization is missing a required scope.")
+          finally:
+            os.close(private_fd)
+        except Exception:
+          self.token = None
+          raise AuthError("Cannot refresh private YouTube authorization.") from None
+
+    credentials = DurableCredentials(
       token=None, refresh_token=token, token_uri=TOKEN_URI,
       client_id=client_id, client_secret=client_secret, scopes=SCOPES)
-    with _quiet_google():
-      credentials.refresh(Request())
-    if not credentials.valid:
-      raise AuthError("Authorization is invalid or revoked.")
-    if credentials.granted_scopes is not None and not set(SCOPES).issubset(credentials.granted_scopes):
-      raise AuthError("Authorization is missing a required scope.")
+    credentials.refresh(Request())
     return credentials, channel_id
   except Exception:
     raise AuthError("Cannot load valid private YouTube authorization.") from None
