@@ -10,9 +10,10 @@ Records are retrieved individually as complete envelopes, never as stripped
 legacy frames. The snapshot is not a playback or transport interface.
 Snapshot access is not thread-safe.
 
-Structural validity is not renderer availability or authorization. In
-particular Starfield is unavailable: no private assets or provenance documents
-are read or verified here. CRC and hashes do not authenticate input.
+Structural validity is not renderer availability or authorization. Starfield
+is unavailable and files containing it are rejected after structural
+validation; no private assets or provenance documents are read or verified
+here. CRC and hashes do not authenticate input.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import stat
 import struct
 import tempfile
 import zlib
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import BinaryIO
 
 
@@ -33,6 +34,11 @@ MAX_FILE_SIZE = HEADER_SIZE + RECORD_SIZE * MAX_RECORDS
 _MIN_EPOCH = 946_684_800_000
 _MAX_EPOCH = 4_102_444_799_999
 _MAX_VARIANT = (0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0)
+_VALIDATED = object()
+
+
+class UnavailableSceneError(ValueError):
+  """The structurally valid catalog contains a currently unavailable scene."""
 
 
 def _crc(data: bytes) -> int:
@@ -41,7 +47,10 @@ def _crc(data: bytes) -> int:
 
 @dataclass(frozen=True)
 class Record:
-  """An intact extended envelope; renderer availability is not established."""
+  """An intact envelope from a validated catalog.
+
+  Direct construction and dataclasses.replace are unsupported.
+  """
 
   envelope: bytes
   sequence: int
@@ -49,6 +58,11 @@ class Record:
   family: int
   variant: int
   metadata: bytes
+  _capability: InitVar[object] = None
+
+  def __post_init__(self, _capability: object) -> None:
+    if _capability is not _VALIDATED:
+      raise TypeError("records must come from open_catalog")
 
   @property
   def renderer_availability(self) -> str:
@@ -110,9 +124,12 @@ def _validate_record(wire: bytes, expected: int, star_metadata: bytes | None) ->
 
 
 class Catalog:
-  """A validated, private temporary snapshot; no renderer is implied."""
+  """A validated snapshot returned by open_catalog; no renderer is implied."""
 
-  def __init__(self, snapshot: BinaryIO, header: bytes, count: int) -> None:
+  def __init__(self, snapshot: BinaryIO, header: bytes, count: int, *,
+               _capability: object = None) -> None:
+    if _capability is not _VALIDATED:
+      raise TypeError("catalogs must come from open_catalog")
     self._snapshot = snapshot
     self.header = header
     self.count = count
@@ -123,7 +140,8 @@ class Catalog:
     self._snapshot.seek(index * RECORD_SIZE)
     wire = self._snapshot.read(RECORD_SIZE)
     sequence, tick = struct.unpack_from("<QQ", wire, 8)
-    return Record(wire, sequence, tick, wire[44], wire[6], wire[57:141])
+    return Record(wire, sequence, tick, wire[44], wire[6], wire[57:141],
+                  _capability=_VALIDATED)
 
   def close(self) -> None:
     self._snapshot.close()
@@ -163,9 +181,10 @@ def open_catalog(fd: int) -> Catalog:
   on remote, virtual, or faulty filesystems.
 
   Raises TypeError for path arguments, ValueError for invalid structure or
-  non-regular input, or OSError for I/O failures. No record is exposed on
-  failure, including errors in later records, at EOF, or while flushing the
-  snapshot. The caller must independently establish renderer and safety
+  non-regular input, UnavailableSceneError for structurally valid files
+  containing Starfield, or OSError for I/O failures. No record is exposed
+  on failure, including errors in later records, at EOF, or while flushing
+  the snapshot. The caller must independently establish renderer and safety
   conditions.
   """
   snapshot = None
@@ -195,8 +214,10 @@ def open_catalog(fd: int) -> Catalog:
         snapshot.write(wire)
       if source.read(1):
         raise ValueError("trailing bytes")
+      if star_metadata is not None:
+        raise UnavailableSceneError("Starfield is unavailable")
       snapshot.flush()
-    return Catalog(snapshot, header, count)
+    return Catalog(snapshot, header, count, _capability=_VALIDATED)
   except BaseException:
     if snapshot is not None:
       try:

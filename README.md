@@ -80,7 +80,7 @@ Build one self-running demo per platform before live input:
 6. `chipviz-genesis`: VDP plane and palette visualizer for YM2612 plus SN76489.
 7. `chipviz-nes`: NROM tile/palette visualizer for 2A03 telemetry.
 8. `chipviz-sms`: SMS VDP channel-meter visualizer for SN76489 telemetry.
-9. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets.
+9. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets; the modern renderer also offers catalog-driven Starfield scene 6.
 
 ## Releases
 
@@ -114,9 +114,18 @@ just lint
 just test
 just simulate
 just modern-m1 -- --udp 127.0.0.1:6464
+just modern-m1 -- --scene 6 --star-catalog /path/to/stars.csv --location 45.5,-73.25
 python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz
 python3 host/bridge/chipviz_encode.py --verify-fixtures
 ```
+
+The modern renderer's scene 6 requires a user-supplied HYG-compatible CSV via
+`--star-catalog PATH` (`--catalog` is an alias) and
+observer coordinates (`--location LAT,LON`, decimal degrees, longitude east).
+An optional `--time UNIX_SECONDS` selects a UTC observation time; otherwise it
+uses current UTC. No star catalog is bundled while catalog licensing research
+is unresolved. See [`renderers/modern/README.md`](renderers/modern/README.md)
+for the CSV schema and the projection's accuracy limits.
 
 Each platform entrypoint consumes the shared `control-frame-v0` shape through a
 small connection abstraction. Until a live receiver is supplied, the connection
@@ -143,8 +152,9 @@ Contributions are accepted under the contributor licence agreement in
 Third-party components keep their own licences. Toolchains and SDKs fetched at
 build time, such as libdragon, devkitPro, cc65, PVSnesLib, RGBDS, and the
 Raspberry Pi pico-sdk, are not redistributed in this repository. Rust crates
-are fetched by Cargo under their own licences. Future embedded data, such as
-the HYG star catalog (CC BY-SA 4.0), will carry its own notices.
+are fetched by Cargo under their own licences. The modern Starfield scene
+accepts a user-supplied catalog; HYG/catalog redistribution licensing research
+is unresolved, so no star data is bundled.
 
 Notices for third-party code shipped in release binaries are in
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES): [rust.md](THIRD_PARTY_NOTICES/rust.md)

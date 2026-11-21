@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 pub mod capture;
+pub mod catalog_v1;
 mod control_frame;
 mod phosphor;
 mod profile;
