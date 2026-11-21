@@ -7,6 +7,14 @@
 //! attachments. It prints the actual adapter and fails if none is available.
 //! On integration, register this ignored test in a standard GPU-capable CI
 //! target; an ordinary `cargo test` does not run it.
+//!
+//! The cycle diagnostic reports directional relative-luminance changes, not
+//! flashes, WCAG compliance, certification, or safety. A cyclic window of
+//! 60 transitions is not a time interval; this test has no playback clock.
+//! It reads 160x144 offscreen bytes, not a presented or composited recording.
+//! Scaling, display colour management, physical Pi behaviour, standard test
+//! patterns and independent flash assessment remain unverified. The oracle
+//! is manually derived from the native source and must be re-audited if it changes.
 
 #[expect(
     dead_code,
@@ -230,6 +238,184 @@ impl Offscreen {
         }
         readback.unmap();
         rgba
+    }
+}
+
+// Independently derive the displayed native registers from NativeStep and
+// ApplyDisplay, using arithmetic and explicit palette tables rather than the
+// model's bit rotation, BGP calculation or shade buffer.
+fn cycle_example(step: usize) -> Example {
+    let counter = (step % 256) as u8;
+    let (bgp, shades) = [
+        (0xe4, [255, 170, 85, 0]),
+        (0xec, [255, 0, 85, 0]),
+        (0xf4, [255, 170, 0, 0]),
+        (0xfc, [255, 0, 0, 0]),
+    ][usize::from(counter / 16 % 4)];
+    Example {
+        ticks: step + 1,
+        scx: counter / 2 + (counter % 2) * 128,
+        scy: counter,
+        bgp,
+        shades,
+    }
+}
+
+fn linear_srgb_lut() -> [f64; 256] {
+    std::array::from_fn(|code| {
+        let encoded = code as f64 / 255.0;
+        if encoded <= 0.04045 {
+            encoded / 12.92
+        } else {
+            ((encoded + 0.055) / 1.055).powf(2.4)
+        }
+    })
+}
+
+fn pixel_luminance(pixel: &[u8], linear: &[f64; 256]) -> f64 {
+    0.2126 * linear[usize::from(pixel[0])]
+        + 0.7152 * linear[usize::from(pixel[1])]
+        + 0.0722 * linear[usize::from(pixel[2])]
+}
+
+/// Count changed pixel positions from actual readback, not the native oracle.
+/// A direction qualifies when |delta relative luminance| >= 0.1 and the
+/// darker value is < 0.8. Scrolling and palette changes both contribute.
+fn directional_areas(before: &[u8], after: &[u8], linear: &[f64; 256]) -> (usize, usize) {
+    assert_eq!(before.len(), after.len());
+    assert!(before.len().is_multiple_of(4));
+    let mut brighter = 0;
+    let mut darker = 0;
+    for (a, b) in before.chunks_exact(4).zip(after.chunks_exact(4)) {
+        let old = pixel_luminance(a, linear);
+        let new = pixel_luminance(b, linear);
+        if old.min(new) < 0.8 {
+            if new - old >= 0.1 {
+                brighter += 1;
+            } else if old - new >= 0.1 {
+                darker += 1;
+            }
+        }
+    }
+    (brighter, darker)
+}
+
+fn max_large_transitions(transitions: &[(usize, usize)], pixels: usize) -> (usize, usize, usize) {
+    assert!(!transitions.is_empty());
+    let mut max_bright = 0;
+    let mut max_dark = 0;
+    let mut max_either = 0;
+    for start in 0..transitions.len() {
+        let mut bright = 0;
+        let mut dark = 0;
+        let mut either = 0;
+        for offset in 0..60 {
+            let (brighter, darker) = transitions[(start + offset) % transitions.len()];
+            let bright_large = brighter * 4 > pixels;
+            let dark_large = darker * 4 > pixels;
+            bright += usize::from(bright_large);
+            dark += usize::from(dark_large);
+            either += usize::from(bright_large || dark_large);
+        }
+        max_bright = max_bright.max(bright);
+        max_dark = max_dark.max(dark);
+        max_either = max_either.max(either);
+    }
+    (max_bright, max_dark, max_either)
+}
+
+#[test]
+fn directional_diagnostic_counts_thresholds_and_cyclic_windows() {
+    let linear = linear_srgb_lut();
+    let before = [
+        0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 85, 85, 85, 255, 240, 240, 240, 255,
+    ];
+    let after = [
+        255, 255, 255, 255, 0, 0, 0, 255, 85, 85, 85, 255, 170, 170, 170, 255, 255, 255, 255, 255,
+    ];
+    // 0 -> 85 is only ~0.091 linear luminance; 85 -> 170 exceeds 0.1.
+    // 240 -> 255 exceeds 0.1, but its darker luminance is above 0.8.
+    assert_eq!(directional_areas(&before, &after, &linear), (2, 1));
+    let mut transitions = vec![(0, 0); 256];
+    transitions[250] = (26, 0);
+    transitions[1] = (0, 26);
+    transitions[2] = (25, 25); // exactly 25% is not greater than 25%
+    assert_eq!(max_large_transitions(&transitions, 100), (1, 1, 2));
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn dmg_offscreen_cycle_matches_native_oracle_and_reports_directional_changes() {
+    const PIXELS: usize = 160 * 144;
+    const CYCLE: usize = 256;
+    let gpu = Offscreen::new();
+    let linear = linear_srgb_lut();
+    eprintln!(
+        "DMG OFFSCREEN DIAGNOSTIC ONLY: 160x144 readback; \
+         not presented/composited output, a standardized flash test, certification, or a safety assessment. \
+         Scaling, colour management, physical Pi and standard patterns are unverified. \
+         A 60-transition window is not a time interval; there is no playback clock."
+    );
+    eprintln!(
+        "DMG metric: sRGB-decoded Rec.709 relative luminance; per-pixel |delta Y| >= 0.1 \
+         with darker Y < 0.8, counted separately by direction across {PIXELS} pixels."
+    );
+    for format in [
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ] {
+        let renderer = DmgTileRenderer::new(&gpu.device, format);
+        let mut scene = DmgTileScroll::default();
+        let mut previous: Option<Vec<u8>> = None;
+        let mut transitions = Vec::with_capacity(CYCLE);
+        // tick 1 displays counter 0; tick 257 displays wrapped counter 0.
+        for step in 0..=CYCLE {
+            scene.tick();
+            let example = cycle_example(step);
+            assert_eq!(
+                scene.shown(),
+                Display {
+                    scx: example.scx,
+                    scy: example.scy,
+                    bgp: example.bgp,
+                },
+                "{format:?} displayed counter at cycle step {step}"
+            );
+            let rgba = gpu.render(&renderer, format, (160, 144), scene.shown(), false);
+            assert_eq!(rgba.len(), PIXELS * 4);
+            for (index, pixel) in rgba.chunks_exact(4).enumerate() {
+                let expected = expected_pixel(example, (index % 160) as u32, (index / 160) as u32);
+                let tolerance = if expected == 0 || expected == 255 {
+                    0
+                } else {
+                    1
+                };
+                for &channel in &pixel[..3] {
+                    assert!(
+                        channel.abs_diff(expected) <= tolerance,
+                        "{format:?} step={step} pixel={index} expected {expected}, got {pixel:?}"
+                    );
+                }
+                assert_eq!(pixel[3], 255, "{format:?} step={step} pixel={index}");
+            }
+            if let Some(before) = previous.as_deref() {
+                let (brighter, darker) = directional_areas(before, &rgba, &linear);
+                transitions.push((brighter, darker));
+                eprintln!(
+                    "DMG DIAGNOSTIC {format:?} counter {}->{}: brighter={brighter}/{PIXELS} darker={darker}/{PIXELS} pixels",
+                    step - 1,
+                    step % CYCLE
+                );
+            }
+            previous = Some(rgba);
+        }
+        assert_eq!(transitions.len(), CYCLE);
+        let (max_bright, max_dark, max_either) = max_large_transitions(&transitions, PIXELS);
+        eprintln!(
+            "DMG DIAGNOSTIC {format:?}: maximum transitions with >25% directional area \
+             in any cyclic 60-transition window: brighter={max_bright}, darker={max_dark}, \
+             either={max_either}; these are transition counts, not flash counts or a time interval"
+        );
     }
 }
 
