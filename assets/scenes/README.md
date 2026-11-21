@@ -77,6 +77,10 @@ empty, private directory owned by you and below this checkout's ignored
 symlinks. Output paths cannot traverse symlinks or enter release paths or
 another Git checkout.
 
+**Warning:** `just clean` and `make clean` delete all of `build/`, including
+the catalog, binary, and copied notices in any bundle destination. Keep the
+original catalog and notice files outside `build/` to recreate the bundle.
+
 The destination and all its ancestors, including their ACLs, must be trusted
 against concurrent changes. Permissions do **not** isolate processes using
 the same user account. The utility holds an open directory descriptor: if the
