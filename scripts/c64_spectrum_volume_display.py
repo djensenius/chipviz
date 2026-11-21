@@ -18,6 +18,7 @@ PEPTO = {0: (0x00, 0x00, 0x00), 1: (0xff, 0xff, 0xff), 4: (0x6f, 0x3d, 0x86),
 # Independently specified corner pixels of the four solid 8x8 cells.
 FIDUCIALS = ((0, 0, PEPTO[1]), (319, 0, PEPTO[4]),
              (0, 199, PEPTO[5]), (319, 199, PEPTO[6]))
+_PENDING = object()
 
 
 def check_frame(frame: tuple[int, int, int, bytes]) -> None:
@@ -101,20 +102,22 @@ class Observation:
                  "duplicate-only callbacks" if not first_fresh and data is None else
                  "ambiguous fresh and duplicate callbacks")
       return
-    if data is None:
-      self.events.append((self.serial, None))
-    else:
-      try:
-        if pixel_format != "XRGB8888-LE":
-          raise ValueError("unsupported pixel format")
-        self.events.append((self.serial, copy_frame((width, height, pitch, data))))
-      except (ValueError, TypeError, OverflowError) as error:
-        self.latch(str(error) or "frame callback failed")
+    try:
+      serial = self.serial
+      # Reserve before format checks or buffer conversion can reenter video.
+      self.events.append((serial, None if data is None else _PENDING))
+      if data is None:
         return
-      except BaseException:
-        # Native callback boundaries can swallow even non-Exception failures.
-        self.latch("frame buffer conversion failed")
-        return
+      if pixel_format != "XRGB8888-LE":
+        raise ValueError("unsupported pixel format")
+      copied = copy_frame((width, height, pitch, data))
+      if self.error is None:
+        self.events[0] = (serial, copied)
+    except (ValueError, TypeError, OverflowError) as error:
+      self.latch(str(error) or "frame callback failed")
+    except BaseException:
+      # Native callback boundaries can swallow even non-Exception failures.
+      self.latch("frame buffer conversion failed")
 
   def end(self) -> tuple[int, tuple[int, int, int, bytes]]:
     if self.error is not None:
@@ -127,6 +130,9 @@ class Observation:
     events, self.events = self.events, []
     if not events:
       self.latch("missing callback")
+      self.check()
+    if events[0][1] is _PENDING:
+      self.latch("incomplete frame callback")
       self.check()
     fresh = [event for event in events if event[1] is not None]
     if not fresh:

@@ -72,7 +72,107 @@ class FailingBuffer:
     raise self.error("synthetic buffer failure")
 
 
+class ReentrantBuffer:
+  def __init__(self, callback, trigger, duplicate=False):
+    self.callback = callback
+    self.trigger = trigger
+    self.duplicate = duplicate
+    self.calls = 0
+    self.data = bytes(frame())
+
+  def __buffer__(self, flags):
+    self.calls += 1
+    if self.calls == self.trigger:
+      args = (None, 0, 0, 0, "") if self.duplicate else callback_args(self.data)
+      native_callback(self.callback, *args)
+    return memoryview(self.data)
+
+
 class DisplayTests(unittest.TestCase):
+  def test_reentrant_buffer_callbacks_are_rejected_in_both_observation_frames(self):
+    for frame_number in (1, 2):  # settling frame and frame to be validated
+      for trigger in (1, 2):  # initial size check and subsequent copy
+        for duplicate in (False, True):
+          with self.subTest(frame=frame_number, trigger=trigger, duplicate=duplicate):
+            markers = iter((b"", b"SVD1", b"SVD1", b"SVD1", b"SVD1"))
+            calls = []
+
+            def run(callback):
+              calls.append(1)
+              data = (ReentrantBuffer(callback, trigger, duplicate) if len(calls) == frame_number
+                      else bytes(frame()))
+              native_callback(callback, data, W, H, PITCH, "XRGB8888-LE")
+
+            message = "ambiguous" if duplicate else "extra fresh"
+            with self.assertRaisesRegex(ValueError, message):
+              observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
+                      raster_lines=312, calibration=calibration(), limit=2)
+            self.assertEqual(len(calls), frame_number)
+
+  def test_reentrant_failure_remains_sticky_after_outer_conversion_fails(self):
+    for duplicate in (False, True):
+      with self.subTest(duplicate=duplicate):
+        boundary = display.Observation()
+        callback = boundary.begin()
+        expected = "ambiguous" if duplicate else "extra fresh"
+
+        class NestedThenFail:
+          def __buffer__(self, flags):
+            args = (None, 0, 0, 0, "") if duplicate else callback_args(frame())
+            native_callback(callback, *args)
+            raise MemoryError("outer conversion failed")
+
+        native_callback(callback, NestedThenFail(), W, H, PITCH, "XRGB8888-LE")
+        with self.assertRaisesRegex(ValueError, expected):
+          boundary.end()
+        with self.assertRaisesRegex(ValueError, expected):
+          boundary.begin()
+
+  def test_reentrant_stale_callback_during_buffer_conversion_stays_latched(self):
+    boundary = display.Observation()
+    old = boundary.begin()
+    old(*callback_args(frame()))
+    boundary.end()
+    current = boundary.begin()
+    native_callback(current, ReentrantBuffer(old, 1), W, H, PITCH, "XRGB8888-LE")
+    with self.assertRaisesRegex(ValueError, "stale"):
+      boundary.end()
+    with self.assertRaisesRegex(ValueError, "stale"):
+      boundary.begin()
+
+  def test_reentrant_format_comparison_rejects_nested_callback(self):
+    boundary = display.Observation()
+    callback = boundary.begin()
+    data = bytes(frame())
+
+    class NestedFormat:
+      def __eq__(self, other):
+        native_callback(callback, *callback_args(data))
+        return True
+
+    native_callback(callback, data, W, H, PITCH, NestedFormat())
+    with self.assertRaisesRegex(ValueError, "extra fresh"):
+      boundary.end()
+    with self.assertRaisesRegex(ValueError, "extra fresh"):
+      boundary.begin()
+
+  def test_reentrant_end_cannot_complete_pending_frame(self):
+    boundary = display.Observation()
+    callback = boundary.begin()
+    data = bytes(frame())
+
+    class EndDuringCopy:
+      def __buffer__(self, flags):
+        native_callback(boundary.end)
+        return memoryview(data)
+
+    with contextlib.redirect_stderr(io.StringIO()):
+      native_callback(callback, EndDuringCopy(), W, H, PITCH, "XRGB8888-LE")
+    with self.assertRaisesRegex(ValueError, "incomplete frame callback"):
+      boundary.end()
+    with self.assertRaisesRegex(ValueError, "incomplete frame callback"):
+      boundary.begin()
+
   def test_extra_failing_buffer_callbacks_are_rejected(self):
     for error in (BufferError, MemoryError):
       with self.subTest(error=error.__name__):
