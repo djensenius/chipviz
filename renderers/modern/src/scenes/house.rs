@@ -29,10 +29,16 @@ fn occupied(cell: GridPoint) -> bool {
         && cell.iter().all(|coordinate| coordinate.abs() <= REACH)
 }
 
-fn world_edges() -> &'static [Edge] {
-    static EDGES: OnceLock<Vec<Edge>> = OnceLock::new();
-    EDGES.get_or_init(|| {
-        let mut edges = Vec::new();
+#[derive(Clone, Copy, Debug)]
+struct Face {
+    axis: usize,
+    corners: [GridPoint; 4],
+}
+
+fn world_faces() -> &'static [Face] {
+    static FACES: OnceLock<Vec<Face>> = OnceLock::new();
+    FACES.get_or_init(|| {
+        let mut faces = Vec::new();
         for x in -REACH..=REACH {
             for y in -REACH..=REACH {
                 for z in -REACH..=REACH {
@@ -57,19 +63,87 @@ fn world_edges() -> &'static [Edge] {
                                 corner[u] = 2 * cell[u] + a;
                                 corner[v] = 2 * cell[v] + b;
                             }
-                            for index in 0..4 {
-                                let mut edge = [corners[index], corners[(index + 1) % 4]];
-                                edge.sort_unstable();
-                                if !edges.contains(&edge) {
-                                    edges.push(edge);
-                                }
-                            }
+                            faces.push(Face { axis, corners });
                         }
                     }
                 }
             }
         }
+        faces
+    })
+}
+
+fn world_edges() -> &'static [Edge] {
+    static EDGES: OnceLock<Vec<Edge>> = OnceLock::new();
+    EDGES.get_or_init(|| {
+        let mut edges = Vec::new();
+        for face in world_faces() {
+            for index in 0..4 {
+                let mut edge = [face.corners[index], face.corners[(index + 1) % 4]];
+                edge.sort_unstable();
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        }
         edges
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Occluder {
+    axis: usize,
+    plane: i32,
+    low: [i32; 2],
+    high: [i32; 2],
+}
+
+// Merge coplanar neighboring faces so the numerical tolerance at an
+// external silhouette does not open artificial slits at internal cell seams.
+fn world_occluders() -> &'static [Occluder] {
+    static OCCLUDERS: OnceLock<Vec<Occluder>> = OnceLock::new();
+    OCCLUDERS.get_or_init(|| {
+        let mut walls: Vec<_> = world_faces()
+            .iter()
+            .map(|face| {
+                let u = (face.axis + 1) % 3;
+                let v = (face.axis + 2) % 3;
+                Occluder {
+                    axis: face.axis,
+                    plane: face.corners[0][face.axis],
+                    low: [face.corners[0][u], face.corners[0][v]],
+                    high: [face.corners[2][u], face.corners[2][v]],
+                }
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            'search: for i in 0..walls.len() {
+                for j in i + 1..walls.len() {
+                    let a = walls[i];
+                    let b = walls[j];
+                    let merge_axis = (0..2).find(|&axis| {
+                        let other = 1 - axis;
+                        a.axis == b.axis
+                            && a.plane == b.plane
+                            && a.low[other] == b.low[other]
+                            && a.high[other] == b.high[other]
+                            && (a.high[axis] == b.low[axis] || b.high[axis] == a.low[axis])
+                    });
+                    if let Some(axis) = merge_axis {
+                        walls[i].low[axis] = a.low[axis].min(b.low[axis]);
+                        walls[i].high[axis] = a.high[axis].max(b.high[axis]);
+                        walls.remove(j);
+                        changed = true;
+                        break 'search;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        walls
     })
 }
 
@@ -196,6 +270,91 @@ fn camera_space(point: Point, camera: Camera) -> Point {
     [right, cp * y - sp * forward, sp * y + cp * forward]
 }
 
+// Restrict a parameter interval to the nonnegative side of a linear
+// inequality whose values at the original segment endpoints are a and b.
+fn clip_positive(interval: &mut [f32; 2], a: f32, b: f32) -> bool {
+    if a < 0.0 && b < 0.0 {
+        return false;
+    }
+    if a < 0.0 || b < 0.0 {
+        let t = a / (a - b);
+        if a < 0.0 {
+            interval[0] = interval[0].max(t);
+        } else {
+            interval[1] = interval[1].min(t);
+        }
+    }
+    interval[0] < interval[1]
+}
+
+// Each exposed boundary rectangle casts a pyramidal shadow from the camera.
+// Its five linear halfspaces clip a world segment to the part behind that opaque
+// face. Union those intervals and emit their complement, before projection.
+// A target on its supporting face is not behind it; the small plane epsilon
+// also protects shared edges from floating-point self-occlusion.
+fn visible_segments(edge: [Point; 2], eye: Point) -> Vec<[Point; 2]> {
+    const PLANE_EPSILON: f32 = 0.0001;
+    let mut shadows: Vec<[f32; 2]> = Vec::new();
+    for wall in world_occluders() {
+        let axis = wall.axis;
+        let u = (axis + 1) % 3;
+        let v = (axis + 2) % 3;
+        let plane = wall.plane as f32 * HALF_WIDTH;
+        let distance = (plane - eye[axis]).abs();
+        if distance <= PLANE_EPSILON {
+            continue;
+        }
+        let side = (plane - eye[axis]).signum();
+        let q = edge.map(|point| side * (point[axis] - eye[axis]));
+        let mut interval = [0.0, 1.0];
+        if !clip_positive(
+            &mut interval,
+            q[0] - distance - PLANE_EPSILON,
+            q[1] - distance - PLANE_EPSILON,
+        ) {
+            continue;
+        }
+        let mut intersects = true;
+        for (index, coordinate) in [u, v].into_iter().enumerate() {
+            let low = wall.low[index] as f32 * HALF_WIDTH + PLANE_EPSILON - eye[coordinate];
+            let high = wall.high[index] as f32 * HALF_WIDTH - PLANE_EPSILON - eye[coordinate];
+            let offset = edge.map(|point| point[coordinate] - eye[coordinate]);
+            if !clip_positive(
+                &mut interval,
+                distance * offset[0] - low * q[0],
+                distance * offset[1] - low * q[1],
+            ) || !clip_positive(
+                &mut interval,
+                high * q[0] - distance * offset[0],
+                high * q[1] - distance * offset[1],
+            ) {
+                intersects = false;
+                break;
+            }
+        }
+        if intersects {
+            if interval[0] <= 0.0 && interval[1] >= 1.0 {
+                return Vec::new();
+            }
+            shadows.push(interval);
+        }
+    }
+    shadows.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let point = |t: f32| std::array::from_fn(|i| edge[0][i] + t * (edge[1][i] - edge[0][i]));
+    let mut visible = Vec::new();
+    let mut start = 0.0_f32;
+    for [low, high] in shadows {
+        if low > start + 0.000001 {
+            visible.push([point(start), point(low)]);
+        }
+        start = start.max(high);
+    }
+    if start < 1.0 - 0.000001 {
+        visible.push([point(start), edge[1]]);
+    }
+    visible
+}
+
 // Clip in camera space before division, then clip to the viewport so a line
 // crossing the eye or the screen cannot create enormous screen instances.
 fn project_edge(
@@ -271,33 +430,40 @@ pub(crate) fn project(
     });
     let camera = camera(elapsed_seconds);
     let mut visible = Vec::new();
-    for edge in world_edges() {
-        if let Some((start, end, depth)) = project_edge(edge.map(world_point), camera, aspect) {
+    let mut add_edge = |edge, width, intensity| {
+        // A wholly off-screen edge cannot contribute any visible subsegment.
+        if project_edge(edge, camera, aspect).is_none() {
+            return;
+        }
+        for segment in visible_segments(edge, camera.position) {
+            let Some((start, end, depth)) = project_edge(segment, camera, aspect) else {
+                continue;
+            };
             let fade = (1.0 / (1.0 + depth * 0.055)).clamp(0.2, 1.0);
             visible.push((
                 depth,
                 ProjectedLine {
                     start,
                     end,
-                    width: 0.003 + 0.001 * bass + 0.0005 * treble,
-                    intensity: (0.48 + 0.16 * energy + 0.08 * treble) * fade,
+                    width,
+                    intensity: intensity * fade,
                 },
             ));
         }
+    };
+    for edge in world_edges() {
+        add_edge(
+            edge.map(world_point),
+            0.003 + 0.001 * bass + 0.0005 * treble,
+            0.48 + 0.16 * energy + 0.08 * treble,
+        );
     }
     for &(_, edge) in world_details() {
-        if let Some((start, end, depth)) = project_edge(edge, camera, aspect) {
-            let fade = (1.0 / (1.0 + depth * 0.055)).clamp(0.2, 1.0);
-            visible.push((
-                depth,
-                ProjectedLine {
-                    start,
-                    end,
-                    width: 0.0045 + 0.001 * bass + 0.0005 * treble,
-                    intensity: (0.62 + 0.16 * energy + 0.08 * treble) * fade,
-                },
-            ));
-        }
+        add_edge(
+            edge,
+            0.0045 + 0.001 * bass + 0.0005 * treble,
+            0.62 + 0.16 * energy + 0.08 * treble,
+        );
     }
     // Close structure wins tight budgets; stable sorting preserves ties.
     visible.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -315,6 +481,120 @@ mod tests {
 
     fn distance(a: Point, b: Point) -> f32 {
         ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    }
+
+    // Independent ray/union check: split the ray at the cross's six
+    // boundary planes and test each interval against the occupied volume.
+    fn ray_inside_world(eye: Point, target: Point) -> bool {
+        let mut cuts = vec![0.0_f32, 1.0];
+        for axis in 0..3 {
+            let delta = target[axis] - eye[axis];
+            if delta.abs() < 0.000001 {
+                continue;
+            }
+            for plane in [-13.2, -1.2, 1.2, 13.2] {
+                let t = (plane - eye[axis]) / delta;
+                if t > 0.0 && t < 1.0 {
+                    cuts.push(t);
+                }
+            }
+        }
+        cuts.sort_by(f32::total_cmp);
+        cuts.windows(2).all(|pair| {
+            let t = (pair[0] + pair[1]) * 0.5;
+            let p: Point = std::array::from_fn(|i| eye[i] + t * (target[i] - eye[i]));
+            p.iter().all(|v| v.abs() <= 13.20001)
+                && p.iter().filter(|v| v.abs() > 1.20001).count() <= 1
+        })
+    }
+
+    #[test]
+    fn walls_hide_branch_features_but_openings_reveal_them() {
+        let feature = [[-3.7, -1.19, -0.48], [-3.7, -1.19, 0.48]];
+        let approach = camera(3.0);
+        let (a, b, _) = project_edge(feature, approach, 16.0 / 9.0).unwrap();
+        assert!(visible_segments(feature, approach.position).is_empty());
+        assert!(
+            !project(3.0, 16.0 / 9.0, [0.0; 3], 512)
+                .iter()
+                .any(|line| line.start == a && line.end == b)
+        );
+
+        let junction = camera(11.0);
+        let visible = visible_segments(feature, junction.position);
+        assert!(!visible.is_empty());
+        let junction_lines = project(11.0, 16.0 / 9.0, [0.0; 3], 512);
+        let near = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) < 0.0001;
+        assert!(visible.iter().any(|&piece| {
+            project_edge(piece, junction, 16.0 / 9.0).is_some_and(|(a, b, _)| {
+                junction_lines.iter().any(|line| {
+                    (near(line.start, a) && near(line.end, b))
+                        || (near(line.start, b) && near(line.end, a))
+                })
+            })
+        }));
+
+        // The near part of the same side rail is seen through the aperture;
+        // the remainder is hidden by the approach corridor's solid wall.
+        let rail = [[-1.4, -1.19, 0.0], [-10.8, -1.19, 0.0]];
+        let pieces = visible_segments(rail, [0.0, 0.0, -5.0]);
+        assert_eq!(pieces.len(), 1);
+        assert!((pieces[0][0][0] + 1.4).abs() < 0.001);
+        assert!(pieces[0][1][0] < -1.5 && pieces[0][1][0] > -1.7);
+
+        // A ray hitting the seam between two coplanar cells still hits a
+        // solid wall, rather than leaking through a numerical crack.
+        let seam = [[-30.0 / 7.0, -0.2, 0.0], [-30.0 / 7.0, 0.2, 0.0]];
+        assert!(visible_segments(seam, [0.0, 0.0, -5.0]).is_empty());
+
+        // A wall's own edge must not disappear, including when the eye is
+        // very close to that wall or aligned with a cell boundary.
+        let edge = [[-1.2, -1.2, -3.6], [-1.2, -1.2, -6.0]];
+        for eye in [[0.0, 0.0, -2.4], [-1.199, -1.199, -2.4]] {
+            assert_eq!(visible_segments(edge, eye), vec![edge]);
+        }
+    }
+
+    #[test]
+    fn visibility_agrees_with_independent_union_ray_checks() {
+        for eye in [
+            [0.0, 0.0, -5.0],
+            [0.2, 0.12, 0.3],
+            [0.0, 0.0, -2.4],
+            [0.8, 0.12, -0.4],
+            [-3.0, 0.0, 0.0],
+            [0.0, 3.8, 0.0],
+            [0.0, -3.8, 0.0],
+        ] {
+            for edge in world_edges()
+                .iter()
+                .map(|edge| edge.map(world_point))
+                .chain(world_details().iter().map(|(_, edge)| *edge))
+            {
+                let pieces = visible_segments(edge, eye);
+                let axis = (0..3)
+                    .max_by(|&a, &b| {
+                        (edge[1][a] - edge[0][a])
+                            .abs()
+                            .total_cmp(&(edge[1][b] - edge[0][b]).abs())
+                    })
+                    .unwrap();
+                let parameter =
+                    |point: Point| (point[axis] - edge[0][axis]) / (edge[1][axis] - edge[0][axis]);
+                for t in [0.13, 0.37, 0.63, 0.87] {
+                    let target =
+                        std::array::from_fn(|i| edge[0][i] + t * (edge[1][i] - edge[0][i]));
+                    let shown = pieces.iter().any(|piece| {
+                        t >= parameter(piece[0]) - 0.00001 && t <= parameter(piece[1]) + 0.00001
+                    });
+                    assert_eq!(
+                        shown,
+                        ray_inside_world(eye, target),
+                        "eye {eye:?}, edge {edge:?}, t {t}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -598,5 +878,36 @@ mod tests {
             project(0.0, 1.0, [f32::NAN; 3], 10),
             project(0.0, 1.0, [0.0; 3], 10)
         );
+    }
+
+    #[test]
+    fn full_path_visibility_is_finite_repeatable_and_bounded() {
+        // The fixed world bounds per-frame work independently of profile:
+        // no more than one shadow interval per occluder per source edge.
+        assert_eq!(world_faces().len(), 126);
+        assert!(world_occluders().len() <= 32);
+        assert!(world_edges().len() + world_details().len() <= 320);
+        for sample in 0..=120 {
+            let time = sample as f32 * 0.5;
+            let all = project(time, 16.0 / 9.0, [0.25, 0.5, 0.75], 512);
+            assert!(!all.is_empty());
+            assert_eq!(all, project(time, 16.0 / 9.0, [0.25, 0.5, 0.75], 512));
+            for line in &all {
+                assert!(
+                    line.start
+                        .into_iter()
+                        .chain(line.end)
+                        .all(|v| v.is_finite() && v.abs() <= 1.00001)
+                );
+                assert!(line.width.is_finite() && line.width > 0.0);
+                assert!((0.0..=1.0).contains(&line.intensity));
+            }
+            for budget in [1, 7, 64, 128] {
+                assert_eq!(
+                    project(time, 16.0 / 9.0, [0.25, 0.5, 0.75], budget),
+                    all[..all.len().min(budget)]
+                );
+            }
+        }
     }
 }
