@@ -1,8 +1,8 @@
 //! PulseTunnel: beat-driven planes and bars moving through depth.
 
 use super::{
-    CameraMode, SceneBuild, SceneEntry, SceneState, TunnelVariant, lines, note_emphasis, palette,
-    sin_cos,
+    CameraMode, SceneBuild, SceneEntry, SceneState, TunnelVariant, house, lines, note_emphasis,
+    palette, planar_hallway, sin_cos,
 };
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
@@ -55,10 +55,12 @@ fn build(
     }
 }
 
-/// Slow audio envelopes advanced once per draw or capture replay step.
+/// Slow audio and projected-look colour envelopes, advanced once per draw or
+/// capture replay step. Existing tunnel builders continue to use wire colour.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TunnelState {
     levels: [f32; 3],
+    projected_color: Option<[f32; 4]>,
     last_elapsed: Option<f64>,
 }
 
@@ -76,6 +78,11 @@ impl TunnelState {
         {
             *level += (f32::from(input) / 255.0 - *level) * blend;
         }
+        let target = palette(frame.palette, 0.42, 0.5);
+        let color = self.projected_color.get_or_insert(target);
+        for (channel, target) in color[..3].iter_mut().zip(target) {
+            *channel += (target - *channel) * blend;
+        }
         self.last_elapsed = Some(previous.max(elapsed));
     }
 }
@@ -86,6 +93,7 @@ fn segment(
     a: [f32; 2],
     b: [f32; 2],
     aspect: f32,
+    width: f32,
     color: [f32; 4],
 ) {
     if instances.len() >= budget {
@@ -99,12 +107,55 @@ fn segment(
     let direction = [delta[0] / length, delta[1] / length];
     instances.push(Instance {
         center: [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, 0.0],
-        size: [length, lines::ndc_width(direction, 0.004, aspect.max(0.01))],
+        size: [length, lines::ndc_width(direction, width, aspect.max(0.01))],
         color,
         rotation: delta[1].atan2(delta[0]),
         scene_mix: 2.0,
         pattern: [0.0; 2],
     });
+}
+
+pub(crate) fn build_projected(
+    profile: &RenderProfile,
+    frame: ControlFrame,
+    elapsed: f32,
+    aspect: f32,
+    state: &SceneState,
+    instances: &mut Vec<Instance>,
+    is_house: bool,
+) {
+    let remaining = profile.instance_count.saturating_sub(instances.len());
+    let mut draw = |start, end, width, intensity: f32| {
+        let mut color = state
+            .tunnel
+            .projected_color
+            .unwrap_or_else(|| palette(frame.palette, 0.42, 0.5));
+        color[3] = intensity.clamp(0.0, 1.0);
+        segment(
+            instances,
+            profile.instance_count,
+            start,
+            end,
+            aspect,
+            width,
+            color,
+        );
+    };
+    if is_house {
+        for line in house::project(elapsed, aspect, state.tunnel.levels, remaining)
+            .into_iter()
+            .take(remaining)
+        {
+            draw(line.start, line.end, line.width, line.intensity);
+        }
+    } else {
+        for line in planar_hallway::project(elapsed, aspect, state.tunnel.levels, remaining)
+            .into_iter()
+            .take(remaining)
+        {
+            draw(line.start, line.end, line.width, line.intensity);
+        }
+    }
 }
 
 pub(crate) fn build_variant(
@@ -121,7 +172,15 @@ pub(crate) fn build_variant(
     let mut draw = |a, b, fade: f32| {
         let mut color = base;
         color[3] = fade.clamp(0.0, 1.0);
-        segment(instances, profile.instance_count, a, b, aspect, color);
+        segment(
+            instances,
+            profile.instance_count,
+            a,
+            b,
+            aspect,
+            0.004,
+            color,
+        );
     };
     match state.config().tunnel_variant {
         TunnelVariant::Hallway => {
@@ -170,7 +229,9 @@ pub(crate) fn build_variant(
                 }
             }
         }
-        TunnelVariant::Original => unreachable!("original uses its unchanged builder"),
+        TunnelVariant::Original | TunnelVariant::SurfaceHallway => {
+            unreachable!("uses a separate builder")
+        }
     }
 }
 
@@ -195,6 +256,98 @@ mod tests {
             tunnel_variant: TunnelVariant::Hallway,
             ..SceneConfig::default()
         })
+    }
+
+    #[test]
+    fn projected_palette_changes_smoothly_on_live_and_replay_steps() {
+        let profile = RenderProfile::pi5();
+        for house in [false, true] {
+            let mut live = SceneState::new(SceneConfig {
+                tunnel_variant: if house {
+                    TunnelVariant::Original
+                } else {
+                    TunnelVariant::SurfaceHallway
+                },
+                ..SceneConfig::default()
+            });
+            live.set_local_house(house);
+            let mut replay = live.clone();
+            let mut previous: Option<[f32; 4]> = None;
+            for i in 0..=420 {
+                let frame = ControlFrame {
+                    scene: 2,
+                    palette: if i < 120 { (i % 2) as u8 * 3 } else { 2 },
+                    ..audio(180)
+                };
+                let time = f64::from(i) / 60.0;
+                // Fresh observations do not advance the envelope; live and
+                // replay each advance once on the displayed frame clock.
+                replay.observe_at(&frame, time);
+                live.observe_live_at(&frame, time);
+                replay.advance_tunnel(&frame, time);
+                live.advance_tunnel(&frame, time);
+                let color = live.tunnel.projected_color.unwrap();
+                assert_eq!(color, replay.tunnel.projected_color.unwrap());
+                if let Some(previous) = previous {
+                    for channel in 0..3 {
+                        assert!((color[channel] - previous[channel]).abs() < 0.01);
+                    }
+                }
+                previous = Some(color);
+                if i % 60 == 0 {
+                    let live_instances =
+                        build_instances(&profile, frame, time as f32, 16.0 / 9.0, &live);
+                    let replay_instances =
+                        build_instances(&profile, frame, time as f32, 16.0 / 9.0, &replay);
+                    assert!(!live_instances.is_empty());
+                    assert_eq!(
+                        bytemuck::cast_slice::<Instance, u8>(&live_instances),
+                        bytemuck::cast_slice::<Instance, u8>(&replay_instances)
+                    );
+                    assert_eq!(&live_instances[0].color[..3], &color[..3]);
+                }
+            }
+            let target = palette(2, 0.42, 0.5);
+            let before = live.tunnel.projected_color.unwrap();
+            for channel in 0..3 {
+                assert!((before[channel] - target[channel]).abs() < 0.001);
+            }
+            let changed = ControlFrame {
+                palette: 0,
+                ..audio(180)
+            };
+            live.advance_tunnel(&changed, 67.0);
+            let after_stall = live.tunnel.projected_color.unwrap();
+            for channel in 0..3 {
+                assert!((after_stall[channel] - before[channel]).abs() < 0.02);
+            }
+            live.advance_tunnel(&changed, 66.0);
+            assert_eq!(live.tunnel.projected_color.unwrap(), after_stall);
+        }
+    }
+
+    #[test]
+    fn existing_flat_tunnels_keep_immediate_palette_changes() {
+        let profile = RenderProfile::pi5();
+        for variant in [TunnelVariant::Hallway, TunnelVariant::Abstract] {
+            let mut state = SceneState::new(SceneConfig {
+                tunnel_variant: variant,
+                ..SceneConfig::default()
+            });
+            let first = ControlFrame {
+                palette: 0,
+                ..audio(180)
+            };
+            let changed = ControlFrame {
+                palette: 3,
+                ..first
+            };
+            state.advance_tunnel(&first, 0.0);
+            state.advance_tunnel(&changed, 1.0 / 60.0);
+            let instances = build_instances(&profile, changed, 1.0, 16.0 / 9.0, &state);
+            assert!(!instances.is_empty());
+            assert_eq!(&instances[0].color[..3], &palette(3, 0.42, 0.5)[..3]);
+        }
     }
 
     #[test]

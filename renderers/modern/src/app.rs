@@ -167,6 +167,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         lines_drop_cuts: args.lines_drop_cuts,
         tunnel_variant: args.tunnel_variant,
     });
+    renderer.pipeline_mut().enable_local_house(args.house);
     renderer
         .pipeline_mut()
         .configure_starfield(starfield.clone());
@@ -418,7 +419,7 @@ fn usage(program: &str) -> String {
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
        [--dmg-preview]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
-       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
+       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract|surface-hallway] [--house]
        [--scene N]
        {program} --list-monitors | --list-audio-devices
 
@@ -456,7 +457,8 @@ Options:
                           default builds print a notice and draw nothing
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
-  --tunnel-variant MODE   PulseTunnel look: original (default), hallway or abstract
+  --tunnel-variant MODE   PulseTunnel look: original (default), hallway, abstract or surface-hallway
+  --house                 local House for native displays; incompatible with --dmg-preview, --scene and --tunnel-variant
   Scene 6 requires both --star-catalog and --location; scene 7 remains ColourField
   -h, --help              print this help
 
@@ -668,6 +670,7 @@ struct AppArgs {
     location: Option<(f64, f64)>,
     unix_seconds: Option<f64>,
     tunnel_variant: TunnelVariant,
+    house: bool,
 }
 
 /// Wire palettes go through the stability gate, and a stable absolute 3 or 7
@@ -727,7 +730,9 @@ impl AppArgs {
         let mut parsed = Self::default();
         let args: Vec<String> = args.into_iter().collect();
         let preview_requested = args.iter().any(|arg| arg == "--dmg-preview");
+        let house_requested = has_standalone_house(&args);
         let mut args = args.into_iter();
+        let mut tunnel_variant_supplied = false;
         let mut preview_conflict = None;
 
         let mut first = true;
@@ -746,6 +751,7 @@ impl AppArgs {
                     | "--allow-flash"
                     | "--lines-drop-cuts"
                     | "--tunnel-variant"
+                    | "--house"
                     | "--catalog"
                     | "--star-catalog"
                     | "--location"
@@ -773,12 +779,18 @@ impl AppArgs {
                         "--udp",
                         "LISTEN_ADDR:PORT",
                         preview_requested,
+                        house_requested,
                     )?)
                 }
                 "--fullscreen" => parsed.fullscreen = true,
                 "--monitor" => {
-                    let value =
-                        required_value(&mut args, "--monitor", "INDEX or NAME", preview_requested)?;
+                    let value = required_value(
+                        &mut args,
+                        "--monitor",
+                        "INDEX or NAME",
+                        preview_requested,
+                        house_requested,
+                    )?;
                     parsed.monitor = Some(DeviceSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
@@ -789,6 +801,7 @@ impl AppArgs {
                         "--audio-device",
                         "INDEX or NAME",
                         preview_requested,
+                        house_requested,
                     )?;
                     parsed.audio_device = Some(DeviceSelector::parse(&value));
                 }
@@ -799,6 +812,7 @@ impl AppArgs {
                         "--layout",
                         "auto|v2|h2|v3|h3",
                         preview_requested,
+                        house_requested,
                     )?;
                     parsed.layout = parse_layout(&value)?;
                 }
@@ -809,6 +823,7 @@ impl AppArgs {
                         "--mic-layers",
                         "off|scope|bursts|both",
                         preview_requested,
+                        house_requested,
                     )?;
                     parsed.mic_layers = mic_layers::Mode::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
@@ -818,7 +833,13 @@ impl AppArgs {
                 }
                 "--lines-drop-cuts" => parsed.lines_drop_cuts = true,
                 "--scene" => {
-                    let value = required_value(&mut args, "--scene", "0-255", preview_requested)?;
+                    let value = required_value(
+                        &mut args,
+                        "--scene",
+                        "0-255",
+                        preview_requested,
+                        house_requested,
+                    )?;
                     parsed.scene = Some(value.parse::<u8>().map_err(|_| {
                         invalid_input(format!("--scene expects 0-255, got {value}"))
                     })?);
@@ -829,16 +850,27 @@ impl AppArgs {
                         arg.as_str(),
                         "PATH",
                         preview_requested,
+                        house_requested,
                     )?));
                 }
                 "--location" => {
-                    let value =
-                        required_value(&mut args, "--location", "LAT,LON", preview_requested)?;
+                    let value = required_value(
+                        &mut args,
+                        "--location",
+                        "LAT,LON",
+                        preview_requested,
+                        house_requested,
+                    )?;
                     parsed.location = Some(parse_location(&value)?);
                 }
                 "--time" => {
-                    let value =
-                        required_value(&mut args, "--time", "UNIX_SECONDS", preview_requested)?;
+                    let value = required_value(
+                        &mut args,
+                        "--time",
+                        "UNIX_SECONDS",
+                        preview_requested,
+                        house_requested,
+                    )?;
                     let seconds = value.parse::<f64>().map_err(|_| {
                         invalid_input(format!("--time must be finite UNIX seconds, got {value}"))
                     })?;
@@ -852,20 +884,28 @@ impl AppArgs {
                     parsed.unix_seconds = Some(seconds);
                 }
                 "--tunnel-variant" => {
+                    tunnel_variant_supplied = true;
                     let value = required_value(
                         &mut args,
                         "--tunnel-variant",
-                        "original|hallway|abstract",
+                        "original|hallway|abstract|surface-hallway",
                         preview_requested,
+                        house_requested,
                     )?;
                     parsed.tunnel_variant = TunnelVariant::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
-                            "--tunnel-variant expects original|hallway|abstract, got {value}"
+                            "--tunnel-variant expects original|hallway|abstract|surface-hallway, got {value}"
                         ))
                     })?;
                 }
+                "--house" => parsed.house = true,
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
+                "--help" | "-h" if preview_requested && house_requested => {
+                    return Err(invalid_input(
+                        "--dmg-preview cannot be combined with --house".to_string(),
+                    ));
+                }
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
                 _ => return Err(invalid_input(format!("unknown argument: {arg}"))),
             }
@@ -877,6 +917,18 @@ impl AppArgs {
             return Err(invalid_input(format!(
                 "--dmg-preview cannot be combined with {conflict}"
             )));
+        }
+        if parsed.house
+            && (parsed.scene.is_some()
+                || tunnel_variant_supplied
+                || parsed.catalog_path.is_some()
+                || parsed.location.is_some()
+                || parsed.unix_seconds.is_some())
+        {
+            return Err(invalid_input(
+                "--house is incompatible with --scene, --tunnel-variant and Starfield options"
+                    .to_string(),
+            ));
         }
         if parsed.audio_device.is_some() && !parsed.mic && !parsed.list_audio_devices {
             return Err(invalid_input("--audio-device requires --mic".to_string()));
@@ -963,15 +1015,45 @@ fn parse_location(value: &str) -> Result<(f64, f64), AppError> {
     Ok((latitude, longitude))
 }
 
+fn has_standalone_house(args: &[String]) -> bool {
+    // Keep this value-taking list in sync with AppArgs::parse_from.
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if matches!(
+            arg.as_str(),
+            "--udp"
+                | "--monitor"
+                | "--audio-device"
+                | "--layout"
+                | "--mic-layers"
+                | "--scene"
+                | "--catalog"
+                | "--star-catalog"
+                | "--location"
+                | "--time"
+                | "--tunnel-variant"
+        ) {
+            let _ = args.next();
+        } else if arg == "--house" {
+            return true;
+        }
+    }
+    false
+}
+
 fn required_value(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
     expected: &str,
     preview_requested: bool,
+    house_requested: bool,
 ) -> Result<String, AppError> {
     match args.next() {
         Some(value) if value == "--dmg-preview" => Err(invalid_input(format!(
             "{flag} requires {expected}; --dmg-preview is not a value"
+        ))),
+        Some(value) if house_requested && value == "--house" => Err(invalid_input(format!(
+            "{flag} requires {expected}; --house is an option, not a value"
         ))),
         Some(value) if preview_requested && is_app_option(&value) => Err(invalid_input(format!(
             "{flag} requires {expected}; {value} is an option, not a value"
@@ -1001,6 +1083,7 @@ fn is_app_option(value: &str) -> bool {
             | "--location"
             | "--time"
             | "--tunnel-variant"
+            | "--house"
             | "--dmg-preview"
             | "--help"
             | "-h"
@@ -1286,6 +1369,100 @@ mod tests {
         assert_eq!(AppArgs::default().scene, None);
     }
 
+    #[test]
+    fn integration_selectors_remain_explicit_and_exclusive() {
+        let defaults = parse_run(&[]);
+        assert!(!defaults.dmg_preview);
+        assert!(!defaults.house);
+        assert_eq!(defaults.tunnel_variant, TunnelVariant::Original);
+        assert!(parse_run(&["--house"]).house);
+        for (name, variant) in [
+            ("original", TunnelVariant::Original),
+            ("hallway", TunnelVariant::Hallway),
+            ("abstract", TunnelVariant::Abstract),
+            ("surface-hallway", TunnelVariant::SurfaceHallway),
+        ] {
+            let args = parse_run(&["--tunnel-variant", name]);
+            assert_eq!(args.tunnel_variant, variant);
+            assert!(!args.house && !args.dmg_preview);
+        }
+        for args in [
+            &["--house", "--dmg-preview"][..],
+            &["--dmg-preview", "--house"][..],
+            &["--help", "--house", "--dmg-preview"][..],
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            if cfg!(feature = "dmg-preview") || args[0] == "--help" {
+                assert!(error.contains("cannot be combined with --house"), "{error}");
+            } else {
+                assert!(
+                    error.contains("requires the dmg-preview Cargo feature"),
+                    "{error}"
+                );
+            }
+        }
+        if cfg!(feature = "dmg-preview") {
+            assert!(parse_run(&["--dmg-preview"]).dmg_preview);
+        }
+    }
+
+    #[test]
+    fn live_house_literal_values_keep_legacy_parsing_without_a_standalone_flag() {
+        for flag in ["--catalog", "--star-catalog"] {
+            let args = parse_run(&[flag, "--house", "--location", "0,0", "--scene", "6"]);
+            assert_eq!(args.catalog_path, Some("--house".into()));
+            assert_eq!(args.scene, Some(6));
+            assert!(!args.house);
+        }
+        assert_eq!(
+            parse_run(&["--monitor", "--house"]).monitor,
+            Some(DeviceSelector::Name("--house".into()))
+        );
+        assert_eq!(
+            parse_run(&["--mic", "--audio-device", "--house"]).audio_device,
+            Some(DeviceSelector::Name("--house".into()))
+        );
+        assert_eq!(
+            parse_run(&["--udp", "--house"]).udp_endpoint.as_deref(),
+            Some("--house")
+        );
+        for args in [
+            &["--house", "--star-catalog", "--house"][..],
+            &["--star-catalog", "--house", "--house"][..],
+            &["--monitor", "--house", "--house"][..],
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            assert!(error.contains("--house is an option"), "{args:?}: {error}");
+        }
+    }
+
+    #[cfg(all(feature = "dmg-preview", feature = "unmeasured-flash"))]
+    #[test]
+    fn combined_preview_flash_isolation() {
+        assert!(std::hint::black_box(colour_field::FLASH_BUILD));
+        assert!(std::hint::black_box(mic_layers::LAYERS_BUILD));
+        let args = parse_run(&["--dmg-preview"]);
+        assert!(args.dmg_preview);
+        assert!(!args.allow_flash);
+        assert_eq!(args.mic_layers, mic_layers::Mode::Off);
+        for conflict in [&["--allow-flash"][..], &["--mic-layers", "both"][..]] {
+            for preview_first in [true, false] {
+                let mut args = conflict.to_vec();
+                if preview_first {
+                    args.insert(0, "--dmg-preview");
+                } else {
+                    args.push("--dmg-preview");
+                }
+                let error = parse(&args).unwrap_err().to_string();
+                assert!(
+                    error.contains("--dmg-preview cannot be combined with"),
+                    "{args:?}: {error}"
+                );
+                assert!(error.contains(conflict[0]), "{args:?}: {error}");
+            }
+        }
+    }
+
     #[cfg(not(feature = "dmg-preview"))]
     #[test]
     fn preview_flag_requires_feature_before_input_or_window_setup() {
@@ -1325,6 +1502,7 @@ mod tests {
             &["--allow-flash"],
             &["--lines-drop-cuts"],
             &["--tunnel-variant", "original"],
+            &["--house"],
             &["--catalog", "stars.csv"],
             &["--star-catalog", "stars.csv"],
             &["--location", "0,0"],
@@ -1371,6 +1549,11 @@ mod tests {
             let error = parse(&[flag, "--dmg-preview"]).unwrap_err().to_string();
             assert!(error.contains(&format!("{flag} requires")), "{error}");
             assert!(error.contains("--dmg-preview is not a value"), "{error}");
+            let error = parse(&["--house", flag, "--house"])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("{flag} requires")), "{error}");
+            assert!(error.contains("--house is an option"), "{error}");
         }
         let error = parse(&["--mic", "--audio-device", "--dmg-preview"])
             .unwrap_err()
@@ -1417,6 +1600,7 @@ mod tests {
             "--location",
             "--time",
             "--tunnel-variant",
+            "--house",
             "--help",
             "-h",
             "--",
@@ -2967,8 +3151,34 @@ mod tests {
             parse_run(&["--tunnel-variant", "abstract"]).tunnel_variant,
             TunnelVariant::Abstract
         );
+        assert_eq!(
+            parse_run(&["--tunnel-variant", "surface-hallway"]).tunnel_variant,
+            TunnelVariant::SurfaceHallway
+        );
         assert!(parse(&["--tunnel-variant", "lines"]).is_err());
         assert!(parse(&["--tunnel-variant"]).is_err());
+    }
+
+    #[test]
+    fn house_is_local_and_rejects_competing_selections() {
+        assert!(!AppArgs::default().house);
+        assert!(parse_run(&["--house", "--udp", "127.0.0.1:6464"]).house);
+        for conflict in [
+            vec!["--house", "--scene", "2"],
+            vec!["--scene", "7", "--house"],
+            vec!["--house", "--tunnel-variant", "original"],
+            vec!["--tunnel-variant", "surface-hallway", "--house"],
+            vec![
+                "--house",
+                "--star-catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+            ],
+        ] {
+            assert!(parse(&conflict).is_err(), "{conflict:?}");
+        }
+        assert!(parse(&["--udp", "--house", "--house"]).is_err());
     }
 
     #[test]

@@ -26,7 +26,7 @@ const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scen
                        [--size WxH] [--mic-layers off|scope|bursts|both]
                        [--catalog FILE --location LAT,LON]
                        [--time UNIX_SECONDS] [--follow-time]
-                       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
+                       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract|surface-hallway] [--house]
                        [--exclusive-output] [--catalog-v1]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
@@ -56,7 +56,9 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --time     observation UTC as Unix seconds (1800..2200); defaults to current UTC
   --follow-time advance from --time (or current UTC), for reproducible moving-sky captures
   --tunnel-variant
-             PulseTunnel look: original (default), hallway or abstract
+             PulseTunnel look: original (default), hallway, abstract or surface-hallway
+  --house    local House for native displays; incompatible with --scene,
+             --tunnel-variant, Starfield options and --catalog-v1
   --exclusive-output
              create PNGs and manifest exclusively; fail on existing leaves or
              duplicate frames. Requires a trusted, non-mutable output directory;
@@ -308,7 +310,7 @@ fn parse_args_internal(
                 }
                 let text = value()?;
                 tunnel_variant = TunnelVariant::parse(&text).ok_or_else(|| {
-                    format!("--tunnel-variant expects original|hallway|abstract, got {text}")
+                    format!("--tunnel-variant expects original|hallway|abstract|surface-hallway, got {text}")
                 })?;
             }
             "--catalog" | "--star-catalog" => {
@@ -394,6 +396,8 @@ fn parse_args_internal(
 }
 
 fn is_cli_option(value: &str) -> bool {
+    // `--house` and `--dmg-preview` were literal values before the local opt-ins.
+    // With a standalone House flag, cli_house_tokens checks them separately.
     matches!(
         value,
         "--help"
@@ -590,7 +594,14 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
 /// Capture using #139's tunnel options. Legacy scene bytes, including scene 6,
 /// keep their original native mapping in this API.
 pub fn run_with_options(args: &CaptureArgs, options: CaptureOptions) -> Result<(), String> {
-    run_internal(args, options, &StarfieldOptions::default(), false, false)
+    run_internal(
+        args,
+        options,
+        &StarfieldOptions::default(),
+        false,
+        false,
+        false,
+    )
 }
 
 /// Capture with an explicit Starfield opt-in and its separate configuration.
@@ -605,6 +616,7 @@ pub fn run_with_starfield_options(
         options.capture,
         &options.starfield,
         options.starfield_enabled,
+        false,
         false,
     )
 }
@@ -626,6 +638,7 @@ fn run_internal(
     starfield_options: &StarfieldOptions,
     starfield_enabled: bool,
     exclusive: bool,
+    house: bool,
 ) -> Result<(), String> {
     if exclusive {
         validate_unique_frames(&args.frames)?;
@@ -729,6 +742,7 @@ fn run_internal(
         lines_drop_cuts: args.lines_drop_cuts,
         tunnel_variant: options.tunnel_variant,
     });
+    renderer.pipeline_mut().enable_local_house(house);
     renderer
         .pipeline_mut()
         .configure_starfield(starfield.clone());
@@ -761,16 +775,19 @@ fn run_internal(
         let displayed_scene = renderer.pipeline_mut().committed_displayed_scene();
         let entry = scenes::dispatch_configured(displayed_scene, starfield_enabled);
         let name = match (entry.name(), options.tunnel_variant) {
+            (_, _) if house && displayed_scene != colour_field::SCENE => "House",
             ("PulseTunnel", TunnelVariant::Hallway) => "PulseTunnel-Hallway",
             ("PulseTunnel", TunnelVariant::Abstract) => "PulseTunnel-Abstract",
+            ("PulseTunnel", TunnelVariant::SurfaceHallway) => "PulseTunnel-SurfaceHallway",
             _ => entry.name(),
         };
-        let camera =
-            if entry.name() == "PulseTunnel" && options.tunnel_variant != TunnelVariant::Original {
-                CameraMode::ScreenSpace
-            } else {
-                entry.camera()
-            };
+        let camera = if name == "House"
+            || (entry.name() == "PulseTunnel" && options.tunnel_variant != TunnelVariant::Original)
+        {
+            CameraMode::ScreenSpace
+        } else {
+            entry.camera()
+        };
         let file = format!("frame{index:06}-{name}.png");
         write_png(&mut outputs, &args.out.join(&file), width, height, &rgb)?;
         println!("wrote {}", args.out.join(&file).display());
@@ -778,7 +795,7 @@ fn run_internal(
             || "null".to_string(),
             |config| config.epoch_at(elapsed(index) as f32).to_string(),
         );
-        captures.push(manifest_capture_entry(ManifestCaptureEntry {
+        let capture_entry = ManifestCaptureEntry {
             file: &file,
             frame_index: index,
             elapsed: elapsed(index),
@@ -787,7 +804,12 @@ fn run_internal(
             displayed_scene,
             scene_name: name,
             camera,
-        }));
+        };
+        captures.push(if name == "House" {
+            manifest_house_entry(capture_entry)
+        } else {
+            manifest_capture_entry(capture_entry)
+        });
     }
 
     let input = match &args.input {
@@ -796,8 +818,15 @@ fn run_internal(
         Input::File(path) => path.display().to_string(),
     };
     let (starfield_epoch, starfield_advances) = starfield_metadata(starfield.as_ref());
+    let local_mode = if house {
+        "  \"local_mode\": \"house\",\n"
+    } else if options.tunnel_variant == TunnelVariant::SurfaceHallway {
+        "  \"tunnel_variant\": \"surface-hallway\",\n"
+    } else {
+        ""
+    };
     let manifest = format!(
-        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"starfield_epoch_unix_seconds\": {starfield_epoch},\n  \"starfield_epoch_advances_with_elapsed\": {starfield_advances},\n  \"captures\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"profile\": {},\n  \"input\": {},\n{local_mode}  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"starfield_epoch_unix_seconds\": {starfield_epoch},\n  \"starfield_epoch_advances_with_elapsed\": {starfield_advances},\n  \"captures\": [\n{}\n  ]\n}}\n",
         json_string(args.profile.name),
         json_string(&input),
         json_string(layers.name()),
@@ -842,6 +871,17 @@ fn manifest_capture_entry(entry: ManifestCaptureEntry<'_>) -> String {
             CameraMode::Orbit3D => "orbit3d",
             CameraMode::ScreenSpace => "screen_space",
         }),
+    )
+}
+
+fn manifest_house_entry(entry: ManifestCaptureEntry<'_>) -> String {
+    format!(
+        "    {{\"file\": {}, \"frame_index\": {}, \"elapsed\": {}, \"starfield_epoch_unix_seconds\": {}, \"scene\": {}, \"displayed_scene\": null, \"local_mode\": \"house\", \"scene_name\": \"House\", \"camera\": \"screen_space\"}}",
+        json_string(entry.file),
+        entry.frame_index,
+        entry.elapsed,
+        entry.starfield_epoch,
+        entry.requested_scene,
     )
 }
 
@@ -983,9 +1023,88 @@ fn json_string(text: &str) -> String {
     out
 }
 
+fn cli_house_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), String> {
+    let value_options = [
+        "--profile",
+        "--scene",
+        "--frames",
+        "--input",
+        "--size",
+        "--out",
+        "--mic-layers",
+        "--tunnel-variant",
+        "--catalog",
+        "--star-catalog",
+        "--location",
+        "--time",
+    ];
+    // A token in a value position is not a House flag, even if it is named
+    // `--house`. Preserve legacy literal paths unless a separate flag appears.
+    let mut args = tokens.iter();
+    let mut house = false;
+    while let Some(token) = args.next() {
+        if value_options.contains(&token.as_str()) {
+            let _ = args.next();
+        } else if token == "--house" {
+            house = true;
+        }
+    }
+    if !house {
+        return Ok((tokens, false));
+    }
+    for pair in tokens.windows(2) {
+        if value_options.contains(&pair[0].as_str())
+            && (matches!(pair[1].as_str(), "--house" | "--dmg-preview") || is_cli_option(&pair[1]))
+        {
+            return Err(format!(
+                "{} requires a value; {} is an option",
+                pair[0], pair[1]
+            ));
+        }
+    }
+    if let Some(flag) = tokens.last()
+        && value_options.contains(&flag.as_str())
+    {
+        return Err(format!("{flag} requires a value"));
+    }
+    if tokens.iter().any(|token| token == "--dmg-preview") {
+        return Err("--house is incompatible with --dmg-preview".into());
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "--scene"
+                | "--tunnel-variant"
+                | "--starfield"
+                | "--catalog"
+                | "--star-catalog"
+                | "--location"
+                | "--time"
+                | "--follow-time"
+                | "--catalog-v1"
+        )
+    }) {
+        return Err("--house is incompatible with --scene, --tunnel-variant, Starfield options and --catalog-v1".into());
+    }
+    Ok((
+        tokens
+            .into_iter()
+            .filter(|token| token != "--house")
+            .collect(),
+        true,
+    ))
+}
+
 pub fn main() -> ExitCode {
     let tokens: Vec<String> = std::env::args().skip(1).collect();
     let (tokens, catalog) = match catalog_capture::cli_tokens(tokens) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("chipviz-capture: {error}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let (tokens, house) = match cli_house_tokens(tokens) {
         Ok(result) => result,
         Err(error) => {
             eprintln!("chipviz-capture: {error}\n\n{USAGE}");
@@ -1007,6 +1126,7 @@ pub fn main() -> ExitCode {
                     &options.starfield,
                     options.starfield_enabled,
                     exclusive,
+                    house,
                 )
             };
             match result {
@@ -1643,12 +1763,14 @@ mod tests {
             ("original", TunnelVariant::Original),
             ("hallway", TunnelVariant::Hallway),
             ("abstract", TunnelVariant::Abstract),
+            ("surface-hallway", TunnelVariant::SurfaceHallway),
         ] {
             let args = ["--out", "o", "--tunnel-variant", text].map(str::to_string);
             match parse_args_with_options(args).unwrap() {
                 ConfiguredCommand::Capture(_, options) => {
                     assert_eq!(options.tunnel_variant, expected)
                 }
+
                 ConfiguredCommand::Help => panic!("unexpected help"),
             }
         }
@@ -1663,6 +1785,345 @@ mod tests {
                 .is_err()
         );
         assert!(parse(&["--out", "o", "--tunnel-variant", "hallway"]).is_err());
+    }
+
+    #[test]
+    fn cli_house_is_explicit_and_conflicts_are_rejected() {
+        let tokens = ["--out", "shots", "--house"].map(str::to_string).to_vec();
+        let (tokens, house) = cli_house_tokens(tokens).unwrap();
+        assert!(house);
+        assert!(matches!(
+            parse_starfield_args(tokens, true),
+            Ok((StarfieldConfiguredCommand::Capture(..), _))
+        ));
+        assert!(parse_args(["--out", "shots", "--house"].map(str::to_string)).is_err());
+        assert!(
+            parse_args_with_options(["--out", "shots", "--house"].map(str::to_string)).is_err()
+        );
+        for conflict in [
+            &["--scene", "2"][..],
+            &["--tunnel-variant", "original"][..],
+            &["--starfield"][..],
+            &["--catalog-v1"][..],
+            &["--catalog", "stars.csv"][..],
+            &["--location", "0,0"][..],
+            &["--time", "0"][..],
+            &["--follow-time"][..],
+            &["--dmg-preview"][..],
+        ] {
+            for house_first in [true, false] {
+                let mut tokens = vec!["--out", "shots"];
+                if house_first {
+                    tokens.push("--house");
+                }
+                tokens.extend_from_slice(conflict);
+                if !house_first {
+                    tokens.push("--house");
+                }
+                assert!(
+                    cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integration_selectors_capture_house_rejects_preview_and_missing_values() {
+        for args in [
+            vec!["--out", "shots", "--house", "--dmg-preview"],
+            vec!["--out", "shots", "--dmg-preview", "--house"],
+        ] {
+            let error =
+                cli_house_tokens(args.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(error.contains("incompatible with --dmg-preview"), "{error}");
+        }
+        for flag in [
+            "--profile",
+            "--scene",
+            "--frames",
+            "--input",
+            "--size",
+            "--out",
+            "--mic-layers",
+            "--tunnel-variant",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+        ] {
+            for option in [
+                "--help",
+                "-h",
+                "--profile",
+                "--scene",
+                "--frames",
+                "--input",
+                "--size",
+                "--out",
+                "--mic-layers",
+                "--lines-drop-cuts",
+                "--exclusive-output",
+                "--catalog-v1",
+                "--tunnel-variant",
+                "--catalog",
+                "--star-catalog",
+                "--location",
+                "--time",
+                "--follow-time",
+                "--starfield",
+                "--house",
+                "--dmg-preview",
+            ] {
+                for args in [vec!["--house", flag, option], vec![flag, option, "--house"]] {
+                    let error = cli_house_tokens(args.into_iter().map(str::to_string).collect())
+                        .unwrap_err();
+                    assert!(
+                        error.contains(&format!("{flag} requires a value; {option} is an option")),
+                        "{error}"
+                    );
+                }
+            }
+            let error =
+                cli_house_tokens(["--house", flag].map(str::to_string).to_vec()).unwrap_err();
+            assert!(
+                error.contains(&format!("{flag} requires a value")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_dmg_preview_paths_preserve_exclusive_cli_preprocessing() {
+        for tokens in [
+            vec!["--exclusive-output", "--out", "--dmg-preview"],
+            vec!["--out", "--dmg-preview", "--exclusive-output"],
+            vec![
+                "--exclusive-output",
+                "--out",
+                "--dmg-preview",
+                "--input",
+                "--dmg-preview",
+                "--star-catalog",
+                "--dmg-preview",
+                "--location",
+                "0,0",
+            ],
+        ] {
+            let original: Vec<String> = tokens.into_iter().map(str::to_string).collect();
+            let (tokens, house) = cli_house_tokens(original.clone()).unwrap();
+            assert!(!house);
+            assert_eq!(tokens, original);
+            let (StarfieldConfiguredCommand::Capture(args, options), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert!(exclusive);
+            assert_eq!(args.out, PathBuf::from("--dmg-preview"));
+            if original.iter().any(|token| token == "--input") {
+                assert_eq!(args.input, Input::File("--dmg-preview".into()));
+                assert_eq!(options.starfield.catalog_path, Some("--dmg-preview".into()));
+            }
+        }
+    }
+
+    #[test]
+    fn literal_house_paths_preserve_public_parser_and_cli_contract() {
+        let tokens = ["--out", "--house"].map(str::to_string);
+        let Command::Capture(legacy) = parse_args(tokens.clone()).unwrap() else {
+            panic!("unexpected help");
+        };
+        let ConfiguredCommand::Capture(configured, _) =
+            parse_args_with_options(tokens.clone()).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        let StarfieldConfiguredCommand::Capture(starfield, _) =
+            parse_args_with_starfield_options(tokens).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        for args in [legacy, configured, starfield] {
+            assert_eq!(args.out, PathBuf::from("--house"));
+        }
+
+        let tokens = ["--out", "shots", "--input", "--house"].map(str::to_string);
+        let Command::Capture(legacy) = parse_args(tokens.clone()).unwrap() else {
+            panic!("unexpected help");
+        };
+        let ConfiguredCommand::Capture(configured, _) =
+            parse_args_with_options(tokens.clone()).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        let StarfieldConfiguredCommand::Capture(starfield, _) =
+            parse_args_with_starfield_options(tokens).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        for args in [legacy, configured, starfield] {
+            assert_eq!(args.input, Input::File(PathBuf::from("--house")));
+        }
+
+        let StarfieldConfiguredCommand::Capture(_, options) = parse_args_with_starfield_options(
+            [
+                "--out",
+                "shots",
+                "--star-catalog",
+                "--house",
+                "--location",
+                "0,0",
+            ]
+            .map(str::to_string),
+        )
+        .unwrap() else {
+            panic!("unexpected help");
+        };
+        assert_eq!(
+            options.starfield.catalog_path,
+            Some(PathBuf::from("--house"))
+        );
+
+        for tokens in [
+            vec!["--out", "--house"],
+            vec!["--out", "--house", "--help"],
+            vec!["--out", "shots", "--input", "--house", "--help"],
+            vec!["--out", "shots", "--star-catalog", "--house", "--help"],
+        ] {
+            let tokens: Vec<String> = tokens.into_iter().map(str::to_string).collect();
+            let (processed, house) = cli_house_tokens(tokens.clone()).unwrap();
+            assert!(!house);
+            assert_eq!(processed, tokens);
+        }
+        let (tokens, house) =
+            cli_house_tokens(["--out", "--house"].map(str::to_string).to_vec()).unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, _), _) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.out, PathBuf::from("--house"));
+        let (tokens, house) = cli_house_tokens(
+            ["--out", "shots", "--input", "--house"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, _), _) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.input, Input::File(PathBuf::from("--house")));
+        for tokens in [
+            vec!["--exclusive-output", "--out", "--house"],
+            vec!["--out", "--house", "--exclusive-output"],
+        ] {
+            let (tokens, house) =
+                cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(!house);
+            let (StarfieldConfiguredCommand::Capture(args, _), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert!(exclusive);
+            assert_eq!(args.out, PathBuf::from("--house"));
+        }
+        let tokens = [
+            "--exclusive-output",
+            "--out",
+            "--house",
+            "--input",
+            "--house",
+            "--star-catalog",
+            "--house",
+            "--location",
+            "0,0",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let (tokens, house) = cli_house_tokens(tokens).unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, options), exclusive) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert!(exclusive);
+        assert_eq!(args.out, PathBuf::from("--house"));
+        assert_eq!(args.input, Input::File("--house".into()));
+        assert_eq!(options.starfield.catalog_path, Some("--house".into()));
+        for tokens in [
+            vec!["--out", "--house", "--house"],
+            vec!["--house", "--out", "--house"],
+            vec!["--input", "--house", "--out", "shots", "--house"],
+        ] {
+            let error =
+                cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(
+                error.contains("requires a value; --house is an option"),
+                "{error}"
+            );
+        }
+        for tokens in [
+            vec!["--house", "--out", "./--house"],
+            vec!["--out", "./--house", "--house"],
+        ] {
+            let (tokens, house) =
+                cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(house);
+            let (StarfieldConfiguredCommand::Capture(args, _), _) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert_eq!(args.out, PathBuf::from("./--house"));
+        }
+        let tokens = ["--out", "shots", "--house", "--scene", "2"].map(str::to_string);
+        assert!(
+            cli_house_tokens(tokens.to_vec())
+                .unwrap_err()
+                .contains("incompatible")
+        );
+        let tokens = ["--out", "shots", "--house", "--catalog-v1"].map(str::to_string);
+        assert!(
+            catalog_capture::cli_tokens(tokens.to_vec())
+                .unwrap_err()
+                .contains("incompatible")
+        );
+        let (tokens, house) =
+            cli_house_tokens(["--out", "./--house"].map(str::to_string).to_vec()).unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, _), _) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.out, PathBuf::from("./--house"));
+    }
+
+    #[test]
+    fn house_manifest_never_claims_a_catalog_scene() {
+        let entry = manifest_house_entry(ManifestCaptureEntry {
+            file: "house.png",
+            frame_index: 0,
+            elapsed: 0.0,
+            starfield_epoch: "null".into(),
+            requested_scene: 14,
+            displayed_scene: 2,
+            scene_name: "House",
+            camera: CameraMode::ScreenSpace,
+        });
+        assert!(entry.contains("\"scene\": 14, \"displayed_scene\": null"));
+        assert!(entry.contains("\"local_mode\": \"house\""));
+        assert_eq!(scenes::dispatch_configured(14, false).name(), "PulseTunnel");
+        assert_eq!(
+            scenes::dispatch_configured(7, false).name(),
+            colour_field::NAME
+        );
     }
 
     #[test]
@@ -2378,6 +2839,210 @@ mod tests {
             }
         };
         0.2126 * decode(pixel[0]) + 0.7152 * decode(pixel[1]) + 0.0722 * decode(pixel[2])
+    }
+
+    fn projected_test_frame(index: u64, level: u8) -> ControlFrame {
+        ControlFrame {
+            scene: 2,
+            palette: 1,
+            energy: level,
+            bass: level,
+            treble: level,
+            ..ControlFrame::procedural(index)
+        }
+    }
+
+    fn configure_projected_test(renderer: &mut OffscreenRenderer, house: bool) {
+        renderer.pipeline_mut().configure_scenes(SceneConfig {
+            tunnel_variant: if house {
+                TunnelVariant::Original
+            } else {
+                TunnelVariant::SurfaceHallway
+            },
+            ..SceneConfig::default()
+        });
+        renderer.pipeline_mut().enable_local_house(house);
+    }
+
+    fn projected_test_still(renderer: &mut OffscreenRenderer, index: u64, level: u8) -> Vec<u8> {
+        let size = renderer.size();
+        renderer.pipeline_mut().reset_state();
+        for previous in 0..index {
+            renderer.pipeline_mut().advance_state(
+                projected_test_frame(previous, level),
+                elapsed(previous),
+                size,
+            );
+        }
+        renderer
+            .render(projected_test_frame(index, level), elapsed(index))
+            .unwrap()
+    }
+
+    /// Runs each still from frame zero, as capture does. The luminance bounds
+    /// are regression evidence, not a photosensitivity assessment.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn projected_modes_offscreen_stills_are_bounded_and_repeatable() {
+        const HOUSE: [(&str, u64); 6] = [
+            ("forward", 3),
+            ("left", 11),
+            ("right", 19),
+            ("back", 27),
+            ("up", 35),
+            ("down", 43),
+        ];
+        const HALLWAY: [(&str, u64); 6] = [
+            ("near", 1),
+            ("early", 3),
+            ("middle", 7),
+            ("later", 11),
+            ("farther", 19),
+            ("long", 27),
+        ];
+        let (width, height) = (320, 180);
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for house in [false, true] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                configure_projected_test(&mut renderer, house);
+                for level in [0, 255] {
+                    for (cue, seconds) in if house { HOUSE } else { HALLWAY } {
+                        let index = seconds * CAPTURE_FPS as u64;
+                        let rgb = projected_test_still(&mut renderer, index, level);
+                        let repeated = projected_test_still(&mut renderer, index, level);
+                        let context = format!("{} house={house} level={level} {cue}", profile.name);
+                        assert_eq!(rgb, repeated, "{context}: replay differs");
+                        assert_eq!(rgb.len(), (width * height * 3) as usize, "{context}");
+                        assert!(rgb.iter().any(|&value| value > 16), "{context}: blank");
+                        assert!(
+                            rgb.iter().any(|&value| value < 16),
+                            "{context}: no dark pixels"
+                        );
+                        let mean = rgb.chunks_exact(3).map(luminance_srgb).sum::<f32>()
+                            / (width * height) as f32;
+                        assert!(mean < 0.5, "{context}: mean luminance {mean}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same whole-frame luminance convention as the existing tunnel test;
+    /// sampled readback is supporting evidence, not safety certification.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn projected_modes_offscreen_bound_abrupt_input_luminance_changes() {
+        let (width, height) = (320, 180);
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            for house in [false, true] {
+                let mut renderer =
+                    pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height))
+                        .unwrap();
+                configure_projected_test(&mut renderer, house);
+                renderer.pipeline_mut().reset_state();
+                let mut previous: Option<Vec<f32>> = None;
+                let mut max_changed = 0.0_f32;
+                let mut max_mean_delta = 0.0_f32;
+                for index in 0..120_u64 {
+                    let high = index.is_multiple_of(2);
+                    let frame = ControlFrame {
+                        palette: if high { 0 } else { 2 },
+                        ..projected_test_frame(index, if high { 255 } else { 0 })
+                    };
+                    let rgb = renderer.render(frame, elapsed(index)).unwrap();
+                    let current: Vec<_> = rgb.chunks_exact(3).map(luminance_srgb).collect();
+                    if let Some(before) = &previous {
+                        let count = current.len() as f32;
+                        let changed = before
+                            .iter()
+                            .zip(&current)
+                            .filter(|(a, b)| (*a - *b).abs() >= 0.1)
+                            .count() as f32
+                            / count;
+                        let mean_delta = (before.iter().sum::<f32>() - current.iter().sum::<f32>())
+                            .abs()
+                            / count;
+                        max_changed = max_changed.max(changed);
+                        max_mean_delta = max_mean_delta.max(mean_delta);
+                    }
+                    previous = Some(current);
+                }
+                println!(
+                    "{} house={house}: max changed={max_changed:.4}, max mean delta={max_mean_delta:.4}",
+                    profile.name
+                );
+                assert!(max_changed < 0.12);
+                assert!(max_mean_delta < 0.08);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn house_offscreen_preserves_colour_field_gate() {
+        let (width, height) = (160, 90);
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let mut house =
+                pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height)).unwrap();
+            let mut baseline =
+                pollster::block_on(OffscreenRenderer::new(profile.clone(), width, height)).unwrap();
+            configure_projected_test(&mut house, true);
+            let mut field_frames = 0;
+            let mut returned_native = false;
+            for index in 0..240_u64 {
+                let scene = if (30..150).contains(&index) {
+                    colour_field::SCENE
+                } else {
+                    2
+                };
+                let frame = ControlFrame {
+                    scene,
+                    ..projected_test_frame(index, 128)
+                };
+                if index.is_multiple_of(5) {
+                    let actual = house.render(frame, elapsed(index)).unwrap();
+                    let expected = baseline.render(frame, elapsed(index)).unwrap();
+                    let displayed = house.pipeline_mut().committed_displayed_scene();
+                    assert_eq!(
+                        displayed,
+                        baseline.pipeline_mut().committed_displayed_scene()
+                    );
+                    if displayed == colour_field::SCENE {
+                        assert_eq!(actual, expected, "{} frame {index}", profile.name);
+                        field_frames += 1;
+                    }
+                } else {
+                    house
+                        .pipeline_mut()
+                        .advance_state(frame, elapsed(index), (width, height));
+                    baseline
+                        .pipeline_mut()
+                        .advance_state(frame, elapsed(index), (width, height));
+                    assert_eq!(
+                        house.pipeline_mut().committed_displayed_scene(),
+                        baseline.pipeline_mut().committed_displayed_scene()
+                    );
+                }
+                let displayed = house.pipeline_mut().committed_displayed_scene();
+                if (30..59).contains(&index) {
+                    assert_ne!(displayed, colour_field::SCENE, "premature entry at {index}");
+                }
+                if (150..179).contains(&index) {
+                    assert_eq!(displayed, colour_field::SCENE, "premature exit at {index}");
+                }
+                if index >= 150 && displayed != colour_field::SCENE {
+                    returned_native = true;
+                }
+            }
+            assert!(
+                field_frames > 0,
+                "{} never entered ColourField",
+                profile.name
+            );
+            assert!(returned_native, "{} never returned to native", profile.name);
+        }
     }
 
     #[test]

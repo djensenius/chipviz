@@ -22,6 +22,7 @@ pub(super) fn cli_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), Str
         if matches!(
             token.as_str(),
             "--scene"
+                | "--house"
                 | "--tunnel-variant"
                 | "--starfield"
                 | "--catalog"
@@ -650,6 +651,7 @@ mod tests {
     fn catalog_cli_conflicts_and_option_values_in_both_orders() {
         for conflict in [
             "--scene",
+            "--house",
             "--tunnel-variant",
             "--starfield",
             "--catalog",
@@ -692,6 +694,113 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn catalog_cli_preserves_literal_house_paths_but_rejects_a_standalone_flag() {
+        for (tokens, expected_out, expected_input, expected_exclusive) in [
+            (
+                vec!["--catalog-v1", "--input", "recording", "--out", "--house"],
+                "--house",
+                "recording",
+                false,
+            ),
+            (
+                vec!["--catalog-v1", "--out", "shots", "--input", "--house"],
+                "shots",
+                "--house",
+                false,
+            ),
+            (
+                vec![
+                    "--catalog-v1",
+                    "--exclusive-output",
+                    "--out",
+                    "--house",
+                    "--input",
+                    "--house",
+                ],
+                "--house",
+                "--house",
+                true,
+            ),
+        ] {
+            let (tokens, catalog) =
+                cli_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(catalog);
+            let (tokens, house) = cli_house_tokens(tokens).unwrap();
+            assert!(!house);
+            let (StarfieldConfiguredCommand::Capture(args, _), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert_eq!(args.out, PathBuf::from(expected_out));
+            assert_eq!(args.input, Input::File(expected_input.into()));
+            assert_eq!(exclusive, expected_exclusive);
+        }
+        for tokens in [
+            vec!["--catalog-v1", "--input", "recording", "--house"],
+            vec!["--house", "--catalog-v1", "--input", "recording"],
+            vec!["--catalog-v1", "--input", "--house", "--house"],
+        ] {
+            let error = cli_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(
+                error.contains("--house is incompatible with --catalog-v1"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_cli_preserves_literal_dmg_preview_paths() {
+        for (tokens, expected_out, expected_input, expected_exclusive) in [
+            (
+                vec![
+                    "--catalog-v1",
+                    "--input",
+                    "recording",
+                    "--out",
+                    "--dmg-preview",
+                ],
+                "--dmg-preview",
+                "recording",
+                false,
+            ),
+            (
+                vec!["--catalog-v1", "--out", "shots", "--input", "--dmg-preview"],
+                "shots",
+                "--dmg-preview",
+                false,
+            ),
+            (
+                vec![
+                    "--catalog-v1",
+                    "--exclusive-output",
+                    "--out",
+                    "--dmg-preview",
+                    "--input",
+                    "--dmg-preview",
+                ],
+                "--dmg-preview",
+                "--dmg-preview",
+                true,
+            ),
+        ] {
+            let (tokens, catalog) =
+                cli_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(catalog);
+            let (tokens, house) = cli_house_tokens(tokens).unwrap();
+            assert!(!house);
+            let (StarfieldConfiguredCommand::Capture(args, _), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert_eq!(args.out, PathBuf::from(expected_out));
+            assert_eq!(args.input, Input::File(expected_input.into()));
+            assert_eq!(exclusive, expected_exclusive);
+        }
     }
 
     #[test]
