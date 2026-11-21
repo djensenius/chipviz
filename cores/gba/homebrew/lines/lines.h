@@ -33,7 +33,9 @@ typedef struct {
 
 void lines_init(lines_state_t *state);
 /* First sample establishes held keys; duplicate or delta > 8 samples do
- * nothing and return 0. Unsigned subtraction permits a counter wrap. */
+ * nothing and return 0. Unsigned subtraction permits a counter wrap. For an
+ * accepted gap, the newly sampled L level applies to every elapsed step and
+ * an A rising edge to the final step; unsampled edges cannot be recovered. */
 int lines_observe(lines_state_t *state, uint32_t step, uint16_t keys);
 void lines_snapshot(const lines_state_t *state, lines_snapshot_t *snapshot);
 /* Restart discards partial progress; cancel never touches the destination. */

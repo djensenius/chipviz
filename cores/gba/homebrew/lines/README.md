@@ -15,7 +15,10 @@ time or music synchronization.
 The caller supplies an unsigned step counter. The first sample records held
 keys; duplicate samples and gaps greater than eight steps are rejected without
 changing state. Counter wrap is supported. Reinitializing after a rejected gap
-resets the phrase and fold; unsampled edges cannot be recovered.
+resets the phrase and fold. For an accepted gap, the newly sampled L level
+applies to every elapsed step; an A rising edge applies to the final step.
+Unsampled edges cannot be recovered. The visual phase wraps every 48 steps,
+the period of the cross-line pattern.
 
 A snapshot freezes state and all 256 staged palette entries. Rendering writes
 at most 240 packed halfwords per batch into a caller-owned, explicitly sized

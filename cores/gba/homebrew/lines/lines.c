@@ -6,6 +6,7 @@
 #define MIN_SECTION_STEPS 192u
 #define FALLBACK_STEPS 512u
 #define FOLD_MAX 64u
+#define PHASE_PERIOD 48u
 
 void lines_init(lines_state_t *state) {
   memset(state, 0, sizeof(*state));
@@ -28,6 +29,9 @@ int lines_observe(lines_state_t *state, uint32_t step, uint16_t keys) {
   for (i = 0; i < delta; ++i) {
     uint8_t phrase = 0;
     ++state->phase;
+    if (state->phase == PHASE_PERIOD) {
+      state->phase = 0;
+    }
     if (state->section_age < MIN_SECTION_STEPS) {
       ++state->section_age;
     }

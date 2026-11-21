@@ -123,6 +123,28 @@ static void samples(void) {
   check(a.energy == 17, "L energy rises gently");
   lines_observe(&a, 2, 0);
   check(a.energy == 16, "released energy returns gently");
+
+  lines_init(&a);
+  lines_init(&b);
+  lines_observe(&a, 0, 0);
+  lines_observe(&b, 0, 0);
+  check(lines_observe(&a, 4, LINES_KEY_A | LINES_KEY_B | LINES_KEY_L),
+        "multi-step L and A sample accepted");
+  for (i = 1; i <= 4; ++i) {
+    lines_observe(&b, i, LINES_KEY_L | (i == 4 ? LINES_KEY_A | LINES_KEY_B : 0));
+  }
+  check(memcmp(&a, &b, sizeof(a)) == 0 && a.energy == 20 &&
+        a.phrase_beats == 1 && a.beat_age == 0,
+        "new L applies across the gap and A+B edge on the final step");
+  b = a;
+  check(lines_observe(&a, 8, LINES_KEY_A | LINES_KEY_B),
+        "multi-step L release accepted");
+  for (i = 5; i <= 8; ++i) {
+    lines_observe(&b, i, LINES_KEY_A | LINES_KEY_B);
+  }
+  check(memcmp(&a, &b, sizeof(a)) == 0 && a.energy == 16 &&
+        a.phrase_beats == 1 && a.beat_age == 4,
+        "released L applies across the gap without a held A repeat");
 }
 
 static void regular_phrases(unsigned rate) {
@@ -170,6 +192,41 @@ static void rapid_phrases(void) {
     }
   }
   check(switches >= 2, "rapid input eventually changes sections");
+}
+
+static void phase_wrap(void) {
+  lines_state_t state;
+  lines_snapshot_t before, after, old_phase;
+  lines_render_t render;
+  uint32_t i;
+  int accepted;
+  lines_init(&state);
+  accepted = lines_observe(&state, 0, 0);
+  for (i = 1; i <= 65520u; ++i) {
+    accepted &= lines_observe(&state, i, 0);
+  }
+  lines_snapshot(&state, &before);
+  before.fold = 32;
+  old_phase = before;
+  old_phase.phase = 65520u;
+  for (; i <= 65568u; ++i) {
+    accepted &= lines_observe(&state, i, 0);
+  }
+  lines_snapshot(&state, &after);
+  after.fold = 32;
+  check(accepted, "long-running phase samples accepted");
+  check(memcmp(before.palette, after.palette, sizeof(before.palette)) == 0,
+        "phase comparison uses the same palette");
+  lines_render_begin(&render, &before);
+  check(finish(&render, plane, LINES_BATCH_HALFWORDS) == 1, "pre-wrap phase page completed");
+  lines_render_begin(&render, &old_phase);
+  check(finish(&render, reference, LINES_BATCH_HALFWORDS) == 1, "legacy phase page completed");
+  check(memcmp(plane, reference, sizeof(plane)) == 0,
+        "pre-wrap phase preserves legacy pixels");
+  lines_render_begin(&render, &after);
+  check(finish(&render, expected, LINES_BATCH_HALFWORDS) == 1, "post-wrap phase page completed");
+  check(memcmp(plane, expected, sizeof(plane)) == 0,
+        "pages 48 steps apart match across the former 16-bit phase wrap");
 }
 
 static void rendering(void) {
@@ -245,6 +302,7 @@ int main(void) {
   regular_phrases(120);
   regular_phrases(126);
   rapid_phrases();
+  phase_wrap();
   rendering();
   printf("gba lines tests: %u checks, %u failures\n", checks, failures);
   return failures ? 1 : 0;
