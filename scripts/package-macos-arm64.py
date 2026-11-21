@@ -247,7 +247,8 @@ def prepare_output_directory(path: pathlib.Path, *, root: pathlib.Path = ROOT) -
   return path
 
 
-def check_cargo_home(path: pathlib.Path, *, account_home: pathlib.Path | None = None) -> None:
+def check_cargo_home(path: pathlib.Path, *, account_home: pathlib.Path | None = None,
+                     root: pathlib.Path = ROOT) -> None:
   """Fail closed on unsafe Cargo cache routing; this does not sandbox Cargo."""
   if account_home is None:
     account_home = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir)
@@ -261,12 +262,42 @@ def check_cargo_home(path: pathlib.Path, *, account_home: pathlib.Path | None = 
     def safe(info: os.stat_result) -> bool:
       return info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o022
 
-      home_fd = open_directory(path.parent)
+    def contains(ancestor_fd: int, descendant_fd: int) -> bool:
+      ancestor = os.fstat(ancestor_fd)
+      current_fd = os.dup(descendant_fd)
       try:
-        if not safe(os.fstat(home_fd)):
-          raise PackageError("account home must be user-owned and not group/world-writable")
+        for _ in range(256):
+          current = os.fstat(current_fd)
+          if (current.st_dev, current.st_ino) == (ancestor.st_dev, ancestor.st_ino):
+            return True
+          parent_fd = os.open("..", DIRECTORY_FLAGS, dir_fd=current_fd)
+          try:
+            parent = os.fstat(parent_fd)
+          except BaseException:
+            os.close(parent_fd)
+            raise
+          if (current.st_dev, current.st_ino) == (parent.st_dev, parent.st_ino):
+            os.close(parent_fd)
+            return False
+          os.close(current_fd)
+          current_fd = parent_fd
+        raise PackageError("directory ancestry is too deep")
       finally:
-        os.close(home_fd)
+        os.close(current_fd)
+
+    root_fd = open_directory(absolute_path(root))
+    try:
+      if contains(fd, root_fd) or contains(root_fd, fd):
+        raise PackageError("Cargo home and checkout must not overlap")
+    finally:
+      os.close(root_fd)
+
+    home_fd = open_directory(path.parent)
+    try:
+      if not safe(os.fstat(home_fd)):
+        raise PackageError("account home must be user-owned and not group/world-writable")
+    finally:
+      os.close(home_fd)
 
     def scan(directory_fd: int, depth: int) -> None:
       if depth > 64:

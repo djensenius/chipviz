@@ -331,7 +331,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     snippet = snippet.split("```sh\n", 1)[1].split("\n```", 1)[0]
     tools = self.root / "fake-tools"
     tools.mkdir()
-    account_home = self.root / "account-home"
+    account_home = self.root.parent / "account-home"
     account_home.mkdir(mode=0o700)
     cargo_home = account_home / ".cargo"
     for name in ("index", "cache", "src"):
@@ -450,7 +450,7 @@ print(path)
     saved.rename(cargo_home)
 
   def test_cargo_home_rejects_wrong_paths_links_and_unpopulated_cache(self) -> None:
-    home = self.root / "account-home"
+    home = self.root.parent / "account-home"
     home.mkdir(mode=0o700)
     cargo_home = home / ".cargo"
     for name in ("index", "cache", "src"):
@@ -458,6 +458,12 @@ print(path)
       directory.mkdir(parents=True)
       (directory / "prepopulated").write_bytes(b"fixture")
     PACKAGE.check_cargo_home(cargo_home, account_home=home)
+    for mode in (0o720, 0o702):
+      with self.subTest(account_home_mode=oct(mode)):
+        home.chmod(mode)
+        with self.assertRaisesRegex(PACKAGE.PackageError, "account home must be"):
+          PACKAGE.check_cargo_home(cargo_home, account_home=home)
+    home.chmod(0o700)
     for path in (self.dist.parent, self.personal.parent, home / ".." / ".cargo"):
       with self.subTest(path=path):
         with self.assertRaises(PACKAGE.PackageError):
@@ -493,6 +499,63 @@ print(path)
       PACKAGE.check_cargo_home(cargo_home, account_home=home)
     self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
     self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
+
+  def test_documented_build_rejects_cargo_home_checkout_overlap(self) -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    snippet = readme.split("### Local Apple Silicon archive", 1)[1]
+    snippet = snippet.split("```sh\n", 1)[1].split("\n```", 1)[0]
+    tools = self.root.parent / "fake-overlap-tools"
+    tools.mkdir()
+    mise = tools / "mise"
+    mise.write_text(f"""#!{sys.executable}
+import os, pwd, runpy, sys, types
+args = sys.argv[1:]
+if args[:3] != ["exec", "--", "python"]:
+  print("unexpected build invocation", file=sys.stderr)
+  sys.exit(90)
+pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_dir=os.environ["HOME"])
+sys.argv = args[3:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+""", encoding="utf-8")
+    mise.chmod(0o755)
+    mktemp = tools / "mktemp"
+    mktemp.write_text("#!/bin/sh\nprintf 'unexpected mktemp invocation\\n' >&2\nexit 91\n",
+                      encoding="utf-8")
+    mktemp.chmod(0o755)
+
+    inner_home = self.root / "nested-account"
+    outer_home = self.root.parent / "outer-account"
+    inner_home.mkdir(mode=0o700)
+    outer_home.mkdir(mode=0o700)
+    for home in (inner_home, outer_home):
+      for name in ("index", "cache", "src"):
+        directory = home / ".cargo/registry" / name
+        directory.mkdir(parents=True)
+        (directory / "prepopulated").write_bytes(b"fixture")
+    nested_checkout = outer_home / ".cargo/checkout"
+    (nested_checkout / "scripts").mkdir(parents=True)
+    shutil.copyfile(SCRIPT, nested_checkout / "scripts" / SCRIPT.name)
+
+    for checkout, home in ((self.root, inner_home), (nested_checkout, outer_home)):
+      with self.subTest(checkout=checkout, home=home):
+        env = os.environ.copy()
+        env.update({"PATH": str(tools) + os.pathsep + env["PATH"], "HOME": str(home)})
+        result = subprocess.run(["sh", "-c", snippet], cwd=checkout, env=env,
+                                capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Cargo home and checkout must not overlap", result.stderr)
+        self.assertNotIn("unexpected build invocation", result.stderr)
+        self.assertNotIn("unexpected mktemp invocation", result.stderr)
+    self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+    self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
+
+    cargo_home = outer_home / ".cargo"
+    with self.assertRaisesRegex(PACKAGE.PackageError, "must not overlap"):
+      PACKAGE.check_cargo_home(cargo_home, account_home=outer_home, root=cargo_home)
+    alias = self.root.parent / "checkout-link"
+    alias.symlink_to(self.root, target_is_directory=True)
+    with self.assertRaises(OSError):
+      PACKAGE.check_cargo_home(cargo_home, account_home=outer_home, root=alias)
 
   def test_tmpdir_protected_directories_have_no_transient_writes_or_removals(self) -> None:
     original_open = os.open
