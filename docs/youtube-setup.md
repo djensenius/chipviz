@@ -12,12 +12,14 @@ set video privacy.
 2. Create an OAuth client ID of type **Desktop app**. Keep the client ID and
    client secret private. Do not copy them into chat, the repository, shell
    history, or command-line arguments.
-3. In your own Python environment, install the dependencies from
-   `scripts/requirements-youtube.txt`. Run from the repository root:
+3. In your own terminal, prepare a virtual environment and run the setup from
+   the repository root:
 
    ```sh
-   python3 scripts/youtube_auth.py configure
-   python3 scripts/youtube_auth.py authorize
+   python3 -m venv .venv
+   .venv/bin/python -m pip install -r scripts/requirements-youtube.txt
+   .venv/bin/python scripts/youtube_auth.py configure
+   .venv/bin/python scripts/youtube_auth.py authorize
    ```
 
    Paste the ID and secret only into the non-echoing local prompts. The second
