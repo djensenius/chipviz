@@ -23,6 +23,7 @@ const CONTEXT = [
   ])],
   ['variant', 'Variant', new Map([
     ['Hallway surface', 'Hallway surface'], ['House', 'House'], ['Original', 'Original'],
+    ['hallway', 'hallway'], ['abstract', 'abstract'], ['original', 'original'],
     ['spectral', 'spectral'], ['held', 'held'], ['hard-cuts', 'hard-cuts'],
   ])],
   ['scenario', 'Scenario', new Map([
@@ -74,6 +75,9 @@ export function reference(clip, seconds) {
     if (value && field === 'platform' && value === 'Pi 5 profile' &&
         clip.collection === 'draft' && clip.capture === DRAFT_PI_MAC) {
       value = 'Pi 5 profile on Mac GPU (not physical Pi hardware)';
+    }
+    if (field === 'variant' && value === 'hallway' && clip.family === 'Pulse Tunnel') {
+      value = 'hallway (Pulse Tunnel variant)';
     }
     if (value) context.push(`${label} (inferred): ${value}`);
   }

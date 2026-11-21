@@ -72,9 +72,25 @@ test('references describe all recognized draft combinations as inferred', () => 
   assert.doesNotMatch(otherCollection, /Review-only draft|password=secret/);
 });
 
+test('references distinguish supported Pulse Tunnel variants from draft Hallway surface', () => {
+  for (const [variant, label] of [['hallway', 'hallway (Pulse Tunnel variant)'],
+    ['abstract', 'abstract'], ['original', 'original']]) {
+    const text = reference({ ...clip(), collection: 'library', family: 'Pulse Tunnel', variant,
+      capture: 'Unknown capture', title: 'token=secret', notes: ['/private/path'] }, 3);
+    assert.ok(text.includes(`Variant (inferred): ${label}\n`));
+    assert.doesNotMatch(text, /Hallway surface|Review-only draft|not human-reviewed|token=secret|\/private/);
+  }
+  const draft = reference(clip(), 3);
+  assert.match(draft, /Variant \(inferred\): Hallway surface\n/);
+  assert.doesNotMatch(draft, /hallway \(Pulse Tunnel variant\)/);
+  const other = reference({ ...clip(), family: 'House', variant: 'hallway' }, 3);
+  assert.match(other, /Variant \(inferred\): hallway\n/);
+  assert.doesNotMatch(other, /Pulse Tunnel variant/);
+});
+
 test('arbitrary metadata never leaks through any optional reference field', () => {
   for (const field of ['title', 'family', 'platform', 'variant', 'scenario', 'capture']) {
-    for (const payload of ['Hallway\npassword=secret', '/Users/person/video.mp4',
+    for (const payload of ['Hallway\npassword=secret', 'hallway\npassword=secret', '/Users/person/video.mp4',
       'http://127.0.0.1:8000/capability/', 'token=secret', '__proto__']) {
       const text = reference({ ...clip(), [field]: payload, notes: [payload] }, 0);
       assert.equal(text.includes(payload), false, `${field}: ${payload}`);
@@ -140,9 +156,16 @@ test('filters, text-only rendering, embedded seeking and copy fallback', async (
   descendants(detail).find(item => item.textContent === 'Open local video').events.click();
   const video = descendants(detail).find(item => item.tagName === 'video');
   assert.equal(video.src, `http://127.0.0.1:8000/capability/media/${value.id}`);
+  input.value = '1:33';
+  descendants(detail).find(item => item.textContent === 'Open local video').events.click();
+  const secondVideo = descendants(detail).find(item => item.tagName === 'video');
+  assert.notEqual(secondVideo, video);
+  secondVideo.events.loadedmetadata();
+  assert.equal(secondVideo.currentTime, 93);
   video.events.loadedmetadata();
   assert.equal(video.currentTime, 65);
-  video.currentTime = 72.9;
+  assert.equal(secondVideo.currentTime, 93);
+  secondVideo.currentTime = 72.9;
   descendants(detail).find(item => item.textContent === 'Use current playback time').events.click();
   assert.equal(input.value, '72');
   await descendants(detail).find(item => item.textContent === 'Copy reference').events.click();

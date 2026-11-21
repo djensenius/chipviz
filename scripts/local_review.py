@@ -247,7 +247,7 @@ def entry(root_fd, relative, namespace, budget):
         code = names[1].lower()
         platform = PLATFORMS.get(code, names[1])
         family = FAMILIES.get(names[2].lower(), names[2])
-        variant = names[3] if len(names) >= 5 else ("Original" if family == "Pulse Tunnel" else "Unknown")
+        variant = names[3] if len(names) >= 5 else "Unknown"
     elif len(names) >= 3 and names[0].lower() == "retro":
         code = names[1].lower()
         platform = PLATFORMS.get(code, names[1])
@@ -256,14 +256,29 @@ def entry(root_fd, relative, namespace, budget):
             family = "Colour Field"
             if len(names) >= 5:
                 variant = names[3]
-        if len(names) == 3 and code == "gba":
-            family, variant = "Blockscape", title.split("-", 1)[0].lower()
+        if len(names) == 3:
+            stem = title.lower()
+            if re.match(r"^colour-field(?:[-_]|$)", stem):
+                family = "Colour Field"
+            elif code == "gba" and re.match(r"^blockscape(?:[-_]|$)", stem):
+                family = "Blockscape"
+                match_variant = re.match(r"^blockscape[-_](base|tunnel|stripes|stars)(?:[-_]|$)", stem)
+                if match_variant:
+                    variant = match_variant.group(1)
+            elif code == "n64" and re.match(r"^perspective-meters(?:[-_]|$)", stem):
+                family = "Perspective Meters"
+            elif code == "snes" and re.match(r"^tile-meters(?:[-_]|$)", stem):
+                family = "Tile Meters"
+        elif code == "gba" and family.lower() == "blockscape":
+            family = "Blockscape"
+        elif code == "n64" and family.lower() == "perspective-meters":
+            family = "Perspective Meters"
+        elif code == "snes" and family.lower() == "tile-meters":
+            family = "Tile Meters"
         if family.lower() == "native-demo":
             family = {"game-boy": "Tile Scroll", "nes": "Diamond Scroll"}.get(code, family)
         if family.lower() == "native-petscii" and code == "c64":
             family = "PETSCII Meter Field"
-        if code in ("n64", "snes"):
-            family = {"n64": "Perspective Meters", "snes": "Tile Meters"}[code]
         if code in ("genesis", "master-system", "sms") and "vdp-seed" in relative.lower():
             family = "Static diagnostic"
     if not match:

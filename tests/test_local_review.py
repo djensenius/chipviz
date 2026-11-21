@@ -182,6 +182,63 @@ class GalleryTests(unittest.TestCase):
         for clip in clips:
             self.assertEqual(clip["capture"], "Unknown capture")
 
+    def test_modern_variant_requires_an_explicit_directory(self):
+        cases = (
+            ("modern/m1/PulseTunnel/hallway-quiet.mp4", "Unknown"),
+            ("modern/m1/PulseTunnel/quiet.mp4", "Unknown"),
+            ("modern/m1/PulseTunnel/hallway/quiet.mp4", "hallway"),
+            ("modern/m1/PulseTunnel/abstract/quiet.mp4", "abstract"),
+            ("modern/m1/PulseTunnel/original/quiet.mp4", "original"),
+            ("modern/m1/PulseTunnel/Original/quiet.mp4", "Original"),
+            ("modern/m1/Lines/quiet.mp4", "Unknown"),
+        )
+        for relative, expected in cases:
+            with self.subTest(relative=relative):
+                self.write(self.root, relative, b"synthetic")
+                clip, _ = gallery.entry(self.fds[0], relative, "library", gallery.ScanBudget())
+                self.assertEqual(clip["variant"], expected)
+                self.assertEqual(clip["capture"], "Unknown capture")
+        self.draft_clip("hallway", "quiet", "pi5")
+        clip, _ = gallery.entry(self.fds[1], "stream-hallway-quiet-pi5/evaluation.mp4",
+                                "draft", gallery.ScanBudget())
+        self.assertEqual(clip["variant"], "Hallway surface")
+        self.assertIn("not physical Pi", clip["capture"])
+
+    def test_retro_families_require_identifying_paths(self):
+        cases = (
+            ("retro/gba/colour-field.mp4", "Colour Field", "Unknown"),
+            ("retro/gba/blockscape-tunnel-quiet.mp4", "Blockscape", "tunnel"),
+            ("retro/gba/blockscape.mp4", "Blockscape", "Unknown"),
+            ("retro/gba/blockscapeish.mp4", "Unknown", "Unknown"),
+            ("retro/gba/tunnel-quiet.mp4", "Unknown", "Unknown"),
+            ("retro/gba/unknown.mp4", "Unknown", "Unknown"),
+            ("retro/gba/blockscape/quiet.mp4", "Blockscape", "Unknown"),
+            ("retro/n64/colour-field.mp4", "Colour Field", "Unknown"),
+            ("retro/n64/colour-field/quiet.mp4", "Colour Field", "Unknown"),
+            ("retro/n64/perspective-meters-quiet.mp4", "Perspective Meters", "Unknown"),
+            ("retro/n64/perspective-meters/quiet.mp4", "Perspective Meters", "Unknown"),
+            ("retro/n64/perspective-metersish.mp4", "Unknown", "Unknown"),
+            ("retro/n64/scene-02.mp4", "Unknown", "Unknown"),
+            ("retro/n64/other/quiet.mp4", "other", "Unknown"),
+            ("retro/snes/colour-field.mp4", "Colour Field", "Unknown"),
+            ("retro/snes/colour-field/quiet.mp4", "Colour Field", "Unknown"),
+            ("retro/snes/colour-field/spectral/quiet.mp4", "Colour Field", "spectral"),
+            ("retro/snes/tile-meters-quiet.mp4", "Tile Meters", "Unknown"),
+            ("retro/snes/tile-meters/quiet.mp4", "Tile Meters", "Unknown"),
+            ("retro/snes/demo.mp4", "Unknown", "Unknown"),
+            ("retro/snes/other/quiet.mp4", "other", "Unknown"),
+            ("retro/game-boy/native-demo/quiet.mp4", "Tile Scroll", "Unknown"),
+            ("retro/nes/native-demo/quiet.mp4", "Diamond Scroll", "Unknown"),
+            ("retro/c64/native-petscii/quiet.mp4", "PETSCII Meter Field", "Unknown"),
+        )
+        for relative, family, variant in cases:
+            with self.subTest(relative=relative):
+                self.write(self.root, relative, b"synthetic")
+                clip, _ = gallery.entry(self.fds[0], relative, "library", gallery.ScanBudget())
+                self.assertEqual((clip["family"], clip["variant"]), (family, variant))
+                self.assertEqual(clip["capture"], "Unknown capture")
+                self.assertIsNone(clip["source_revision"])
+
     def test_scan_skips_irrelevant_unsafe_names_but_rejects_relevant_ones(self):
         self.write(self.root, "notes 100%.txt", b"notes")
         (self.root / "shortcut 100%").symlink_to(self.base, target_is_directory=True)

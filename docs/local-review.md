@@ -66,7 +66,8 @@ do-not-publish warning. Other free-form metadata is omitted. The stable identity
 incorporates the collection, relative name and video bytes; renames or changed
 bytes produce a new identity. A revision from a labelled library README or a draft
 `source_commit` is a declaration, not independent proof. Other labels are
-inferred from filenames; library capture sources remain unknown. Library lookup
+inferred from paths; a library family or variant without an identifying label
+remains unknown, as do library capture sources. Library lookup
 skips unrelated READMEs and searches ancestors; invalid or conflicting labelled
 revision declarations across the nearest directory's READMEs leave the revision
 unknown. A declaration must contain a single full SHA, optionally backticked
