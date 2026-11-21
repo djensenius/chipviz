@@ -137,6 +137,101 @@ class PortTraceTests(unittest.TestCase):
     self.assertTrue(any("cleanup interruption" in note for note in caught.exception.__notes__))
     self.assert_original_slots()
 
+  def test_context_entry_exception_restores_installed_hooks(self):
+    hook = self.open_trace()
+    try:
+      with mock.patch.object(hook, "_require_owner", side_effect=KeyboardInterrupt("entry interruption")):
+        with self.assertRaisesRegex(KeyboardInterrupt, "entry interruption"):
+          with hook:
+            self.fail("entry must not succeed")
+      self.assert_original_slots()
+      self.assertNotIn(hook, trace.retained_traces())
+      self.assertFalse(hook.active)
+    finally:
+      hook.retry_cleanup()
+
+  def test_context_entry_cleanup_interruption_is_retryable(self):
+    hook = self.open_trace()
+    owner_ref = weakref.ref(hook)
+    try:
+      with mock.patch.object(hook, "_require_owner", side_effect=KeyboardInterrupt("entry interruption")):
+        with mock.patch.object(hook, "_native_uninstall", side_effect=RuntimeError("cleanup interruption")):
+          with self.assertRaisesRegex(KeyboardInterrupt, "entry interruption") as caught:
+            with hook:
+              self.fail("entry must not succeed")
+      self.assertIs(caught.exception.trace_owner, hook)
+      self.assertTrue(any("cleanup interruption" in note for note in caught.exception.__notes__))
+      self.assertTrue(any("retry_cleanup" in note for note in caught.exception.__notes__))
+      self.assertIn(hook, trace.retained_traces())
+      core_ref = weakref.ref(hook.core)
+      shim_ref = weakref.ref(hook.shim)
+      del caught
+      hook = None
+      gc.collect()
+      hook = owner_ref()
+      self.assertIsNotNone(hook)
+      self.assertIs(hook.core, core_ref())
+      self.assertIs(hook.shim, shim_ref())
+      for action in (lambda: hook.begin_frame(0), hook.end_frame, hook.events, hook.close):
+        with self.assertRaisesRegex(RuntimeError, "not active"):
+          action()
+      with mock.patch.object(hook, "_native_uninstall", side_effect=RuntimeError("cleanup again")):
+        with self.assertRaisesRegex(RuntimeError, "not active") as repeated:
+          hook.__enter__()
+      self.assertIs(repeated.exception.trace_owner, hook)
+      self.assertIn(hook, trace.retained_traces())
+      hook.retry_cleanup()
+      self.assertNotIn(hook, trace.retained_traces())
+      self.assert_original_slots()
+      self.assert_failed_trace_unusable(hook)
+    finally:
+      owner = owner_ref()
+      if owner is not None:
+        owner.retry_cleanup()
+
+  def test_context_entry_does_not_uninstall_another_owner(self):
+    stale = self.open_trace()
+    self.assertEqual(stale.shim.sms_trace_uninstall(*stale._keys), 0)
+    try:
+      with self.open_trace() as existing:
+        with self.assertRaisesRegex(RuntimeError, "ownership mismatch"):
+          with stale:
+            self.fail("stale entry must not succeed")
+        existing.begin_frame(0)
+        self.core.fake_write(1, 2)
+        existing.end_frame()
+        self.assertEqual([(event.port, event.value) for event in existing.events()], [(1, 2)])
+        self.assertFalse(stale.active)
+        self.assertNotIn(stale, trace.retained_traces())
+    finally:
+      stale.retry_cleanup()
+
+  def test_context_entry_retry_leaves_another_owner_untouched(self):
+    stale = self.open_trace()
+    self.assertEqual(stale.shim.sms_trace_uninstall(*stale._keys), 0)
+    try:
+      with self.open_trace() as existing:
+        with mock.patch.object(stale.shim, "sms_trace_owned",
+                               side_effect=[KeyboardInterrupt("entry interruption"),
+                                            RuntimeError("cleanup interruption")]):
+          with self.assertRaisesRegex(KeyboardInterrupt, "entry interruption") as caught:
+            with stale:
+              self.fail("stale entry must not succeed")
+        self.assertIs(caught.exception.trace_owner, stale)
+        self.assertTrue(any("cleanup interruption" in note for note in caught.exception.__notes__))
+        self.assertFalse(stale.active)
+        self.assertIn(stale, trace.retained_traces())
+        with self.assertRaisesRegex(RuntimeError, "not active"):
+          stale.events()
+        existing.begin_frame(0)
+        self.core.fake_write(1, 2)
+        existing.end_frame()
+        stale.retry_cleanup()
+        self.assertNotIn(stale, trace.retained_traces())
+        self.assertEqual([(event.port, event.value) for event in existing.events()], [(1, 2)])
+    finally:
+      stale.retry_cleanup()
+
   def test_cleanup_failure_keeps_owner_for_retry(self):
     hook = self.open_trace()
     def interrupted(_hook):

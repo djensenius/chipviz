@@ -75,6 +75,7 @@ class Trace:
     self._owner = ctypes.c_byte()
     self._keys = (ctypes.byref(self._owner), ctypes.byref(self.read_slot), ctypes.byref(self.write_slot))
     self.active = False
+    self._abandoned = False
     self.in_frame = False
     self._invalid = False
     self.last_frame = -1
@@ -84,13 +85,7 @@ class Trace:
         raise RuntimeError("trace installation failed")
       self.active = True
     except BaseException as error:
-      self.active = False
-      if not self._recover(error):
-        try:
-          error.trace_owner = self
-        except BaseException:
-          pass
-        BaseException.add_note(error, "trace retained: retry trace_owner.retry_cleanup() or inspect retained_traces()")
+      self._abandon(error)
       raise
 
   def _bind(self):
@@ -144,6 +139,16 @@ class Trace:
         pass
       return id(self) not in _RETAINED
 
+  def _abandon(self, error):
+    self.active = False
+    self._abandoned = True
+    if not self._recover(error):
+      try:
+        error.trace_owner = self
+      except BaseException:
+        pass
+      BaseException.add_note(error, "trace retained: retry trace_owner.retry_cleanup() or inspect retained_traces()")
+
   def _require_owner(self):
     if not self.active:
       raise RuntimeError("trace is not active")
@@ -195,8 +200,9 @@ class Trace:
     return result
 
   def close(self):
-    if not self.active and id(self) in _RETAINED:
-      raise RuntimeError("trace is not active; retry cleanup")
+    if not self.active and (self._abandoned or id(self) in _RETAINED):
+      suffix = "; retry cleanup" if id(self) in _RETAINED else ""
+      raise RuntimeError("trace is not active" + suffix)
     if self.active:
       try:
         if not self.shim.sms_trace_owned(*self._keys):
@@ -215,8 +221,12 @@ class Trace:
         raise
 
   def __enter__(self):
-    self._require_owner()
-    return self
+    try:
+      self._require_owner()
+      return self
+    except BaseException as error:
+      self._abandon(error)
+      raise
 
   def __exit__(self, exc_type, exc, traceback):
     try:

@@ -26,12 +26,14 @@ slots; a further exception during cleanup is reported on the original error,
 and an existing trace object can retry `close()`.
 
 The manager retains active owners and both library handles. If construction
-fails and cleanup is interrupted, the original exception normally exposes
-`trace_owner`; call `trace_owner.retry_cleanup()` after the interruption.
+or context entry fails and cleanup is interrupted, the original exception
+normally exposes `trace_owner`; call `trace_owner.retry_cleanup()` after the
+interruption.
 If that attribute is unavailable, inspect `retained_traces()` to identify the
 failed owner. That list also contains healthy active traces: never blindly
-clean up another owner's trace. A failed constructor cannot run trace
-operations, even if it acquired native ownership; only retry cleanup.
+clean up another owner's trace. A failed constructor or context entry cannot
+run trace operations, even if it acquired native ownership; retry cleanup
+for any retained owner.
 Native trace operations also verify the owner token and both slot addresses.
 Do not unload or run a core with unresolved
 ownership. Repeated interruptions can interrupt retries; retry until cleanup
