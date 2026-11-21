@@ -92,8 +92,10 @@ def listener_inode(data):
 
 def decode_frame(data):
   require(len(data) <= MAX_RESPONSE)
-  header, sep, body = data.partition(b"\r\n\r\n")
-  require(sep and len(header) <= MAX_HEADER)
+  header_end = data.find(b"\r\n\r\n")
+  require(header_end >= 0 and header_end <= MAX_HEADER)
+  header = data[:header_end]
+  offset = header_end + 4
   lines = header.split(b"\r\n")
   require(lines[0] == b"HTTP/1.1 200 OK")
   headers = {}
@@ -107,21 +109,22 @@ def decode_frame(data):
   if b"content-length" in headers:
     length = headers[b"content-length"]
     require(re.fullmatch(rb"[0-9]{1,7}", length) is not None)
-    require(int(length) == len(body))
-    return body
+    require(int(length) == len(data) - offset)
+    return data[offset:]
   require(headers.get(b"transfer-encoding") == b"chunked")
   result = bytearray()
   while True:
-    size_text, sep, rest = body.partition(b"\r\n")
-    require(sep and re.fullmatch(rb"[0-9A-Fa-f]{1,8}", size_text) is not None)
-    size = int(size_text, 16)
+    size_end = data.find(b"\r\n", offset, offset + 10)
+    require(size_end >= 0 and re.fullmatch(rb"[0-9A-Fa-f]{1,8}", data[offset:size_end]) is not None)
+    size = int(data[offset:size_end], 16)
+    offset = size_end + 2
     if size == 0:
-      require(rest == b"\r\n")
+      require(len(data) == offset + 2 and data[offset:offset + 2] == b"\r\n")
       return bytes(result)
-    require(size <= MAX_RESPONSE - len(result) and len(rest) >= size + 2)
-    require(rest[size:size + 2] == b"\r\n")
-    result.extend(rest[:size])
-    body = rest[size + 2:]
+    require(size <= MAX_RESPONSE - len(result) and len(data) - offset >= size + 2)
+    require(data[offset + size:offset + size + 2] == b"\r\n")
+    result.extend(data[offset:offset + size])
+    offset += size + 2
 
 
 def parse_info(data):

@@ -384,6 +384,70 @@ class PreflightTests(unittest.TestCase):
       with self.subTest(data=data[:80]), self.assertRaises((preflight.Rejected, ValueError)):
         preflight.parse_info(data)
 
+  def test_many_tiny_chunks_use_bounded_scans_and_slices(self):
+    class CountingBytes(bytes):
+      def __new__(cls, data):
+        value = super().__new__(cls, data)
+        value.scanned = 0
+        value.sliced = 0
+        return value
+
+      def find(self, sub, start=0, end=None):
+        end = len(self) if end is None else min(end, len(self))
+        self.scanned += max(0, end - start)
+        return super().find(sub, start, end)
+
+      def __getitem__(self, key):
+        if isinstance(key, slice):
+          self.sliced += len(range(*key.indices(len(self))))
+        return super().__getitem__(key)
+
+      def partition(self, _sep):
+        raise AssertionError("frame parsing must not copy the unread tail")
+
+    count = 60000
+    data = CountingBytes(
+      b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+      + b"1\r\nx\r\n" * count + b"0\r\n\r\n"
+    )
+    self.assertEqual(preflight.decode_frame(data), b"x" * count)
+    self.assertLessEqual(data.scanned, len(data) + 10 * (count + 1))
+    self.assertLessEqual(data.sliced, 2 * len(data))
+
+  def test_chunk_terminators_and_malformed_frames(self):
+    header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    self.assertEqual(preflight.decode_frame(header + b"0\r\n\r\n"), b"")
+    self.assertEqual(preflight.decode_frame(
+      header + b"00000001\r\nx\r\n0000000A\r\n0123456789\r\n00000000\r\n\r\n"
+    ), b"x0123456789")
+    for body in (
+      b"", b"0", b"0\r\n", b"0\r\n\r", b"0\r\n\r\nx", b"0\r\nX: y\r\n\r\n",
+      b"\r\n", b"g\r\n", b"1;ext\r\nx\r\n0\r\n\r\n", b"000000001\r\nx\r\n0\r\n\r\n",
+      b"1\r\n", b"1\r\nx", b"1\r\nx\r", b"1\r\nxXX0\r\n\r\n",
+      b"2\r\nx\r\n0\r\n\r\n", b"1\r\nx\r\n", b"ffffffff\r\nx\r\n",
+    ):
+      with self.subTest(body=body), self.assertRaises(preflight.Rejected):
+        preflight.decode_frame(header + body)
+
+  def test_chunked_response_and_header_size_bounds(self):
+    prefix = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    size = preflight.MAX_RESPONSE - len(prefix) - 7 - 7
+    size_text = f"{size:x}".encode()
+    self.assertEqual(len(size_text), 5)
+    data = prefix + size_text + b"\r\n" + b"x" * size + b"\r\n0\r\n\r\n"
+    self.assertEqual(len(data), preflight.MAX_RESPONSE)
+    self.assertEqual(preflight.decode_frame(data), b"x" * size)
+    with self.assertRaises(preflight.Rejected):
+      preflight.decode_frame(data + b"x")
+
+    first = b"HTTP/1.1 200 OK\r\nX: "
+    last = b"\r\nTransfer-Encoding: chunked"
+    header = first + b"a" * (preflight.MAX_HEADER - len(first) - len(last)) + last
+    self.assertEqual(len(header), preflight.MAX_HEADER)
+    self.assertEqual(preflight.decode_frame(header + b"\r\n\r\n0\r\n\r\n"), b"")
+    with self.assertRaises(preflight.Rejected):
+      preflight.decode_frame(header + b"a\r\n\r\n0\r\n\r\n")
+
   def test_timeout_and_exception_output_are_sanitized(self):
     fake = FakeHost()
     fake.data = socket.timeout("secret-password /private/path")
