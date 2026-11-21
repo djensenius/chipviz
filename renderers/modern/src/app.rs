@@ -248,7 +248,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
                     args.scene,
                     elapsed,
                     |fresh, elapsed| {
-                        renderer.pipeline_mut().observe(fresh, elapsed);
+                        renderer.pipeline_mut().observe_live(fresh, elapsed);
                     },
                 );
                 let requested_scene = renderer.pipeline_mut().requested_scene(frame);
@@ -1945,6 +1945,189 @@ mod tests {
         }
         packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
         packet
+    }
+
+    #[test]
+    fn live_lines_drop_edges_follow_received_duplicates_without_ticks() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        struct Live {
+            source: FrameSource,
+            sender: UdpSocket,
+            address: std::net::SocketAddr,
+            now: Instant,
+            field: ColourField,
+            reference: ColourField,
+            scenes: scenes::SceneState,
+        }
+
+        impl Live {
+            fn new(cuts: bool) -> Self {
+                let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+                let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+                Self {
+                    source: FrameSource::with_feed(udp, None),
+                    sender: UdpSocket::bind("127.0.0.1:0").unwrap(),
+                    address,
+                    now: Instant::now(),
+                    field: ColourField::new(Config::default()),
+                    reference: ColourField::new(Config::default()),
+                    scenes: scenes::SceneState::new(scenes::SceneConfig {
+                        lines_drop_cuts: cuts,
+                        ..Default::default()
+                    }),
+                }
+            }
+
+            fn batch(&mut self, frames: &[(u16, u16, u8)]) {
+                for &(counter, beat, flags) in frames {
+                    let mut packet = wire_packet(90, flags, None);
+                    packet[2..4].copy_from_slice(&counter.to_le_bytes());
+                    packet[4] = 240; // one-bar guard is 60 frames
+                    packet[6..8].copy_from_slice(&beat.to_le_bytes());
+                    packet[20] = 7;
+                    packet[21] = 3;
+                    packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+                    self.sender.send_to(&packet, self.address).unwrap();
+                }
+                // Loopback delivery can span several polls. Collect the real
+                // FrameSource observations in receive order, then observe
+                // them together as one redraw batch.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut received = Vec::new();
+                while received.len() < frames.len() {
+                    self.source.next_frame_at(self.now);
+                    received.extend_from_slice(self.source.fresh());
+                    if received.len() < frames.len() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out receiving UDP batch: got {} of {} frames",
+                            received.len(),
+                            frames.len()
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                assert_eq!(
+                    received
+                        .iter()
+                        .map(|f| (f.frame, f.beat_count, f.flags))
+                        .collect::<Vec<_>>(),
+                    frames
+                );
+                self.observe_batch(&received);
+            }
+
+            fn held_redraw(&mut self) {
+                self.source.next_frame_at(self.now);
+                assert!(self.source.fresh().is_empty());
+                self.observe_batch(&[]);
+            }
+
+            fn observe_batch(&mut self, frames: &[ControlFrame]) {
+                observe_fresh_frames(frames, None, 0.0, |frame, elapsed| {
+                    crate::renderer::observe_live_states(
+                        &mut self.field,
+                        &mut self.scenes,
+                        frame,
+                        elapsed,
+                    );
+                    self.reference.observe(frame);
+                });
+                assert_eq!(self.field.has_new_frame(), self.reference.has_new_frame());
+                if self.field.has_new_frame() {
+                    assert_eq!(
+                        self.field.step(Controls::default()),
+                        self.reference.step(Controls::default())
+                    );
+                }
+                // Includes the debounce, onset history and all safety gates.
+                assert_eq!(format!("{:?}", self.field), format!("{:?}", self.reference));
+            }
+        }
+
+        let drop = audio::DROP_FLAG;
+        // After the first rising edge and its guard, a duplicate low re-arms
+        // the next frame's high even though the last distinct frame was high.
+        let mut second_edge = Live::new(true);
+        second_edge.batch(&[(9, 0, 0), (10, 0, drop)]);
+        assert_eq!(second_edge.scenes.lines.section(), 1);
+        for counter in [18, 26, 34, 42, 50, 58, 66, 70] {
+            second_edge.batch(&[(counter, 0, drop)]);
+        }
+        second_edge.batch(&[(70, 0, 0), (71, 0, drop)]);
+        assert_eq!(second_edge.scenes.lines.section(), 2);
+
+        // A duplicate low is observed before the next counter's high, even in
+        // one receive batch. A held redraw's cleared flags are not observed.
+        let mut live = Live::new(true);
+        live.batch(&[(10, 15, drop)]);
+        live.batch(&[(10, 16, 0), (11, 15, drop)]);
+        assert_eq!(
+            (live.scenes.lines.section(), live.scenes.lines.morph()),
+            (1, 1.0)
+        );
+        live.held_redraw();
+        // Advance 60 frames without a new edge, including the held redraw.
+        for counter in [19, 27, 35, 43, 51, 59, 67, 71] {
+            live.batch(&[(counter, 15, drop)]);
+        }
+        assert_eq!(live.scenes.lines.section(), 1);
+        let static_before = format!("{:?}", live.scenes.static_noise);
+        live.batch(&[(71, 16, 0), (71, 16, drop)]);
+        assert_eq!(
+            (live.scenes.lines.section(), live.scenes.lines.morph()),
+            (2, 0.0)
+        );
+        assert_eq!(format!("{:?}", live.scenes.static_noise), static_before);
+        assert!(!live.field.has_new_frame());
+
+        // A duplicate edge inside the guard is discarded, not delayed. It
+        // cannot earn a frame or beat tick, including at the boundary.
+        live.batch(&[(71, 16, 0), (71, 16, drop)]);
+        for counter in [79, 87, 95, 103, 111, 119, 127, 130] {
+            live.batch(&[(counter, 15, drop)]);
+        }
+        for _ in 0..3 {
+            live.batch(&[(130, 16, 0), (130, 16, drop)]);
+        }
+        assert_eq!(live.scenes.lines.section(), 2);
+        live.batch(&[(131, 15, drop)]);
+        assert_eq!(live.scenes.lines.section(), 2);
+        live.batch(&[(131, 16, 0), (131, 16, drop)]);
+        assert_eq!(live.scenes.lines.section(), 3);
+
+        // Disabled cuts ignore both duplicate and ordinary DROP rises; a
+        // duplicate beat boundary alone must not trigger a phrase.
+        let mut disabled = Live::new(false);
+        disabled.batch(&[(10, 15, 0)]);
+        let static_before = format!("{:?}", disabled.scenes.static_noise);
+        disabled.batch(&[(10, 16, drop), (10, 16, 0), (10, 16, drop)]);
+        assert_eq!(disabled.scenes.lines.section(), 0);
+        assert_eq!(format!("{:?}", disabled.scenes.static_noise), static_before);
+        assert!(!disabled.field.has_new_frame());
+        disabled.batch(&[(11, 15, 0), (12, 15, drop)]);
+        assert_eq!(disabled.scenes.lines.section(), 0);
+        disabled.batch(&[(13, 16, 0)]);
+        assert_eq!(disabled.scenes.lines.section(), 1);
+
+        // Legacy/replay observation retains its duplicate-counter behavior.
+        let mut replay = scenes::SceneState::new(scenes::SceneConfig {
+            lines_drop_cuts: true,
+            ..Default::default()
+        });
+        for (counter, flags) in [(10, drop), (10, 0), (11, drop)] {
+            replay.observe_at(
+                &ControlFrame {
+                    frame: counter,
+                    beat_count: 0,
+                    flags,
+                    ..ControlFrame::procedural(0)
+                },
+                0.0,
+            );
+        }
+        assert_eq!(replay.lines.section(), 0);
     }
 
     #[test]
