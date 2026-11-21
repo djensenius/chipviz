@@ -2131,6 +2131,109 @@ mod tests {
     }
 
     #[test]
+    fn live_mic_counter_collision_rearms_lines_drop_without_ticks() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        // Wait for the datagram without polling FrameSource: an empty poll
+        // after the hold expires would itself generate a fresh mic frame.
+        fn receive_udp(
+            source: &mut FrameSource,
+            sender: &UdpSocket,
+            address: std::net::SocketAddr,
+            now: Instant,
+        ) {
+            let mut packet = wire_packet(90, audio::DROP_FLAG, None);
+            packet[2..4].copy_from_slice(&1u16.to_le_bytes());
+            packet[6..8].copy_from_slice(&15u16.to_le_bytes());
+            packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+            sender.send_to(&packet, address).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut peek = [0; WIRE_SIZE];
+            loop {
+                match source.udp.socket.as_ref().unwrap().peek_from(&mut peek) {
+                    Ok((size, _)) => {
+                        assert_eq!(size, WIRE_SIZE);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for UDP packet"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("UDP peek failed: {error}"),
+                }
+            }
+            source.next_frame_at(now);
+            assert!(!source.showing_mic());
+            assert_eq!(source.fresh().len(), 1);
+            let frame = source.fresh()[0];
+            assert_eq!(
+                (frame.frame, frame.beat_count, frame.flags),
+                (1, 15, audio::DROP_FLAG)
+            );
+        }
+
+        fn observe(source: &FrameSource, field: &mut ColourField, scenes: &mut scenes::SceneState) {
+            observe_fresh_frames(source.fresh(), None, 0.0, |frame, elapsed| {
+                crate::renderer::observe_live_states(field, scenes, frame, elapsed);
+            });
+        }
+
+        let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+        let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures {
+            beat_count: 16,
+            ..AudioFeatures::default()
+        }));
+        let mut source = FrameSource::with_feed(udp, Some(Box::new(FakeMic(feed))));
+        let mut field = ColourField::new(Config::default());
+        let mut scenes = scenes::SceneState::new(scenes::SceneConfig {
+            lines_drop_cuts: true,
+            ..Default::default()
+        });
+        let start = Instant::now();
+
+        // UDP does not advance the fallback index, so the first mic frame
+        // naturally collides with this UDP counter of 1.
+        receive_udp(&mut source, &sender, address, start);
+        observe(&source, &mut field, &mut scenes);
+        assert!(field.has_new_frame());
+        field.step(Controls::default());
+        let lines_before = format!("{:?}", scenes.lines);
+        assert!(lines_before.contains("flags: 4"));
+        let static_before = format!("{:?}", scenes.static_noise);
+
+        source.next_frame_at(start + UDP_HOLD + Duration::from_millis(1));
+        assert!(source.showing_mic());
+        assert_eq!(source.fresh().len(), 1);
+        let mic = source.fresh()[0];
+        assert_eq!((mic.frame, mic.beat_count, mic.flags), (1, 16, 0));
+        observe(&source, &mut field, &mut scenes);
+        // Only flag history changed: no frame or beat tick, including the
+        // apparent 15 -> 16 phrase boundary, and no Static or field step.
+        assert_eq!(
+            format!("{:?}", scenes.lines),
+            lines_before.replace("flags: 4", "flags: 0")
+        );
+        assert_eq!(format!("{:?}", scenes.static_noise), static_before);
+        assert!(!field.has_new_frame());
+
+        receive_udp(
+            &mut source,
+            &sender,
+            address,
+            start + UDP_HOLD + Duration::from_millis(1),
+        );
+        observe(&source, &mut field, &mut scenes);
+        assert_eq!((scenes.lines.section(), scenes.lines.morph()), (1, 1.0));
+        assert_eq!(format!("{:?}", scenes.static_noise), static_before);
+        assert!(!field.has_new_frame());
+    }
+
+    #[test]
     fn mic_counter_discontinuity_resynchronizes_the_live_source() {
         let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures::default()));
         let mut source = FrameSource::with_feed(
