@@ -208,6 +208,7 @@ class PreflightTests(unittest.TestCase):
       stdout=b"MainPID=123\nActiveState=active\nSubState=running\n")
     net = (
       b"Num RefCount Protocol Flags Type St Inode Path\n"
+      b"01: 00000003 00000000 00000000 0001 03 43 /run/docker.sock\n"
       b"00: 00000002 00000000 00010000 0001 01 42 /run/docker.sock\n"
     )
     contents = {
@@ -363,6 +364,40 @@ class PreflightTests(unittest.TestCase):
                     listener.replace(b"/run/docker.sock", b"/tmp/remote")):
       with self.subTest(invalid=invalid), self.assertRaises(preflight.Rejected):
         preflight.listener_inode(invalid)
+
+  def test_listener_ignores_only_recognized_established_streams(self):
+    header = b"Num RefCount Protocol Flags Type St Inode Path\n"
+    listener = b"00: 00000002 00000000 00010000 0001 01 42 /run/docker.sock\n"
+    established = b"01: 00000003 00000000 00000000 0001 03 43 /run/docker.sock\n"
+    for rows in (listener + established, established + listener,
+                 established + listener + established.replace(b" 43 ", b" 44 ")):
+      with self.subTest(rows=rows):
+        self.assertEqual(preflight.listener_inode(header + rows), "42")
+
+    malformed = (
+      established.replace(b"00000000 0001 03", b"00010000 0001 03"),
+      established.replace(b"00000000 0001 03", b"00000000 0001 01"),
+      established.replace(b"00000000 0001 03", b"00000000 0002 03"),
+      established.replace(b"00000000 0001 03", b"00000001 0001 03"),
+      established.replace(b" 43 ", b" bad "),
+      established.replace(b" 43 ", b" 42 "),
+      established.replace(b" 43 ", b" 042 "),
+      established.replace(b" 43 ", b" "),
+      established.replace(b"/run/docker.sock", b"/run/docker.sock extra"),
+      established.replace(b"01:", b"invalid:", 1),
+      established.replace(b"00000003", b"nothex00", 1),
+      established.replace(b"00000000 00000000", b"00000001 00000000"),
+    )
+    for rows in (established, listener + listener, listener + listener.replace(b" 42 ", b" 44 "),
+                 listener + established + established):
+      with self.subTest(rows=rows), self.assertRaises(preflight.Rejected):
+        preflight.listener_inode(header + rows)
+    with self.assertRaises(preflight.Rejected):
+      preflight.listener_inode(listener + established)
+    for row in malformed:
+      for rows in (listener + row, row + listener):
+        with self.subTest(rows=rows), self.assertRaises(preflight.Rejected):
+          preflight.listener_inode(header + rows)
 
   def test_framing_and_sensitive_fields_fail_closed(self):
     payload = json.dumps(INFO).encode()

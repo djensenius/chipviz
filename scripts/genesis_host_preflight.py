@@ -80,11 +80,23 @@ def parse_service(data):
 def listener_inode(data):
   require(len(data) <= MAX_RESPONSE)
   matches = []
-  for line in data.decode("ascii").splitlines()[1:]:
+  inodes = set()
+  lines = data.decode("ascii").splitlines()
+  require(lines and lines[0].split() == ["Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path"])
+  for line in lines[1:]:
     fields = line.split()
-    if len(fields) == 8 and fields[7] == SOCKET_PATH:
-      require(fields[3] == "00010000" and fields[4] == "0001" and fields[5] == "01")
+    if SOCKET_PATH in fields:
+      require(len(fields) == 8 and fields[7] == SOCKET_PATH)
+      require(re.fullmatch(r"[0-9a-fA-F]+:", fields[0]) is not None)
+      require(re.fullmatch(r"[0-9a-fA-F]{8}", fields[1]) is not None and fields[2] == "00000000")
       require(re.fullmatch(r"[0-9]+", fields[6]) is not None)
+      inode = fields[6].lstrip("0") or "0"
+      require(inode not in inodes)
+      inodes.add(inode)
+      # Accepted stream sockets can retain the listener path.
+      if fields[3:6] == ["00000000", "0001", "03"]:
+        continue
+      require(fields[3:6] == ["00010000", "0001", "01"])
       matches.append(fields[6])
   require(len(matches) == 1)
   return matches[0]
