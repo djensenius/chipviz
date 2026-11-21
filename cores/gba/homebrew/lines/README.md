@@ -66,7 +66,9 @@ the latest accepted chunk is allowed; older replays and corrupt repeats fail.
 A missing, corrupt or incomplete trace, or a timeout, is a failure, not a
 successful comparison. The libretro core must expose 240x160 RGB565 frames.
 
-With a C99 compiler, from the repository root, the focused host checks are:
+`just gba-lines-fixture-test` runs the focused host checks; they also run as
+part of `just python-test`. With a C99 compiler, the equivalent direct checks
+from the repository root are:
 
 ```sh
 mkdir -p build/lines-fixture
