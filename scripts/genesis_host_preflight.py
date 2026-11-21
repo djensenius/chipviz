@@ -189,7 +189,7 @@ class Host:
     try:
       client.connect(SOCKET_PATH)
       return client
-    except Exception:
+    except (Exception, KeyboardInterrupt):
       client.close()
       raise
 
@@ -248,7 +248,7 @@ def collect(host):
 def main():
   try:
     version = collect(Host())
-  except Exception as error:
+  except (Exception, KeyboardInterrupt) as error:
     print("host metadata: UNAVAILABLE")
     stage = getattr(error, "stage", None) if isinstance(error, StageError) else None
     print("failure stage: " + (stage if isinstance(stage, str) and stage in STAGES else "internal"))

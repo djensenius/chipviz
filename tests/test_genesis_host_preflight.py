@@ -204,6 +204,14 @@ class PreflightTests(unittest.TestCase):
     factory.assert_called_once_with(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect.assert_called_once_with("/run/docker.sock")
 
+  def test_interrupted_connection_closes_fake_socket(self):
+    client = mock.MagicMock()
+    client.connect.side_effect = KeyboardInterrupt("secret-password /private/path")
+    with mock.patch.object(preflight.socket, "socket", return_value=client):
+      with self.assertRaises(KeyboardInterrupt):
+        preflight.Host().connect()
+    client.close.assert_called_once_with()
+
   def test_production_snapshot_rejects_unsafe_socket_before_service_query(self):
     directory = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
     for mode, uid in ((stat.S_IFLNK | 0o777, 0), (stat.S_IFSOCK | 0o666, 0),
@@ -351,6 +359,35 @@ class PreflightTests(unittest.TestCase):
       "mount isolation: UNVERIFIED\n"
       "toolchain builds authorized: NO\n"
     ))
+
+  def test_interruption_output_is_sanitized(self):
+    for location in ("constructor", "environment", "response"):
+      fake = FakeHost()
+      interruption = KeyboardInterrupt("secret-password /private/path")
+      if location == "environment":
+        fake.environment = mock.Mock(side_effect=interruption)
+      elif location == "response":
+        fake.response = mock.Mock(side_effect=interruption)
+      host = (mock.patch.object(preflight, "Host", side_effect=interruption)
+              if location == "constructor" else
+              mock.patch.object(preflight, "Host", return_value=fake))
+      with self.subTest(location=location), host:
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+          self.assertEqual(preflight.main(), 1)
+        self.assertEqual(output.getvalue(), (
+          "host metadata: UNAVAILABLE\n"
+          "failure stage: internal\n"
+          "builder isolation: UNVERIFIED\n"
+          "mount isolation: UNVERIFIED\n"
+          "toolchain builds authorized: NO\n"
+        ))
+        self.assertEqual(error.getvalue(), "")
+        if location == "response":
+          fake.response.assert_called_once()
+        else:
+          self.assertNotIn(("connect",), fake.calls)
+          self.assertNotIn(("response",), fake.calls)
 
   def test_failure_stages_are_fixed_and_sanitized(self):
     sensitive = "secret-password /private/path"
