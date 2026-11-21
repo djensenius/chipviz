@@ -813,8 +813,11 @@ in `scene`, set `displayed_scene` to null, and mark `local_mode: "house"`;
 ColourField entries retain their normal scene identity. The manifest also
 records a selected `surface-hallway` even when no tunnel is displayed. The
 catalog-v1 contract remains IDs 0–13; byte 14 keeps its legacy mapping without
-an explicit local opt-in. Profile budgets simulate Pi and M1 limits; they are
-not physical Pi performance or display-safety testing.
+an explicit local opt-in. Both new projected looks smooth palette changes on
+the same bounded live/replay clock as their audio envelope; the existing
+tunnel looks keep their original palette behavior. This is not photosensitivity
+certification. Profile budgets simulate Pi and M1 limits; they are not physical
+Pi performance or display-safety testing.
 
 ### PulseTunnel evaluation
 
