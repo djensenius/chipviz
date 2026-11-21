@@ -1,15 +1,27 @@
 import contextlib
+import datetime
 import io
+import json
 import logging
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
-import google.auth.credentials
-import google.auth.exceptions
-from google.auth.transport.requests import AuthorizedSession
-import requests
-from requests.adapters import HTTPAdapter
+try:
+  import google.auth.credentials
+  import google.auth.exceptions
+  from google.oauth2 import reauth as google_reauth
+  from google.auth.transport.requests import AuthorizedSession
+  import requests
+  from requests.adapters import HTTPAdapter
+except ImportError:
+  google = None
+  requests = None
+  AuthorizedSession = None
+  HTTPAdapter = object
+  google_reauth = None
 
 from scripts import youtube_auth
 from scripts import youtube_transport as transport
@@ -238,8 +250,23 @@ class YouTubeTransportTests(unittest.TestCase):
     self.assertNotIn(URI, stderr.getvalue())
     self.assertNotIn("token", stderr.getvalue())
 
+  def test_auth_failure_kind_is_preserved_without_leaking(self):
+    for kind in ("auth_required", "uncertain"):
+      with self.subTest(kind=kind):
+        error = youtube_auth.AuthError("secret " + URI, kind=kind)
+        result = self.assert_kind(kind, transport.query_status, Session(error), URI, 1)
+        self.assertIsNone(result.__context__)
 
-class OfflineCredentials(google.auth.credentials.Credentials):
+  def test_initiation_with_uncertain_auth_failure_is_not_replayed(self):
+    session = Session(youtube_auth.AuthError("secret " + URI))
+    error = self.assert_kind("uncertain", transport.create_session,
+                             session, {"snippet": {}}, 1)
+    self.assertIsNone(error.__context__)
+    self.assertEqual(len(session.calls), 1)
+    self.assertEqual(session.calls[0][0], "post")
+
+
+class OfflineCredentials(google.auth.credentials.Credentials if google else object):
   def __init__(self, refresh_error=None):
     super().__init__()
     self.token = "synthetic-token" if refresh_error is None else None
@@ -254,11 +281,12 @@ class OfflineCredentials(google.auth.credentials.Credentials):
 
 
 class OfflineAdapter(HTTPAdapter):
-  def __init__(self, status=308, error=None, response_url=None):
+  def __init__(self, status=308, error=None, response_url=None, body=b"{}"):
     super().__init__(max_retries=0)
     self.status = status
     self.error = error
     self.response_url = response_url
+    self.body = body
     self.calls = []
 
   def send(self, request, **kwargs):
@@ -273,10 +301,12 @@ class OfflineAdapter(HTTPAdapter):
     response.status_code = self.status
     response.url = self.response_url or request.url
     response.request = request
-    response._content = b"{}"
+    response._content = self.body
     return response
 
 
+@unittest.skipUnless(google is not None and requests is not None,
+                     "optional Google and Requests dependencies not installed")
 class RealLibraryOfflineTests(unittest.TestCase):
   def setUp(self):
     self.credentials = OfflineCredentials()
@@ -336,9 +366,15 @@ class RealLibraryOfflineTests(unittest.TestCase):
     self.assertEqual(output.getvalue(), "")
 
   def test_auth_refresh_failures_are_sanitized_without_upload(self):
-    for error in (youtube_auth.AuthError("secret " + URI),
-                  google.auth.exceptions.RefreshError("secret " + URI)):
-      with self.subTest(error=type(error)):
+    cases = (
+      (youtube_auth.AuthError("secret " + URI, kind="auth_required"), "auth_required"),
+      (youtube_auth.AuthError("secret " + URI), "uncertain"),
+      (google.auth.exceptions.RefreshError("secret " + URI, retryable=True), "uncertain"),
+      (google.auth.exceptions.RefreshError("secret " + URI), "uncertain"),
+      (google.auth.exceptions.TransportError("secret " + URI), "uncertain"),
+    )
+    for error, kind in cases:
+      with self.subTest(error=type(error), kind=kind):
         credentials = OfflineCredentials(error)
         session = transport.make_session(credentials)
         self.addCleanup(session.close)
@@ -346,11 +382,47 @@ class RealLibraryOfflineTests(unittest.TestCase):
         session.mount("https://", adapter)
         with self.assertRaises(transport.TransportError) as caught:
           transport.query_status(session, URI, 1)
-        self.assertEqual(caught.exception.kind, "auth_required")
+        self.assertEqual(caught.exception.kind, kind)
         self.assertNotIn("secret-session", str(caught.exception))
         self.assertIsNone(caught.exception.__context__)
         self.assertEqual(credentials.refreshes, 1)
         self.assertEqual(adapter.calls, [])
+
+  def test_rotation_persistence_failure_prevents_upload_and_replay(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      home = Path(temporary).resolve() / "home"
+      home.mkdir(mode=0o700)
+      with mock.patch.object(youtube_auth.Path, "home", return_value=home):
+        with mock.patch.object(youtube_auth.getpass, "getpass", side_effect=(
+            "synthetic.apps.googleusercontent.com", "synthetic-secret")):
+          youtube_auth.configure()
+        state = home / ".config" / "chipviz" / youtube_auth.STATE_FILE
+        state.write_text(youtube_auth._state_text("UC" + "a" * 22, "synthetic-refresh"))
+        state.chmod(0o600)
+        expiry = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        expiry += datetime.timedelta(hours=1)
+        initial = ("synthetic-access", "synthetic-refresh", expiry, {}, None)
+        with mock.patch.object(google_reauth, "refresh_grant", return_value=initial):
+          credentials, _ = youtube_auth.load_credentials()
+        credentials.token = None
+        session = transport.make_session(credentials)
+        self.addCleanup(session.close)
+        upload = OfflineAdapter()
+        session.mount("https://", upload)
+        token = OfflineAdapter(status=200, body=json.dumps({
+          "access_token": "synthetic-access-two", "expires_in": 3600,
+          "refresh_token": "synthetic-rotated",
+        }).encode())
+        session._auth_request_session.mount("https://", token)
+        with mock.patch.object(youtube_auth, "_atomic_write", side_effect=OSError("synthetic-secret")):
+          for _ in range(2):
+            with self.assertRaises(transport.TransportError) as error:
+              transport.create_session(session, {"snippet": {}}, 1)
+            self.assertEqual(error.exception.kind, "uncertain")
+            self.assertNotIn("synthetic-secret", str(error.exception))
+            self.assertIsNone(error.exception.__context__)
+        self.assertEqual(len(token.calls), 1)
+        self.assertEqual(upload.calls, [])
 
   def test_normalized_response_url_matches_requests_preparation(self):
     uri = URI + "%7E"

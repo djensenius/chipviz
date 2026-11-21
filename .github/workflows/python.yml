@@ -14,4 +14,10 @@ jobs:
       - uses: jdx/mise-action@v4.2.0
       - run: mise exec -- just python-lint
       - run: mise exec -- just python-test
+      - name: YouTube tests with optional dependencies
+        run: |
+          mise exec -- python -m venv "$RUNNER_TEMP/chipviz-youtube-venv"
+          "$RUNNER_TEMP/chipviz-youtube-venv/bin/python" -m pip install -r scripts/requirements-youtube.txt
+          "$RUNNER_TEMP/chipviz-youtube-venv/bin/python" -c 'import google.auth, google.oauth2.credentials, google_auth_oauthlib, googleapiclient, requests'
+          "$RUNNER_TEMP/chipviz-youtube-venv/bin/python" -m unittest discover -s tests -p 'test_youtube*.py' -v
       - run: mise exec -- just host-sample

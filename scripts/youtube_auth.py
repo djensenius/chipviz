@@ -37,7 +37,11 @@ CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}\Z")
 
 
 class AuthError(Exception):
-  """An intentionally non-secret diagnostic."""
+  """A non-secret diagnostic; only auth_required warrants reauthorization."""
+
+  def __init__(self, message, *, kind="uncertain"):
+    super().__init__(message)
+    self.kind = kind
 
 
 @contextlib.contextmanager
@@ -378,7 +382,13 @@ def authorize() -> None:
 
 
 def load_credentials() -> tuple[object, str]:
-  """Return (refreshed Google Credentials, expected channel ID), or raise AuthError."""
+  """Return credentials and channel; AuthError.kind distinguishes uncertain failures.
+
+  Each token refresh makes at most one token-endpoint request. This prevents
+  google-auth's separate 5xx retries from replaying a potentially rotated
+  refresh token. A failed refresh permanently invalidates that credentials
+  object. Ambiguous refresh or persistence failures require quarantine.
+  """
   try:
     fd = _directory(create=False)
     try:
@@ -393,6 +403,8 @@ def load_credentials() -> tuple[object, str]:
     class DurableCredentials(Credentials):
       def refresh(self, request):
         try:
+          if getattr(self, "_youtube_refresh_failed", False):
+            raise AuthError("Token refresh outcome is uncertain.")
           private_fd = _directory(create=False)
           try:
             with _state_lock(private_fd):
@@ -401,8 +413,27 @@ def load_credentials() -> tuple[object, str]:
               if (current_client != (client_id, client_secret) or current_channel != channel_id
                   or current_token != self.refresh_token):
                 raise AuthError("Authorization changed; reload credentials.")
+
+              attempts = 0
+              def single_token_request(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts != 1:
+                  raise AuthError("Token refresh outcome is uncertain.")
+                response = request(*args, **kwargs)
+                if response.status != 200:
+                  if response.status == 400:
+                    try:
+                      body = json.loads(response.data)
+                    except (ValueError, TypeError, UnicodeDecodeError):
+                      body = None
+                    if isinstance(body, dict) and body.get("error") == "invalid_grant":
+                      raise AuthError("YouTube authorization required.", kind="auth_required")
+                  raise AuthError("Token refresh outcome is uncertain.")
+                return response
+
               with _quiet_google():
-                super().refresh(request)
+                super().refresh(single_token_request)
               new_token = self.refresh_token
               if not _token_valid(new_token):
                 raise AuthError("Google returned an invalid refresh token.")
@@ -411,20 +442,23 @@ def load_credentials() -> tuple[object, str]:
               if not self.valid:
                 raise AuthError("Authorization is invalid or revoked.")
               if self.granted_scopes is not None and not set(SCOPES).issubset(self.granted_scopes):
-                raise AuthError("Authorization is missing a required scope.")
+                raise AuthError("Authorization is missing a required scope.", kind="auth_required")
           finally:
             os.close(private_fd)
-        except Exception:
+        except Exception as error:
           self.token = None
-          raise AuthError("Cannot refresh private YouTube authorization.") from None
+          self._youtube_refresh_failed = True
+          kind = error.kind if isinstance(error, AuthError) else "uncertain"
+          raise AuthError("Cannot refresh private YouTube authorization.", kind=kind) from None
 
     credentials = DurableCredentials(
       token=None, refresh_token=token, token_uri=TOKEN_URI,
       client_id=client_id, client_secret=client_secret, scopes=SCOPES)
     credentials.refresh(Request())
     return credentials, channel_id
-  except Exception:
-    raise AuthError("Cannot load valid private YouTube authorization.") from None
+  except Exception as error:
+    kind = error.kind if isinstance(error, AuthError) else "uncertain"
+    raise AuthError("Cannot load valid private YouTube authorization.", kind=kind) from None
 
 
 class _Parser(argparse.ArgumentParser):

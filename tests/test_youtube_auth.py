@@ -247,6 +247,7 @@ class YouTubeAuthTests(unittest.TestCase):
       with self.assertRaises(AUTH.AuthError) as error:
         AUTH.load_credentials()
     self.assertNotIn(TOKEN, str(error.exception))
+    self.assertEqual(error.exception.kind, "uncertain")
     state.chmod(0o644)
     with self.assertRaises(AUTH.AuthError):
       AUTH.load_credentials()
@@ -254,6 +255,25 @@ class YouTubeAuthTests(unittest.TestCase):
     state.symlink_to(self.app / AUTH.ENV_FILE)
     with self.assertRaises(AUTH.AuthError):
       AUTH.load_credentials()
+
+  def test_loading_preserves_safe_refresh_failure_kind(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    for failure, kind in (
+      (AUTH.AuthError(TOKEN, kind="auth_required"), "auth_required"),
+      (AUTH.AuthError(TOKEN), "uncertain"),
+      (OSError(TOKEN), "uncertain"),
+    ):
+      with self.subTest(kind=kind, failure=type(failure)):
+        modules, _, _, _, _, credentials_class = self.google_modules()
+        credentials_class.refresh_mock.side_effect = failure
+        with mock.patch.dict(sys.modules, modules):
+          with self.assertRaises(AUTH.AuthError) as error:
+            AUTH.load_credentials()
+        self.assertEqual(error.exception.kind, kind)
+        self.assertNotIn(TOKEN, str(error.exception))
 
   def test_oauth_errors_and_logs_do_not_expose_secrets(self):
     self.configure()
@@ -367,6 +387,52 @@ class YouTubeAuthTests(unittest.TestCase):
     self.assertEqual(headers["authorization"], "Bearer synthetic-access-two")
     self.assertEqual(json.loads(state.read_text())["refresh_token"], "synthetic-rotation-two")
 
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_real_google_refresh_does_not_retry_token_endpoint_5xx(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    expiry = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=1)
+    initial = ("synthetic-access", TOKEN, expiry, {}, None)
+    with mock.patch.object(google_reauth, "refresh_grant", return_value=initial):
+      credentials, _ = AUTH.load_credentials()
+    response = types.SimpleNamespace(status=503, data=b'{"error":"server_error"}')
+    request = mock.Mock(return_value=response)
+    with self.assertRaises(AUTH.AuthError) as error:
+      credentials.refresh(request)
+    self.assertEqual(request.call_count, 1)
+    self.assertEqual(error.exception.kind, "uncertain")
+    self.assertIsNone(credentials.token)
+    self.assertEqual(json.loads(state.read_text())["refresh_token"], TOKEN)
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_real_google_refresh_classifies_only_definitive_invalid_grant(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    expiry = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=1)
+    initial = ("synthetic-access", TOKEN, expiry, {}, None)
+    cases = (
+      (400, b'{"error":"invalid_grant","error_description":"synthetic-refresh-token"}',
+       "auth_required"),
+      (503, b'{"error":"invalid_grant"}', "uncertain"),
+      (400, b'{"error":"temporarily_unavailable"}', "uncertain"),
+      (400, b"synthetic-refresh-token", "uncertain"),
+    )
+    for status, body, kind in cases:
+      with self.subTest(status=status, kind=kind):
+        with mock.patch.object(google_reauth, "refresh_grant", return_value=initial):
+          credentials, _ = AUTH.load_credentials()
+        request = mock.Mock(return_value=types.SimpleNamespace(status=status, data=body))
+        with self.assertRaises(AUTH.AuthError) as error:
+          credentials.refresh(request)
+        self.assertEqual(error.exception.kind, kind)
+        self.assertNotIn(TOKEN, str(error.exception))
+        self.assertEqual(request.call_count, 1)
+        self.assertIsNone(credentials.token)
+
   def test_rotation_serializes_and_stale_credentials_fail_closed(self):
     self.configure()
     state = self.app / AUTH.STATE_FILE
@@ -416,10 +482,39 @@ class YouTubeAuthTests(unittest.TestCase):
         with self.assertRaises(AUTH.AuthError) as error:
           credentials.refresh(object())
       self.assertNotIn(TOKEN, str(error.exception))
+      self.assertEqual(error.exception.kind, "uncertain")
       self.assertIsNone(credentials.token)
       self.assertEqual(json.loads(state.read_text())["refresh_token"], TOKEN)
-      with self.assertRaises(AUTH.AuthError):
+      with self.assertRaises(AUTH.AuthError) as stale:
         credentials.refresh(object())
+      self.assertEqual(stale.exception.kind, "uncertain")
+
+  def test_ambiguous_published_rotation_cannot_refresh_again(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    modules, _, _, _, _, credentials_class = self.google_modules()
+    original_write = AUTH._atomic_write
+    with mock.patch.dict(sys.modules, modules):
+      credentials, _ = AUTH.load_credentials()
+      def rotate(cred, _request):
+        cred.refresh_token = "synthetic-rotated-token"
+      credentials_class.refresh_mock.side_effect = rotate
+      def publish_then_fail(*args, **kwargs):
+        original_write(*args, **kwargs)
+        raise OSError("synthetic-refresh-token")
+      with mock.patch.object(AUTH, "_atomic_write", side_effect=publish_then_fail):
+        with self.assertRaises(AUTH.AuthError) as error:
+          credentials.refresh(object())
+      self.assertEqual(error.exception.kind, "uncertain")
+      self.assertEqual(json.loads(state.read_text())["refresh_token"], "synthetic-rotated-token")
+      calls = credentials_class.refresh_mock.call_count
+      with self.assertRaises(AUTH.AuthError) as error:
+        credentials.refresh(object())
+      self.assertEqual(error.exception.kind, "uncertain")
+      self.assertEqual(credentials_class.refresh_mock.call_count, calls)
+      self.assertIsNone(credentials.token)
 
   def test_unsafe_lock_is_rejected_without_touching_target(self):
     self.configure()

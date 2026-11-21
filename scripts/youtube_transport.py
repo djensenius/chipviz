@@ -8,6 +8,8 @@ responsible for excluding local paths and secrets.
 
 make_session(credentials) constructs the supported Google AuthorizedSession
 with upload and credential-refresh adapter retries and 401 replays disabled.
+The supported youtube_auth credentials also prevent google-auth's separate
+token-endpoint 5xx retries; ambiguous refresh/rotation failures are uncertain.
 Requests sessions not satisfying this contract are rejected. Test doubles must
 set __youtube_transport_test_double__ = True and perform one request without
 redirects or retries. They are for offline tests only. Do not mutate the session,
@@ -202,12 +204,8 @@ def _request(session, method, uri, **kwargs):
         uri, timeout=_TIMEOUT, allow_redirects=False, **kwargs
       )
   except Exception as error:
-    try:
-      from google.auth.exceptions import RefreshError
-      auth_errors = (AuthError, RefreshError)
-    except ImportError:
-      auth_errors = (AuthError,)
-    failure = "auth_required" if isinstance(error, auth_errors) else "uncertain"
+    failure = (error.kind if isinstance(error, AuthError)
+               and error.kind == "auth_required" else "uncertain")
   if failure:
     message = ("YouTube authorization required" if failure == "auth_required"
                else "Upload request failed; check session status")
