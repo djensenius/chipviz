@@ -12,6 +12,7 @@ jobs:
   build:
     # This is an Ubuntu ARM64 smoke check, not a physical Pi or Pi OS test.
     runs-on: ubuntu-22.04-arm
+    timeout-minutes: 45
     env:
       MISE_AUTO_INSTALL: "false"
       LC_ALL: C
