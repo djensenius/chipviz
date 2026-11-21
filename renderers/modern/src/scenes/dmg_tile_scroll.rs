@@ -2,7 +2,9 @@
 //!
 //! This is not registered as a selectable scene. It models native steps and
 //! their next-VBlank display registers, not scene switching or boot hardware
-//! state. It makes no profile, hardware, or photosensitivity validation claim.
+//! state. Source data and step logic are not automatically guarded against
+//! ROM changes and must be re-audited. It makes no profile, hardware, or
+//! photosensitivity validation claim.
 
 /// The native background is a 32 by 32 tile map, wrapping at 256 pixels.
 pub const MAP_PIXELS: u16 = 256;

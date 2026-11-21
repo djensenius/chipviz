@@ -3,7 +3,9 @@
 //! This owns a fixed-size shade texture and a separate fullscreen pipeline;
 //! it is not wired into the window, capture, scene selection, or safety gates.
 //! The caller advances the autonomous model explicitly and supplies its shown
-//! display. Profile performance, hardware, and photosensitivity are untested.
+//! display. The grayscale palette is illustrative; offscreen readback is not
+//! emulator parity or timed presented output. Profile performance, physical
+//! hardware, and photosensitivity are untested.
 
 use super::dmg_tile_scroll::{Display, SCREEN_HEIGHT, SCREEN_WIDTH};
 
@@ -11,7 +13,7 @@ const WIDTH: u32 = SCREEN_WIDTH as u32;
 const HEIGHT: u32 = SCREEN_HEIGHT as u32;
 const PIXELS: usize = WIDTH as usize * HEIGHT as usize;
 
-/// SameBoy's neutral DMG greys, as sRGB-encoded bytes.
+/// Illustrative neutral DMG greys, as sRGB-encoded bytes.
 pub fn shade_pixels(display: Display) -> [u8; PIXELS] {
     let mut pixels = [0; PIXELS];
     for y in 0..HEIGHT {
