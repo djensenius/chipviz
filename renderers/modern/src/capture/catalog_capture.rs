@@ -22,6 +22,7 @@ pub(super) fn cli_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), Str
         if matches!(
             token.as_str(),
             "--scene"
+                | "--house"
                 | "--tunnel-variant"
                 | "--starfield"
                 | "--catalog"
@@ -650,6 +651,7 @@ mod tests {
     fn catalog_cli_conflicts_and_option_values_in_both_orders() {
         for conflict in [
             "--scene",
+            "--house",
             "--tunnel-variant",
             "--starfield",
             "--catalog",

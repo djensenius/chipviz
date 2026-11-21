@@ -71,7 +71,8 @@ The renderer starts windowed by default.
 | `--mic-layers off\|scope\|bursts\|both` | Draw the [mic layers](#mic-layers) over eligible native scenes (not ColourField or Starfield). Default `off`. |
 | `--allow-flash` | Only builds with the `unmeasured-flash` Cargo feature can flash (see [Flash/gate is off by default](#flashgate-is-off-by-default)). In those builds it prints the photosensitivity warning to stderr at start-up and arms operator requests for flash/gate (palettes 3 and 7); the opt-in for wire arming is the host's own `--allow-flash` (hosts send 3 or 7 only with it), so a stable absolute wire 3 or 7 in scene 7 arms with or without this flag. Default builds accept the flag, print a notice that it has no effect, and run 3 and 7 as hard cuts. Procedural and mic frames never arm. |
 | `--lines-drop-cuts` | Let Lines (scene 3) cut straight between plane and hallway on a rising drop flag (0x04), at most once per bar. The cut refolds the same lines; it is not a full-screen flash. Default: the drop flag is ignored. |
-| `--tunnel-variant original\|hallway\|abstract` | Choose the PulseTunnel look at startup, for every scene byte selecting it. Default `original` preserves the orbiting tunnel. Also supported by `chipviz-capture`. |
+| `--tunnel-variant original\|hallway\|abstract\|surface-hallway` | Choose the PulseTunnel look at startup, for every scene byte selecting it. Default `original` preserves the orbiting tunnel; the existing `hallway` and `abstract` looks are unchanged. Also supported by `chipviz-capture`. |
+| `--house` | Opt into the local House on native displays. Scene 7 still follows ColourField gating. Incompatible with `--scene`, `--tunnel-variant`, and Starfield options. Also supported by `chipviz-capture`. |
 
 ```sh
 just modern-m1 -- --list-monitors
@@ -790,6 +791,30 @@ pass `capture::CaptureOptions { tunnel_variant: capture::TunnelVariant::Hallway 
 to `capture::run_with_options`. For command-line parsing in a library caller,
 `capture::parse_args_with_options` returns both arguments and options;
 the original `capture::parse_args` rejects the new flag rather than losing it.
+
+`surface-hallway` is a separate PulseTunnel variant, not a catalog scene:
+
+```sh
+just modern-m1 -- --scene 2 --tunnel-variant surface-hallway
+just modern-capture --out build/surface --scene 2 --tunnel-variant surface-hallway --frames 60,120
+just modern-m1 -- --house
+just modern-capture --out build/house --house --input synth-mic --frames 60,120
+```
+
+House is a local override of native displays, including those from recordings;
+it never assigns a wire byte. Scene 7 remains governed by ColourField's gates.
+`--house` rejects any `--scene` or `--tunnel-variant`, Starfield setup/opt-in,
+and capture's strict `--catalog-v1` replay. It is CLI-only: existing capture
+API structs and `run`/`run_with_options` semantics remain unchanged and their
+parsers reject `--house`. The public `TunnelVariant` enum gains
+`SurfaceHallway`, so downstream exhaustive matches must add that variant.
+House capture entries retain the requested wire byte
+in `scene`, set `displayed_scene` to null, and mark `local_mode: "house"`;
+ColourField entries retain their normal scene identity. The manifest also
+records a selected `surface-hallway` even when no tunnel is displayed. The
+catalog-v1 contract remains IDs 0–13; byte 14 keeps its legacy mapping without
+an explicit local opt-in. Profile budgets simulate Pi and M1 limits; they are
+not physical Pi performance or display-safety testing.
 
 ### PulseTunnel evaluation
 

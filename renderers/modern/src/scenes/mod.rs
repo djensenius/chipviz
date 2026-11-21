@@ -17,9 +17,11 @@
 //! other bytes retain their original mapping.
 
 pub mod colour_field;
+mod house;
 mod lines;
 pub mod mic_layers;
 mod object;
+mod planar_hallway;
 mod pulse_tunnel;
 #[cfg(test)]
 mod reference;
@@ -90,6 +92,7 @@ pub enum TunnelVariant {
     Original,
     Hallway,
     Abstract,
+    SurfaceHallway,
 }
 
 impl TunnelVariant {
@@ -98,6 +101,7 @@ impl TunnelVariant {
             "original" => Some(Self::Original),
             "hallway" => Some(Self::Hallway),
             "abstract" => Some(Self::Abstract),
+            "surface-hallway" => Some(Self::SurfaceHallway),
             _ => None,
         }
     }
@@ -114,6 +118,7 @@ pub struct SceneState {
     pub(crate) lines: lines::LinesState,
     pub(crate) static_noise: static_noise::StaticState,
     pub(crate) tunnel: pulse_tunnel::TunnelState,
+    local_house: bool,
     starfield: Option<starfield::StarfieldConfig>,
     starfield_dispatch_enabled: bool,
     starfield_projection: RefCell<Option<starfield::ProjectionCache>>,
@@ -126,6 +131,7 @@ impl SceneState {
             lines: lines::LinesState::new(config.lines_drop_cuts),
             static_noise: static_noise::StaticState::default(),
             tunnel: pulse_tunnel::TunnelState::default(),
+            local_house: false,
             starfield: None,
             starfield_dispatch_enabled: false,
             starfield_projection: RefCell::new(None),
@@ -134,6 +140,14 @@ impl SceneState {
 
     pub fn config(&self) -> SceneConfig {
         self.config
+    }
+
+    pub(crate) fn set_local_house(&mut self, enabled: bool) {
+        self.local_house = enabled;
+    }
+
+    pub(crate) fn local_house(&self) -> bool {
+        self.local_house
     }
 
     pub fn configure_starfield(&mut self, config: Option<starfield::StarfieldConfig>) {
@@ -261,12 +275,20 @@ pub(crate) fn build_tunnel_variant(
     state: &SceneState,
     instances: &mut Vec<Instance>,
 ) -> bool {
+    if state.local_house {
+        pulse_tunnel::build_projected(profile, frame, elapsed, aspect, state, instances, true);
+        return true;
+    }
     if select(frame.scene).name != pulse_tunnel::ENTRY.name
         || state.config.tunnel_variant == TunnelVariant::Original
     {
         return false;
     }
-    pulse_tunnel::build_variant(profile, frame, elapsed, aspect, state, instances);
+    if state.config.tunnel_variant == TunnelVariant::SurfaceHallway {
+        pulse_tunnel::build_projected(profile, frame, elapsed, aspect, state, instances, false);
+    } else {
+        pulse_tunnel::build_variant(profile, frame, elapsed, aspect, state, instances);
+    }
     true
 }
 
@@ -397,6 +419,84 @@ mod tests {
 
     const INDICES: [u64; 9] = [0, 1, 17, 95, 96, 200, 511, 1000, 65_600];
     const ELAPSED: [f32; 4] = [0.0, 0.5, 3.25, 120.0];
+
+    #[test]
+    fn projected_local_modes_are_bounded_and_deterministic() {
+        for profile in [RenderProfile::pi5(), RenderProfile::m1()] {
+            for house in [false, true] {
+                let mut state = SceneState::new(SceneConfig {
+                    tunnel_variant: if house {
+                        TunnelVariant::Original
+                    } else {
+                        TunnelVariant::SurfaceHallway
+                    },
+                    ..SceneConfig::default()
+                });
+                state.set_local_house(house);
+                let frame = ControlFrame {
+                    scene: 2,
+                    ..ControlFrame::procedural(0)
+                };
+                state.advance_tunnel(&frame, 0.0);
+                state.advance_tunnel(&frame, 1.0 / 60.0);
+                for aspect in [16.0 / 9.0, 9.0 / 16.0] {
+                    let a = build_instances(&profile, frame, 1.0, aspect, &state);
+                    let b = build_instances(&profile, frame, 1.0, aspect, &state);
+                    assert!(!a.is_empty());
+                    assert!(a.len() <= profile.instance_count);
+                    assert_eq!(
+                        bytemuck::cast_slice::<Instance, u8>(&a),
+                        bytemuck::cast_slice::<Instance, u8>(&b)
+                    );
+                    assert!(a.iter().all(|line| {
+                        line.center
+                            .iter()
+                            .chain(line.size.iter())
+                            .chain(line.color.iter())
+                            .all(|x| x.is_finite())
+                            && (0.0..=1.0).contains(&line.color[3])
+                    }));
+                }
+            }
+        }
+        assert_eq!(dispatch_configured(14, false).name(), "PulseTunnel");
+        assert_eq!(dispatch_configured(7, false).name(), colour_field::NAME);
+        assert_eq!(
+            SceneState::default().config().tunnel_variant,
+            TunnelVariant::Original
+        );
+        assert!(!SceneState::default().local_house());
+    }
+
+    #[test]
+    fn surface_hallway_only_changes_tunnel_dispatch() {
+        let profile = RenderProfile::pi5();
+        let state = SceneState::new(SceneConfig {
+            tunnel_variant: TunnelVariant::SurfaceHallway,
+            ..SceneConfig::default()
+        });
+        for scene in [0, 1, 3, 4, 5, 6, 13] {
+            let frame = ControlFrame {
+                scene,
+                ..ControlFrame::procedural(0)
+            };
+            let base = build_instances(&profile, frame, 1.0, 1.0, &SceneState::default());
+            let opted = build_instances(&profile, frame, 1.0, 1.0, &state);
+            assert_eq!(
+                bytemuck::cast_slice::<Instance, u8>(&base),
+                bytemuck::cast_slice::<Instance, u8>(&opted),
+                "scene {scene}"
+            );
+        }
+        assert_eq!(
+            selected_camera_configured(14, false, state.config()),
+            CameraMode::ScreenSpace
+        );
+        assert_eq!(
+            selected_camera_configured(2, false, SceneConfig::default()),
+            CameraMode::Orbit3D
+        );
+    }
 
     #[test]
     fn tunnel_variants_are_selected_only_for_tunnel_and_follow_audio() {

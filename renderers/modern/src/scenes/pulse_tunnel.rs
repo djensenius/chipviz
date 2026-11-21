@@ -1,8 +1,8 @@
 //! PulseTunnel: beat-driven planes and bars moving through depth.
 
 use super::{
-    CameraMode, SceneBuild, SceneEntry, SceneState, TunnelVariant, lines, note_emphasis, palette,
-    sin_cos,
+    CameraMode, SceneBuild, SceneEntry, SceneState, TunnelVariant, house, lines, note_emphasis,
+    palette, planar_hallway, sin_cos,
 };
 use crate::control_frame::ControlFrame;
 use crate::profile::RenderProfile;
@@ -86,6 +86,7 @@ fn segment(
     a: [f32; 2],
     b: [f32; 2],
     aspect: f32,
+    width: f32,
     color: [f32; 4],
 ) {
     if instances.len() >= budget {
@@ -99,12 +100,52 @@ fn segment(
     let direction = [delta[0] / length, delta[1] / length];
     instances.push(Instance {
         center: [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, 0.0],
-        size: [length, lines::ndc_width(direction, 0.004, aspect.max(0.01))],
+        size: [length, lines::ndc_width(direction, width, aspect.max(0.01))],
         color,
         rotation: delta[1].atan2(delta[0]),
         scene_mix: 2.0,
         pattern: [0.0; 2],
     });
+}
+
+pub(crate) fn build_projected(
+    profile: &RenderProfile,
+    frame: ControlFrame,
+    elapsed: f32,
+    aspect: f32,
+    state: &SceneState,
+    instances: &mut Vec<Instance>,
+    is_house: bool,
+) {
+    let remaining = profile.instance_count.saturating_sub(instances.len());
+    let mut draw = |start, end, width, intensity: f32| {
+        let mut color = palette(frame.palette, 0.42, 0.5);
+        color[3] = intensity.clamp(0.0, 1.0);
+        segment(
+            instances,
+            profile.instance_count,
+            start,
+            end,
+            aspect,
+            width,
+            color,
+        );
+    };
+    if is_house {
+        for line in house::project(elapsed, aspect, state.tunnel.levels, remaining)
+            .into_iter()
+            .take(remaining)
+        {
+            draw(line.start, line.end, line.width, line.intensity);
+        }
+    } else {
+        for line in planar_hallway::project(elapsed, aspect, state.tunnel.levels, remaining)
+            .into_iter()
+            .take(remaining)
+        {
+            draw(line.start, line.end, line.width, line.intensity);
+        }
+    }
 }
 
 pub(crate) fn build_variant(
@@ -121,7 +162,15 @@ pub(crate) fn build_variant(
     let mut draw = |a, b, fade: f32| {
         let mut color = base;
         color[3] = fade.clamp(0.0, 1.0);
-        segment(instances, profile.instance_count, a, b, aspect, color);
+        segment(
+            instances,
+            profile.instance_count,
+            a,
+            b,
+            aspect,
+            0.004,
+            color,
+        );
     };
     match state.config().tunnel_variant {
         TunnelVariant::Hallway => {
@@ -170,7 +219,9 @@ pub(crate) fn build_variant(
                 }
             }
         }
-        TunnelVariant::Original => unreachable!("original uses its unchanged builder"),
+        TunnelVariant::Original | TunnelVariant::SurfaceHallway => {
+            unreachable!("uses a separate builder")
+        }
     }
 }
 

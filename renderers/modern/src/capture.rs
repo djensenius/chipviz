@@ -26,7 +26,7 @@ const USAGE: &str = "usage: chipviz-capture --out DIR [--profile m1|pi5] [--scen
                        [--size WxH] [--mic-layers off|scope|bursts|both]
                        [--catalog FILE --location LAT,LON]
                        [--time UNIX_SECONDS] [--follow-time]
-                       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
+                       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract|surface-hallway] [--house]
                        [--exclusive-output] [--catalog-v1]
 
 Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
@@ -56,7 +56,9 @@ Renders frames offscreen (no window) and writes PNGs plus manifest.json to DIR.
   --time     observation UTC as Unix seconds (1800..2200); defaults to current UTC
   --follow-time advance from --time (or current UTC), for reproducible moving-sky captures
   --tunnel-variant
-             PulseTunnel look: original (default), hallway or abstract
+             PulseTunnel look: original (default), hallway, abstract or surface-hallway
+  --house    local House for native displays; incompatible with --scene,
+             --tunnel-variant, Starfield options and --catalog-v1
   --exclusive-output
              create PNGs and manifest exclusively; fail on existing leaves or
              duplicate frames. Requires a trusted, non-mutable output directory;
@@ -237,7 +239,7 @@ fn parse_args_internal(
             let value = args
                 .next()
                 .ok_or_else(|| format!("{arg} requires a value"))?;
-            if strict_values && is_cli_option(&value) {
+            if (strict_values && is_cli_option(&value)) || value == "--house" {
                 return Err(format!(
                     "{arg} requires a value; {value} is an option (use ./{value} for a literal path)"
                 ));
@@ -308,7 +310,7 @@ fn parse_args_internal(
                 }
                 let text = value()?;
                 tunnel_variant = TunnelVariant::parse(&text).ok_or_else(|| {
-                    format!("--tunnel-variant expects original|hallway|abstract, got {text}")
+                    format!("--tunnel-variant expects original|hallway|abstract|surface-hallway, got {text}")
                 })?;
             }
             "--catalog" | "--star-catalog" => {
@@ -415,6 +417,7 @@ fn is_cli_option(value: &str) -> bool {
             | "--time"
             | "--follow-time"
             | "--starfield"
+            | "--house"
     )
 }
 
@@ -590,7 +593,14 @@ pub fn run(args: &CaptureArgs) -> Result<(), String> {
 /// Capture using #139's tunnel options. Legacy scene bytes, including scene 6,
 /// keep their original native mapping in this API.
 pub fn run_with_options(args: &CaptureArgs, options: CaptureOptions) -> Result<(), String> {
-    run_internal(args, options, &StarfieldOptions::default(), false, false)
+    run_internal(
+        args,
+        options,
+        &StarfieldOptions::default(),
+        false,
+        false,
+        false,
+    )
 }
 
 /// Capture with an explicit Starfield opt-in and its separate configuration.
@@ -605,6 +615,7 @@ pub fn run_with_starfield_options(
         options.capture,
         &options.starfield,
         options.starfield_enabled,
+        false,
         false,
     )
 }
@@ -626,6 +637,7 @@ fn run_internal(
     starfield_options: &StarfieldOptions,
     starfield_enabled: bool,
     exclusive: bool,
+    house: bool,
 ) -> Result<(), String> {
     if exclusive {
         validate_unique_frames(&args.frames)?;
@@ -729,6 +741,7 @@ fn run_internal(
         lines_drop_cuts: args.lines_drop_cuts,
         tunnel_variant: options.tunnel_variant,
     });
+    renderer.pipeline_mut().enable_local_house(house);
     renderer
         .pipeline_mut()
         .configure_starfield(starfield.clone());
@@ -761,16 +774,19 @@ fn run_internal(
         let displayed_scene = renderer.pipeline_mut().committed_displayed_scene();
         let entry = scenes::dispatch_configured(displayed_scene, starfield_enabled);
         let name = match (entry.name(), options.tunnel_variant) {
+            (_, _) if house && displayed_scene != colour_field::SCENE => "House",
             ("PulseTunnel", TunnelVariant::Hallway) => "PulseTunnel-Hallway",
             ("PulseTunnel", TunnelVariant::Abstract) => "PulseTunnel-Abstract",
+            ("PulseTunnel", TunnelVariant::SurfaceHallway) => "PulseTunnel-SurfaceHallway",
             _ => entry.name(),
         };
-        let camera =
-            if entry.name() == "PulseTunnel" && options.tunnel_variant != TunnelVariant::Original {
-                CameraMode::ScreenSpace
-            } else {
-                entry.camera()
-            };
+        let camera = if name == "House"
+            || (entry.name() == "PulseTunnel" && options.tunnel_variant != TunnelVariant::Original)
+        {
+            CameraMode::ScreenSpace
+        } else {
+            entry.camera()
+        };
         let file = format!("frame{index:06}-{name}.png");
         write_png(&mut outputs, &args.out.join(&file), width, height, &rgb)?;
         println!("wrote {}", args.out.join(&file).display());
@@ -778,7 +794,7 @@ fn run_internal(
             || "null".to_string(),
             |config| config.epoch_at(elapsed(index) as f32).to_string(),
         );
-        captures.push(manifest_capture_entry(ManifestCaptureEntry {
+        let capture_entry = ManifestCaptureEntry {
             file: &file,
             frame_index: index,
             elapsed: elapsed(index),
@@ -787,7 +803,12 @@ fn run_internal(
             displayed_scene,
             scene_name: name,
             camera,
-        }));
+        };
+        captures.push(if name == "House" {
+            manifest_house_entry(capture_entry)
+        } else {
+            manifest_capture_entry(capture_entry)
+        });
     }
 
     let input = match &args.input {
@@ -796,8 +817,15 @@ fn run_internal(
         Input::File(path) => path.display().to_string(),
     };
     let (starfield_epoch, starfield_advances) = starfield_metadata(starfield.as_ref());
+    let local_mode = if house {
+        "  \"local_mode\": \"house\",\n"
+    } else if options.tunnel_variant == TunnelVariant::SurfaceHallway {
+        "  \"tunnel_variant\": \"surface-hallway\",\n"
+    } else {
+        ""
+    };
     let manifest = format!(
-        "{{\n  \"profile\": {},\n  \"input\": {},\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"starfield_epoch_unix_seconds\": {starfield_epoch},\n  \"starfield_epoch_advances_with_elapsed\": {starfield_advances},\n  \"captures\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"profile\": {},\n  \"input\": {},\n{local_mode}  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"starfield_epoch_unix_seconds\": {starfield_epoch},\n  \"starfield_epoch_advances_with_elapsed\": {starfield_advances},\n  \"captures\": [\n{}\n  ]\n}}\n",
         json_string(args.profile.name),
         json_string(&input),
         json_string(layers.name()),
@@ -842,6 +870,17 @@ fn manifest_capture_entry(entry: ManifestCaptureEntry<'_>) -> String {
             CameraMode::Orbit3D => "orbit3d",
             CameraMode::ScreenSpace => "screen_space",
         }),
+    )
+}
+
+fn manifest_house_entry(entry: ManifestCaptureEntry<'_>) -> String {
+    format!(
+        "    {{\"file\": {}, \"frame_index\": {}, \"elapsed\": {}, \"starfield_epoch_unix_seconds\": {}, \"scene\": {}, \"displayed_scene\": null, \"local_mode\": \"house\", \"scene_name\": \"House\", \"camera\": \"screen_space\"}}",
+        json_string(entry.file),
+        entry.frame_index,
+        entry.elapsed,
+        entry.starfield_epoch,
+        entry.requested_scene,
     )
 }
 
@@ -983,9 +1022,67 @@ fn json_string(text: &str) -> String {
     out
 }
 
+fn cli_house_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), String> {
+    if !tokens.iter().any(|token| token == "--house") {
+        return Ok((tokens, false));
+    }
+    let value_options = [
+        "--profile",
+        "--scene",
+        "--frames",
+        "--input",
+        "--size",
+        "--out",
+        "--mic-layers",
+        "--tunnel-variant",
+        "--catalog",
+        "--star-catalog",
+        "--location",
+        "--time",
+    ];
+    for pair in tokens.windows(2) {
+        if value_options.contains(&pair[0].as_str()) && pair[1] == "--house" {
+            return Err(format!(
+                "{} requires a value; --house is an option",
+                pair[0]
+            ));
+        }
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "--scene"
+                | "--tunnel-variant"
+                | "--starfield"
+                | "--catalog"
+                | "--star-catalog"
+                | "--location"
+                | "--time"
+                | "--follow-time"
+                | "--catalog-v1"
+        )
+    }) {
+        return Err("--house is incompatible with --scene, --tunnel-variant, Starfield options and --catalog-v1".into());
+    }
+    Ok((
+        tokens
+            .into_iter()
+            .filter(|token| token != "--house")
+            .collect(),
+        true,
+    ))
+}
+
 pub fn main() -> ExitCode {
     let tokens: Vec<String> = std::env::args().skip(1).collect();
     let (tokens, catalog) = match catalog_capture::cli_tokens(tokens) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("chipviz-capture: {error}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let (tokens, house) = match cli_house_tokens(tokens) {
         Ok(result) => result,
         Err(error) => {
             eprintln!("chipviz-capture: {error}\n\n{USAGE}");
@@ -1007,6 +1104,7 @@ pub fn main() -> ExitCode {
                     &options.starfield,
                     options.starfield_enabled,
                     exclusive,
+                    house,
                 )
             };
             match result {
@@ -1265,6 +1363,7 @@ mod tests {
             "--time",
             "--follow-time",
             "--starfield",
+            "--house",
         ];
         for value_option in value_options {
             for token in option_tokens {
@@ -1643,12 +1742,14 @@ mod tests {
             ("original", TunnelVariant::Original),
             ("hallway", TunnelVariant::Hallway),
             ("abstract", TunnelVariant::Abstract),
+            ("surface-hallway", TunnelVariant::SurfaceHallway),
         ] {
             let args = ["--out", "o", "--tunnel-variant", text].map(str::to_string);
             match parse_args_with_options(args).unwrap() {
                 ConfiguredCommand::Capture(_, options) => {
                     assert_eq!(options.tunnel_variant, expected)
                 }
+
                 ConfiguredCommand::Help => panic!("unexpected help"),
             }
         }
@@ -1663,6 +1764,62 @@ mod tests {
                 .is_err()
         );
         assert!(parse(&["--out", "o", "--tunnel-variant", "hallway"]).is_err());
+    }
+
+    #[test]
+    fn cli_house_is_explicit_and_conflicts_are_rejected() {
+        let tokens = ["--out", "shots", "--house"].map(str::to_string).to_vec();
+        let (tokens, house) = cli_house_tokens(tokens).unwrap();
+        assert!(house);
+        assert!(matches!(
+            parse_starfield_args(tokens, true),
+            Ok((StarfieldConfiguredCommand::Capture(..), _))
+        ));
+        assert!(parse_args(["--out", "shots", "--house"].map(str::to_string)).is_err());
+        assert!(
+            parse_args_with_options(["--out", "shots", "--house"].map(str::to_string)).is_err()
+        );
+        for conflict in [
+            "--scene",
+            "--tunnel-variant",
+            "--starfield",
+            "--catalog-v1",
+            "--catalog",
+            "--location",
+            "--time",
+            "--follow-time",
+        ] {
+            for tokens in [
+                vec!["--out", "shots", "--house", conflict],
+                vec![conflict, "--house", "--out", "shots"],
+            ] {
+                assert!(
+                    cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).is_err()
+                );
+            }
+        }
+        assert!(cli_house_tokens(["--out", "--house"].map(str::to_string).to_vec()).is_err());
+    }
+
+    #[test]
+    fn house_manifest_never_claims_a_catalog_scene() {
+        let entry = manifest_house_entry(ManifestCaptureEntry {
+            file: "house.png",
+            frame_index: 0,
+            elapsed: 0.0,
+            starfield_epoch: "null".into(),
+            requested_scene: 14,
+            displayed_scene: 2,
+            scene_name: "House",
+            camera: CameraMode::ScreenSpace,
+        });
+        assert!(entry.contains("\"scene\": 14, \"displayed_scene\": null"));
+        assert!(entry.contains("\"local_mode\": \"house\""));
+        assert_eq!(scenes::dispatch_configured(14, false).name(), "PulseTunnel");
+        assert_eq!(
+            scenes::dispatch_configured(7, false).name(),
+            colour_field::NAME
+        );
     }
 
     #[test]

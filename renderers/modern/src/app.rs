@@ -162,6 +162,7 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         lines_drop_cuts: args.lines_drop_cuts,
         tunnel_variant: args.tunnel_variant,
     });
+    renderer.pipeline_mut().enable_local_house(args.house);
     renderer
         .pipeline_mut()
         .configure_starfield(starfield.clone());
@@ -326,7 +327,7 @@ fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
-       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
+       [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract|surface-hallway] [--house]
        [--scene N]
        {program} --list-monitors | --list-audio-devices
 
@@ -362,7 +363,8 @@ Options:
                           default builds print a notice and draw nothing
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
-  --tunnel-variant MODE   PulseTunnel look: original (default), hallway or abstract
+  --tunnel-variant MODE   PulseTunnel look: original (default), hallway, abstract or surface-hallway
+  --house                 local House for native displays; incompatible with --scene and --tunnel-variant
   Scene 6 requires both --star-catalog and --location; scene 7 remains ColourField
   -h, --help              print this help
 
@@ -565,6 +567,7 @@ struct AppArgs {
     location: Option<(f64, f64)>,
     unix_seconds: Option<f64>,
     tunnel_variant: TunnelVariant,
+    house: bool,
 }
 
 /// Wire palettes go through the stability gate, and a stable absolute 3 or 7
@@ -623,6 +626,7 @@ impl AppArgs {
     fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<ArgsCommand, AppError> {
         let mut parsed = Self::default();
         let mut args = args.into_iter();
+        let mut tunnel_variant_supplied = false;
 
         let mut first = true;
         while let Some(arg) = args.next() {
@@ -690,14 +694,19 @@ impl AppArgs {
                     parsed.unix_seconds = Some(seconds);
                 }
                 "--tunnel-variant" => {
-                    let value =
-                        required_value(&mut args, "--tunnel-variant", "original|hallway|abstract")?;
+                    tunnel_variant_supplied = true;
+                    let value = required_value(
+                        &mut args,
+                        "--tunnel-variant",
+                        "original|hallway|abstract|surface-hallway",
+                    )?;
                     parsed.tunnel_variant = TunnelVariant::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
-                            "--tunnel-variant expects original|hallway|abstract, got {value}"
+                            "--tunnel-variant expects original|hallway|abstract|surface-hallway, got {value}"
                         ))
                     })?;
                 }
+                "--house" => parsed.house = true,
                 // `cargo run -- ...` / `just recipe -- ...` may forward a separator.
                 "--" if is_first => {}
                 "--help" | "-h" => return Ok(ArgsCommand::Help),
@@ -705,6 +714,18 @@ impl AppArgs {
             }
         }
 
+        if parsed.house
+            && (parsed.scene.is_some()
+                || tunnel_variant_supplied
+                || parsed.catalog_path.is_some()
+                || parsed.location.is_some()
+                || parsed.unix_seconds.is_some())
+        {
+            return Err(invalid_input(
+                "--house is incompatible with --scene, --tunnel-variant and Starfield options"
+                    .to_string(),
+            ));
+        }
         if parsed.audio_device.is_some() && !parsed.mic && !parsed.list_audio_devices {
             return Err(invalid_input("--audio-device requires --mic".to_string()));
         }
@@ -795,8 +816,15 @@ fn required_value(
     flag: &str,
     expected: &str,
 ) -> Result<String, AppError> {
-    args.next()
-        .ok_or_else(|| invalid_input(format!("{flag} requires {expected}")))
+    let value = args
+        .next()
+        .ok_or_else(|| invalid_input(format!("{flag} requires {expected}")))?;
+    if value == "--house" {
+        return Err(invalid_input(format!(
+            "{flag} requires {expected}; --house is an option"
+        )));
+    }
+    Ok(value)
 }
 
 fn invalid_input(message: String) -> AppError {
@@ -2520,8 +2548,34 @@ mod tests {
             parse_run(&["--tunnel-variant", "abstract"]).tunnel_variant,
             TunnelVariant::Abstract
         );
+        assert_eq!(
+            parse_run(&["--tunnel-variant", "surface-hallway"]).tunnel_variant,
+            TunnelVariant::SurfaceHallway
+        );
         assert!(parse(&["--tunnel-variant", "lines"]).is_err());
         assert!(parse(&["--tunnel-variant"]).is_err());
+    }
+
+    #[test]
+    fn house_is_local_and_rejects_competing_selections() {
+        assert!(!AppArgs::default().house);
+        assert!(parse_run(&["--house", "--udp", "127.0.0.1:6464"]).house);
+        for conflict in [
+            vec!["--house", "--scene", "2"],
+            vec!["--scene", "7", "--house"],
+            vec!["--house", "--tunnel-variant", "original"],
+            vec!["--tunnel-variant", "surface-hallway", "--house"],
+            vec![
+                "--house",
+                "--star-catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+            ],
+        ] {
+            assert!(parse(&conflict).is_err(), "{conflict:?}");
+        }
+        assert!(parse(&["--udp", "--house"]).is_err());
     }
 
     #[test]
