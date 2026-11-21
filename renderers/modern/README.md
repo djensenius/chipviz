@@ -683,7 +683,44 @@ needs no screen-recording permission, only a GPU adapter.
 ```sh
 just modern-capture --profile m1 --scene 1 --frames 0,120,240 --size 1920x1080 --out build/shots
 just modern-capture --input host/fixtures/musical/groove.cvz --frames 0,30 --out build/groove
+just modern-capture --catalog-v1 --input recording.cvxe --frames 0,30 --out build/catalog-shots
 ```
+
+`--catalog-v1` is an explicit CLI-only offline mode, not extension or content
+auto-detection. It requires `--input FILE` and rejects `--scene`,
+`--tunnel-variant`, and all Starfield options. Only catalog families 0–5
+(SignalField, SpectrumVolume, PulseTunnel, Lines, Static and Object), variant
+0, are accepted on the M1 and Pi 5 profiles. Starfield, ColourField and all
+other pairs are unavailable; they are never mapped to legacy substitutes.
+The tunnel is always original, and Starfield dispatch is disabled. This is
+profile support, not evidence from physical Pi hardware. Catalog-v1 capture
+currently requires Unix: it uses a nonblocking open and rejects non-regular
+input files, including FIFOs, before reading.
+
+The entire file and every record are checked before GPU initialization or
+output-directory/file creation, including records after the last requested
+still. `--frames` must be strictly increasing and within the recording.
+Each record is applied once in order at index/60 seconds; requested stills do
+not reset replay state. The manifest includes the requested record's exact
+family, variant, sequence, tick, metadata and complete envelope (hex), plus
+the renderer's displayed scene. Native renderer transition/safety behavior
+is unchanged.
+
+The file limit is 1,000,000 records, or 145,000,020 bytes. Validation copies
+the acquisition buffer, so a maximum-size file needs approximately
+290,000,040 bytes at peak, plus allocator and other overhead; the acquisition
+buffer is released before rendering. Output and renderer memory are additional.
+Use a trusted input and trusted, non-mutable input directory. Acquisition
+checks file identity where available and metadata before and after reading,
+and fails on detected changes; these checks cannot make arbitrary concurrent
+mutation an atomic filesystem snapshot. Replay uses only the owned validated
+bytes and never reopens the source.
+Catalog-v1 refuses output leaves that are the input file, including hard-link
+or symlink aliases. It checks the manifest before GPU setup and again before
+writing, and each PNG after its displayed scene determines the filename and
+before creating it. A later PNG collision can therefore leave earlier outputs.
+These identity checks require trusted, non-mutable input and output directories;
+they are not protection against concurrent path replacement.
 
 By default capture overwrites existing outputs. The CLI's `--exclusive-output`
 instead atomically creates each PNG and manifest, refusing existing files or
@@ -692,7 +729,8 @@ an untrusted or mutable parent directory. On failure, newly created files
 (including partial files) may remain; existing outputs are never deleted. With
 this opt-in, recognized options cannot be consumed as values; use `./` for a
 literal path named like an option, for example `./--out`. Default CLI parsing
-retains its legacy behavior.
+retains its legacy behavior. Catalog-v1 mode also refuses recognized options
+as values, even without `--exclusive-output`.
 
 Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
 frame 0, so very large frame indices take longer to capture.
