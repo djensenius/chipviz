@@ -13,8 +13,10 @@ const HALF_WIDTH: f32 = 2.4;
 const HALF_HEIGHT: f32 = 1.5;
 const NEAR: f32 = 0.5;
 const FOCAL: f32 = 1.2;
-const DEPTH_ROWS: usize = 22;
+const DEPTH_ROWS: usize = 10;
 const SEGMENTS_PER_STROKE: usize = 4;
+const EDGE_DEPTHS: [f32; 6] = [0.0, 4.0, 9.0, 18.0, 36.0, 64.0];
+const LANES: [f32; 3] = [-0.62, 0.0, 0.62];
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {
@@ -50,17 +52,45 @@ impl Surface {
     }
 }
 
-// Each row contains an oblique stroke ending at surface edges and a shorter
-// longitudinal stroke. Staggering the surfaces prevents rectangular hoops.
-fn world_line(surface: Surface, surface_index: usize, row: usize, across: bool) -> [[f32; 3]; 2] {
-    let z = 1.5 + row as f32 * 2.6 + surface_index as f32 * 0.38;
-    let extent = surface.extent();
-    if across {
-        [surface.point(-extent, z), surface.point(extent, z + 1.4)]
+// Corner seams are shared by adjacent planes. Splitting them in world depth
+// keeps the perspective taper well sampled from the viewport to the distance.
+fn edge_line(corner: usize, interval: usize) -> [[f32; 3]; 2] {
+    let x = if corner.is_multiple_of(2) {
+        -HALF_WIDTH
     } else {
-        let u = extent * if row.is_multiple_of(2) { -0.38 } else { 0.38 };
-        [surface.point(u, z + 0.3), surface.point(u, z + 2.3)]
-    }
+        HALF_WIDTH
+    };
+    let y = if corner < 2 {
+        -HALF_HEIGHT
+    } else {
+        HALF_HEIGHT
+    };
+    [
+        [x, y, EDGE_DEPTHS[interval]],
+        [x, y, EDGE_DEPTHS[interval + 1]],
+    ]
+}
+
+// Interrupted longitudinal paint tracks remain in fixed world coordinates.
+// The different phase and length of each lane avoid aligned cross sections.
+fn stripe(surface: Surface, surface_index: usize, row: usize, lane: usize) -> [[f32; 3]; 2] {
+    let u = surface.extent() * LANES[lane];
+    let z = 1.5 + row as f32 * 6.0 + surface_index as f32 * 0.55 + lane as f32 * 0.85;
+    let length = 4.0 + lane as f32 * 0.35;
+    [surface.point(u, z), surface.point(u, z + length)]
+}
+
+// Sparse short ticks start exactly on a corner and stop inside that plane.
+// They never span a plane, so they cannot make circumferential rings.
+fn edge_mark(surface: Surface, surface_index: usize, row: usize) -> [[f32; 3]; 2] {
+    let sign = if (surface_index + row).is_multiple_of(2) {
+        -1.0
+    } else {
+        1.0
+    };
+    let u = surface.extent() * sign;
+    let z = 2.0 + row as f32 * 6.0 + surface_index as f32 * 1.35;
+    [surface.point(u, z), surface.point(u * 0.55, z + 1.4)]
 }
 
 // A bounded, continuous camera path avoids recycling geometry past the
@@ -209,15 +239,33 @@ pub(crate) fn project(
     let thickness = 0.025 + 0.008 * treble;
     let intensity = 0.35 + 0.20 * energy + 0.10 * bass;
     let mut lines = Vec::new();
+    // Visit each corner at every depth before adding surface marks, so even
+    // a limited budget favours the corridor's actual perspective boundaries.
+    for interval in 0..EDGE_DEPTHS.len() - 1 {
+        for corner in 0..4 {
+            if lines.len() == max_lines {
+                return lines;
+            }
+            if let Some(stroke) = project_line(edge_line(corner, interval), eye, aspect) {
+                append_stroke(&stroke, thickness, intensity, max_lines, &mut lines);
+            }
+        }
+    }
     for row in 0..DEPTH_ROWS {
         for (index, surface) in SURFACES.into_iter().enumerate() {
-            for across in [true, false] {
+            for lane in 0..LANES.len() {
                 if lines.len() == max_lines {
                     return lines;
                 }
-                if let Some(stroke) =
-                    project_line(world_line(surface, index, row, across), eye, aspect)
-                {
+                if let Some(stroke) = project_line(stripe(surface, index, row, lane), eye, aspect) {
+                    append_stroke(&stroke, thickness, intensity, max_lines, &mut lines);
+                }
+            }
+            if row.is_multiple_of(3) {
+                if lines.len() == max_lines {
+                    return lines;
+                }
+                if let Some(stroke) = project_line(edge_mark(surface, index, row), eye, aspect) {
                     append_stroke(&stroke, thickness, intensity, max_lines, &mut lines);
                 }
             }
@@ -242,35 +290,73 @@ mod tests {
     }
 
     #[test]
-    fn strokes_are_on_their_planes_and_terminate_at_edges() {
+    fn stripes_are_longitudinal_staggered_and_confined_to_planes() {
+        let mut stripe_count = 0;
+        let mut mark_count = 0;
         for (index, surface) in SURFACES.into_iter().enumerate() {
             for row in 0..DEPTH_ROWS {
-                for across in [true, false] {
-                    let [a, b] = world_line(surface, index, row, across);
-                    let (fixed, value, u) = match surface {
-                        Surface::Left => (0, -HALF_WIDTH, 1),
-                        Surface::Right => (0, HALF_WIDTH, 1),
-                        Surface::Floor => (1, -HALF_HEIGHT, 0),
-                        Surface::Ceiling => (1, HALF_HEIGHT, 0),
-                    };
+                let (fixed, value, u) = match surface {
+                    Surface::Left => (0, -HALF_WIDTH, 1),
+                    Surface::Right => (0, HALF_WIDTH, 1),
+                    Surface::Floor => (1, -HALF_HEIGHT, 0),
+                    Surface::Ceiling => (1, HALF_HEIGHT, 0),
+                };
+                for lane in 0..LANES.len() {
+                    let [a, b] = stripe(surface, index, row, lane);
+                    stripe_count += 1;
                     close(a[fixed], value);
                     close(b[fixed], value);
-                    assert!(a[u].abs() <= surface.extent());
-                    assert!(b[u].abs() <= surface.extent());
-                    if across {
-                        close(a[u], -surface.extent());
-                        close(b[u], surface.extent());
-                        assert_ne!(a[2], b[2]);
-                    } else {
-                        close(a[u], b[u]);
+                    close(a[u], b[u]);
+                    assert!(a[u].abs() < surface.extent());
+                    assert!(b[2] > a[2]);
+                    if row + 1 < DEPTH_ROWS {
+                        assert!(b[2] < stripe(surface, index, row + 1, lane)[0][2]);
                     }
+                    if lane + 1 < LANES.len() {
+                        assert_ne!(a[2], stripe(surface, index, row, lane + 1)[0][2]);
+                    }
+                }
+                if row.is_multiple_of(3) {
+                    let [a, b] = edge_mark(surface, index, row);
+                    mark_count += 1;
+                    close(a[fixed], value);
+                    close(b[fixed], value);
+                    close(a[u].abs(), surface.extent());
+                    assert!(b[u].abs() < surface.extent());
+                    assert_eq!(a[u].signum(), b[u].signum());
+                    assert!(b[2] > a[2]);
                 }
             }
         }
-        // Adjacent surface strokes do not close into depth-aligned hoops.
+        // Full-width, depth-aligned strokes cannot join to form hoops.
+        assert!(stripe_count > 7 * mark_count);
         assert_ne!(
-            world_line(Surface::Left, 0, 5, true)[0][2],
-            world_line(Surface::Floor, 2, 5, true)[0][2]
+            edge_mark(Surface::Left, 0, 3)[0][2],
+            edge_mark(Surface::Floor, 2, 3)[0][2]
+        );
+    }
+
+    #[test]
+    fn corridor_edges_are_shared_plane_corners_and_continuous() {
+        for corner in 0..4 {
+            for interval in 0..EDGE_DEPTHS.len() - 1 {
+                let [a, b] = edge_line(corner, interval);
+                close(a[0].abs(), HALF_WIDTH);
+                close(a[1].abs(), HALF_HEIGHT);
+                close(a[0], b[0]);
+                close(a[1], b[1]);
+                assert!(b[2] > a[2]);
+                if interval + 1 < EDGE_DEPTHS.len() - 1 {
+                    assert_eq!(b, edge_line(corner, interval + 1)[0]);
+                }
+            }
+        }
+        let eye = camera(0.0);
+        let edge = segments(edge_line(0, 2), eye, SEGMENTS_PER_STROKE);
+        assert!(
+            project(0.0, 1.0, [0.0; 3], 1000)
+                .windows(edge.len())
+                .any(|window| window == edge)
         );
     }
 
@@ -303,7 +389,7 @@ mod tests {
     #[test]
     fn one_surface_stroke_tapers_continuously_with_depth() {
         let eye = camera(0.0);
-        let world = world_line(Surface::Floor, 2, 1, false);
+        let world = stripe(Surface::Floor, 2, 1, 0);
         let lines = segments(world, eye, SEGMENTS_PER_STROKE);
         assert_eq!(lines.len(), SEGMENTS_PER_STROKE);
         for pair in lines.windows(2) {
@@ -340,7 +426,7 @@ mod tests {
 
     #[test]
     fn fixed_marks_follow_continuously_moving_camera() {
-        let world = world_line(Surface::Floor, 2, 5, true);
+        let world = edge_mark(Surface::Floor, 2, 3);
         let at = |t| project_line(world, camera(t), 1.0).unwrap();
         let a = at(2.0);
         let b = at(2.001);
