@@ -281,18 +281,20 @@ class OfflineCredentials(google.auth.credentials.Credentials if google else obje
 
 
 class OfflineAdapter(HTTPAdapter):
-  def __init__(self, status=308, error=None, response_url=None, body=b"{}"):
+  def __init__(self, status=308, error=None, response_url=None, body=b"{}", location=None):
     super().__init__(max_retries=0)
     self.status = status
     self.error = error
     self.response_url = response_url
     self.body = body
+    self.location = location
     self.calls = []
 
   def send(self, request, **kwargs):
     self.calls.append(request)
     logging.getLogger("urllib3.connectionpool").debug(
-      'PUT %s Authorization %s', request.url, request.headers.get("Authorization"))
+      'PUT %s Authorization %s body %s',
+      request.url, request.headers.get("Authorization"), request.body)
     print("wire debug " + request.url + " " + request.headers.get("Authorization", ""))
     print("wire error " + request.url, file=sys.stderr)
     if self.error:
@@ -302,6 +304,8 @@ class OfflineAdapter(HTTPAdapter):
     response.url = self.response_url or request.url
     response.request = request
     response._content = self.body
+    if self.location:
+      response.headers["Location"] = self.location
     return response
 
 
@@ -413,8 +417,10 @@ class RealLibraryOfflineTests(unittest.TestCase):
           "access_token": "synthetic-access-two", "expires_in": 3600,
           "refresh_token": "synthetic-rotated",
         }).encode())
-        session._auth_request_session.mount("https://", token)
-        with mock.patch.object(youtube_auth, "_atomic_write", side_effect=OSError("synthetic-secret")):
+        def send_token(_adapter, request, **kwargs):
+          return token.send(request, **kwargs)
+        with mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send_token), \
+            mock.patch.object(youtube_auth, "_atomic_write", side_effect=OSError("synthetic-secret")):
           for _ in range(2):
             with self.assertRaises(transport.TransportError) as error:
               transport.create_session(session, {"snippet": {}}, 1)
@@ -423,6 +429,54 @@ class RealLibraryOfflineTests(unittest.TestCase):
             self.assertIsNone(error.exception.__context__)
         self.assertEqual(len(token.calls), 1)
         self.assertEqual(upload.calls, [])
+
+  def test_authorized_session_refresh_blocks_all_token_redirects(self):
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    logger = logging.getLogger("urllib3.connectionpool")
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    self.addCleanup(logger.removeHandler, handler)
+    self.addCleanup(logger.setLevel, previous)
+    with tempfile.TemporaryDirectory() as temporary:
+      home = Path(temporary).resolve() / "home"
+      home.mkdir(mode=0o700)
+      with mock.patch.object(youtube_auth.Path, "home", return_value=home):
+        with mock.patch.object(youtube_auth.getpass, "getpass", side_effect=(
+            "synthetic.apps.googleusercontent.com", "synthetic-secret")):
+          youtube_auth.configure()
+        state = home / ".config" / "chipviz" / youtube_auth.STATE_FILE
+        state.write_text(youtube_auth._state_text("UC" + "a" * 22, "synthetic-refresh"))
+        state.chmod(0o600)
+        expiry = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        expiry += datetime.timedelta(hours=1)
+        initial = ("synthetic-access", "synthetic-refresh", expiry, {}, None)
+        for status in (301, 302, 303, 307, 308):
+          with self.subTest(status=status):
+            with mock.patch.object(google_reauth, "refresh_grant", return_value=initial):
+              credentials, _ = youtube_auth.load_credentials()
+            credentials.token = None
+            session = transport.make_session(credentials)
+            self.addCleanup(session.close)
+            upload = OfflineAdapter()
+            session.mount("https://", upload)
+            token = OfflineAdapter(status=status, location="https://attacker.invalid/steal")
+            def send_token(_adapter, request, **kwargs):
+              return token.send(request, **kwargs)
+            with mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send_token), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+              with self.assertRaises(transport.TransportError) as error:
+                transport.create_session(session, {"snippet": {}}, 1)
+            self.assertEqual(error.exception.kind, "uncertain")
+            self.assertNotIn("synthetic-refresh", str(error.exception))
+            self.assertNotIn("attacker.invalid", str(error.exception))
+            self.assertEqual(len(token.calls), 1)
+            self.assertEqual(token.calls[0].url, youtube_auth.TOKEN_URI)
+            self.assertEqual(upload.calls, [])
+    for secret in ("synthetic-secret", "synthetic-refresh", "attacker.invalid",
+                   youtube_auth.TOKEN_URI):
+      self.assertNotIn(secret, output.getvalue())
 
   def test_normalized_response_url_matches_requests_preparation(self):
     uri = URI + "%7E"

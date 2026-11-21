@@ -18,13 +18,20 @@ import threading
 import types
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs
 
 try:
+  from google_auth_oauthlib.flow import InstalledAppFlow
   from google.oauth2.credentials import Credentials as GoogleCredentials
   from google.oauth2 import reauth as google_reauth
+  import requests
+  from requests.adapters import HTTPAdapter
 except ImportError:
   GoogleCredentials = None
   google_reauth = None
+  InstalledAppFlow = None
+  requests = None
+  HTTPAdapter = object
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "youtube_auth.py"
@@ -35,6 +42,28 @@ CLIENT = "synthetic-client.apps.googleusercontent.com"
 SECRET = "synthetic-secret"
 TOKEN = "synthetic-refresh-token"
 CHANNEL = "UC" + "a" * 22
+
+
+class FakeTokenAdapter(HTTPAdapter):
+  def __init__(self, status, body=b"{}"):
+    super().__init__(max_retries=0)
+    self.status = status
+    self.body = body
+    self.calls = []
+
+  def send(self, request, **kwargs):
+    self.calls.append((request, kwargs))
+    logging.getLogger("urllib3.connectionpool").debug(
+      "synthetic token %s %s", request.url, request.body)
+    logging.getLogger("urllib3.connectionpool").log(
+      logging.CRITICAL + 1, "synthetic token %s %s", request.url, request.body)
+    response = requests.Response()
+    response.status_code = self.status
+    response.url = request.url
+    response.request = request
+    response.headers["Location"] = "https://attacker.invalid/steal"
+    response._content = self.body
+    return response
 
 
 class YouTubeAuthTests(unittest.TestCase):
@@ -93,11 +122,14 @@ class YouTubeAuthTests(unittest.TestCase):
       "google.auth.transport.requests": types.ModuleType("google.auth.transport.requests"),
       "google.oauth2": types.ModuleType("google.oauth2"),
       "google.oauth2.credentials": types.ModuleType("google.oauth2.credentials"),
+      "requests": types.ModuleType("requests"),
+      "requests.adapters": types.ModuleType("requests.adapters"),
     }
     modules["google_auth_oauthlib.flow"].InstalledAppFlow = flow_class
     modules["googleapiclient.discovery"].build = build
     modules["google.auth.transport.requests"].Request = request
     modules["google.oauth2.credentials"].Credentials = credentials_class
+    modules["requests.adapters"].HTTPAdapter = mock.Mock()
     return modules, credentials, flow_class, flow, service, credentials_class
 
   def test_configure_uses_getpass_and_private_exact_permissions(self):
@@ -200,6 +232,9 @@ class YouTubeAuthTests(unittest.TestCase):
     flow_class.from_client_config.assert_called_once()
     self.assertEqual(flow_class.from_client_config.call_args.kwargs["scopes"], AUTH.SCOPES)
     self.assertTrue(flow_class.from_client_config.call_args.kwargs["autogenerate_code_verifier"])
+    self.assertFalse(flow.oauth2session.trust_env)
+    self.assertEqual(flow.oauth2session.mount.call_count, 2)
+    flow.oauth2session.close.assert_called_once()
     self.assertEqual(flow.run_local_server.call_args.kwargs["host"], "127.0.0.1")
     self.assertTrue(flow.run_local_server.call_args.kwargs["open_browser"])
     service.channels.return_value.list.assert_called_once_with(
@@ -214,6 +249,187 @@ class YouTubeAuthTests(unittest.TestCase):
     self.assertIn(CHANNEL, output.getvalue())
     for value in (CLIENT, SECRET, TOKEN):
       self.assertNotIn(value, output.getvalue())
+
+  @unittest.skipUnless(InstalledAppFlow is not None, "optional Google dependencies not installed")
+  def test_real_code_exchange_blocks_redirects_and_preserves_pkce(self):
+    for status in (301, 302, 303, 307, 308):
+      with self.subTest(status=status):
+        config = {"installed": {"client_id": CLIENT, "client_secret": SECRET,
+                                "auth_uri": AUTH.AUTH_URI, "token_uri": AUTH.TOKEN_URI,
+                                "redirect_uris": ["http://localhost"]}}
+        flow = InstalledAppFlow.from_client_config(
+          config, scopes=AUTH.SCOPES, autogenerate_code_verifier=True)
+        flow.redirect_uri = "http://127.0.0.1:12345/"
+        url, _ = flow.authorization_url()
+        self.assertIn("code_challenge=", url)
+        AUTH._protect_token_session(flow.oauth2session)
+        adapter = FakeTokenAdapter(status)
+        flow.oauth2session.mount("https://", adapter)
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        logger = logging.getLogger("urllib3.connectionpool")
+        previous = logger.level
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        try:
+          with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://attacker.invalid:1234"}), \
+              contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            with self.assertRaises(AUTH.AuthError) as error, AUTH._quiet_google():
+              flow.fetch_token(code="synthetic-code")
+        finally:
+          logger.removeHandler(handler)
+          logger.setLevel(previous)
+          flow.oauth2session.close()
+        self.assertEqual(error.exception.kind, "uncertain")
+        self.assertNotIn("attacker.invalid", str(error.exception))
+        self.assertEqual(len(adapter.calls), 1)
+        request, kwargs = adapter.calls[0]
+        self.assertEqual(request.url, AUTH.TOKEN_URI)
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(parse_qs(request.body)["code_verifier"], [flow.code_verifier])
+        self.assertFalse(kwargs["proxies"])
+        self.assertEqual(kwargs["timeout"], AUTH.TOKEN_TIMEOUT)
+        for secret in (CLIENT, SECRET, "synthetic-code", flow.code_verifier, "attacker.invalid"):
+          self.assertNotIn(secret, output.getvalue())
+
+  @unittest.skipUnless(InstalledAppFlow is not None, "optional Google dependencies not installed")
+  def test_real_code_exchange_succeeds_with_pkce(self):
+    config = {"installed": {"client_id": CLIENT, "client_secret": SECRET,
+                            "auth_uri": AUTH.AUTH_URI, "token_uri": AUTH.TOKEN_URI,
+                            "redirect_uris": ["http://localhost"]}}
+    flow = InstalledAppFlow.from_client_config(
+      config, scopes=AUTH.SCOPES, autogenerate_code_verifier=True)
+    flow.redirect_uri = "http://127.0.0.1:12345/"
+    flow.authorization_url()
+    AUTH._protect_token_session(flow.oauth2session)
+    adapter = FakeTokenAdapter(200, json.dumps({
+      "access_token": "synthetic-access", "refresh_token": TOKEN, "expires_in": 3600,
+      "scope": " ".join(AUTH.SCOPES), "token_type": "Bearer",
+    }).encode())
+    flow.oauth2session.mount("https://", adapter)
+    try:
+      with AUTH._quiet_google():
+        flow.fetch_token(code="synthetic-code")
+      self.assertEqual(flow.credentials.refresh_token, TOKEN)
+      self.assertEqual(parse_qs(adapter.calls[0][0].body)["code_verifier"], [flow.code_verifier])
+      self.assertEqual(len(adapter.calls), 1)
+    finally:
+      flow.oauth2session.close()
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_real_initial_refresh_blocks_all_redirects(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    logger = logging.getLogger("urllib3.connectionpool")
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    self.addCleanup(logger.removeHandler, handler)
+    self.addCleanup(logger.setLevel, previous)
+    for status in (301, 302, 303, 307, 308):
+      with self.subTest(status=status):
+        adapter = FakeTokenAdapter(status)
+        def send(_self, request, **kwargs):
+          return adapter.send(request, **kwargs)
+        with mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send), \
+            mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://attacker.invalid:1234"}), \
+            contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+          with self.assertRaises(AUTH.AuthError) as error:
+            AUTH.load_credentials()
+        self.assertEqual(error.exception.kind, "uncertain")
+        self.assertNotIn(TOKEN, str(error.exception))
+        self.assertEqual(len(adapter.calls), 1)
+        request, kwargs = adapter.calls[0]
+        self.assertEqual(request.url, AUTH.TOKEN_URI)
+        self.assertEqual(request.method, "POST")
+        self.assertFalse(kwargs["proxies"])
+        self.assertEqual(kwargs["timeout"], AUTH.TOKEN_TIMEOUT)
+        self.assertEqual(json.loads(state.read_text())["refresh_token"], TOKEN)
+    for secret in (TOKEN, SECRET, AUTH.TOKEN_URI, "attacker.invalid"):
+      self.assertNotIn(secret, output.getvalue())
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_token_guard_rejects_wrong_endpoint_or_method_before_send(self):
+    for method, url in (
+      ("POST", "https://attacker.invalid/token"),
+      ("POST", "http://oauth2.googleapis.com/token"),
+      ("POST", AUTH.TOKEN_URI + "?other=1"),
+      ("GET", AUTH.TOKEN_URI),
+    ):
+      with self.subTest(method=method, url=url):
+        session = requests.Session()
+        AUTH._protect_token_session(session)
+        adapter = FakeTokenAdapter(200)
+        session.mount("https://", adapter)
+        try:
+          with self.assertRaises(AUTH.AuthError):
+            session.request(method, url, data=TOKEN)
+          self.assertEqual(adapter.calls, [])
+        finally:
+          session.close()
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_token_guard_rejects_second_attempt(self):
+    session = requests.Session()
+    AUTH._protect_token_session(session)
+    adapter = FakeTokenAdapter(200)
+    session.mount("https://", adapter)
+    try:
+      with AUTH._quiet_google():
+        session.request("POST", AUTH.TOKEN_URI, data=TOKEN)
+        with self.assertRaises(AUTH.AuthError):
+          session.request("POST", AUTH.TOKEN_URI, data=TOKEN)
+      self.assertEqual(len(adapter.calls), 1)
+    finally:
+      session.close()
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_real_initial_refresh_preserves_definitive_revocation(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    adapter = FakeTokenAdapter(400, b'{"error":"invalid_grant"}')
+    def send(_self, request, **kwargs):
+      return adapter.send(request, **kwargs)
+    with mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send):
+      with self.assertRaises(AUTH.AuthError) as error:
+        AUTH.load_credentials()
+    self.assertEqual(error.exception.kind, "auth_required")
+    self.assertEqual(len(adapter.calls), 1)
+    self.assertEqual(json.loads(state.read_text())["refresh_token"], TOKEN)
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_channel_confirmation_refresh_also_blocks_redirects(self):
+    self.configure()
+    credentials = GoogleCredentials(
+      token=None, refresh_token=TOKEN, token_uri=AUTH.TOKEN_URI,
+      client_id=CLIENT, client_secret=SECRET, scopes=AUTH.SCOPES)
+    flow = mock.Mock()
+    flow.oauth2session = requests.Session()
+    flow.run_local_server.return_value = credentials
+    service = mock.Mock()
+    def confirm():
+      credentials.refresh(object())
+      return {"items": [{"id": CHANNEL, "snippet": {"title": "Synthetic"}}]}
+    service.channels.return_value.list.return_value.execute.side_effect = confirm
+    adapter = FakeTokenAdapter(307)
+    def send(_self, request, **kwargs):
+      return adapter.send(request, **kwargs)
+    with mock.patch.object(InstalledAppFlow, "from_client_config", return_value=flow), \
+        mock.patch("googleapiclient.discovery.build", return_value=service), \
+        mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send), \
+        contextlib.redirect_stdout(io.StringIO()):
+      with self.assertRaises(AUTH.AuthError) as error:
+        AUTH.authorize()
+    self.assertEqual(error.exception.kind, "uncertain")
+    self.assertEqual(len(adapter.calls), 1)
+    self.assertEqual(adapter.calls[0][0].url, AUTH.TOKEN_URI)
+    self.assertFalse((self.app / AUTH.STATE_FILE).exists())
 
   def test_unconfirmed_or_ambiguous_channel_and_no_refresh_token(self):
     self.configure()
@@ -399,8 +615,9 @@ class YouTubeAuthTests(unittest.TestCase):
       credentials, _ = AUTH.load_credentials()
     response = types.SimpleNamespace(status=503, data=b'{"error":"server_error"}')
     request = mock.Mock(return_value=response)
-    with self.assertRaises(AUTH.AuthError) as error:
-      credentials.refresh(request)
+    with mock.patch.object(AUTH, "_token_request", return_value=contextlib.nullcontext(request)):
+      with self.assertRaises(AUTH.AuthError) as error:
+        credentials.refresh(request)
     self.assertEqual(request.call_count, 1)
     self.assertEqual(error.exception.kind, "uncertain")
     self.assertIsNone(credentials.token)
@@ -426,8 +643,9 @@ class YouTubeAuthTests(unittest.TestCase):
         with mock.patch.object(google_reauth, "refresh_grant", return_value=initial):
           credentials, _ = AUTH.load_credentials()
         request = mock.Mock(return_value=types.SimpleNamespace(status=status, data=body))
-        with self.assertRaises(AUTH.AuthError) as error:
-          credentials.refresh(request)
+        with mock.patch.object(AUTH, "_token_request", return_value=contextlib.nullcontext(request)):
+          with self.assertRaises(AUTH.AuthError) as error:
+            credentials.refresh(request)
         self.assertEqual(error.exception.kind, kind)
         self.assertNotIn(TOKEN, str(error.exception))
         self.assertEqual(request.call_count, 1)

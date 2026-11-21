@@ -39,26 +39,37 @@ processes running as your user, administrators, malware, and insecure backups
 can still read or alter them. This is not a hardware-backed secret store.
 
 Google can revoke refresh tokens, and testing-mode or unused tokens can expire;
-consent is not a guarantee of permanent unattended operation. If authorization
-fails or is revoked, delete the private token file yourself and repeat
-`authorize`. To replace the client, remove both private files yourself and
-repeat both commands. Protect the old files when removing them. The uploader
-must stop if `load_credentials()` fails, and must verify it is operating on the
-returned expected channel before uploading. The loader refreshes with Google
-each time, so it requires network access and rejects revoked or unavailable
-authorization rather than treating stale credentials as valid.
+consent is not a guarantee of permanent unattended operation. After a network,
+storage, or other uncertain failure, stop and preserve all private state; do not
+delete it or start another upload. A failed or interrupted token rotation may
+leave the current token unknown and requires deliberate recovery. Only after
+definitive revocation and an intentional recovery decision should you securely
+preserve the existing private state and remove the token file to repeat
+`authorize`. Replacing the client is a separate intentional operation: securely
+preserve both private files before removing them and repeating both commands.
+The uploader must stop if `load_credentials()` fails, and must verify it is
+operating on the returned expected channel before uploading. The loader
+refreshes with Google each time, so it requires network access and rejects
+revoked or unavailable authorization rather than treating stale credentials as
+valid.
 Refresh-token rotation is saved atomically, including subsequent automatic
 refreshes on the returned credentials. A process crash or storage failure after
-Google rotates a token but before it is saved can require reauthorization.
+Google rotates a token but before it is saved has an uncertain outcome; preserve
+the state and quarantine the operation rather than automatically reauthorizing.
 Concurrent cooperating processes serialize using `.youtube.lock`; do not remove
-or replace this lock while chipviz is running. Stale credentials must be
-reloaded if another process rotates the token. A crash may leave an owner-only
-`.youtube-<random>` temporary file in the app directory; it may contain a
-secret and can be removed after all chipviz processes have stopped.
+or replace this lock while chipviz is running. After a confirmed successful
+rotation by another process, stale credentials must be reloaded; an uncertain
+rotation instead requires quarantine. A crash may leave an owner-only
+`.youtube-<random>` temporary file in the app directory; it may contain the
+only copy of a rotated secret. Preserve it securely for deliberate recovery.
 
 The importable interface is `load_credentials() -> tuple[object, str]`: a
 refreshed Google Credentials object and the confirmed channel ID. It raises
 `AuthError` on missing, unsafe, invalid, revoked, or unavailable authorization.
+`AuthError.kind` is `auth_required` only for a definitive authorization failure;
+`uncertain` requires preserving state and stopping.
+Token exchanges use only Google's fixed HTTPS token endpoint, without proxies,
+redirects, or automatic retries.
 Call it serially: while contacting Google, it temporarily suppresses
 process-wide logging and redirects standard output and error to protect OAuth
 data from library diagnostics.

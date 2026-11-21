@@ -28,6 +28,7 @@ SCOPES = (
 )
 AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
+TOKEN_TIMEOUT = (10, 60)
 ENV_FILE = ".env.youtube"
 STATE_FILE = "youtube-token.json"
 LOCK_FILE = ".youtube.lock"
@@ -48,12 +49,75 @@ class AuthError(Exception):
 def _quiet_google():
   # Library handlers may point to the original streams, not redirected ones.
   previous = logging.root.manager.disable
-  logging.disable(max(previous, logging.CRITICAL))
+  logging.disable(max(previous, sys.maxsize))
   try:
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
       yield
   finally:
     logging.disable(previous)
+
+
+def _protect_token_session(session):
+  """Constrain a newly created Requests/OAuth2Session to one token POST."""
+  from requests.adapters import HTTPAdapter
+
+  session.trust_env = False
+  session.proxies.clear()
+  for scheme in ("http://", "https://"):
+    session.mount(scheme, HTTPAdapter(max_retries=0))
+  original = session.request
+  attempts = 0
+
+  def request(method, url, **kwargs):
+    nonlocal attempts
+    attempts += 1
+    if attempts != 1 or method.upper() != "POST" or url != TOKEN_URI:
+      raise AuthError("Token exchange outcome is uncertain.")
+    kwargs.update(allow_redirects=False, proxies={}, timeout=TOKEN_TIMEOUT, verify=True)
+    response = original(method, url, **kwargs)
+    if (response.history or response.url != TOKEN_URI
+        or 300 <= response.status_code < 400):
+      raise AuthError("Token exchange outcome is uncertain.")
+    return response
+
+  session.request = request
+
+
+@contextlib.contextmanager
+def _token_request():
+  from google.auth.transport.requests import Request
+  from requests import Session
+
+  session = Session()
+  try:
+    _protect_token_session(session)
+    yield Request(session)
+  finally:
+    session.close()
+
+
+def _refresh_once(refresh):
+  attempts = 0
+
+  def request(*args, **kwargs):
+    nonlocal attempts
+    attempts += 1
+    if attempts != 1:
+      raise AuthError("Token refresh outcome is uncertain.")
+    with _token_request() as guarded:
+      response = guarded(*args, **kwargs)
+    if response.status != 200:
+      if response.status == 400:
+        try:
+          body = json.loads(response.data)
+        except (ValueError, TypeError, UnicodeDecodeError):
+          body = None
+        if isinstance(body, dict) and body.get("error") == "invalid_grant":
+          raise AuthError("YouTube authorization required.", kind="auth_required")
+      raise AuthError("Token refresh outcome is uncertain.")
+    return response
+
+  refresh(request)
 
 
 def _check_acl(fd: int, *, allow_denies: bool = False) -> None:
@@ -328,9 +392,18 @@ def _authorize_locked(fd: int) -> None:
   with _quiet_google():
     flow = InstalledAppFlow.from_client_config(
       client_config, scopes=SCOPES, autogenerate_code_verifier=True)
-    credentials = flow.run_local_server(
-      host="127.0.0.1", port=0, open_browser=True,
-      authorization_prompt_message=None, timeout_seconds=300, prompt="consent")
+    _protect_token_session(flow.oauth2session)
+    try:
+      credentials = flow.run_local_server(
+        host="127.0.0.1", port=0, open_browser=True,
+        authorization_prompt_message=None, timeout_seconds=300, prompt="consent")
+    finally:
+      flow.oauth2session.close()
+    original_refresh = credentials.refresh
+    def guarded_refresh(_request):
+      with _quiet_google():
+        _refresh_once(original_refresh)
+    credentials.refresh = guarded_refresh
     if not _token_valid(credentials.refresh_token):
       raise AuthError("Google did not provide a durable refresh token.")
     granted = credentials.granted_scopes
@@ -397,7 +470,6 @@ def load_credentials() -> tuple[object, str]:
         channel_id, token = _state_values(_read(fd, STATE_FILE))
     finally:
       os.close(fd)
-    from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
     class DurableCredentials(Credentials):
@@ -414,26 +486,8 @@ def load_credentials() -> tuple[object, str]:
                   or current_token != self.refresh_token):
                 raise AuthError("Authorization changed; reload credentials.")
 
-              attempts = 0
-              def single_token_request(*args, **kwargs):
-                nonlocal attempts
-                attempts += 1
-                if attempts != 1:
-                  raise AuthError("Token refresh outcome is uncertain.")
-                response = request(*args, **kwargs)
-                if response.status != 200:
-                  if response.status == 400:
-                    try:
-                      body = json.loads(response.data)
-                    except (ValueError, TypeError, UnicodeDecodeError):
-                      body = None
-                    if isinstance(body, dict) and body.get("error") == "invalid_grant":
-                      raise AuthError("YouTube authorization required.", kind="auth_required")
-                  raise AuthError("Token refresh outcome is uncertain.")
-                return response
-
               with _quiet_google():
-                super().refresh(single_token_request)
+                _refresh_once(super().refresh)
               new_token = self.refresh_token
               if not _token_valid(new_token):
                 raise AuthError("Google returned an invalid refresh token.")
@@ -454,7 +508,7 @@ def load_credentials() -> tuple[object, str]:
     credentials = DurableCredentials(
       token=None, refresh_token=token, token_uri=TOKEN_URI,
       client_id=client_id, client_secret=client_secret, scopes=SCOPES)
-    credentials.refresh(Request())
+    credentials.refresh(None)
     return credentials, channel_id
   except Exception as error:
     kind = error.kind if isinstance(error, AuthError) else "uncertain"
