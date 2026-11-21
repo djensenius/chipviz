@@ -98,8 +98,11 @@ function selectClip(clip) {
   let video = null;
   let state = 'unopened';
   let copyVersion = 0;
+  let copySeconds = null;
+  let seekFeedbackVersion = null;
   function invalidateCopy() {
     copyVersion += 1;
+    copySeconds = null;
     fallback.hidden = true;
   }
   function discardVideo() {
@@ -160,16 +163,19 @@ function selectClip(clip) {
     });
     openedVideo.addEventListener('seeked', () => {
       if (video !== openedVideo || !['seeking', 'invalid'].includes(state) || openedVideo.seeking) return;
-      invalidateCopy();
       if (!Number.isFinite(openedVideo.duration) || openedVideo.duration < 0 ||
           !Number.isFinite(openedVideo.currentTime) || openedVideo.currentTime < 0 ||
           openedVideo.currentTime > openedVideo.duration) {
+        invalidateCopy();
         state = 'error';
         feedback.textContent = 'Video metadata or seek failed. Reopen the video and try again.';
         return;
       }
       state = 'ready';
-      feedback.textContent = '';
+      if (copySeconds !== null && copySeconds > openedVideo.duration) {
+        invalidateCopy();
+        feedback.textContent = 'Time exceeds the video duration. Enter a time within the video.';
+      } else if (seekFeedbackVersion === copyVersion) feedback.textContent = '';
     });
     openedVideo.addEventListener('loadedmetadata', () => {
       if (video !== openedVideo || state !== 'loading') return;
@@ -179,12 +185,14 @@ function selectClip(clip) {
         feedback.textContent = 'Video duration is unavailable. Reopen the video and try again.';
       } else if (seconds > openedVideo.duration) {
         state = 'invalid';
+        seekFeedbackVersion = copyVersion;
         feedback.textContent = 'Time exceeds the video duration. Enter a time within the video.';
       } else if (openedVideo.currentTime === seconds && !openedVideo.seeking) {
         state = 'ready';
         feedback.textContent = '';
       } else {
         state = 'seeking';
+        seekFeedbackVersion = copyVersion;
         try {
           openedVideo.currentTime = seconds;
           feedback.textContent = 'Waiting for the initial seek to finish.';
@@ -205,8 +213,10 @@ function selectClip(clip) {
     invalidateCopy();
     if (!hasDuration()) return;
     if (state === 'invalid') {
+      seekFeedbackVersion = copyVersion;
       feedback.textContent = 'Enter a valid time and reopen the video, or seek with the player.';
     } else if (state !== 'ready' || video.seeking) {
+      seekFeedbackVersion = copyVersion;
       feedback.textContent = 'Wait for the video seek to finish before using playback time.';
     } else if (Number.isFinite(video.currentTime) && video.currentTime >= 0 && inDuration(video.currentTime)) {
       input.value = String(Math.floor(video.currentTime));
@@ -237,6 +247,7 @@ function selectClip(clip) {
       feedback.textContent = 'A clipboard write is still in progress. Wait and try copying again.';
       return;
     }
+    copySeconds = seconds;
     try {
       if (!navigator.clipboard || !window.isSecureContext) throw new Error('Clipboard unavailable');
       clipboardWritePending = true;
