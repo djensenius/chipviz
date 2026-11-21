@@ -26,6 +26,8 @@ libc = "0.2"
 # or a Harding-style flash and red-flash check), so it is off by default and
 # must not ship until they have been.
 unmeasured-flash = []
+# Development-only preview; do not enable in release artifacts pending review.
+dmg-preview = []
 
 [[bin]]
 name = "chipviz-pi5"
