@@ -30,7 +30,12 @@ mailbox is held unchanged for three further emulator frames, and the final
 two must be fresh, non-null, complete, equal callbacks. Consecutive selected
 states must not return identical images. A clone of the model receives one
 additional tick to expose the prepared output without advancing the model for
-the next acknowledged step. The test compares every native RGB pixel to the
+the next acknowledged step. The capture process sends binary records on
+stdout: a two-byte little-endian `wStep` read after acknowledgement and
+freeze, followed by exactly 160×144×3 RGB bytes. Before GPU use, Rust requires
+the complete expected record count, exact total length and exact ordered IDs,
+including across the 8-bit mailbox counter wrap; stderr carries diagnostics.
+The test compares every native RGB pixel to the
 model and both UNORM and sRGB offscreen GPU readbacks (allowing one code of
 GPU rounding for intermediate greys). It covers selected scroll positions,
 palette boundaries, and wrap, not all possible states or cores.

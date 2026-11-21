@@ -16,6 +16,7 @@ SOURCE = ROOT / "cores" / "gb" / "homebrew"
 STEPS = (1, 2, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 127, 128, 255, 256, 257)
 WIDTH, HEIGHT = 160, 144
 FRAME_BYTES = WIDTH * HEIGHT * 3
+RECORD_BYTES = 2 + FRAME_BYTES
 
 
 def registers(step):
@@ -117,6 +118,7 @@ def capture(rom, core, sym):
       raise AssertionError("unexpected fixture initial state")
     selected = set(STEPS)
     frames = []
+    records = []
     for step in range(1, max(STEPS) + 1):
       write("wFxSeq", step % 256)
       for _ in range(4):
@@ -139,7 +141,10 @@ def capture(rom, core, sym):
         if frames and frames[-1] == second:
           raise AssertionError(f"consecutive selected states have identical frames at step {step}")
         frames.append(second)
-    return b"".join(frames)
+        # state() has checked this actual 16-bit native step and the mailbox
+        # acknowledgement after the freeze; do not label it from the loop.
+        records.append(read("wStep", 2) + second)
+    return b"".join(records)
   finally:
     gb.close()
 
@@ -159,7 +164,7 @@ def main():
                         ("ROM", rom), ("core", core)):
       print(f"{label}: {path} sha256={hashlib.sha256(path.read_bytes()).hexdigest()}", file=sys.stderr)
     data = capture(rom, core, symbols(sym))
-    if len(data) != len(STEPS) * FRAME_BYTES:
+    if len(data) != len(STEPS) * RECORD_BYTES:
       raise AssertionError("incomplete capture")
     sys.stdout.buffer.write(data)
 

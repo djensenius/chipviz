@@ -16,23 +16,51 @@ const STEPS: [usize; 19] = [
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 144;
 const RGB_BYTES: usize = WIDTH as usize * HEIGHT as usize * 3;
+const RECORD_BYTES: usize = 2 + RGB_BYTES;
 
 fn frames(data: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
-    if data.len() != STEPS.len() * RGB_BYTES {
+    if data.len() != STEPS.len() * RECORD_BYTES {
         return Err("missing, truncated or extra capture bytes");
     }
-    Ok(data.chunks_exact(RGB_BYTES).collect())
+    let mut frames = Vec::with_capacity(STEPS.len());
+    for (record, &expected) in data.chunks_exact(RECORD_BYTES).zip(&STEPS) {
+        let step = u16::from_le_bytes([record[0], record[1]]);
+        if usize::from(step) != expected {
+            return Err("unexpected or out-of-order native step ID");
+        }
+        frames.push(&record[2..]);
+    }
+    Ok(frames)
 }
 
 #[test]
-fn capture_protocol_rejects_missing_truncated_and_extra_frames() {
+fn capture_protocol_checks_length_and_ordered_native_step_ids() {
     assert!(frames(&[]).is_err());
-    let mut data = vec![0; STEPS.len() * RGB_BYTES];
-    assert_eq!(frames(&data).unwrap().len(), STEPS.len());
-    data.pop();
-    assert!(frames(&data).is_err());
-    data.extend_from_slice(&[0, 0]);
-    assert!(frames(&data).is_err());
+    // All pixels are identical: only the IDs distinguish repeated-looking
+    // states, including counter 1 and counter 257 after wrap.
+    let mut data = Vec::with_capacity(STEPS.len() * RECORD_BYTES);
+    for &step in &STEPS {
+        data.extend_from_slice(&(step as u16).to_le_bytes());
+        data.resize(data.len() + RGB_BYTES, 0);
+    }
+    let decoded = frames(&data).unwrap();
+    assert_eq!(decoded.len(), STEPS.len());
+    assert!(decoded.iter().all(|frame| frame.len() == RGB_BYTES));
+    assert!(frames(&data[..data.len() - 1]).is_err());
+    let mut extra = data.clone();
+    extra.push(0);
+    assert!(frames(&extra).is_err());
+
+    let mut wrong = data.clone();
+    wrong[..2].copy_from_slice(&257_u16.to_le_bytes());
+    assert!(frames(&wrong).is_err());
+    let mut repeated = data.clone();
+    repeated[RECORD_BYTES..RECORD_BYTES + 2].copy_from_slice(&1_u16.to_le_bytes());
+    assert!(frames(&repeated).is_err());
+    let mut swapped = data;
+    swapped[..2].copy_from_slice(&2_u16.to_le_bytes());
+    swapped[RECORD_BYTES..RECORD_BYTES + 2].copy_from_slice(&1_u16.to_le_bytes());
+    assert!(frames(&swapped).is_err());
 }
 
 #[test]
