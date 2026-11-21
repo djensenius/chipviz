@@ -36,12 +36,12 @@ Before creating the destination, ensure the checkout, `build/`, and their
 ancestors are trusted and contain no symlinks:
 
 ```sh
-cargo build --release --manifest-path renderers/modern/Cargo.toml --bin chipviz-m1 &&
+mise exec -- cargo build --release --manifest-path renderers/modern/Cargo.toml --bin chipviz-m1 &&
 mkdir -p build &&
 (
   umask 077 &&
   mkdir -m 700 build/personal-starfield &&
-  python3 scripts/personal-starfield-bundle.py \
+  mise exec -- python scripts/personal-starfield-bundle.py \
     --catalog "/path/to/local/hyg_v44.csv.gz" \
     --binary "renderers/modern/target/release/chipviz-m1"
 ) &&
