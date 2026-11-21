@@ -11,7 +11,6 @@ use winit::window::{Fullscreen, Window, WindowBuilder};
 
 use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
-use crate::dmg_preview::DmgPreview;
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
 use crate::scenes::{SceneConfig, TunnelVariant, colour_field, mic_layers, starfield};
@@ -321,7 +320,6 @@ fn run_dmg_preview(
     window.set_cursor_visible(cursor_visible(args.fullscreen));
     let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
     renderer.enable_dmg_preview();
-    let mut preview = DmgPreview::default();
     let size = window.inner_size();
     let mut drawable = preview_drawable(size.width, size.height);
     let mut modifiers = ModifiersState::empty();
@@ -350,16 +348,14 @@ fn run_dmg_preview(
                     _ => {}
                 }
             }
-            WindowEvent::RedrawRequested if drawable => {
-                match renderer.render_dmg_preview(&mut preview) {
-                    Ok(()) => {}
-                    Err(RendererError::Surface(
-                        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
-                    )) => renderer.resize_to_current_window(),
-                    Err(RendererError::Surface(wgpu::SurfaceError::OutOfMemory)) => target.exit(),
-                    Err(error) => eprintln!("{error}"),
-                }
-            }
+            WindowEvent::RedrawRequested if drawable => match renderer.render_dmg_preview() {
+                Ok(()) => {}
+                Err(RendererError::Surface(
+                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
+                )) => renderer.resize_to_current_window(),
+                Err(RendererError::Surface(wgpu::SurfaceError::OutOfMemory)) => target.exit(),
+                Err(error) => eprintln!("{error}"),
+            },
             _ => {}
         },
         Event::AboutToWait => window.request_redraw(),
@@ -716,6 +712,8 @@ impl AppArgs {
 
     fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<ArgsCommand, AppError> {
         let mut parsed = Self::default();
+        let args: Vec<String> = args.into_iter().collect();
+        let preview_requested = args.iter().any(|arg| arg == "--dmg-preview");
         let mut args = args.into_iter();
         let mut preview_conflict = None;
 
@@ -746,28 +744,48 @@ impl AppArgs {
             match arg.as_str() {
                 "--dmg-preview" => parsed.dmg_preview = true,
                 "--udp" => {
-                    parsed.udp_endpoint =
-                        Some(required_value(&mut args, "--udp", "LISTEN_ADDR:PORT")?)
+                    parsed.udp_endpoint = Some(required_value(
+                        &mut args,
+                        "--udp",
+                        "LISTEN_ADDR:PORT",
+                        preview_requested,
+                    )?)
                 }
                 "--fullscreen" => parsed.fullscreen = true,
                 "--monitor" => {
-                    let value = required_value(&mut args, "--monitor", "INDEX or NAME")?;
+                    let value =
+                        required_value(&mut args, "--monitor", "INDEX or NAME", preview_requested)?;
                     parsed.monitor = Some(DeviceSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
                 "--mic" => parsed.mic = true,
                 "--audio-device" => {
-                    let value = required_value(&mut args, "--audio-device", "INDEX or NAME")?;
+                    let value = required_value(
+                        &mut args,
+                        "--audio-device",
+                        "INDEX or NAME",
+                        preview_requested,
+                    )?;
                     parsed.audio_device = Some(DeviceSelector::parse(&value));
                 }
                 "--list-audio-devices" => parsed.list_audio_devices = true,
                 "--layout" => {
-                    let value = required_value(&mut args, "--layout", "auto|v2|h2|v3|h3")?;
+                    let value = required_value(
+                        &mut args,
+                        "--layout",
+                        "auto|v2|h2|v3|h3",
+                        preview_requested,
+                    )?;
                     parsed.layout = parse_layout(&value)?;
                 }
                 "--allow-flash" => parsed.allow_flash = true,
                 "--mic-layers" => {
-                    let value = required_value(&mut args, "--mic-layers", "off|scope|bursts|both")?;
+                    let value = required_value(
+                        &mut args,
+                        "--mic-layers",
+                        "off|scope|bursts|both",
+                        preview_requested,
+                    )?;
                     parsed.mic_layers = mic_layers::Mode::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
                             "--mic-layers expects off|scope|bursts|both, got {value}"
@@ -776,7 +794,7 @@ impl AppArgs {
                 }
                 "--lines-drop-cuts" => parsed.lines_drop_cuts = true,
                 "--scene" => {
-                    let value = required_value(&mut args, "--scene", "0-255")?;
+                    let value = required_value(&mut args, "--scene", "0-255", preview_requested)?;
                     parsed.scene = Some(value.parse::<u8>().map_err(|_| {
                         invalid_input(format!("--scene expects 0-255, got {value}"))
                     })?);
@@ -786,14 +804,17 @@ impl AppArgs {
                         &mut args,
                         arg.as_str(),
                         "PATH",
+                        preview_requested,
                     )?));
                 }
                 "--location" => {
-                    let value = required_value(&mut args, "--location", "LAT,LON")?;
+                    let value =
+                        required_value(&mut args, "--location", "LAT,LON", preview_requested)?;
                     parsed.location = Some(parse_location(&value)?);
                 }
                 "--time" => {
-                    let value = required_value(&mut args, "--time", "UNIX_SECONDS")?;
+                    let value =
+                        required_value(&mut args, "--time", "UNIX_SECONDS", preview_requested)?;
                     let seconds = value.parse::<f64>().map_err(|_| {
                         invalid_input(format!("--time must be finite UNIX seconds, got {value}"))
                     })?;
@@ -807,8 +828,12 @@ impl AppArgs {
                     parsed.unix_seconds = Some(seconds);
                 }
                 "--tunnel-variant" => {
-                    let value =
-                        required_value(&mut args, "--tunnel-variant", "original|hallway|abstract")?;
+                    let value = required_value(
+                        &mut args,
+                        "--tunnel-variant",
+                        "original|hallway|abstract",
+                        preview_requested,
+                    )?;
                     parsed.tunnel_variant = TunnelVariant::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
                             "--tunnel-variant expects original|hallway|abstract, got {value}"
@@ -918,9 +943,45 @@ fn required_value(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
     expected: &str,
+    preview_requested: bool,
 ) -> Result<String, AppError> {
-    args.next()
-        .ok_or_else(|| invalid_input(format!("{flag} requires {expected}")))
+    match args.next() {
+        Some(value) if value == "--dmg-preview" => Err(invalid_input(format!(
+            "{flag} requires {expected}; --dmg-preview is not a value"
+        ))),
+        Some(value) if preview_requested && is_app_option(&value) => Err(invalid_input(format!(
+            "{flag} requires {expected}; {value} is an option, not a value"
+        ))),
+        Some(value) => Ok(value),
+        None => Err(invalid_input(format!("{flag} requires {expected}"))),
+    }
+}
+
+fn is_app_option(value: &str) -> bool {
+    matches!(
+        value,
+        "--udp"
+            | "--fullscreen"
+            | "--monitor"
+            | "--list-monitors"
+            | "--mic"
+            | "--audio-device"
+            | "--list-audio-devices"
+            | "--layout"
+            | "--allow-flash"
+            | "--mic-layers"
+            | "--lines-drop-cuts"
+            | "--scene"
+            | "--catalog"
+            | "--star-catalog"
+            | "--location"
+            | "--time"
+            | "--tunnel-variant"
+            | "--dmg-preview"
+            | "--help"
+            | "-h"
+            | "--"
+    )
 }
 
 fn invalid_input(message: String) -> AppError {
@@ -1175,6 +1236,7 @@ impl FrameSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dmg_preview::DmgPreview;
     use crate::scenes;
 
     fn parse(args: &[&str]) -> Result<ArgsCommand, AppError> {
@@ -1228,6 +1290,7 @@ mod tests {
                 } else {
                     args.push("--dmg-preview");
                 }
+
                 let error = parse(&args).unwrap_err().to_string();
                 assert!(
                     error.contains("--dmg-preview cannot be combined with"),
@@ -1240,6 +1303,101 @@ mod tests {
         assert!(args.dmg_preview);
         assert!(!args.mic);
         assert!(args.udp_endpoint.is_none());
+    }
+
+    #[test]
+    fn preview_token_cannot_be_consumed_as_a_value_before_input_setup() {
+        for flag in [
+            "--udp",
+            "--monitor",
+            "--audio-device",
+            "--layout",
+            "--mic-layers",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+        ] {
+            let error = parse(&[flag, "--dmg-preview"]).unwrap_err().to_string();
+            assert!(error.contains(&format!("{flag} requires")), "{error}");
+            assert!(error.contains("--dmg-preview is not a value"), "{error}");
+        }
+        let error = parse(&["--mic", "--audio-device", "--dmg-preview"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--audio-device requires"), "{error}");
+        // Other flag-like legacy values retain their old parsing behavior.
+        assert_eq!(
+            parse_run(&["--mic", "--audio-device", "--mic"]).audio_device,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+    }
+
+    #[test]
+    fn preview_rejects_recognized_options_as_missing_values_in_either_order() {
+        let flags = [
+            "--udp",
+            "--monitor",
+            "--audio-device",
+            "--layout",
+            "--mic-layers",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+        ];
+        let options = [
+            "--udp",
+            "--fullscreen",
+            "--monitor",
+            "--list-monitors",
+            "--mic",
+            "--audio-device",
+            "--list-audio-devices",
+            "--layout",
+            "--allow-flash",
+            "--mic-layers",
+            "--lines-drop-cuts",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+            "--help",
+            "-h",
+            "--",
+        ];
+        for flag in flags {
+            for option in options {
+                for args in [
+                    vec!["--dmg-preview", flag, option],
+                    vec![flag, option, "--dmg-preview"],
+                ] {
+                    let error = parse(&args).unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("{flag} requires")),
+                        "{args:?}: {error}"
+                    );
+                    assert!(
+                        error.contains("is an option, not a value"),
+                        "{args:?}: {error}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            parse_run(&["--monitor", "--mic"]).monitor,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+        assert_eq!(
+            parse_run(&["--mic", "--audio-device", "--mic"]).audio_device,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
     }
 
     #[test]
@@ -1279,7 +1437,10 @@ mod tests {
         let mut frame = None;
         for (size, millis) in [((160, 144), 0), ((0, 144), 100), ((320, 288), 200)] {
             if preview_drawable(size.0, size.1) {
-                frame = Some(preview.acquired(start + Duration::from_millis(millis)));
+                let now = start + Duration::from_millis(millis);
+                frame = Some(preview.acquired(now));
+                preview.submitted(now);
+                preview.presented(now);
             }
         }
         let frame = frame.unwrap();

@@ -29,9 +29,10 @@ use crate as scenes;
 #[path = "../src/dmg_preview.rs"]
 mod dmg_preview;
 
-use dmg_preview::{DmgPreview, acquired_dmg_frame};
+use dmg_preview::{DmgPresenter, DmgTarget};
 use dmg_tile_scroll::{Display, DmgTileScroll};
 use dmg_tile_scroll_render::DmgTileRenderer;
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 // Independently decoded from cores/gb/homebrew/main.asm's Tiles: each ASCII
@@ -185,14 +186,6 @@ impl Offscreen {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let row_bytes = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("DMG test readback"),
-            size: u64::from(row_bytes) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -212,6 +205,91 @@ impl Offscreen {
                 assert!(!renderer.encode(&self.queue, &mut encoder, &view, empty, unexpected));
             }
         }
+        self.read_texture(&texture, size, encoder)
+    }
+
+    fn render_preview(
+        &self,
+        presenter: &mut DmgPresenter,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+        timing: (Instant, Instant, Duration),
+        expected_wait: Duration,
+    ) -> Vec<u8> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("DMG preview offscreen target"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let calls = Cell::new(0);
+        let waited = Cell::new(Duration::ZERO);
+        let (acquired, encoded, present_delay) = timing;
+        assert!(
+            presenter
+                .render(
+                    &self.device,
+                    &self.queue,
+                    size,
+                    DmgTarget {
+                        acquire: || Ok::<_, ()>(&texture),
+                        view: |texture: &&wgpu::Texture| {
+                            texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        },
+                        present: |_| {},
+                    },
+                    || {
+                        let call = calls.get();
+                        calls.set(call + 1);
+                        match call {
+                            0 => acquired,
+                            1 | 2 => encoded + waited.get(),
+                            3 => encoded + waited.get() + present_delay,
+                            _ => panic!("unexpected clock sample"),
+                        }
+                    },
+                    |duration| waited.set(duration),
+                )
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 4);
+        assert_eq!(waited.get(), expected_wait);
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("DMG preview readback encoder"),
+            });
+        self.read_texture(&texture, size, encoder)
+    }
+
+    fn read_texture(
+        &self,
+        texture: &wgpu::Texture,
+        size: (u32, u32),
+        mut encoder: wgpu::CommandEncoder,
+    ) -> Vec<u8> {
+        let (width, height) = size;
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let row_bytes = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("DMG test readback"),
+            size: u64::from(row_bytes) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             wgpu::ImageCopyBuffer {
@@ -357,27 +435,112 @@ fn preview_acquisition_clock_and_offscreen_renderer_match_native_oracle() {
         wgpu::TextureFormat::Rgba8UnormSrgb,
         wgpu::TextureFormat::Rgba8Unorm,
     ] {
-        let renderer = DmgTileRenderer::new(&gpu.device, format);
+        let mut presenter = DmgPresenter::new(&gpu.device, format);
         let start = Instant::now();
-        let mut preview = DmgPreview::default();
-        // Simulate acquisition: failure must not sample time, and neither a
-        // repeated redraw nor a long stall replays missed model steps.
+        // The real orchestration must skip zero-sized targets before
+        // acquisition and must not sample time on acquisition failure.
         assert_eq!(
-            acquired_dmg_frame::<(), _>(Err("lost"), &mut preview, || {
-                panic!("failed acquisition sampled time")
-            }),
+            presenter.render(
+                &gpu.device,
+                &gpu.queue,
+                (0, 144),
+                DmgTarget {
+                    acquire: || -> Result<(), &str> { panic!("zero-size acquisition") },
+                    view: |_: &()| panic!("zero-size view"),
+                    present: |_| panic!("zero-size present"),
+                },
+                || panic!("zero-size clock"),
+                |_| panic!("zero-size wait"),
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            presenter.render(
+                &gpu.device,
+                &gpu.queue,
+                (160, 144),
+                DmgTarget {
+                    acquire: || Err::<(), _>("lost"),
+                    view: |_: &()| panic!("failed acquisition view"),
+                    present: |_| panic!("failed acquisition present"),
+                },
+                || panic!("failed acquisition sampled time"),
+                |_| panic!("failed acquisition wait"),
+            ),
             Err("lost")
         );
-        for (elapsed, step, size, scale) in [
-            (Duration::ZERO, 0, (160, 144), 1),
-            (Duration::from_nanos(16_742_706), 0, (320, 288), 2),
-            (Duration::from_nanos(16_742_707), 1, (160, 144), 1),
-            (Duration::from_secs(10), 2, (320, 288), 2),
-            (Duration::from_secs(10), 2, (160, 144), 1),
+        for (acquired, encoded, present_delay, wait, step, size, scale) in [
+            (
+                Duration::ZERO,
+                Duration::from_millis(100),
+                Duration::ZERO,
+                Duration::ZERO,
+                0,
+                (160, 144),
+                1,
+            ),
+            (
+                Duration::from_nanos(116_742_706),
+                Duration::from_nanos(116_742_706),
+                Duration::ZERO,
+                Duration::ZERO,
+                0,
+                (320, 288),
+                2,
+            ),
+            (
+                Duration::from_nanos(116_742_707),
+                Duration::from_nanos(116_742_707),
+                Duration::ZERO,
+                Duration::ZERO,
+                1,
+                (160, 144),
+                1,
+            ),
+            (
+                Duration::from_nanos(150_228_118),
+                Duration::from_nanos(150_228_118),
+                Duration::from_millis(8),
+                Duration::ZERO,
+                2,
+                (160, 144),
+                1,
+            ),
+            (
+                Duration::from_nanos(158_228_119),
+                Duration::from_nanos(158_228_119),
+                Duration::ZERO,
+                Duration::from_nanos(7_999_999),
+                3,
+                (160, 144),
+                1,
+            ),
+            (
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Duration::ZERO,
+                Duration::ZERO,
+                4,
+                (320, 288),
+                2,
+            ),
+            (
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Duration::ZERO,
+                Duration::ZERO,
+                4,
+                (160, 144),
+                1,
+            ),
         ] {
-            let (_, display) =
-                acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start + elapsed).unwrap();
-            let rgba = gpu.render(&renderer, format, size, display, false);
+            let rgba = gpu.render_preview(
+                &mut presenter,
+                format,
+                size,
+                (start + acquired, start + encoded, present_delay),
+                wait,
+            );
             let example = cycle_example(step);
             for y in 0..size.1 {
                 for x in 0..size.0 {

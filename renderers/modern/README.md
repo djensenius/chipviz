@@ -56,6 +56,10 @@ python3 host/bridge/chipviz_bridge.py --frames 600 --udp 127.0.0.1:6464
 
 ### Experimental DMG preview
 
+**Do not use or distribute this preview** pending independent assessment of
+presented-output flashing and normal-speed human review under the existing
+safety gates. Offscreen tests do not establish visual safety.
+
 For development only, `just modern-m1 -- --dmg-preview` or
 `just modern-pi5 -- --dmg-preview` opens a self-running DMG Tile Scroll
 preview. It is not audio reactive and is not a catalog or wire scene. Only
@@ -64,11 +68,20 @@ listing, scene and overlay options are rejected, and `L` and `M` do nothing.
 No live inputs are opened. The native LCD is integer-scaled where it fits;
 smaller windows use fractional scaling.
 
-The first successfully acquired surface ticks the model once; subsequent
-ticks use the monotonic DMG VBlank period (70,224 / 4,194,304 seconds), not
-redraw counts. A redraw can hold a frame or miss a clock interval; rates below
-native VBlank cannot keep up. Failed acquisitions and zero-sized windows do
-not tick; on resume, at most one tick runs and missed intervals are dropped.
+The first successfully acquired surface ticks the model once. The clock
+starts after its submission and `present()` return, holding that initial state
+for one native VBlank period (70,224 / 4,194,304 seconds). Subsequent ticks
+follow that monotonic clock at acquisition, not redraw counts. After encoding
+and command-buffer finalization,
+the preview thread sleeps if needed (requesting at most 16 ms, without busy
+waiting; the OS can oversleep) before submitting a changed frame, so its
+timestamp sampled just before submission is at least 16 ms after the previous
+changed submission's timestamp.
+This minimum is below the 16.667 ms 60 Hz refresh period; jitter and work that
+exceeds the available cadence can still drop steps.
+A redraw can hold a frame or miss a clock interval; rates below native
+VBlank cannot keep up. Failed acquisitions and zero-sized windows do not
+tick; on resume, at most one tick runs and missed intervals are dropped.
 Resize does not reset the clock. Submission and `present()` do not prove
 display timing.
 This preview has not had physical Pi validation or visual-safety certification;
