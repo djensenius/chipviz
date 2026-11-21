@@ -1,4 +1,5 @@
 // Test the unregistered prototype without adding it to the application.
+#[expect(dead_code, reason = "this fixture uses only the model API under test")]
 #[path = "../src/scenes/dmg_tile_scroll.rs"]
 mod dmg_tile_scroll;
 

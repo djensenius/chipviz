@@ -8,6 +8,10 @@
 //! On integration, register this ignored test in a standard GPU-capable CI
 //! target; an ordinary `cargo test` does not run it.
 
+#[expect(
+    dead_code,
+    reason = "this fixture uses only the model API needed for GPU readback"
+)]
 #[path = "../src/scenes/dmg_tile_scroll.rs"]
 mod dmg_tile_scroll;
 #[path = "../src/scenes/dmg_tile_scroll_render.rs"]

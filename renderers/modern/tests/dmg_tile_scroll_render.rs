@@ -1,6 +1,14 @@
 // Exercise the unregistered CPU preparation without starting a GPU.
+#[expect(
+    dead_code,
+    reason = "this fixture uses only the model API needed by CPU preparation"
+)]
 #[path = "../src/scenes/dmg_tile_scroll.rs"]
 mod dmg_tile_scroll;
+#[expect(
+    dead_code,
+    reason = "this CPU fixture does not construct the GPU renderer"
+)]
 #[path = "../src/scenes/dmg_tile_scroll_render.rs"]
 mod dmg_tile_scroll_render;
 
