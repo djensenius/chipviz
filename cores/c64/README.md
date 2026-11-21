@@ -145,6 +145,86 @@ steady hard cuts with the flash latch clear, that 610 frames of scene 7 make
 demo animates. It needs a local RetroArch core, so it is not part of
 `just check`.
 
+## SpectrumVolume prototype (not selectable)
+
+`homebrew/src/spectrum_volume.c` is an isolated scene core, not linked into
+the program or legacy scene dispatch. It adapts the modern scene's repeated
+eight-band volume as three staggered slices of reverse-space blocks in the
+uppercase/graphics ROM. Each band has a height of 0–5 cells, rising or
+falling by at most one cell per step; low energy reduces the height. The
+eight fixed VIC-II inks exclude black and white. Palette changes advance one
+band per step; at most 32 screen cells and 52 colour cells are written per
+step. This bounds individual updates, but is not a photosensitivity
+measurement or a guarantee about transitions.
+
+The caller must reset the state and supply an exclusively owned, blank 40x25
+screen on a black background, with the uppercase/graphics ROM selected; it
+must select standard text mode with ECM, bitmap and multicolour disabled, and
+arrange safe entry and restoration itself. The core writes no VIC registers,
+does not clear the screen, and must run outside the raster IRQ.
+The caller must avoid the reserved ColourField screens at `$3000`–`$3FFF`.
+Eventual integration must preserve the existing IRQ timing and
+keyboard/joystick roles, and account for the current HID keyboard path's zero
+spectrum (which produces silence, not fabricated audio). Selection awaits the
+extended catalog contract in #140 and #152. Production cc65 linking/memory
+headroom, PAL/NTSC timing, native/ColourField transitions, visual captures and
+independent flash-safety measurement remain unverified.
+
+The isolated host test can be run without building the C64 program:
+
+```sh
+mkdir -p build/tests
+cc -std=c99 -Wall -Wextra -Werror -pedantic -Icores/c64/homebrew/src tests/c64_spectrum_volume_tests.c cores/c64/homebrew/src/spectrum_volume.c -o build/tests/c64_spectrum_volume_tests
+build/tests/c64_spectrum_volume_tests
+```
+
+`tests/c64_spectrum_volume_fixture.c` is a separate test-only PRG, linked
+against the isolated scene. It uses guarded ordinary RAM buffers, not VIC
+screen or colour RAM. Its 112-record bounded trace covers each band rising
+and falling, band and energy thresholds, palette changes, silence and reset.
+Each record contains state, a 16-bit sum and an order-sensitive CRC-16 per
+complete buffer, and a guard result. These are not exact comparisons:
+collisions remain possible. `scripts/c64_spectrum_volume_fixture.py` compares
+them against an independently rendered synthetic oracle through the existing
+VICE libretro RAM seam. Versioned completion and progress markers reject the
+old trace format. The host-only oracle tests run with Python unittest
+discovery. Build the fixture and, when an emulator slot is available, run it
+separately:
+
+```sh
+mkdir -p build/tests/c64-spectrum-fixture
+cl65 -t c64 -Oirs --static-locals -Icores/c64/homebrew/src -c -o build/tests/c64-spectrum-fixture/fixture.o tests/c64_spectrum_volume_fixture.c
+cl65 -t c64 -Oirs --static-locals -c -o build/tests/c64-spectrum-fixture/spectrum_volume.o cores/c64/homebrew/src/spectrum_volume.c
+cl65 -t c64 -m build/tests/c64-spectrum-fixture/fixture.map -Ln build/tests/c64-spectrum-fixture/fixture.lbl -o build/tests/c64-spectrum-fixture/fixture.prg build/tests/c64-spectrum-fixture/fixture.o build/tests/c64-spectrum-fixture/spectrum_volume.o
+python3 scripts/c64_spectrum_volume_fixture.py --model pal --frames 16000
+python3 scripts/c64_spectrum_volume_fixture.py --model ntsc --frames 16000
+python3 scripts/c64_spectrum_volume_fixture.py --model ntsc-old --frames 16000
+```
+
+The script needs a local VICE x64sc libretro core (override with `--core`).
+Always rebuild matching PRG and labels together. On prototype head `9727671`,
+the rebuilt fixture matched all 112 records after 5304 PAL frames, 6156 NTSC
+frames and 6284 early NTSC frames using the earlier checksums, not the current
+CRC fixture. A prior NTSC run did not finish within the old 6000-frame
+timeout. PAL's 5304 frames represent about 104.3 million
+nominal VIC cycles, versus 102.6 million in 6000 NTSC frames (100.6 million
+on early NTSC). Boot, IRQs and VIC bus contention vary, so this supports an
+insufficient nominal cycle budget as a diagnosis, but does not prove the
+timeout's cause. With the CRC fixture on head `a1d1ffc`, PAL matched all 112
+records after 10643 frames; NTSC and early NTSC timed out at 12000 frames,
+with matching prefixes of 108 and 106 records respectively. CRC calculation
+adds work to this test-only fixture. With the 16000-frame limit on head
+`9be9b61`, the strengthened CRC fixture matched all 112 records after 10643
+PAL frames, 12345 NTSC frames and 12603 early NTSC frames. The default and
+maximum are 16000 frames; `--frames` can choose a smaller limit. On timeout
+the script reports recent completed-record counts and checks the completed
+trace prefix, distinguishing some trace errors from lack of completion; a
+matching prefix does not prove the target cannot hang later. These prototype
+results are not exact-head verification. The fixture does not exercise the
+production PRG, actual screen/colour RAM, raster IRQ or scene transitions.
+It does not demonstrate displayed output, target timing or physical flash
+safety.
+
 ## Connection path
 
 Use Raspberry Pi USB HID keyboard/joystick output as the first C64 Ultimate live
