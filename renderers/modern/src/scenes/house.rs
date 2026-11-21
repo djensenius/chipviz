@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use super::{cos, sin_cos};
+use super::sin_cos;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ProjectedLine {
@@ -20,7 +20,7 @@ type Edge = [GridPoint; 2];
 const HALF_WIDTH: f32 = 1.2;
 const REACH: i32 = 5;
 const NEAR: f32 = 0.18;
-const PERIOD: f32 = 36.0;
+const PERIOD: f32 = 60.0;
 
 // Each cell is a cube; their union is one cross-shaped place, not six
 // overlapping closed tunnels. Faces between occupied cells are omitted.
@@ -96,14 +96,22 @@ fn camera(elapsed: f32) -> Camera {
     } else {
         0.0
     };
-    let progress = (1.0 - cos(time * std::f32::consts::TAU / PERIOD)) * 0.5;
-    let side = cue(time, 6.0, 10.0) - cue(time, 11.0, 14.0);
-    let back = cue(time, 14.0, 17.0) - cue(time, 20.0, 23.0);
-    let up = cue(time, 22.0, 24.0) - cue(time, 25.0, 28.0);
+    // Capture windows (seconds modulo 60): forward 2–5, left 10–12,
+    // right 18–20, back 26–28, up 34–36, down 42–44. Approach the
+    // junction, drift inside it while looking around, then retrace the same
+    // corridor. Look cues and the loop seam have zero endpoint velocity.
+    let approach = cue(time, 0.0, 10.0) - cue(time, 50.0, 60.0);
+    let drift = (cue(time, 8.0, 10.0) - cue(time, 50.0, 52.0))
+        * ((time - 10.0) * std::f32::consts::TAU / 40.0).sin();
+    let left = cue(time, 7.0, 10.0) - cue(time, 12.0, 15.0);
+    let right = cue(time, 15.0, 18.0) - cue(time, 20.0, 23.0);
+    let back = cue(time, 23.0, 26.0) - cue(time, 28.0, 31.0);
+    let up = cue(time, 31.0, 34.0) - cue(time, 36.0, 39.0);
+    let down = cue(time, 39.0, 42.0) - cue(time, 44.0, 47.0);
     Camera {
-        position: [0.0, 0.0, -5.0 + 6.0 * progress],
-        yaw: -std::f32::consts::FRAC_PI_2 * side + std::f32::consts::PI * back,
-        pitch: 1.15 * up,
+        position: [0.0, 0.0, -5.0 + 5.0 * approach + 0.25 * drift],
+        yaw: std::f32::consts::FRAC_PI_2 * (right - left) + std::f32::consts::PI * back,
+        pitch: 1.15 * (up - down),
     }
 }
 
@@ -273,7 +281,7 @@ mod tests {
 
     #[test]
     fn camera_path_and_orientation_are_continuous_and_inside_the_place() {
-        for i in -3600..=7200 {
+        for i in -6000..=12000 {
             let time = i as f32 / 100.0;
             let a = camera(time);
             let b = camera(time + 0.01);
@@ -282,36 +290,88 @@ mod tests {
             assert!((a.pitch - b.pitch).abs() < 0.02);
             assert!(a.position[0].abs() < HALF_WIDTH && a.position[1].abs() < HALF_WIDTH);
             assert!(a.position[2].abs() < (2 * REACH + 1) as f32 * HALF_WIDTH);
+            if a.pitch.abs() > 0.0001 {
+                assert!(a.position[2].abs() < HALF_WIDTH, "shaft look at {time}s");
+            }
         }
-        assert!(camera(18.0).yaw > 3.0);
-        assert!(camera(24.5).pitch > 1.0);
+        // Check both sides of every cue boundary and the wrap explicitly.
+        for time in [
+            0.0, 7.0, 8.0, 10.0, 12.0, 15.0, 18.0, 20.0, 23.0, 26.0, 28.0, 31.0, 34.0, 36.0, 39.0,
+            42.0, 44.0, 47.0, 50.0, 52.0, 60.0,
+        ] {
+            let before = camera(time - 0.001);
+            let after = camera(time + 0.001);
+            assert!(distance(before.position, after.position) < 0.004);
+            assert!((before.yaw - after.yaw).abs() < 0.004);
+            assert!((before.pitch - after.pitch).abs() < 0.004);
+
+            let before = camera(time - 0.01);
+            let at = camera(time);
+            let after = camera(time + 0.01);
+            let velocity_before =
+                std::array::from_fn(|i| (at.position[i] - before.position[i]) / 0.01);
+            let velocity_after =
+                std::array::from_fn(|i| (after.position[i] - at.position[i]) / 0.01);
+            assert!(distance(velocity_before, velocity_after) < 0.05, "{time}s");
+            assert!(((after.yaw - 2.0 * at.yaw + before.yaw) / 0.01).abs() < 0.05);
+            assert!(((after.pitch - 2.0 * at.pitch + before.pitch) / 0.01).abs() < 0.05);
+        }
     }
 
     #[test]
-    fn side_and_shaft_depth_edges_are_visible_at_the_look_cues() {
-        // Longitudinal edges inside each branch, beyond its shared aperture.
-        let side = [[-3.6, 1.2, -1.2], [-6.0, 1.2, -1.2]];
-        let shaft = [[1.2, 3.6, -1.2], [1.2, 6.0, -1.2]];
-        let traveled = [[-1.2, 1.2, -3.6], [-1.2, 1.2, -6.0]];
-        for (time, edge) in [
-            (10.5, side),
-            (11.0, side),
-            (18.0, traveled),
-            (24.0, shaft),
-            (24.5, shaft),
-            (25.0, shaft),
+    fn all_six_branch_depths_are_visible_at_the_look_cues() {
+        // Every sample tests four distinct real world edges beyond the
+        // aperture, not just a forward vector or the existence of a branch.
+        for (name, axis, sign, start, end) in [
+            ("forward", 2, 1, 2.0, 5.0),
+            ("left", 0, -1, 10.0, 12.0),
+            ("right", 0, 1, 18.0, 20.0),
+            ("back", 2, -1, 26.0, 28.0),
+            ("up", 1, 1, 34.0, 36.0),
+            ("down", 1, -1, 42.0, 44.0),
         ] {
-            let (a, b, _) =
-                project_edge(edge, camera(time), 16.0 / 9.0).expect("branch depth must be visible");
-            assert!((a[0] - b[0]).hypot(a[1] - b[1]) > 0.02);
-            let near = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) < 0.0001;
-            assert!(
-                project(time, 16.0 / 9.0, [0.0; 3], 64)
-                    .iter()
-                    .any(|line| (near(line.start, a) && near(line.end, b))
-                        || (near(line.start, b) && near(line.end, a))),
-                "missing branch depth at {time}s"
-            );
+            for sample in 0..=8 {
+                let time = start + (end - start) * sample as f32 / 8.0;
+                let camera = camera(time);
+                let mut direction = camera.position;
+                direction[axis] += sign as f32;
+                assert!(
+                    camera_space(direction, camera)[2] > 0.9,
+                    "{name} at {time}s"
+                );
+                // The distant forward branch shares the frame with the
+                // nearer approach corridor; the other looks need only 64.
+                let budget = if name == "forward" { 128 } else { 64 };
+                let lines = project(time, 16.0 / 9.0, [0.0; 3], budget);
+                let near = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) < 0.0001;
+                let mut visible = 0;
+                for u in [-1, 1] {
+                    for v in [-1, 1] {
+                        let mut first = [0; 3];
+                        let mut last = [0; 3];
+                        first[axis] = 3 * sign;
+                        last[axis] = 5 * sign;
+                        first[(axis + 1) % 3] = u;
+                        last[(axis + 1) % 3] = u;
+                        first[(axis + 2) % 3] = v;
+                        last[(axis + 2) % 3] = v;
+                        let mut edge = [first, last];
+                        edge.sort_unstable();
+                        assert!(world_edges().contains(&edge));
+                        if let Some((a, b, _)) =
+                            project_edge(edge.map(world_point), camera, 16.0 / 9.0)
+                            && (a[0] - b[0]).hypot(a[1] - b[1]) > 0.02
+                            && lines.iter().any(|line| {
+                                (near(line.start, a) && near(line.end, b))
+                                    || (near(line.start, b) && near(line.end, a))
+                            })
+                        {
+                            visible += 1;
+                        }
+                    }
+                }
+                assert!(visible >= 2, "{name} at {time}s: {visible} depth edges");
+            }
         }
     }
 
@@ -334,7 +394,7 @@ mod tests {
 
     #[test]
     fn audio_is_deterministic_and_budgets_are_hard_limits() {
-        for time in [0.0, 10.5, 18.0, 24.5, 35.99, f32::NAN] {
+        for time in [0.0, 4.0, 11.0, 19.0, 27.0, 35.0, 43.0, 59.99, f32::NAN] {
             for aspect in [0.0, 0.3, 1.0, 16.0 / 9.0, 100.0, f32::INFINITY] {
                 let quiet = project(time, aspect, [0.0; 3], 512);
                 let loud = project(time, aspect, [1.0; 3], 512);
