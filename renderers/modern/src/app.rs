@@ -1948,6 +1948,33 @@ mod tests {
     }
 
     #[test]
+    fn mic_counter_discontinuity_resynchronizes_the_live_source() {
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures::default()));
+        let mut source = FrameSource::with_feed(
+            UdpFrameSource::bind(None).unwrap(),
+            Some(Box::new(FakeMic(feed.clone()))),
+        );
+        let now = Instant::now();
+        for (count, flags) in [
+            (1000, 0),
+            (0, 0),
+            (1, audio::BEAT_FLAG),
+            (8, 0),
+            (9, audio::BEAT_FLAG),
+            (12, audio::BEAT_FLAG | audio::BAR_FLAG),
+            (u16::MAX, 0),
+            (0, audio::BEAT_FLAG | audio::BAR_FLAG),
+        ] {
+            feed.set(AudioFeatures {
+                beat_count: count,
+                ..AudioFeatures::default()
+            });
+            let frame = source.next_frame_at(now);
+            assert_eq!((frame.beat_count, frame.flags), (count, flags), "{count}");
+        }
+    }
+
+    #[test]
     fn mic_beat_flag_resets_after_a_udp_packet() {
         let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
         let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
