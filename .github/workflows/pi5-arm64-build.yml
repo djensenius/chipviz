@@ -1,0 +1,74 @@
+name: Pi 5 ARM64 build smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # This is an Ubuntu ARM64 smoke check, not a physical Pi or Pi OS test.
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 45
+    env:
+      MISE_AUTO_INSTALL: "false"
+      LC_ALL: C
+    steps:
+      - name: Record initial disk usage
+        run: df -h
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify host and checkout
+        run: |
+          uname -a
+          test "$(uname -m)" = aarch64
+          echo "GitHub ref: $GITHUB_REF"
+          echo "Expected checkout: $GITHUB_SHA"
+          git log -1 --format='Checkout: %H %s'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: jdx/mise-action@v4.2.0
+        with:
+          cache: false
+          install_args: rust
+      - name: Verify Rust host
+        run: |
+          rust_info="$(mise exec -- rustc -vV)"
+          printf '%s\n' "$rust_info"
+          printf '%s\n' "$rust_info" | grep -Fx 'host: aarch64-unknown-linux-gnu'
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+      - name: Build native release binary
+        run: mise exec -- cargo build --manifest-path renderers/modern/Cargo.toml --locked --release --no-default-features --target aarch64-unknown-linux-gnu --bin chipviz-pi5
+      - name: Inspect ELF and run headless CLI smoke checks
+        run: |
+          binary=renderers/modern/target/aarch64-unknown-linux-gnu/release/chipviz-pi5
+          header="$(readelf -h "$binary")"
+          printf '%s\n' "$header"
+          printf '%s\n' "$header" | grep -E '^ *Class: *ELF64$'
+          printf '%s\n' "$header" | grep -E "^ *Data: *2's complement, little endian$"
+          printf '%s\n' "$header" | grep -E '^ *Machine: *AArch64$'
+          echo "Program headers (including interpreter):"
+          readelf -l "$binary"
+          echo "Dynamic section (including direct NEEDED libraries):"
+          readelf -d "$binary"
+          echo "Versioned symbols:"
+          readelf --wide --dyn-syms "$binary"
+          readelf --version-info "$binary"
+          timeout -k 2s 10s env -u DISPLAY -u WAYLAND_DISPLAY "$binary" --help
+          set +e
+          output="$(timeout -k 2s 10s env -u DISPLAY -u WAYLAND_DISPLAY "$binary" --dmg-preview 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          echo "Preview exit status: $status"
+          test "$status" -ne 0
+          test "$status" -ne 124
+          test "$status" -ne 137
+          printf '%s\n' "$output" | grep -F -- '--dmg-preview requires the dmg-preview Cargo feature'
+      - name: Record final disk usage
+        if: always()
+        run: df -h
