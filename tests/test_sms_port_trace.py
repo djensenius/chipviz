@@ -4,9 +4,13 @@ import ctypes
 import gc
 import hashlib
 import importlib.util
+import json
+import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -26,8 +30,11 @@ class PortTraceTests(unittest.TestCase):
     cls.core_path = Path(cls.temp.name) / "fake.so"
     cls.shim_path = Path(cls.temp.name) / "shim.so"
     for source, output in (("sms_port_trace_fake.c", cls.core_path), ("sms_port_trace.c", cls.shim_path)):
-      subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                      "-shared", "-fPIC", str(HERE / source), "-o", str(output)], check=True)
+      command = shlex.split(os.environ.get("CC", "cc")) + [
+        "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic",
+        "-shared", "-fPIC", str(HERE / source), "-o", str(output),
+      ]
+      subprocess.run(command, check=True)
     cls.digest = hashlib.sha256(cls.core_path.read_bytes()).hexdigest()
     cls.layout = trace.Layout(size=68, cycle_offset=64)
     cls.layouts = mock.patch.dict(trace._VETTED_LAYOUTS, {cls.digest: cls.layout})
@@ -63,6 +70,38 @@ class PortTraceTests(unittest.TestCase):
       with self.subTest(action=action):
         with self.assertRaisesRegex(RuntimeError, "not active"):
           action()
+
+  def test_configured_compiler_and_flags_are_used(self):
+    with tempfile.TemporaryDirectory() as temp:
+      wrapper = Path(temp) / "compiler wrapper.py"
+      marker = Path(temp) / "compiler calls.jsonl"
+      wrapper.write_text(
+        "import json, os, sys\n"
+        "if sys.argv[1:3] != ['--wrapper-flag', 'selected flag with spaces']:\n"
+        "  raise SystemExit(71)\n"
+        "with open(os.environ['CHIPVIZ_SMS_CC_LOG'], 'a', encoding='utf-8') as log:\n"
+        "  log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "os.execvp(sys.argv[3], sys.argv[3:])\n",
+        encoding="utf-8",
+      )
+      compiler = shlex.split(os.environ.get("CC", "cc"))
+      prefix = ["--wrapper-flag", "selected flag with spaces", *compiler, "-DCHIPVIZ_SMS_CC_PROBE=1"]
+      env = os.environ.copy()
+      env["CC"] = shlex.join([sys.executable, str(wrapper), *prefix])
+      env["CHIPVIZ_SMS_CC_LOG"] = str(marker)
+      env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(HERE), env.get("PYTHONPATH", ""))))
+      result = subprocess.run(
+        [sys.executable, "-m", "unittest", "test_sms_port_trace.PortTraceTests.test_boundaries_and_counter_reset"],
+        cwd=HERE.parent, env=env, capture_output=True, text=True,
+      )
+      self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+      self.assertTrue(marker.exists(), "configured CC wrapper was not invoked")
+      calls = [json.loads(line) for line in marker.read_text(encoding="utf-8").splitlines()]
+      self.assertEqual(len(calls), 2)
+      for call in calls:
+        self.assertEqual(call[:len(prefix)], prefix)
+        self.assertIn("-std=c11", call)
+      self.assertEqual([Path(call[-3]).name for call in calls], ["sms_port_trace_fake.c", "sms_port_trace.c"])
 
   def test_exception_after_native_install_restores(self):
     bind = trace.Trace._bind
