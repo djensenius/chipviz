@@ -417,10 +417,13 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.catalog_lock:
                     if self.server.closing.is_set():
                         return
-                    with self.server.media_lock:
-                        self.server.media = {}
-                    catalog, media = local_catalog(self.server.roots)
-                    data = json.dumps(catalog, ensure_ascii=True).encode("utf-8")
+                    try:
+                        catalog, media = local_catalog(self.server.roots)
+                        data = json.dumps(catalog, ensure_ascii=True).encode("utf-8")
+                    except BaseException:
+                        with self.server.media_lock:
+                            self.server.media = {}
+                        raise
                     with self.server.media_lock:
                         self.server.media = media
                 self.headers_for(200, "application/json; charset=utf-8", len(data))

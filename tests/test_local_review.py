@@ -225,10 +225,13 @@ class GalleryTests(unittest.TestCase):
                 self.request(server, f"/{server.token}/")
         self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
 
-    def test_catalog_refresh_is_serialized_and_media_fails_closed(self):
+    def test_catalog_refresh_is_serialized_and_preserves_unchanged_media(self):
         server = self.serve()
         prefix = f"/{server.token}/"
-        clip = self.catalog(server)["clips"][0]
+        self.write(self.root, "other/remove.mp4", b"remove")
+        clips = self.catalog(server)["clips"]
+        clip = next(c for c in clips if c["family"] == "Colour Field")
+        removed = next(c for c in clips if c["title"] == "remove")
         entered = threading.Event()
         release = threading.Event()
         second_request = threading.Event()
@@ -272,7 +275,14 @@ class GalleryTests(unittest.TestCase):
             first.start()
             try:
                 self.assertTrue(entered.wait(2))
-                self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
+                status, headers, data = self.request(
+                    server, prefix + "media/" + clip["id"], headers={"Range": "bytes=2-5"}
+                )
+                self.assertEqual((status, headers["Content-Range"], data), (206, "bytes 2-5/10", b"2345"))
+                self.write(self.root, self.relative, b"changed")
+                (self.root / "other" / "remove.mp4").unlink()
+                self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 409)
+                self.assertEqual(self.request(server, prefix + "media/" + removed["id"])[0], 404)
                 self.assertEqual(self.request(server, prefix)[0], 200)
                 second.start()
                 self.assertTrue(second_request.wait(2))
@@ -286,7 +296,72 @@ class GalleryTests(unittest.TestCase):
             self.assertFalse(second.is_alive())
             self.assertTrue(second_scan.is_set())
             self.assertEqual(sorted(results), [200, 200])
+        self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
+        replacement = self.catalog(server)["clips"][0]
+        self.assertNotEqual(replacement["id"], clip["id"])
+        self.assertEqual(self.request(server, prefix + "media/" + replacement["id"])[2], b"changed")
+
+    def test_failed_refresh_invalidates_prior_media_until_next_success(self):
+        server = self.serve()
+        prefix = f"/{server.token}/"
+        clip = self.catalog(server)["clips"][0]
+        first_entered, second_entered = threading.Event(), threading.Event()
+        release_first, release_second = threading.Event(), threading.Event()
+        original_catalog = gallery.local_catalog
+        scans = 0
+        statuses = []
+
+        def blocked_catalog(roots):
+            nonlocal scans
+            scans += 1
+            if scans == 1:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise ValueError("test timed out")
+                raise ValueError("invalid catalog")
+            second_entered.set()
+            if not release_second.wait(5):
+                raise ValueError("test timed out")
+            return original_catalog(roots)
+
+        def fetch_catalog():
+            statuses.append(self.request(server, prefix + "catalog.json")[0])
+
+        with mock.patch.object(gallery, "local_catalog", blocked_catalog):
+            first = threading.Thread(target=fetch_catalog)
+            second = threading.Thread(target=fetch_catalog)
+            first.start()
+            try:
+                self.assertTrue(first_entered.wait(2))
+                second.start()
+                status, _, data = self.request(
+                    server, prefix + "media/" + clip["id"], headers={"Range": "bytes=2-5"}
+                )
+                self.assertEqual((status, data), (206, b"2345"))
+                release_first.set()
+                self.assertTrue(second_entered.wait(2))
+                first.join(5)
+                self.assertEqual(statuses, [404])
+                self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
+            finally:
+                release_first.set()
+                release_second.set()
+                first.join(5)
+                if second.ident is not None:
+                    second.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(statuses, [404, 200])
         self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[2], b"0123456789")
+
+    def test_unexpected_catalog_failure_invalidates_prior_media(self):
+        server = self.serve()
+        prefix = f"/{server.token}/"
+        clip = self.catalog(server)["clips"][0]
+        with mock.patch.object(gallery, "local_catalog", side_effect=RuntimeError("scan failed")):
+            with self.assertRaises((OSError, http.client.HTTPException)):
+                self.request(server, prefix + "catalog.json")
+        self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
 
     def test_shutdown_waits_for_catalog_worker_before_closing_roots(self):
         server = self.serve()

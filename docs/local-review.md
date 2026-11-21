@@ -27,7 +27,8 @@ particular port. Open the printed URL on the same machine and stop the server
 with Ctrl-C. Refresh the page to rescan both roots. Scanning hashes every MP4
 and may take time. A malformed draft provenance file, inaccessible file, or
 unsafe catalog entry fails the scan closed; fix the local input and refresh.
-The viewer skips symlinks and never lists directories.
+Unchanged indexed clips remain playable during a scan; a failed scan clears the
+index. The viewer skips symlinks and never lists directories.
 
 **Treat the entire URL as a password.** Anyone who obtains it on this machine
 can view the selected footage. Do not share, screenshot, commit, or publish it.
