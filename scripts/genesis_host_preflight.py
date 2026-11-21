@@ -189,6 +189,7 @@ def collect(host):
   require(env.get("GITHUB_EVENT_NAME") == "pull_request")
   require(not any(key in env for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")))
   require(host.free("/") >= MIN_FREE)
+  require(host.free("/var/lib/docker") >= MIN_FREE)
   before = host.snapshot()
   with host.connect() as client:
     pid, uid, _gid = host.peer(client)

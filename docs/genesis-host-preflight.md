@@ -14,8 +14,10 @@ use secrets, external caches or release triggers. Its sanitized job log is
 still sent to GitHub.
 
 The helper only accepts the GitHub-hosted ARM64 environment and fixed
-`/run/docker.sock`; it rejects inherited Docker routing variables. Before
-connecting it checks root-owned socket and parent directories, an active
+`/run/docker.sock`. The workflow uses `env -i` to remove inherited Docker
+routing variables; the helper also rejects them if they are present in its
+own environment. Before connecting it checks free space on `/` and the expected
+daemon root, root-owned socket and parent directories, an active
 `docker.service`, the daemon executable and cgroup, and the listener inode in
 the daemon's file descriptors. It then requires root `SO_PEERCRED` matching the
 service PID and rechecks the socket and service around the single bounded

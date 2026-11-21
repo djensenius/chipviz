@@ -46,6 +46,7 @@ class FakeHost:
     self.env = dict(ENV)
     self.arch = "aarch64"
     self.disk = preflight.MIN_FREE
+    self.daemon_disk = preflight.MIN_FREE
     self.snapshots = [SNAPSHOT, SNAPSHOT, SNAPSHOT]
     self.peer_info = (123, 0, 999)
     self.data = frame(json.dumps(INFO).encode())
@@ -59,7 +60,7 @@ class FakeHost:
 
   def free(self, path):
     self.calls.append(("free", path))
-    return self.disk
+    return self.daemon_disk if path == "/var/lib/docker" else self.disk
 
   def snapshot(self):
     self.calls.append(("snapshot",))
@@ -119,6 +120,24 @@ class PreflightTests(unittest.TestCase):
     with self.assertRaises(preflight.Rejected):
       preflight.collect(fake)
     self.assertNotIn(("connect",), fake.calls)
+
+  def test_insufficient_daemon_disk_is_rejected_before_connection(self):
+    fake = FakeHost()
+    fake.daemon_disk = preflight.MIN_FREE - 1
+    with self.assertRaises(preflight.Rejected):
+      preflight.collect(fake)
+    self.assertEqual(fake.calls, [("free", "/"), ("free", "/var/lib/docker")])
+    self.assertNotIn(("connect",), fake.calls)
+    self.assertNotIn(("response",), fake.calls)
+
+  def test_daemon_disk_is_rechecked_after_response(self):
+    fake = FakeHost()
+    with mock.patch.object(fake, "free", side_effect=[
+      preflight.MIN_FREE, preflight.MIN_FREE, preflight.MIN_FREE - 1
+    ]):
+      with self.assertRaises(preflight.Rejected):
+        preflight.collect(fake)
+    self.assertIn(("response",), fake.calls)
 
   def test_missing_ambiguous_and_swapped_socket_are_rejected(self):
     for snapshots in ([FileNotFoundError()], [preflight.Rejected()],
