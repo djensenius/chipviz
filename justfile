@@ -173,10 +173,17 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test s
     @echo "chipviz C tests OK"
 
 python-lint:
-    @${PYTHON:-python3} -m py_compile {{ python_files }} tests/sms_port_trace.py tests/test_sms_port_trace.py
+    @${PYTHON:-python3} -m py_compile {{ python_files }} tests/sms_port_trace.py tests/test_sms_port_trace.py cores/gba/homebrew/lines/fixture/harness.py cores/gba/homebrew/lines/fixture/host_tests.py
     @echo "chipviz Python lint OK"
 
-python-test:
+gba-lines-fixture-test:
+    @mkdir -p build/lines-fixture
+    @${CC:-cc} {{ cflags }} -O2 -shared -fPIC cores/gba/homebrew/lines/fixture/fixture.c cores/gba/homebrew/lines/lines.c -o build/lines-fixture/fixture.so
+    @${CC:-cc} {{ cflags }} -fsyntax-only cores/gba/homebrew/lines/fixture/main.c cores/gba/homebrew/lines/fixture/fixture.c cores/gba/homebrew/lines/lines.c
+    @${PYTHON:-python3} cores/gba/homebrew/lines/fixture/host_tests.py build/lines-fixture/fixture.so
+    @echo "GBA Lines fixture host tests OK"
+
+python-test: gba-lines-fixture-test
     @${PYTHON:-python3} -m unittest discover -s tests -p 'test_*.py'
     @echo "chipviz Python tests OK"
 
