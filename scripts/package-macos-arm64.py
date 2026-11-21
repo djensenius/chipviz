@@ -78,6 +78,28 @@ def open_directory(path: pathlib.Path, *, root: pathlib.Path | None = None) -> i
     raise
 
 
+def open_trusted_account_home(path: pathlib.Path) -> int:
+  """Open the account home through trusted, non-symlink ancestors."""
+  fd = os.open("/", DIRECTORY_FLAGS)
+  current = pathlib.Path("/")
+  try:
+    for part in ("", *path.parts[1:]):
+      if part:
+        next_fd = os.open(part, DIRECTORY_FLAGS, dir_fd=fd)
+        os.close(fd)
+        fd = next_fd
+        current /= part
+      info = os.fstat(fd)
+      owners = (os.geteuid(),) if current == path else (0, os.geteuid())
+      if info.st_uid not in owners or stat.S_IMODE(info.st_mode) & 0o022:
+        label = "account home" if current == path else f"account home ancestor {current}"
+        raise PackageError(f"{label} must be trusted and not group/world-writable")
+    return fd
+  except BaseException:
+    os.close(fd)
+    raise
+
+
 def open_input(path: pathlib.Path) -> BinaryIO:
   path = absolute_path(path)
   directory_fd = open_directory(path.parent)
@@ -257,7 +279,11 @@ def check_cargo_home(path: pathlib.Path, *, account_home: pathlib.Path | None = 
   if path != expected or any(part.casefold() in {"dist", "personal-starfield"}
                              for part in path.parts):
     raise PackageError("Cargo home must be the account's own ~/.cargo, outside protected paths")
-  fd = open_directory(path)
+  home_fd = open_trusted_account_home(path.parent)
+  try:
+    fd = os.open(path.name, DIRECTORY_FLAGS, dir_fd=home_fd)
+  finally:
+    os.close(home_fd)
   try:
     def safe(info: os.stat_result) -> bool:
       return info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o022
@@ -291,13 +317,6 @@ def check_cargo_home(path: pathlib.Path, *, account_home: pathlib.Path | None = 
         raise PackageError("Cargo home and checkout must not overlap")
     finally:
       os.close(root_fd)
-
-    home_fd = open_directory(path.parent)
-    try:
-      if not safe(os.fstat(home_fd)):
-        raise PackageError("account home must be user-owned and not group/world-writable")
-    finally:
-      os.close(home_fd)
 
     def scan(directory_fd: int, depth: int) -> None:
       if depth > 64:

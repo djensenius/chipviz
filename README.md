@@ -141,7 +141,10 @@ automatically. Cargo's command-line target and build-directory overrides take
 precedence over their environment and configuration values; the corresponding
 environment variables are also set explicitly. The command ignores inherited
 `CARGO_HOME` and checks the account's own pre-existing `~/.cargo` for unsafe
-links and permissions; it must not overlap the checkout. Its registry index,
+links and permissions; it must not overlap the checkout. Every ancestor from
+`/` through the account home must be root- or user-owned and not group/world
+writable, including sticky directories. The account and Cargo homes must be
+user-owned. ACLs are not checked. Its registry index,
 cache and sources must already be populated in a trusted setup; the check
 does not prove all locked dependencies
 are present. Cargo's offline resolution fails if required data is unavailable;

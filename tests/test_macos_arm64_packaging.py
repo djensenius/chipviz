@@ -72,6 +72,45 @@ class MacosArm64PackagingTests(unittest.TestCase):
     self.personal.parent.mkdir()
     self.personal.write_bytes(b"personal unchanged")
 
+  def simulate_trusted_fixture_prefix(self) -> None:
+    # Only for synthetic positive cases: system temporary ancestors may be
+    # world-writable. The real ancestor policy is tested separately below.
+    identities = {(path.stat().st_dev, path.stat().st_ino)
+                  for path in self.root.parent.parents}
+    original = os.fstat
+
+    def simulated(fd):
+      info = original(fd)
+      if (info.st_dev, info.st_ino) in identities:
+        values = list(info)
+        values[0] &= ~0o022
+        values[4] = 0
+        return os.stat_result(values)
+      return info
+
+    patcher = mock.patch.object(os, "fstat", side_effect=simulated)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def install_simulated_trusted_prefix(self, tools: pathlib.Path) -> None:
+    # Test subprocesses still execute the actual CLI, with only the external
+    # system temporary prefix represented as trusted metadata.
+    (tools / "sitecustomize.py").write_text("""
+import os, pathlib
+root = pathlib.Path(os.environ["TEST_PRIVATE_ROOT"])
+identities = {(p.stat().st_dev, p.stat().st_ino) for p in root.parents}
+original = os.fstat
+def simulated(fd):
+  info = original(fd)
+  if (info.st_dev, info.st_ino) in identities:
+    values = list(info)
+    values[0] &= ~0o022
+    values[4] = 0
+    return os.stat_result(values)
+  return info
+os.fstat = simulated
+""", encoding="utf-8")
+
   def run_package(self, *, binary: pathlib.Path | None = None,
                   output: pathlib.Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -331,6 +370,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     snippet = snippet.split("```sh\n", 1)[1].split("\n```", 1)[0]
     tools = self.root / "fake-tools"
     tools.mkdir()
+    self.install_simulated_trusted_prefix(tools)
     account_home = self.root.parent / "account-home"
     account_home.mkdir(mode=0o700)
     cargo_home = account_home / ".cargo"
@@ -403,6 +443,8 @@ print(path)
         env = os.environ.copy()
         env.update({
           "PATH": str(tools) + os.pathsep + env["PATH"],
+          "PYTHONPATH": str(tools),
+          "TEST_PRIVATE_ROOT": str(self.root.parent),
           "HOME": str(account_home),
           "CARGO_HOME": str(protected),
           "CARGO_TARGET_DIR": str(protected),
@@ -432,6 +474,8 @@ print(path)
         try:
           env = os.environ.copy()
           env.update({"PATH": str(tools) + os.pathsep + env["PATH"],
+                      "PYTHONPATH": str(tools),
+                      "TEST_PRIVATE_ROOT": str(self.root.parent),
                       "HOME": str(account_home), "CARGO_HOME": str(protected),
                       "FAKE_CARGO_DIR": str(self.root / f"unsafe-cargo-{index}"),
                       "FAKE_BINARY": str(self.binary), "PROTECTED": str(protected)})
@@ -450,6 +494,7 @@ print(path)
     saved.rename(cargo_home)
 
   def test_cargo_home_rejects_wrong_paths_links_and_unpopulated_cache(self) -> None:
+    self.simulate_trusted_fixture_prefix()
     home = self.root.parent / "account-home"
     home.mkdir(mode=0o700)
     cargo_home = home / ".cargo"
@@ -500,12 +545,87 @@ print(path)
     self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
     self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
 
+  def test_cargo_home_requires_trusted_ancestors_from_root(self) -> None:
+    parent = self.root.parent / "account-parent"
+    parent.mkdir(mode=0o700)
+    home = parent / "account"
+    home.mkdir(mode=0o700)
+    cargo_home = home / ".cargo"
+    for name in ("index", "cache", "src"):
+      directory = cargo_home / "registry" / name
+      directory.mkdir(parents=True)
+      (directory / "prepopulated").write_bytes(b"fixture")
+
+    # Never silently bless /tmp or another unsafe real fixture ancestor.
+    unsafe = [path for path in (home, *home.parents)
+              if path.stat().st_uid not in (0, os.geteuid())
+              or stat.S_IMODE(path.stat().st_mode) & 0o022]
+    if unsafe:
+      with self.assertRaisesRegex(PACKAGE.PackageError, "account home ancestor"):
+        PACKAGE.check_cargo_home(cargo_home, account_home=home, root=self.root)
+    else:
+      PACKAGE.check_cargo_home(cargo_home, account_home=home, root=self.root)
+
+    self.simulate_trusted_fixture_prefix()
+    PACKAGE.check_cargo_home(cargo_home, account_home=home, root=self.root)
+    for mode in (0o775, 0o757, 0o1777):
+      with self.subTest(mode=oct(mode)):
+        parent.chmod(mode)
+        with self.assertRaisesRegex(PACKAGE.PackageError, "account home ancestor"):
+          PACKAGE.check_cargo_home(cargo_home, account_home=home, root=self.root)
+    parent.chmod(0o700)
+
+    original = os.fstat
+    identity = (parent.stat().st_dev, parent.stat().st_ino)
+
+    def owner(uid):
+      def changed(fd):
+        info = original(fd)
+        if (info.st_dev, info.st_ino) == identity:
+          values = list(info)
+          values[4] = uid
+          return os.stat_result(values)
+        return info
+      return changed
+
+    with mock.patch.object(os, "fstat", side_effect=owner(0)):
+      PACKAGE.check_cargo_home(cargo_home, account_home=home, root=self.root)
+    with mock.patch.object(os, "fstat", side_effect=owner(os.geteuid() + 100000)):
+      with self.assertRaisesRegex(PACKAGE.PackageError, "account home ancestor"):
+        PACKAGE.check_cargo_home(cargo_home, account_home=home, root=self.root)
+
+    root_info = pathlib.Path("/").stat()
+    root_identity = (root_info.st_dev, root_info.st_ino)
+    for bad_owner in (False, True):
+      with self.subTest(root_bad_owner=bad_owner):
+        def unsafe_root(fd):
+          info = original(fd)
+          if (info.st_dev, info.st_ino) == root_identity:
+            values = list(info)
+            if bad_owner:
+              values[4] = os.geteuid() + 100000
+            else:
+              values[0] |= 0o002
+            return os.stat_result(values)
+          return info
+
+        with mock.patch.object(os, "fstat", side_effect=unsafe_root):
+          with self.assertRaisesRegex(PACKAGE.PackageError, "account home ancestor /"):
+            PACKAGE.check_cargo_home(cargo_home, account_home=home, root=self.root)
+
+    alias = self.root.parent / "account-parent-link"
+    alias.symlink_to(parent, target_is_directory=True)
+    with self.assertRaises(OSError):
+      PACKAGE.check_cargo_home(alias / "account/.cargo", account_home=alias / "account",
+                               root=self.root)
+
   def test_documented_build_rejects_cargo_home_checkout_overlap(self) -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     snippet = readme.split("### Local Apple Silicon archive", 1)[1]
     snippet = snippet.split("```sh\n", 1)[1].split("\n```", 1)[0]
     tools = self.root.parent / "fake-overlap-tools"
     tools.mkdir()
+    self.install_simulated_trusted_prefix(tools)
     mise = tools / "mise"
     mise.write_text(f"""#!{sys.executable}
 import os, pwd, runpy, sys, types
@@ -539,7 +659,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     for checkout, home in ((self.root, inner_home), (nested_checkout, outer_home)):
       with self.subTest(checkout=checkout, home=home):
         env = os.environ.copy()
-        env.update({"PATH": str(tools) + os.pathsep + env["PATH"], "HOME": str(home)})
+        env.update({"PATH": str(tools) + os.pathsep + env["PATH"], "HOME": str(home),
+                    "PYTHONPATH": str(tools), "TEST_PRIVATE_ROOT": str(self.root.parent)})
         result = subprocess.run(["sh", "-c", snippet], cwd=checkout, env=env,
                                 capture_output=True, text=True, check=False)
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -549,6 +670,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
     self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
 
+    self.simulate_trusted_fixture_prefix()
     cargo_home = outer_home / ".cargo"
     with self.assertRaisesRegex(PACKAGE.PackageError, "must not overlap"):
       PACKAGE.check_cargo_home(cargo_home, account_home=outer_home, root=cargo_home)
