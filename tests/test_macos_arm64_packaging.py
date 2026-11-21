@@ -80,6 +80,13 @@ class MacosArm64PackagingTests(unittest.TestCase):
       cwd=self.root, capture_output=True, text=True, check=False,
     )
 
+  def run_prepare(self, output: pathlib.Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+      [sys.executable, str(self.root / "scripts" / SCRIPT.name),
+       "--prepare-output-dir", str(output)],
+      cwd=self.root, capture_output=True, text=True, check=False,
+    )
+
   def assert_rejected(self, data: bytes) -> None:
     self.binary.write_bytes(data)
     result = self.run_package()
@@ -198,6 +205,125 @@ class MacosArm64PackagingTests(unittest.TestCase):
     self.assertNotEqual(result.returncode, 0, result.stdout)
     self.assertIn("268435456-byte snapshot limit", result.stderr)
     self.assertFalse(self.output.exists())
+
+  def test_prepare_creates_private_directories_and_refuses_existing_target(self) -> None:
+    saved = self.root / "saved-build"
+    (self.root / "build").rename(saved)
+    output = self.root / "build/macos-arm64/package"
+    result = self.run_prepare(output)
+    self.assertEqual(result.returncode, 0, result.stderr)
+    for path in (self.root / "build", output.parent, output):
+      self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0)
+    sentinel = output / "keep"
+    sentinel.write_bytes(b"untouched")
+    result = self.run_prepare(output)
+    self.assertNotEqual(result.returncode, 0)
+    self.assertEqual(sentinel.read_bytes(), b"untouched")
+    sentinel.unlink()
+    result = self.run_package(output=output / "local.zip")
+    self.assertEqual(result.returncode, 0, result.stderr)
+    with zipfile.ZipFile(output / "local.zip") as archive:
+      self.assertEqual(archive.read("chipviz-m1"), self.binary.read_bytes())
+    self.assertNotEqual(self.run_prepare(self.root / "dist/package").returncode, 0)
+    self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+    self.assertEqual((saved / "personal-starfield/sentinel").read_bytes(),
+                     b"personal unchanged")
+
+  def test_documented_setup_rejects_symlinked_build_paths_without_transient_touches(self) -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme.split("### Local Apple Silicon archive", 1)[1]
+    snippet = section.split("```sh\n", 1)[1].split("\n```", 1)[0]
+    personal = self.root / "protected-personal"
+    self.personal.parent.rename(personal)
+    tools = self.root / "fake-tools"
+    tools.mkdir()
+    mise = tools / "mise"
+    # Execute the actual packager CLI and observe successful mutation syscalls,
+    # including files/directories subsequently removed.
+    mise.write_text(f"""#!{sys.executable}
+import os, runpy, sys
+if sys.argv[1:4] != ["exec", "--", "python"]:
+  print("unexpected build invocation", file=sys.stderr)
+  sys.exit(90)
+protected = os.path.realpath(os.environ["PROTECTED"])
+root = os.stat(os.getcwd())
+protected_info = os.stat(protected)
+def protected_path(path, dir_fd):
+  if dir_fd is not None:
+    info = os.fstat(dir_fd)
+    if (info.st_dev, info.st_ino) == (protected_info.st_dev, protected_info.st_ino):
+      return True
+    if (info.st_dev, info.st_ino) == (root.st_dev, root.st_ino):
+      path = os.path.join(os.getcwd(), path)
+    else:
+      return False
+  resolved = os.path.realpath(path)
+  return resolved == protected or resolved.startswith(protected + os.sep)
+original_open, original_mkdir, original_unlink = os.open, os.mkdir, os.unlink
+original_rmdir, original_rename = os.rmdir, os.rename
+def watched_open(path, flags, mode=0o777, *, dir_fd=None):
+  fd = original_open(path, flags, mode, dir_fd=dir_fd)
+  if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC) and protected_path(path, dir_fd):
+    print("PROTECTED MUTATION: open", file=sys.stderr)
+  return fd
+def watched_mkdir(path, mode=0o777, *, dir_fd=None):
+  original_mkdir(path, mode, dir_fd=dir_fd)
+  if protected_path(path, dir_fd):
+    print("PROTECTED MUTATION: mkdir", file=sys.stderr)
+def watched_unlink(path, *, dir_fd=None):
+  touched = protected_path(path, dir_fd)
+  original_unlink(path, dir_fd=dir_fd)
+  if touched:
+    print("PROTECTED MUTATION: unlink", file=sys.stderr)
+def watched_rmdir(path, *, dir_fd=None):
+  touched = protected_path(path, dir_fd)
+  original_rmdir(path, dir_fd=dir_fd)
+  if touched:
+    print("PROTECTED MUTATION: rmdir", file=sys.stderr)
+def watched_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+  touched = protected_path(src, src_dir_fd) or protected_path(dst, dst_dir_fd)
+  original_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+  if touched:
+    print("PROTECTED MUTATION: rename", file=sys.stderr)
+os.open, os.mkdir, os.unlink = watched_open, watched_mkdir, watched_unlink
+os.rmdir, os.rename = watched_rmdir, watched_rename
+sys.argv = sys.argv[4:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+""", encoding="utf-8")
+    mise.chmod(0o755)
+    mktemp = tools / "mktemp"
+    mktemp.write_text("#!/bin/sh\nprintf 'unexpected mktemp invocation\\n' >&2\nexit 91\n",
+                      encoding="utf-8")
+    mktemp.chmod(0o755)
+    for name in ("mkdir", "rmdir", "rm"):
+      tool = tools / name
+      tool.write_text("#!/bin/sh\nprintf 'unexpected filesystem command\\n' >&2\nexit 92\n",
+                      encoding="utf-8")
+      tool.chmod(0o755)
+    for component in ("build", "macos-arm64"):
+      for protected in (self.dist.parent, personal):
+        with self.subTest(component=component, protected=protected):
+          path = self.root / "build" if component == "build" else self.base
+          saved = self.root / "saved-path"
+          path.rename(saved)
+          path.symlink_to(protected, target_is_directory=True)
+          try:
+            env = os.environ.copy()
+            env.update({"PATH": str(tools) + os.pathsep + env["PATH"],
+                        "PROTECTED": str(protected)})
+            result = subprocess.run(["sh", "-c", snippet], cwd=self.root, env=env,
+                                    capture_output=True, text=True, check=False)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("error:", result.stderr)
+            self.assertNotIn("PROTECTED MUTATION:", result.stderr)
+            self.assertNotIn("unexpected build invocation", result.stderr)
+            self.assertNotIn("unexpected mktemp invocation", result.stderr)
+            self.assertNotIn("unexpected filesystem command", result.stderr)
+            self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+            self.assertEqual((personal / "sentinel").read_bytes(), b"personal unchanged")
+          finally:
+            path.unlink()
+            saved.rename(path)
 
   def test_tmpdir_protected_directories_have_no_transient_writes_or_removals(self) -> None:
     original_open = os.open

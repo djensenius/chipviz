@@ -105,27 +105,33 @@ is tracked in [#215](https://github.com/djensenius/chipviz/issues/215) and
 On an Apple Silicon Mac with the mise Rust toolchain, the
 `aarch64-apple-darwin` target, and Xcode command-line tools available, wait
 for the serialized build slot before running the following from the checkout
-root. This builds only `chipviz-m1` with the locked dependencies and default
-features, then creates a local archive in a fresh private directory:
+root. The packager first creates a fresh private output directory without
+following symlinks. The build uses a separate fresh directory in macOS's
+`/private/tmp`, not the checkout's potentially symlinked Cargo target path:
 
 ```sh
 (
 set -eu
 checkout=$(pwd -P)
-CARGO_TARGET_DIR="$checkout/renderers/modern/target" mise exec -- cargo build \
+out_dir="$checkout/build/macos-arm64/package"
+export TMPDIR=/private/tmp
+mise exec -- python scripts/package-macos-arm64.py --prepare-output-dir "$out_dir"
+cargo_dir=$(mktemp -d /private/tmp/chipviz-cargo.XXXXXXXX)
+CARGO_TARGET_DIR="$cargo_dir" mise exec -- cargo build \
   --locked --manifest-path renderers/modern/Cargo.toml --release \
   --target aarch64-apple-darwin --bin chipviz-m1
-mkdir -p build
-mkdir -p -m 700 build/macos-arm64
-out_dir=$(mktemp -d "$checkout/build/macos-arm64/package.XXXXXXXX")
 mise exec -- python scripts/package-macos-arm64.py \
-  --binary "$checkout/renderers/modern/target/aarch64-apple-darwin/release/chipviz-m1" \
+  --binary "$cargo_dir/aarch64-apple-darwin/release/chipviz-m1" \
   --output "$out_dir/chipviz-macos-arm64.zip"
 )
 ```
 
 The existing `build` directory must be user-owned and not group/world-writable;
-`build/macos-arm64` must be user-owned and private. The packager rejects
+`build/macos-arm64` must be user-owned and private. The preparation command
+creates these directories if missing and refuses an existing `package`
+directory; choose a different fresh name on retry. Preparation can leave
+created directories if it fails. The private Cargo directory is not removed
+automatically. Cargo and its build dependencies are not sandboxed. The packager rejects
 symlinks, existing targets and unsafe input permissions. It copies the
 owner-executable binary and `LICENSE`, `COMMERCIAL.md`, and
 `THIRD_PARTY_NOTICES/rust.md` into the ZIP. Snapshot limits are 256 MiB for

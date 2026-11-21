@@ -5,6 +5,7 @@ An archive and its included notices do not grant redistribution clearance.
 Header checks do not prove runtime compatibility, rendering, signing, or notarization.
 Use an existing empty, user-owned private directory beneath a private,
 user-owned build/macos-arm64/ directory.
+The optional preparation mode creates these directories without following symlinks.
 The directory and source checks cannot prevent races by the same account.
 On failure, an incomplete archive may remain; no output files are removed.
 Snapshots stay in memory: at most 256 MiB for the binary and 8 MiB per notice.
@@ -204,6 +205,47 @@ def verify_destination(output: pathlib.Path, root: pathlib.Path, directory_fd: i
     os.close(check_fd)
 
 
+def prepare_output_directory(path: pathlib.Path, *, root: pathlib.Path = ROOT) -> pathlib.Path:
+  """Create a fresh private output directory using no-follow directory descriptors."""
+  root = absolute_path(root)
+  path = absolute_path(path)
+  if path.parent != root / "build" / "macos-arm64":
+    raise PackageError("new directory must be directly beneath build/macos-arm64/")
+  fd = open_directory(root)
+  try:
+    for name in ("build", "macos-arm64"):
+      try:
+        os.mkdir(name, 0o700, dir_fd=fd)
+      except FileExistsError:
+        pass
+      next_fd = os.open(name, DIRECTORY_FLAGS, dir_fd=fd)
+      os.close(fd)
+      fd = next_fd
+      info = os.fstat(fd)
+      forbidden = 0o022 if name == "build" else 0o077
+      if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & forbidden:
+        raise PackageError(f"{name} must be user-owned and have safe permissions")
+      try:
+        os.stat(".git", dir_fd=fd, follow_symlinks=False)
+      except FileNotFoundError:
+        pass
+      else:
+        raise PackageError(f"{name} must not be another checkout")
+    verify_destination(path, root, fd)
+    os.mkdir(path.name, 0o700, dir_fd=fd)
+    child_fd = os.open(path.name, DIRECTORY_FLAGS, dir_fd=fd)
+    try:
+      info = os.fstat(child_fd)
+      if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise PackageError("new output directory must be user-owned and private")
+      verify_destination(path / "unused", root, child_fd)
+    finally:
+      os.close(child_fd)
+  finally:
+    os.close(fd)
+  return path
+
+
 def create_package(binary_path: pathlib.Path, output_path: pathlib.Path,
                    *, root: pathlib.Path = ROOT) -> pathlib.Path:
   """The root parameter is an internal test seam, not a CLI option."""
@@ -261,12 +303,21 @@ def create_package(binary_path: pathlib.Path, output_path: pathlib.Path,
 def main(argv: list[str] | None = None) -> int:
   parser = argparse.ArgumentParser(description=__doc__,
                                    formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("--binary", type=pathlib.Path, required=True,
+  parser.add_argument("--binary", type=pathlib.Path,
                       help="existing thin macOS ARM64 Mach-O executable")
-  parser.add_argument("--output", type=pathlib.Path, required=True,
-                      help="new archive in an existing empty private build/macos-arm64/ directory")
+  destinations = parser.add_mutually_exclusive_group(required=True)
+  destinations.add_argument("--output", type=pathlib.Path,
+                            help="new archive in an existing empty private directory")
+  destinations.add_argument("--prepare-output-dir", type=pathlib.Path,
+                            help="create a fresh private directory directly under build/macos-arm64/")
   args = parser.parse_args(argv)
+  if bool(args.binary) != bool(args.output):
+    parser.error("--binary and --output must be supplied together")
   try:
+    if args.prepare_output_dir:
+      output = prepare_output_directory(args.prepare_output_dir)
+      print(f"Created private output directory: {output}")
+      return 0
     output = create_package(args.binary, args.output)
   except (PackageError, OSError, zipfile.BadZipFile) as error:
     print(f"error: {error}", file=sys.stderr)
