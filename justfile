@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/catalog_music_source.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gb_dmg_parity_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py scripts/personal-starfield-bundle.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_personal_starfield_bundle.py tests/personal_starfield_capture_smoke.py tests/test_personal_starfield_capture_smoke.py tests/test_host_bridge.py tests/test_catalog_music_source.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_gb_dmg_parity_helpers.py tests/test_gb_lines.py tests/test_gb_lines_execution.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py cores/sms/homebrew/field_assets.py tests/test_sms_field_assets.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/sms_procedural_test.py renderers/modern/tests/catalog_v1_reference.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/catalog_music_source.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gb_dmg_parity_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py scripts/personal-starfield-bundle.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_personal_starfield_bundle.py tests/personal_starfield_capture_smoke.py tests/test_personal_starfield_capture_smoke.py tests/test_host_bridge.py tests/test_catalog_music_source.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_gb_dmg_parity_helpers.py tests/test_gb_lines.py tests/test_gb_lines_execution.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py scripts/c64_spectrum_volume_fixture.py tests/test_c64_spectrum_volume_fixture.py cores/sms/homebrew/field_assets.py tests/test_sms_field_assets.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/sms_procedural_test.py renderers/modern/tests/catalog_v1_reference.py"
 
 default:
     just --list
@@ -133,6 +133,7 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test
     @${CC:-cc} {{ cflags }} tests/interface_tests.c shared/src/control_frame.c shared/src/interface.c -o build/tests/interface_tests
     @${CC:-cc} {{ cflags }} -Ifirmware/pico/include tests/pico_joybus_tests.c firmware/pico/src/joybus_bridge.c -o build/tests/pico_joybus_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_input_tests.c -o build/tests/gba_input_tests
+    @${CC:-cc} {{ cflags }} cores/gba/homebrew/lines/lines_tests.c cores/gba/homebrew/lines/lines.c -o build/tests/gba_lines_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_native_prefetch_tests.c cores/gba/homebrew/source/native_prefetch.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_native_prefetch_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_native_render_tests.c cores/gba/homebrew/source/native_prefetch.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_native_render_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_colour_field_tests.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_colour_field_tests
@@ -141,11 +142,13 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_joybus_link_tests.c -o build/tests/n64_joybus_link_tests
     @${CC:-cc} {{ cflags }} -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_tests
     @${CC:-cc} {{ cflags }} -DCF_UNMEASURED_FLASH -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_flash_tests
+    @${CC:-cc} {{ cflags }} -Icores/c64/homebrew/src tests/c64_spectrum_volume_tests.c cores/c64/homebrew/src/spectrum_volume.c -o build/tests/c64_spectrum_volume_tests
     @build/tests/control_frame_tests
     @build/tests/connection_tests
     @build/tests/interface_tests
     @build/tests/pico_joybus_tests
     @build/tests/gba_input_tests
+    @build/tests/gba_lines_tests
     @build/tests/gba_native_prefetch_tests
     @build/tests/gba_native_render_tests
     @build/tests/gba_colour_field_tests
@@ -154,6 +157,7 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test
     @build/tests/n64_joybus_link_tests
     @build/tests/c64_colour_field_tests
     @build/tests/c64_colour_field_flash_tests
+    @build/tests/c64_spectrum_volume_tests
     @echo "chipviz C tests OK"
 
 python-lint:
