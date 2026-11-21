@@ -32,7 +32,7 @@ impl Inputs {
     /// Native demo inputs for a given 16-bit frame, independent of hardware.
     pub fn demo(frame: u16) -> Self {
         let frame = u32::from(frame);
-        let scene = (frame / 96 & 3) as u8;
+        let scene = ((frame / 96) & 3) as u8;
         let mut spectrum = [0; 8];
         for (band, value) in spectrum.iter_mut().enumerate() {
             let wave = (frame * (band as u32 + 3) + band as u32 * 29) & 127;
@@ -41,9 +41,9 @@ impl Inputs {
         Self {
             spectrum,
             scene,
-            palette: (frame / 32 & 7) as u8,
+            palette: ((frame / 32) & 7) as u8,
             beat: frame & 31 < 4,
-            note: (48 + (frame / 16 & 23)) as u8,
+            note: (48 + ((frame / 16) & 23)) as u8,
         }
     }
 }

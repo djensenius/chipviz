@@ -58,11 +58,11 @@ fn each_phase_updates_only_its_rows_before_the_meter_overlay() {
         field.step(&data);
         assert_eq!(field.frame(), phase + 1);
         assert_eq!(field.cell(0, usize::from(phase) + 4), expected);
-        for y in 0..18 {
+        for (y, previous) in before.iter().enumerate() {
             if y % 4 != usize::from(phase) {
-                assert_eq!(field.cell(0, y + 4), before[y], "phase={phase} y={y}");
+                assert_eq!(field.cell(0, y + 4), *previous, "phase={phase} y={y}");
             } else {
-                assert_ne!(field.cell(0, y + 4), before[y], "phase={phase} y={y}");
+                assert_ne!(field.cell(0, y + 4), *previous, "phase={phase} y={y}");
             }
         }
         if phase == 0 {
@@ -73,6 +73,79 @@ fn each_phase_updates_only_its_rows_before_the_meter_overlay() {
             assert_eq!(field.cell(0, 21), cell(97, 8));
         }
     }
+}
+
+#[test]
+fn whole_grid_stays_unchanged_outside_each_write_footprint() {
+    fn snapshot(field: &PetsciiMeterField) -> Vec<Vec<Option<Cell>>> {
+        (0..25)
+            .map(|y| (0..40).map(|x| field.cell(x, y)).collect())
+            .collect()
+    }
+
+    fn assert_outside_footprint(
+        before: &[Vec<Option<Cell>>],
+        field: &PetsciiMeterField,
+        rows: &[usize],
+    ) {
+        let meter_columns = [2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31];
+        for (y, row) in before.iter().enumerate() {
+            for (x, previous) in row.iter().enumerate() {
+                let meter = (19..=23).contains(&y) && meter_columns.contains(&x);
+                if !rows.contains(&y) && !meter {
+                    assert_eq!(field.cell(x, y), *previous, "x={x} y={y}");
+                }
+            }
+        }
+    }
+
+    let mut field = PetsciiMeterField::default();
+    let mut data = input([0; 8]);
+    let phases: [(&[usize], usize, Option<Cell>); 4] = [
+        (&[4, 8, 12, 16, 20], 4, cell(87, 1)),
+        (&[5, 9, 13, 17, 21], 5, cell(97, 3)),
+        (&[6, 10, 14, 18], 6, cell(98, 5)),
+        (&[7, 11, 15, 19], 7, cell(99, 7)),
+    ];
+    for (phase, (rows, y, expected)) in phases.into_iter().enumerate() {
+        data.palette = phase as u8;
+        let before = snapshot(&field);
+        field.step(&data);
+        assert_outside_footprint(&before, &field, rows);
+        assert_eq!(field.cell(0, y), expected);
+        assert_ne!(field.cell(0, y), before[y][0]);
+        assert_eq!(field.cell(2, 23), cell(102, 1 + phase as u8));
+        assert_ne!(field.cell(2, 23), before[23][2]);
+    }
+
+    let before = snapshot(&field);
+    field.skip_frame();
+    assert_eq!(field.frame(), 5);
+    assert_eq!(snapshot(&field), before);
+    for _ in field.frame()..u16::MAX {
+        field.skip_frame();
+    }
+    assert_eq!(field.frame(), u16::MAX);
+    assert_eq!(snapshot(&field), before);
+
+    data.palette = 9;
+    field.step(&data);
+    assert_eq!(field.frame(), 0);
+    assert_outside_footprint(&before, &field, &[7, 11, 15, 19]);
+    assert_eq!(field.cell(0, 7), cell(98, 13));
+    assert_eq!(field.cell(2, 23), cell(102, 10));
+    assert_ne!(field.cell(0, 7), before[7][0]);
+    assert_ne!(field.cell(2, 23), before[23][2]);
+
+    let before = snapshot(&field);
+    data.palette = 4;
+    field.step(&data);
+    assert_eq!(field.frame(), 1);
+    assert_outside_footprint(&before, &field, &[4, 8, 12, 16, 20]);
+    assert_eq!(field.cell(0, 4), cell(87, 5));
+    assert_eq!(field.cell(2, 23), cell(102, 5));
+    assert_ne!(field.cell(0, 4), before[4][0]);
+    assert_ne!(field.cell(2, 23), before[23][2]);
 }
 
 #[test]
