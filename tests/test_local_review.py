@@ -141,6 +141,142 @@ class GalleryTests(unittest.TestCase):
         nested.write_text("Revision: " + "d" * 40 + "\nSource revision: " + "e" * 40, encoding="utf-8")
         self.assertIsNone(gallery.source_revision(self.fds[0], self.relative))
 
+    def test_revision_invalid_declarations_block_ancestor(self):
+        parent = self.root / "modern" / "README.md"
+        nested = self.root / "modern" / "pi5" / "README.md"
+        parent.write_text("Revision: " + "b" * 40, encoding="utf-8")
+        for text in ("Revision: deadbee", "Revision: ", "Source revision: nope",
+                     "Revision: " + "c" * 40 + "\nRevision: deadbee",
+                     "Revision: " + "c" * 40 + "\nRevision: " + "d" * 40):
+            with self.subTest(text=text):
+                nested.write_text(text, encoding="utf-8")
+                self.assertIsNone(gallery.source_revision(self.fds[0], self.relative))
+        nested.write_text("Source integration commit: `" + "C" * 40 + "`.\n", encoding="utf-8")
+        self.assertEqual(gallery.source_revision(self.fds[0], self.relative), "c" * 40)
+
+    def test_library_capture_sources_are_unknown(self):
+        self.write(self.root, "modern/m1/Lines/quiet.mp4", b"mac")
+        self.write(self.root, "retro/nes/native-demo/demo.mp4", b"retro")
+        clips = gallery.local_catalog(self.roots)[0]["clips"]
+        self.assertEqual({clip["platform"] for clip in clips}, {"Pi 5 profile", "Mac / M1 profile", "NES"})
+        for clip in clips:
+            self.assertEqual(clip["capture"], "Unknown capture")
+
+    def test_scan_skips_irrelevant_unsafe_names_but_rejects_relevant_ones(self):
+        self.write(self.root, "notes 100%.txt", b"notes")
+        (self.root / "shortcut 100%").symlink_to(self.base, target_is_directory=True)
+        self.assertEqual(len(gallery.local_catalog(self.roots)[0]["clips"]), 1)
+        unsafe_dir = self.root / "unsafe%dir"
+        unsafe_dir.mkdir()
+        with self.assertRaisesRegex(ValueError, "unsafe path"):
+            gallery.local_catalog(self.roots)
+        unsafe_dir.rmdir()
+        self.write(self.root, "unsafe%.mp4", b"video")
+        with self.assertRaisesRegex(ValueError, "unsafe path"):
+            gallery.local_catalog(self.roots)
+
+    def test_scan_entry_depth_and_byte_limits(self):
+        for limits, message in (
+            (gallery.ScanLimits(max_entries=1), "entry limit"),
+            (gallery.ScanLimits(max_depth=1), "depth limit"),
+            (gallery.ScanLimits(max_bytes=9), "byte limit"),
+        ):
+            with self.subTest(message=message):
+                budget = gallery.ScanBudget(limits)
+                with self.assertRaisesRegex(ValueError, message):
+                    gallery.local_catalog(self.roots, budget)
+                if message == "entry limit":
+                    self.assertEqual(budget.entries, 2)
+
+    def test_hash_byte_budget_is_shared_across_roots(self):
+        self.write(self.draft, "other/example.mp4", b"four")
+        budget = gallery.ScanBudget(gallery.ScanLimits(max_bytes=13))
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            gallery.local_catalog(self.roots, budget)
+        self.assertEqual(budget.bytes, 10)
+        budget = gallery.ScanBudget(gallery.ScanLimits(max_bytes=14))
+        self.assertEqual(len(gallery.local_catalog(self.roots, budget)[0]["clips"]), 2)
+        self.assertEqual(budget.bytes, 14)
+
+    def test_hash_byte_budget_checks_growth_before_hashing(self):
+        video = self.write(self.root, self.relative, b"x")
+        stream = gallery.open_file(self.fds[0], self.relative)
+
+        class GrowingStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                stream.close()
+
+            def fileno(self):
+                return stream.fileno()
+
+            def read(self, size):
+                with video.open("ab") as writer:
+                    writer.write(b"more")
+                return stream.read(size)
+
+        budget = gallery.ScanBudget(gallery.ScanLimits(max_bytes=2))
+        with mock.patch.object(gallery, "open_file", return_value=GrowingStream()):
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                gallery.digest_file(self.fds[0], self.relative, "library", budget)
+        self.assertEqual(budget.bytes, 0)
+
+    def test_scan_deadline_checked_during_enumeration(self):
+        now = [0]
+        budget = gallery.ScanBudget(gallery.ScanLimits(max_seconds=1), clock=lambda: now[0])
+        original_stat = os.stat
+
+        def delayed_stat(*args, **kwargs):
+            result = original_stat(*args, **kwargs)
+            now[0] = 2
+            return result
+
+        with mock.patch.object(gallery.os, "stat", side_effect=delayed_stat):
+            with self.assertRaisesRegex(ValueError, "time limit"):
+                gallery.local_catalog(self.roots, budget)
+
+    def test_scan_cancellation_checked_during_hashing(self):
+        self.write(self.root, self.relative, b"x" * (2 * 1024 * 1024))
+        cancelled = threading.Event()
+
+        class CancelAfterBlock(gallery.ScanBudget):
+            def hash_bytes(self, count):
+                super().hash_bytes(count)
+                if self.bytes >= 1024 * 1024:
+                    cancelled.set()
+
+        budget = CancelAfterBlock(cancel=cancelled)
+        with self.assertRaisesRegex(ValueError, "scan cancelled"):
+            gallery.digest_file(self.fds[0], self.relative, "library", budget)
+        self.assertEqual(budget.bytes, 1024 * 1024)
+
+    def test_scan_deadline_checked_during_hashing(self):
+        self.write(self.root, self.relative, b"x" * (2 * 1024 * 1024))
+        now = [0]
+
+        class ExpireAfterBlock(gallery.ScanBudget):
+            def hash_bytes(self, count):
+                super().hash_bytes(count)
+                if self.bytes >= 1024 * 1024:
+                    now[0] = 2
+
+        budget = ExpireAfterBlock(gallery.ScanLimits(max_seconds=1), clock=lambda: now[0])
+        with self.assertRaisesRegex(ValueError, "time limit"):
+            gallery.digest_file(self.fds[0], self.relative, "library", budget)
+        self.assertEqual(budget.bytes, 1024 * 1024)
+
+    def test_limit_failure_clears_previous_index(self):
+        server = self.serve()
+        prefix = f"/{server.token}/"
+        clip = self.catalog(server)["clips"][0]
+        server.scan_limits = gallery.ScanLimits(max_bytes=9)
+        self.assertEqual(self.request(server, prefix + "catalog.json")[0], 404)
+        self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
+        server.scan_limits = gallery.ScanLimits()
+        self.assertEqual(self.catalog(server)["clips"][0]["id"], clip["id"])
+
     def test_incomplete_request_does_not_block_capability_request(self):
         started = threading.Event()
         original = gallery.Handler.handle_one_request
@@ -263,8 +399,8 @@ class GalleryTests(unittest.TestCase):
                 self.request(server, f"/{server.token}/")
         self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
 
-    def test_catalog_refresh_is_serialized_and_preserves_unchanged_media(self):
-        server = self.serve()
+    def test_overlapping_refreshes_do_not_starve_playback(self):
+        server = self.serve(header_timeout=30)
         prefix = f"/{server.token}/"
         self.write(self.root, "other/remove.mp4", b"remove")
         clips = self.catalog(server)["clips"]
@@ -272,47 +408,70 @@ class GalleryTests(unittest.TestCase):
         removed = next(c for c in clips if c["title"] == "remove")
         entered = threading.Event()
         release = threading.Event()
-        second_request = threading.Event()
-        second_scan = threading.Event()
-        guard = threading.Lock()
         original_catalog = gallery.local_catalog
-        original_respond = gallery.Handler.respond
+        original_handle = gallery.Handler.handle_one_request
+        ready = threading.Condition()
+        ready_count = 0
         scans = 0
-        requests = 0
         results = []
 
-        def blocked_catalog(roots):
-            nonlocal scans
-            with guard:
-                scans += 1
-                number = scans
-            if number == 1:
-                entered.set()
-                if not release.wait(5):
-                    raise ValueError("test timed out")
-            else:
-                second_scan.set()
-            return original_catalog(roots)
+        def mark_ready(handler):
+            nonlocal ready_count
+            with ready:
+                ready_count += 1
+                ready.notify_all()
+            return original_handle(handler)
 
-        def mark_request(handler, body):
-            nonlocal requests
-            if handler.path.endswith("/catalog.json"):
-                with guard:
-                    requests += 1
-                    if requests == 2:
-                        second_request.set()
-            return original_respond(handler, body)
+        def blocked_catalog(roots, budget):
+            nonlocal scans
+            scans += 1
+            entered.set()
+            if not release.wait(30):
+                raise ValueError("test timed out")
+            return original_catalog(roots, budget)
 
         def fetch_catalog():
-            results.append(self.request(server, prefix + "catalog.json")[0])
+            results.append(self.request(server, prefix + "catalog.json", timeout=30)[0])
 
         with mock.patch.object(gallery, "local_catalog", blocked_catalog), \
-                mock.patch.object(gallery.Handler, "respond", mark_request):
+                mock.patch.object(gallery.Handler, "handle_one_request", mark_ready):
             first = threading.Thread(target=fetch_catalog)
-            second = threading.Thread(target=fetch_catalog)
             first.start()
+            connections = []
             try:
                 self.assertTrue(entered.wait(2))
+                for number in range(15):
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+                    connections.append(conn)
+                    conn.connect()
+                    with ready:
+                        self.assertTrue(ready.wait_for(lambda: ready_count >= number + 2, timeout=10))
+                gate = threading.Barrier(16)
+                outcomes, errors = [], []
+
+                def overlap(conn):
+                    try:
+                        gate.wait(10)
+                        conn.request("GET", prefix + "catalog.json")
+                        response = conn.getresponse()
+                        outcomes.append((response.status, response.getheader("Retry-After")))
+                        response.read()
+                    except Exception as exc:
+                        errors.append(str(exc))
+                    finally:
+                        conn.close()
+
+                workers = [threading.Thread(target=overlap, args=(conn,)) for conn in connections]
+                for worker in workers:
+                    worker.start()
+                gate.wait(10)
+                for worker in workers:
+                    worker.join(10)
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+                self.assertEqual(errors, [])
+                self.assertEqual(outcomes, [(503, "1")] * 15)
+                with server.connections_lock:
+                    self.assertTrue(server.connections_lock.wait_for(lambda: len(server.connections) == 1, timeout=10))
                 status, headers, data = self.request(
                     server, prefix + "media/" + clip["id"], headers={"Range": "bytes=2-5"}
                 )
@@ -322,18 +481,14 @@ class GalleryTests(unittest.TestCase):
                 self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 409)
                 self.assertEqual(self.request(server, prefix + "media/" + removed["id"])[0], 404)
                 self.assertEqual(self.request(server, prefix)[0], 200)
-                second.start()
-                self.assertTrue(second_request.wait(2))
-                self.assertFalse(second_scan.wait(0.1))
             finally:
+                for conn in connections:
+                    conn.close()
                 release.set()
                 first.join(5)
-                if second.ident is not None:
-                    second.join(5)
             self.assertFalse(first.is_alive())
-            self.assertFalse(second.is_alive())
-            self.assertTrue(second_scan.is_set())
-            self.assertEqual(sorted(results), [200, 200])
+            self.assertEqual(scans, 1)
+            self.assertEqual(results, [200])
         self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
         replacement = self.catalog(server)["clips"][0]
         self.assertNotEqual(replacement["id"], clip["id"])
@@ -349,7 +504,7 @@ class GalleryTests(unittest.TestCase):
         scans = 0
         statuses = []
 
-        def blocked_catalog(roots):
+        def blocked_catalog(roots, budget):
             nonlocal scans
             scans += 1
             if scans == 1:
@@ -360,7 +515,7 @@ class GalleryTests(unittest.TestCase):
             second_entered.set()
             if not release_second.wait(5):
                 raise ValueError("test timed out")
-            return original_catalog(roots)
+            return original_catalog(roots, budget)
 
         def fetch_catalog():
             statuses.append(self.request(server, prefix + "catalog.json")[0])
@@ -371,15 +526,18 @@ class GalleryTests(unittest.TestCase):
             first.start()
             try:
                 self.assertTrue(first_entered.wait(2))
-                second.start()
+                status, headers, _ = self.request(server, prefix + "catalog.json")
+                self.assertEqual((status, headers["Retry-After"]), (503, "1"))
                 status, _, data = self.request(
                     server, prefix + "media/" + clip["id"], headers={"Range": "bytes=2-5"}
                 )
                 self.assertEqual((status, data), (206, b"2345"))
                 release_first.set()
-                self.assertTrue(second_entered.wait(2))
                 first.join(5)
                 self.assertEqual(statuses, [404])
+                self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
+                second.start()
+                self.assertTrue(second_entered.wait(2))
                 self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
             finally:
                 release_first.set()
@@ -406,17 +564,20 @@ class GalleryTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
         closed = threading.Event()
-        scanned = threading.Event()
+        cancelled = threading.Event()
         expected_identity = gallery.directory_identity(self.fds[0])
         original = gallery.local_catalog
 
-        def blocked_catalog(roots):
+        def blocked_catalog(roots, budget):
             entered.set()
             if not release.wait(5):
                 raise ValueError("test timed out")
-            catalog = original(roots)
-            scanned.set()
-            return catalog
+            try:
+                return original(roots, budget)
+            except ValueError as exc:
+                if str(exc) == "scan cancelled":
+                    cancelled.set()
+                raise
 
         def fetch():
             try:
@@ -444,7 +605,7 @@ class GalleryTests(unittest.TestCase):
                 if closer is not None:
                     closer.join(5)
             self.assertTrue(closed.is_set())
-            self.assertTrue(scanned.is_set())
+            self.assertTrue(cancelled.is_set())
             self.assertFalse(client.is_alive())
             self.assertEqual(gallery.directory_identity(self.fds[0]), expected_identity)
 

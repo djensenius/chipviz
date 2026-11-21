@@ -30,10 +30,7 @@ const CONTEXT = [
     ['quiet-96', 'quiet-96'], ['energetic-126', 'energetic-126'],
   ])],
 ];
-const PI_MAC_CAPTURES = new Set([
-  'Pi 5 profile rendered on Mac GPU; not physical Pi hardware',
-  'Pi 5 profile simulated on Mac GPU; not physical Pi hardware',
-]);
+const DRAFT_PI_MAC = 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware';
 
 export function validateCatalog(catalog) {
   if (!catalog || typeof catalog !== 'object' || Array.isArray(catalog) ||
@@ -74,10 +71,14 @@ export function reference(clip, seconds) {
   const context = [];
   for (const [field, label, allowed] of CONTEXT) {
     let value = allowed.get(clip[field]);
-    if (value && field === 'platform' && value === 'Pi 5 profile' && PI_MAC_CAPTURES.has(clip.capture)) {
+    if (value && field === 'platform' && value === 'Pi 5 profile' &&
+        clip.collection === 'draft' && clip.capture === DRAFT_PI_MAC) {
       value = 'Pi 5 profile on Mac GPU (not physical Pi hardware)';
     }
     if (value) context.push(`${label} (inferred): ${value}`);
+  }
+  if (clip.collection === 'draft') {
+    context.push('Review-only draft; not human-reviewed. Do not publish.');
   }
   return [...context, `Clip ID: ${clip.id}`, `SHA-256: ${clip.sha256}`,
     `Declared source revision (unverified): ${clip.source_revision || 'unknown'}`,

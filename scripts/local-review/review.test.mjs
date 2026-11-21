@@ -34,6 +34,7 @@ test('timestamped references only contain validated identity and declared revisi
   assert.match(text, /Clip ID: clip-0123456789abcdef0123/);
   assert.match(text, /Declared source revision \(unverified\): b{40}/);
   assert.match(text, /Time: 65 seconds/);
+  assert.match(text, /Review-only draft; not human-reviewed\. Do not publish\./);
   assert.doesNotMatch(text, /127\.0\.0\.1|capability|\/Users|private\.mp4|token=secret|https?:/);
   assert.match(reference({ ...value, source_revision: null }, 0), /revision \(unverified\): unknown/);
   assert.throws(() => reference({ ...value, id: 'capability' }, 0));
@@ -64,9 +65,11 @@ test('references describe all recognized draft combinations as inferred', () => 
   const unknownCapture = reference({ ...clip(), capture: 'unverified' }, 0);
   assert.match(unknownCapture, /Platform \(inferred\): Pi 5 profile\n/);
   assert.doesNotMatch(unknownCapture, /Mac GPU/);
-  const libraryCapture = reference({ ...clip(),
-    capture: 'Pi 5 profile simulated on Mac GPU; not physical Pi hardware' }, 0);
-  assert.match(libraryCapture, /Pi 5 profile on Mac GPU \(not physical Pi hardware\)/);
+  const libraryCapture = reference({ ...clip(), collection: 'library',
+    capture: 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware' }, 0);
+  assert.doesNotMatch(libraryCapture, /Mac GPU|Review-only draft|not human-reviewed|Do not publish/);
+  const otherCollection = reference({ ...clip(), collection: 'draft\npassword=secret' }, 0);
+  assert.doesNotMatch(otherCollection, /Review-only draft|password=secret/);
 });
 
 test('arbitrary metadata never leaks through any optional reference field', () => {
@@ -148,5 +151,6 @@ test('filters, text-only rendering, embedded seeking and copy fallback', async (
   assert.match(fallback.value, /Time: 72 seconds/);
   assert.match(fallback.value, /Visualization \(inferred\): Hallway/);
   assert.match(fallback.value, /Pi 5 profile on Mac GPU \(not physical Pi hardware\)/);
+  assert.match(fallback.value, /Review-only draft; not human-reviewed\. Do not publish\./);
   assert.doesNotMatch(fallback.value, /capability|127\.0\.0\.1|<img/);
 });

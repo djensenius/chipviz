@@ -27,8 +27,13 @@ and moves after startup may not be detected. `--port 0`
 is the default and chooses an available port; `--port 8000` requests a
 particular port. Open the printed URL on the same machine and stop the server
 with Ctrl-C. Refresh the page to rescan both roots. Scanning hashes every MP4
-and may take time. A malformed draft provenance file, inaccessible file, or
-unsafe catalog entry fails the scan closed; fix the local input and refresh.
+and may take time. Each scan is limited to 50,000 directory entries, 32
+directory levels below each root, 16 GiB of hashed video bytes, and 300 seconds
+of elapsed work across both roots. Limits and shutdown cancellation are checked
+incrementally; an uninterruptibly blocked filesystem syscall can still delay
+shutdown beyond the elapsed limit. A limit breach, malformed draft provenance
+file, inaccessible file, or unsafe catalog entry fails the scan closed; fix
+the local input and refresh.
 Unchanged indexed clips remain playable during a scan; a failed scan clears the
 index. The viewer skips symlinks and never lists directories.
 
@@ -45,33 +50,34 @@ The server allows at most 16 simultaneous connections and closes excess ones.
 Request headers have a five-second total deadline and a 64 KiB limit; network
 I/O has a ten-second inactivity timeout. An untrusted local process can still
 temporarily exhaust the connection limit, and a slow authorized video transfer
-can occupy a slot. Catalog scans are serialized. Shutdown closes connections
-and waits for active scans before releasing the library descriptors, so a slow
-local filesystem can delay exit.
+can occupy a slot. An overlapping catalog refresh is rejected with HTTP 503
+and `Retry-After: 1`; retry after the current scan finishes. Shutdown closes
+connections and waits for active scans before releasing the library descriptors.
 
 Select a capture, open its embedded video, and seek using the player or the
 time field. Use **Use current playback time** and **Copy reference** to copy
 the identity, content hash, declared revision and timestamp without a URL,
 token or file path. Recognized visualization, platform, variant and scenario
 labels are included only from a strict allowlist and are marked as inferred;
-other free-form metadata is omitted. The stable identity incorporates the
-collection, relative name and video bytes; renames or changed bytes produce a
-new identity. A revision from a labelled library README or a draft
+draft references also include a fixed review-only, not-human-reviewed,
+do-not-publish warning. Other free-form metadata is omitted. The stable identity
+incorporates the collection, relative name and video bytes; renames or changed
+bytes produce a new identity. A revision from a labelled library README or a draft
 `source_commit` is a declaration, not independent proof. Other labels are
-inferred from filenames; unknown information remains unknown. Library lookup
-skips READMEs without a labelled full revision and searches ancestors;
-conflicting revisions in one README leave the revision unknown. File changes
+inferred from filenames; library capture sources remain unknown. Library lookup
+skips unrelated READMEs and searches ancestors; invalid or conflicting labelled
+revision declarations in one README leave the revision unknown. File changes
 detected between scanning and playback are rejected until refresh. Changes
 during an active transfer cannot be excluded, so do not edit footage while
 browsing.
 
-Drafts are review-only and not human-reviewed. Hallway/House draft names identify
-quiet or energetic scenarios and M1 or Pi 5 profiles; Pi-profile captures are
-rendered on a Mac GPU, not physical Pi hardware. Normal-speed human review and
-the existing safety/flash assessment remain required. This tool neither
-performs nor attests to them. Retro captures are emulated, not hardware
-validation. Some footage is restricted; local access is not permission to
-publish it.
+Drafts are review-only and not human-reviewed. Recognized Hallway/House draft
+names infer quiet or energetic scenarios and M1 or Pi 5 profiles; the Pi-profile
+drafts are labelled as rendered on a Mac GPU, not physical Pi hardware.
+Normal-speed human review and the existing safety/flash assessment remain
+required. This tool neither performs nor attests to them. Library paths alone
+do not establish emulation or hardware validation. Some footage is restricted;
+local access is not permission to publish it.
 
 The recognized draft layout is
 `stream-{hallway,house}-{quiet,energetic}-{m1,pi5}/evaluation.mp4`, with a

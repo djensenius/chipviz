@@ -15,6 +15,7 @@ import socket
 import stat
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -36,6 +37,42 @@ PLATFORMS = {
     "genesis": "Genesis", "master-system": "Master System", "sms": "Master System",
 }
 FLAGS = os.O_RDONLY | os.O_NOFOLLOW
+
+
+@dataclass(frozen=True)
+class ScanLimits:
+    max_entries: int = 50000
+    max_depth: int = 32
+    max_bytes: int = 16 * 1024 ** 3
+    max_seconds: float = 300
+
+
+class ScanBudget:
+    def __init__(self, limits=None, cancel=None, clock=None):
+        self.limits = limits or ScanLimits()
+        self.cancel = cancel
+        self.clock = clock or time.monotonic
+        self.deadline = self.clock() + self.limits.max_seconds
+        self.entries = 0
+        self.bytes = 0
+
+    def check(self):
+        if self.cancel is not None and self.cancel.is_set():
+            raise ValueError("scan cancelled")
+        if self.clock() >= self.deadline:
+            raise ValueError("scan time limit exceeded")
+
+    def visit(self):
+        self.check()
+        self.entries += 1
+        if self.entries > self.limits.max_entries:
+            raise ValueError("scan entry limit exceeded")
+
+    def hash_bytes(self, count):
+        self.check()
+        if count > self.limits.max_bytes - self.bytes:
+            raise ValueError("scan byte limit exceeded")
+        self.bytes += count
 
 
 def parts(path):
@@ -69,12 +106,23 @@ def fingerprint(st):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def digest_file(root_fd, relative, namespace):
+def digest_file(root_fd, relative, namespace, budget=None):
+    budget = budget or ScanBudget()
+    budget.check()
     with open_file(root_fd, relative) as stream:
-        before = fingerprint(os.fstat(stream.fileno()))
+        info = os.fstat(stream.fileno())
+        before = fingerprint(info)
+        if info.st_size > budget.limits.max_bytes - budget.bytes:
+            raise ValueError("scan byte limit exceeded")
         digest = hashlib.sha256()
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
+        while True:
+            budget.check()
+            block = stream.read(1024 * 1024)
+            budget.hash_bytes(len(block))
+            if not block:
+                break
             digest.update(block)
+        budget.check()
         if before != fingerprint(os.fstat(stream.fileno())):
             raise ValueError("file changed while hashing")
     raw = digest.digest()
@@ -82,50 +130,70 @@ def digest_file(root_fd, relative, namespace):
     return "clip-" + hashlib.sha256(identity).hexdigest()[:20], raw.hex(), before
 
 
-def scan(root_fd, prefix=""):
+def scan(root_fd, budget, prefix="", depth=0):
     """Walk opened directories, never following symlinks, and yield MP4 names."""
+    budget.check()
     with os.scandir(root_fd) as entries:
-        names = sorted(entry.name for entry in entries)
-    for name in names:
+        names = []
+        for item in entries:
+            budget.visit()
+            info = os.stat(item.name, dir_fd=root_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            is_dir = stat.S_ISDIR(info.st_mode)
+            if not is_dir and not (stat.S_ISREG(info.st_mode) and item.name.lower().endswith(".mp4")):
+                continue
+            relative = prefix + item.name
+            parts(relative)
+            names.append((item.name, is_dir))
+    for name, is_dir in sorted(names):
+        budget.check()
         relative = prefix + name
-        parts(relative)
-        info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-        if stat.S_ISLNK(info.st_mode):
-            continue
-        if stat.S_ISDIR(info.st_mode):
+        if is_dir:
+            if depth >= budget.limits.max_depth:
+                raise ValueError("scan depth limit exceeded")
             fd = os.open(name, FLAGS | os.O_DIRECTORY, dir_fd=root_fd)
             try:
-                yield from scan(fd, relative + "/")
+                yield from scan(fd, budget, relative + "/", depth + 1)
             finally:
                 os.close(fd)
-        elif stat.S_ISREG(info.st_mode) and name.lower().endswith(".mp4"):
+        else:
             yield relative
 
 
-def read_small(root_fd, relative):
+def read_small(root_fd, relative, budget=None):
+    if budget:
+        budget.check()
     with open_file(root_fd, relative) as stream:
         before = fingerprint(os.fstat(stream.fileno()))
         data = stream.read(1024 * 1024 + 1)
         if len(data) > 1024 * 1024 or before != fingerprint(os.fstat(stream.fileno())):
             raise ValueError("invalid or changing metadata")
+    if budget:
+        budget.check()
     return data.decode("utf-8")
 
 
-def source_revision(root_fd, relative):
+def source_revision(root_fd, relative, budget=None):
     names = parts(relative)
     for length in range(len(names) - 1, -1, -1):
         for filename in ("README.md", "README.txt"):
             try:
-                text = read_small(root_fd, "/".join(names[:length] + [filename]))
+                text = read_small(root_fd, "/".join(names[:length] + [filename]), budget)
             except OSError as exc:
                 if exc.errno == errno.ENOENT:
                     continue
                 raise
-            matches = re.findall(
+            declarations = re.findall(
                 r"(?im)^[ \t]*(?:[-*][ \t]*)?(?:source revision|source integration commit|revision)"
-                r"[ \t]*:[ \t]*(?:`([0-9a-f]{40})`|([0-9a-f]{40}))(?=[.\s]|$)", text
+                r"[ \t]*:[ \t]*(.*)$", text
             )
-            revisions = {(first or second).lower() for first, second in matches}
+            revisions = set()
+            for value in declarations:
+                match = re.match(r"(?:`([0-9a-f]{40})`|([0-9a-f]{40}))(?=[.\s]|$)", value, re.I)
+                if not match:
+                    return None
+                revisions.add((match.group(1) or match.group(2)).lower())
             if revisions:
                 return revisions.pop() if len(revisions) == 1 else None
     return None
@@ -144,8 +212,8 @@ def invalid_constant(_value):
     raise ValueError("invalid metadata constant")
 
 
-def draft_revision(root_fd, relative):
-    metadata = json.loads(read_small(root_fd, relative.rsplit("/", 1)[0] + "/provenance.json"),
+def draft_revision(root_fd, relative, budget=None):
+    metadata = json.loads(read_small(root_fd, relative.rsplit("/", 1)[0] + "/provenance.json", budget),
                           object_pairs_hook=unique_object, parse_constant=invalid_constant)
     if not isinstance(metadata, dict) or not isinstance(metadata.get("source_commit"), str):
         raise ValueError("missing draft source commit")
@@ -155,8 +223,8 @@ def draft_revision(root_fd, relative):
     return revision
 
 
-def entry(root_fd, relative, namespace):
-    clip_id, sha, stamp = digest_file(root_fd, relative, namespace)
+def entry(root_fd, relative, namespace, budget):
+    clip_id, sha, stamp = digest_file(root_fd, relative, namespace, budget)
     names = parts(relative)
     title = Path(names[-1]).stem
     family = platform = variant = "Unknown"
@@ -173,16 +241,12 @@ def entry(root_fd, relative, namespace):
         variant = "Hallway surface" if look == "hallway" else "House"
         capture = ("Pi 5 profile rendered on Mac GPU; not physical Pi hardware" if profile == "pi5"
                    else "M1 profile rendered on Mac GPU")
-        revision = draft_revision(root_fd, relative)
+        revision = draft_revision(root_fd, relative, budget)
     elif len(names) >= 4 and names[0].lower() == "modern":
         code = names[1].lower()
         platform = PLATFORMS.get(code, names[1])
         family = FAMILIES.get(names[2].lower(), names[2])
         variant = names[3] if len(names) >= 5 else ("Original" if family == "Pulse Tunnel" else "Unknown")
-        if code == "pi5":
-            capture = "Pi 5 profile simulated on Mac GPU; not physical Pi hardware"
-        elif code == "m1":
-            capture = "M1 profile on Mac GPU"
     elif len(names) >= 3 and names[0].lower() == "retro":
         code = names[1].lower()
         platform = PLATFORMS.get(code, names[1])
@@ -201,9 +265,8 @@ def entry(root_fd, relative, namespace):
             family = {"n64": "Perspective Meters", "snes": "Tile Meters"}[code]
         if code in ("genesis", "master-system", "sms") and "vdp-seed" in relative.lower():
             family = "Static diagnostic"
-        capture = "Emulated retro recording; not hardware validation"
     if not match:
-        revision = source_revision(root_fd, relative)
+        revision = source_revision(root_fd, relative, budget)
     if namespace == "draft":
         notes.append("Review-only draft; not human-reviewed. Do not publish. Normal-speed human review and safety/flash assessment remain required.")
     return ({
@@ -213,15 +276,17 @@ def entry(root_fd, relative, namespace):
     }, stamp)
 
 
-def local_catalog(roots):
+def local_catalog(roots, budget=None):
+    budget = budget or ScanBudget()
     clips, media = [], {}
     for namespace, root_fd in roots.items():
-        for relative in scan(root_fd):
-            clip, stamp = entry(root_fd, relative, namespace)
+        for relative in scan(root_fd, budget):
+            clip, stamp = entry(root_fd, relative, namespace, budget)
             if clip["id"] in media:
                 raise ValueError("duplicate clip identity")
             media[clip["id"]] = (root_fd, relative, stamp)
             clips.append(clip)
+    budget.check()
     return {"schema_version": 1, "clips": clips}, media
 
 
@@ -289,8 +354,10 @@ class HeaderReader(io.RawIOBase):
 
 
 class ReviewServer(HTTPServer):
-    def __init__(self, roots, site_fd, port=0, max_workers=16, header_timeout=5, io_timeout=10):
+    def __init__(self, roots, site_fd, port=0, max_workers=16, header_timeout=5, io_timeout=10,
+                 scan_limits=None):
         self.roots, self.site_fd = roots, site_fd
+        self.scan_limits = scan_limits or ScanLimits()
         self.media = {}
         self.media_lock = threading.Lock()
         self.catalog_lock = threading.Lock()
@@ -414,18 +481,25 @@ class Handler(BaseHTTPRequestHandler):
             relative = unquote(url.path[len(prefix):], errors="strict") or "index.html"
             parts(relative)
             if relative == "catalog.json":
-                with self.server.catalog_lock:
+                if not self.server.catalog_lock.acquire(blocking=False):
+                    return self.fail(503, [("Retry-After", "1")])
+                try:
                     if self.server.closing.is_set():
                         return
                     try:
-                        catalog, media = local_catalog(self.server.roots)
+                        budget = ScanBudget(self.server.scan_limits, self.server.closing)
+                        catalog, media = local_catalog(self.server.roots, budget)
+                        budget.check()
                         data = json.dumps(catalog, ensure_ascii=True).encode("utf-8")
+                        budget.check()
                     except BaseException:
                         with self.server.media_lock:
                             self.server.media = {}
                         raise
                     with self.server.media_lock:
                         self.server.media = media
+                finally:
+                    self.server.catalog_lock.release()
                 self.headers_for(200, "application/json; charset=utf-8", len(data))
                 if body:
                     self.wfile.write(data)
