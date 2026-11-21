@@ -95,6 +95,12 @@ class Observation:
     if self.error is not None:
       return
     self.serial += 1
+    if self.events:
+      first_fresh = self.events[0][1] is not None
+      self.latch("extra fresh frames" if first_fresh and data is not None else
+                 "duplicate-only callbacks" if not first_fresh and data is None else
+                 "ambiguous fresh and duplicate callbacks")
+      return
     if data is None:
       self.events.append((self.serial, None))
     else:
@@ -103,12 +109,12 @@ class Observation:
           raise ValueError("unsupported pixel format")
         self.events.append((self.serial, copy_frame((width, height, pitch, data))))
       except (ValueError, TypeError, OverflowError) as error:
-        self.latch(str(error))
+        self.latch(str(error) or "frame callback failed")
         return
-    if len(self.events) > 1:
-      fresh = sum(event[1] is not None for event in self.events)
-      self.latch("extra fresh frames" if fresh == 2 else
-                 "duplicate-only callbacks" if fresh == 0 else "ambiguous fresh and duplicate callbacks")
+      except BaseException:
+        # Native callback boundaries can swallow even non-Exception failures.
+        self.latch("frame buffer conversion failed")
+        return
 
   def end(self) -> tuple[int, tuple[int, int, int, bytes]]:
     if self.error is not None:

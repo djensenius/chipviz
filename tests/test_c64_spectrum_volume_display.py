@@ -1,13 +1,16 @@
 """Synthetic-only tests: no emulator, BIOS, capture, or target execution."""
 from array import array
+import contextlib
 import ctypes
 import functools
+import io
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -59,7 +62,79 @@ def native_callback(callback, *args):
   ctypes.CFUNCTYPE(None)(lambda: callback(*args))()
 
 
+class FailingBuffer:
+  def __init__(self, error):
+    self.error = error
+    self.calls = 0
+
+  def __buffer__(self, flags):
+    self.calls += 1
+    raise self.error("synthetic buffer failure")
+
+
 class DisplayTests(unittest.TestCase):
+  def test_extra_failing_buffer_callbacks_are_rejected(self):
+    for error in (BufferError, MemoryError):
+      with self.subTest(error=error.__name__):
+        broken = FailingBuffer(error)
+        markers = iter((b"", b"SVD1", b"SVD1", b"SVD1", b"SVD1"))
+        calls = []
+
+        def run(callback):
+          calls.append(1)
+          callback(*callback_args(frame()))
+          native_callback(callback, broken, W, H, PITCH, "XRGB8888-LE")
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ValueError, "extra fresh"):
+          observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
+                  raster_lines=312, calibration=calibration(), limit=3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(broken.calls, 0)
+
+  def test_first_buffer_and_copy_failures_are_latched(self):
+    for error in (BufferError, MemoryError, RuntimeError, KeyboardInterrupt, SystemExit):
+      with self.subTest(stage="export", error=error.__name__):
+        broken = FailingBuffer(error)
+        boundary = display.Observation()
+        callback = boundary.begin()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+          native_callback(callback, broken, W, H, PITCH, "XRGB8888-LE")
+        callback(*callback_args(frame()))
+        with self.assertRaisesRegex(ValueError, "buffer|synthetic"):
+          boundary.end()
+        with self.assertRaisesRegex(ValueError, "buffer|synthetic"):
+          boundary.begin()
+        self.assertEqual(broken.calls, 1)
+        self.assertEqual(stderr.getvalue(), "")
+    for error in (BufferError, MemoryError):
+      with self.subTest(stage="copy", error=error.__name__):
+        data = bytes(frame())
+        boundary = display.Observation()
+        callback = boundary.begin()
+        stderr = io.StringIO()
+        with mock.patch.object(display, "bytes", side_effect=error("synthetic copy failure"), create=True), \
+            contextlib.redirect_stderr(stderr):
+          native_callback(callback, data, W, H, PITCH, "XRGB8888-LE")
+        callback(*callback_args(frame()))
+        with self.assertRaisesRegex(ValueError, "frame buffer conversion failed"):
+          boundary.end()
+        with self.assertRaisesRegex(ValueError, "frame buffer conversion failed"):
+          boundary.begin()
+        self.assertEqual(stderr.getvalue(), "")
+
+  def test_duplicate_then_failing_fresh_callback_is_ambiguous_without_conversion(self):
+    for error in (BufferError, MemoryError):
+      with self.subTest(error=error.__name__):
+        broken = FailingBuffer(error)
+        boundary = display.Observation()
+        callback = boundary.begin()
+        callback(None, 0, 0, 0, "")
+        native_callback(callback, broken, W, H, PITCH, "XRGB8888-LE")
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+          boundary.end()
+        self.assertEqual(broken.calls, 0)
+
   def test_settling_frame_rejects_wide_memoryview_with_wrong_byte_count(self):
     bad = memoryview(array("H", [0]) * (PITCH * H))
     self.assertEqual(len(bad), PITCH * H)
