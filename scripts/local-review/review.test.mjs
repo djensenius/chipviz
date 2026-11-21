@@ -185,6 +185,36 @@ function descendants(element) {
   return [element, ...element.children.flatMap(descendants)];
 }
 
+test('capture buttons distinguish matching titles and describe their selected state', async () => {
+  const elements = Object.fromEntries(['count', 'message', 'detail', 'results', 'search', 'reset',
+    'filter-fields'].map(id => [id, new Element('div')]));
+  const first = { ...clip(), title: 'mellow-96', family: 'Pulse Tunnel', platform: 'Mac / M1 profile',
+    variant: 'abstract', scenario: 'mellow-96', collection: 'library' };
+  const otherPlatform = { ...first, id: 'clip-11111111111111111111', platform: 'Pi 5 profile' };
+  const draft = { ...first, id: 'clip-22222222222222222222', collection: 'draft' };
+  globalThis.document = { getElementById: id => elements[id], createElement: tag => new Element(tag) };
+  globalThis.location = { href: 'http://127.0.0.1:8000/capability/' };
+  globalThis.fetch = async () => ({
+    ok: true, json: async () => ({ schema_version: 1, clips: [first, otherPlatform, draft] }),
+  });
+  globalThis.window = { isSecureContext: false };
+  await import('./app.mjs?button-labels');
+  await new Promise(resolve => setImmediate(resolve));
+  const buttons = () => descendants(elements.results).filter(item => item.tagName === 'button');
+  const labels = buttons().map(button => button['aria-label']);
+  assert.equal(new Set(labels).size, 3);
+  for (const [index, value] of [first, otherPlatform, draft].entries()) {
+    for (const part of [value.title, value.family, value.platform, value.variant, value.scenario,
+      value.collection === 'draft' ? 'Review-only draft' : 'Local library']) {
+      assert.ok(labels[index].includes(part));
+    }
+    assert.ok(labels[index].startsWith('View details for '));
+  }
+  buttons()[1].events.click();
+  assert.equal(buttons()[1].textContent, 'Selected');
+  assert.ok(buttons()[1]['aria-label'].startsWith('Selected for '));
+});
+
 test('filters, text-only rendering, embedded seeking and copy fallback', async () => {
   const elements = Object.fromEntries(['count', 'message', 'detail', 'results', 'search', 'reset',
     'filter-fields'].map(id => [id, new Element('div')]));
@@ -376,7 +406,7 @@ test('closing or switching details stops discarded players and ignores stale cal
   await new Promise(resolve => setImmediate(resolve));
   const detail = elements.detail;
   const select = title => descendants(elements.results)
-    .find(item => item['aria-label'] === `View details for ${title}`).events.click();
+    .find(item => item['aria-label']?.includes(` for ${title};`)).events.click();
   const action = text => descendants(detail).find(item => item.textContent === text);
   const currentVideo = () => descendants(detail).find(item => item.tagName === 'video');
   const currentInput = () => descendants(detail).find(item => item.tagName === 'input');
@@ -477,7 +507,7 @@ test('delayed clipboard completions cannot replace newer UI state', async t => {
   await new Promise(resolve => setImmediate(resolve));
   const detail = elements.detail;
   const select = title => descendants(elements.results)
-    .find(item => item['aria-label'] === `View details for ${title}`).events.click();
+    .find(item => item['aria-label']?.includes(` for ${title};`)).events.click();
   const action = text => descendants(detail).find(item => item.textContent === text);
   const input = () => descendants(detail).find(item => item.tagName === 'input');
   const video = () => descendants(detail).find(item => item.tagName === 'video');
