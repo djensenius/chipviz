@@ -279,7 +279,10 @@ class Trace:
 
 
 def check_seed(events):
-  """Check the complete seed write sequence, not calibration or bus timing."""
+  """Check ordered (port & 255, value, kind) and spacing, not calibration.
+
+  Real GX calibration must independently validate full port values.
+  """
   expected = [(0xbf, value) for value in (4, 0x80, 0xe0, 0x81, 0xff, 0x82, 0, 0xc0)]
   expected += [(0xbe, value) for value in (0x3f, 3, 0x0c, 0x30)]
   if [(event.port & 255, event.value, event.kind) for event in events] != [
