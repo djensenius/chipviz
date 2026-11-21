@@ -238,9 +238,9 @@ black. It disables IRQs and CIA interrupt sources, clears the 1000 cells,
 initializes palette 0 and makes one step with band 0 = 255, other bands = 0,
 energy = 255. A separate `SV_DISPLAY_BLANK` build skips the step. It publishes
 `SVD1` or `SVB1` in `sv_display_ready` only after all writes, then holds.
-Both builds need separately matched labels and a linker map proving program,
-stack, marker and surfaces do not overlap. These assumptions, including
-interrupt/NMI isolation and the character ROM, are **not yet verified**.
+Both builds need separately matched labels and maps, plus independent
+runtime isolation evidence. Assumptions including interrupt/NMI isolation,
+stack behavior and the character ROM are **not yet verified**.
 
 `scripts/c64_spectrum_volume_display.py` is a host-only contract, not an
 emulator frontend. Its independent pixel oracle specifies black plus four
@@ -259,9 +259,33 @@ the screen and VIC setup, then holds. A future adapter must observe that
 marker absent before boot and stable across calibration frames. The fixture
 needs its own matched labels and map and proof of memory/interrupt isolation.
 The independent host oracle searches for one corner set and checks every
-pixel of the 320x200 reference: exactly
-four 8x8 coloured cells and black elsewhere. Missing, partial, extra and
-ambiguous references fail.
+pixel of the 320x200 reference: exactly four 8x8 coloured cells and black
+elsewhere. Missing, partial, extra and ambiguous references fail.
+
+The coordinator compiled separate scene, blank and calibration PRGs with
+matched labels and maps at `208bfb1b26be9ea63f2919c32a14cc1dd0288841` using
+`cl65 V2.18 - N/A`, without emulator or GPU execution. The maps reported BSS
+ranges `$0E92-$0EBC`, `$0E4D-$0E6F` and `$0AB2-$0AB8`, respectively; the
+labels place each ready marker at its BSS start. The target configuration
+declares `__HIMEM__=$D000` and `__STACKSIZE__=$0800`. This is static linker
+evidence, not proof of dynamic stack or interrupt safety, ROM contents,
+runtime behavior or physical safety.
+
+For a separate reproduction, create an exclusive output directory and build
+all three matched PRGs, labels and maps together (requires an approved build
+slot; these commands were not rerun for this documentation change):
+
+```sh
+mkdir -p build/tests
+out=$(mktemp -d build/tests/c64-display.XXXXXX)
+cl65 -t c64 -Oirs --static-locals -Icores/c64/homebrew/src -c -o "$out/spectrum_volume.o" cores/c64/homebrew/src/spectrum_volume.c
+cl65 -t c64 -Oirs --static-locals -Icores/c64/homebrew/src -c -o "$out/scene.o" tests/c64_spectrum_volume_display.c
+cl65 -t c64 -Oirs --static-locals -DSV_DISPLAY_BLANK -Icores/c64/homebrew/src -c -o "$out/blank.o" tests/c64_spectrum_volume_display.c
+cl65 -t c64 -Oirs --static-locals -c -o "$out/calibration.o" tests/c64_spectrum_volume_calibration.c
+cl65 -t c64 -m "$out/scene.map" -Ln "$out/scene.lbl" -o "$out/scene.prg" "$out/scene.o" "$out/spectrum_volume.o"
+cl65 -t c64 -m "$out/blank.map" -Ln "$out/blank.lbl" -o "$out/blank.prg" "$out/blank.o" "$out/spectrum_volume.o"
+cl65 -t c64 -m "$out/calibration.map" -Ln "$out/calibration.lbl" -o "$out/calibration.prg" "$out/calibration.o"
+```
 
 The required VICE x64sc libretro options are `vice_external_palette=pepto-pal`
 and `vice_gfx_colors=24bit` (as in `scripts/c64_colour_field_capture.py`);
@@ -289,11 +313,10 @@ cannot invalidate an already returned result. It is not wired to the older
 capture seam, which cannot establish this callback identity. A future adapter
 also needs a separate wall-clock watchdog and trusted process cleanup: the
 frame budget cannot interrupt a hung `retro_run`. No independent raster
-measurement, safe lifecycle, target build or emulator execution is provided
-here; all require separately approved build/emulator ownership and cleanup.
-The calibration fixture has not been built with cc65 or run. No PAL/NTSC
-display, production integration, live timing, flash
-safety or publishing claim follows from these host-only checks.
+measurement, safe lifecycle or emulator execution is established here;
+emulator work requires separately approved ownership and cleanup. No PAL/NTSC
+display, production integration, live timing, flash safety or publishing
+claim follows from the static build evidence or host-only checks.
 
 ## Connection path
 

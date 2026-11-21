@@ -22,6 +22,8 @@ FIDUCIALS = ((0, 0, PEPTO[1]), (319, 0, PEPTO[4]),
 
 def check_frame(frame: tuple[int, int, int, bytes]) -> None:
   width, height, pitch, data = frame
+  if any(isinstance(value, bool) or not isinstance(value, int) for value in (width, height, pitch)):
+    raise ValueError("dimensions and pitch must be integers")
   if not 1 <= width <= MAX_DIMENSION or not 1 <= height <= MAX_DIMENSION:
     raise ValueError("malformed dimensions")
   if pitch < width * 4 or pitch > MAX_PITCH or len(data) != pitch * height:

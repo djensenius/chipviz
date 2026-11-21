@@ -59,6 +59,46 @@ def native_callback(callback, *args):
 
 
 class DisplayTests(unittest.TestCase):
+  def test_frame_geometry_requires_integers_not_bool(self):
+    source = calibration()
+    for index in range(3):
+      for value in (float(source[index]), 1.5, True, False):
+        broken = list(source)
+        broken[index] = value
+        with self.subTest(field=index, value=value):
+          with self.assertRaisesRegex(ValueError, "integers"):
+            display.check_frame(tuple(broken))
+          with self.assertRaisesRegex(ValueError, "integers"):
+            display.calibrate(tuple(broken))
+          with self.assertRaisesRegex(ValueError, "integers"):
+            display.validate(tuple(broken), ORIGIN, False)
+          boundary = display.Observation()
+          callback = boundary.begin()
+          native_callback(callback, broken[3], broken[0], broken[1], broken[2], "XRGB8888-LE")
+          callback(*callback_args(frame()))
+          with self.assertRaisesRegex(ValueError, "integers"):
+            boundary.end()
+          with self.assertRaisesRegex(ValueError, "integers"):
+            boundary.begin()
+
+  def test_settling_frame_rejects_integral_float_geometry(self):
+    for field in range(3):
+      markers = iter((b"", b"SVD1", b"SVD1", b"SVD1", b"SVD1"))
+      calls = []
+
+      def run(callback):
+        calls.append(1)
+        args = list(callback_args(frame()))
+        if len(calls) == 1:
+          args[field + 1] = float(args[field + 1])
+        native_callback(callback, *args)
+
+      with self.subTest(field=field):
+        with self.assertRaisesRegex(ValueError, "integers"):
+          observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
+                  raster_lines=312, calibration=calibration(), limit=3)
+        self.assertEqual(len(calls), 1)
+
   def test_real_observation_is_blocked_without_verified_adapter(self):
     with self.assertRaisesRegex(RuntimeError, "trusted real adapter"):
       display.observe(None, None, blank=False, model="pal", model_flag=1, raster_lines=312,
