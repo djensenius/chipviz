@@ -36,6 +36,28 @@ static void falls_back_to_procedural_frames(void) {
   require(frame.frame == 1, "second procedural frame index");
 }
 
+static void procedural_counter_wraps(void) {
+  ChipvizConnection connection;
+  ChipvizFrame frame;
+  ChipvizConnectionSource source;
+
+  chipviz_connection_init(&connection, NULL, NULL);
+  connection.procedural_frame = 65535u;
+  require(chipviz_connection_next_frame(&connection, &frame, &source) == CHIPVIZ_CONNECTION_RECEIVE_OK,
+          "last procedural frame succeeds");
+  require(source == CHIPVIZ_CONNECTION_SOURCE_PROCEDURAL && frame.frame == 65535u &&
+              frame.beat_count == 4095u && frame.scene == 1u && frame.palette == 7u &&
+              frame.flags == 0u && frame.note_count == 0u,
+          "last procedural frame before wrap");
+  require(chipviz_connection_next_frame(&connection, &frame, &source) == CHIPVIZ_CONNECTION_RECEIVE_OK,
+          "wrapped procedural frame succeeds");
+  require(source == CHIPVIZ_CONNECTION_SOURCE_PROCEDURAL && frame.frame == 0u &&
+              frame.beat_count == 0u && frame.scene == 0u && frame.palette == 0u &&
+              frame.flags == 1u && frame.note_count == 1u && frame.notes[0].note == 48u &&
+              frame.notes[0].velocity == 80u,
+          "procedural counter restarts after 65535");
+}
+
 static void receiver_frame_wins(void) {
   ChipvizConnection connection;
   ChipvizFrame frame;
@@ -74,6 +96,7 @@ static void receiver_error_propagates(void) {
 
 int main(void) {
   falls_back_to_procedural_frames();
+  procedural_counter_wraps();
   receiver_frame_wins();
   receiver_none_falls_back();
   receiver_error_propagates();

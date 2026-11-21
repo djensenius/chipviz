@@ -11,6 +11,32 @@ import chipsynth_stream
 
 
 class ControlFrameTests(unittest.TestCase):
+  def test_procedural_note_boundaries_and_wrap(self) -> None:
+    # Independently expected shared-domain values are also checked in C and
+    # Rust; the out-of-range cases check Python's existing wrap behavior.
+    # index, wire frame, beat, phase, scene, palette, optional (note, velocity)
+    cases = (
+      (0, 0, 0, 0, 0, 0, (48, 80)),
+      (1, 1, 0, 17, 0, 0, None),
+      (4081, 4081, 255, 1, 0, 7, (63, 80)),
+      (4095, 4095, 255, 239, 0, 7, None),
+      (4096, 4096, 256, 0, 0, 0, (64, 80)),
+      (4097, 4097, 256, 17, 0, 0, None),
+      (65521, 65521, 4095, 1, 1, 7, (63, 80)),
+      (65535, 65535, 4095, 239, 1, 7, None),
+      (65536, 0, 4096, 0, 1, 0, (64, 80)),
+      # Python calculates the note from the unbounded beat, before wire truncation.
+      (1048576, 0, 0, 0, 2, 0, (64, 80)),
+    )
+    for index, wire_frame, beat, phase, scene, palette, note in cases:
+      with self.subTest(index=index):
+        frame = chipviz_bridge.make_procedural_frame(index)
+        self.assertEqual((frame.frame, frame.beat_count, frame.beat_phase),
+                         (wire_frame, beat, phase))
+        self.assertEqual((frame.scene, frame.palette), (scene, palette))
+        self.assertEqual(frame.flags, int(note is not None))
+        self.assertEqual(frame.notes, (chipviz_bridge.Note(*note),) if note else ())
+
   def test_procedural_frame_packs_to_expected_wire_shape(self) -> None:
     frame = chipviz_bridge.make_procedural_frame(17)
     wire = chipviz_bridge.pack_frame(frame)

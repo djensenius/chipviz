@@ -43,7 +43,7 @@ impl ControlFrame {
         let mut notes = [Note::default(); MAX_NOTES];
         let note_count = if flags & 0x01 != 0 {
             notes[0] = Note {
-                note: 48 + (beat_count as u8 % 24),
+                note: 48 + (beat_count % 24) as u8,
                 velocity: energy,
             };
             1
@@ -163,4 +163,56 @@ fn checksum(payload: &[u8]) -> u8 {
     payload
         .iter()
         .fold(0, |accumulator, byte| accumulator ^ byte)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlFrame;
+
+    #[test]
+    fn procedural_existing_non_note_fields() {
+        let frame = ControlFrame::procedural(17);
+        assert_eq!((frame.frame, frame.bpm, frame.beat_count), (17, 120, 1));
+        assert_eq!((frame.beat_phase, frame.energy, frame.bass), (33, 96, 222));
+        assert_eq!((frame.mid, frame.treble), (89, 135));
+        assert_eq!(frame.spectrum, [33, 62, 91, 120, 149, 178, 207, 236]);
+        assert_eq!(
+            (frame.scene, frame.palette, frame.flags, frame.note_count),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn procedural_note_boundaries_and_wrap() {
+        // Independently expected shared-domain values are also checked in C and
+        // Python; the out-of-range cases check Rust's existing wrap behavior.
+        // index, wire frame, beat, phase, scene, palette, optional (note, velocity)
+        let cases = [
+            (0, 0, 0, 0, 0, 0, Some((48, 80))),
+            (1, 1, 0, 17, 0, 0, None),
+            (4081, 4081, 255, 1, 0, 7, Some((63, 80))),
+            (4095, 4095, 255, 239, 0, 7, None),
+            (4096, 4096, 256, 0, 0, 0, Some((64, 80))),
+            (4097, 4097, 256, 17, 0, 0, None),
+            (65521, 65521, 4095, 1, 1, 7, Some((63, 80))),
+            (65535, 65535, 4095, 239, 1, 7, None),
+            (65536, 0, 4096, 0, 1, 0, Some((64, 80))),
+            // Rust truncates the beat to u16 before calculating the note.
+            (1048576, 0, 0, 0, 2, 0, Some((48, 80))),
+        ];
+        for (index, wire_frame, beat, phase, scene, palette, note) in cases {
+            let frame = ControlFrame::procedural(index);
+            assert_eq!(frame.frame, wire_frame, "frame {index}");
+            assert_eq!(frame.beat_count, beat, "frame {index}");
+            assert_eq!(frame.beat_phase, phase, "frame {index}");
+            assert_eq!(frame.scene, scene, "frame {index}");
+            assert_eq!(frame.palette, palette, "frame {index}");
+            assert_eq!(frame.flags, u8::from(note.is_some()), "frame {index}");
+            assert_eq!(frame.note_count, u8::from(note.is_some()), "frame {index}");
+            if let Some((pitch, velocity)) = note {
+                assert_eq!(frame.notes[0].note, pitch, "frame {index}");
+                assert_eq!(frame.notes[0].velocity, velocity, "frame {index}");
+            }
+        }
+    }
 }
