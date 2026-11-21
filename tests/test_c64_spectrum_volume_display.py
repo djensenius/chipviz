@@ -1,0 +1,222 @@
+"""Synthetic-only tests: no emulator, BIOS, capture, or target execution."""
+import ctypes
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import c64_spectrum_volume_display as display  # noqa: E402
+
+W, H, PITCH = 336, 216, 336 * 4 + 8
+ORIGIN = (7, 9)
+
+
+def frame(blank=False):
+  data = bytearray(PITCH * H)
+  if not blank:
+    # Manually specified pixels, not rendered from the oracle.
+    for x, y, width, colour in ((48, 64, 8, (53, 40, 121)), (40, 120, 8, (111, 61, 134)),
+                                (32, 176, 16, (88, 141, 67))):
+      for yy in range(y, y + 8):
+        for xx in range(x, x + width):
+          put(data, xx + ORIGIN[0], yy + ORIGIN[1], colour)
+  return data
+
+
+def put(data, x, y, rgb, pitch=PITCH):
+  pos = y * pitch + x * 4
+  data[pos:pos + 4] = bytes((rgb[2], rgb[1], rgb[0], 0))
+
+
+def calibration():
+  data = frame(blank=True)
+  for x, y, colour in ((0, 0, (255, 0, 0)), (319, 0, (0, 255, 0)),
+                       (0, 199, (0, 0, 255)), (319, 199, (255, 255, 0))):
+    put(data, x + ORIGIN[0], y + ORIGIN[1], colour)
+  return W, H, PITCH, bytes(data)
+
+
+def callback_args(data):
+  return (bytes(data), W, H, PITCH, "XRGB8888-LE")
+
+
+class DisplayTests(unittest.TestCase):
+  def test_host_model_complete_surface_against_pixel_oracle(self):
+    class State(ctypes.Structure):
+      _fields_ = [("height", ctypes.c_uint8 * 8), ("palette", ctypes.c_uint8 * 8),
+                  ("next_palette", ctypes.c_uint8)]
+
+    source = ROOT / "cores/c64/homebrew/src"
+    with tempfile.TemporaryDirectory() as directory:
+      library = pathlib.Path(directory) / "model.so"
+      subprocess.run([os.environ.get("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror",
+                      "-pedantic", "-shared", "-fPIC", str(source / "spectrum_volume.c"),
+                      "-o", str(library)], check=True, capture_output=True)
+      model = ctypes.CDLL(str(library))
+      ptr = ctypes.POINTER(ctypes.c_uint8)
+      model.sv_init.argtypes = [ctypes.POINTER(State), ctypes.c_uint8]
+      model.sv_step.argtypes = [ctypes.POINTER(State), ptr, ctypes.c_uint8, ctypes.c_uint8, ptr, ptr]
+      screen = (ctypes.c_uint8 * 1000)(*([32] * 1000))
+      colour = (ctypes.c_uint8 * 1000)()
+      state = State()
+      model.sv_init(ctypes.byref(state), 0)
+      self.assertEqual(bytes(screen), bytes([32]) * 1000)
+      bands = (ctypes.c_uint8 * 8)(255, 0, 0, 0, 0, 0, 0, 0)
+      model.sv_step(ctypes.byref(state), bands, 255, 0, screen, colour)
+      # Interpret only the two assumed ROM glyphs; compare every pixel.
+      pixels = bytearray()
+      for y in range(200):
+        for x in range(320):
+          index = (y // 8) * 40 + x // 8
+          self.assertIn(screen[index], (32, 160))
+          ink = colour[index] if screen[index] == 160 else 0
+          pixels.extend(display.PEPTO[ink])
+      self.assertEqual(bytes(pixels), display.expected_rgb(False))
+
+  def test_oracle_and_full_frame_failures(self):
+    self.assertEqual(display.calibrate(calibration()), ORIGIN)
+    for blank in (False, True):
+      display.validate((W, H, PITCH, bytes(frame(blank))), ORIGIN, blank)
+      expected = display.expected_rgb(blank)
+      self.assertEqual(len(expected), 320 * 200 * 3)
+      self.assertEqual(sum(expected[i:i + 3] != b"\0\0\0" for i in range(0, len(expected), 3)),
+                       0 if blank else 256)
+    for name in ("shifted", "missing", "extra", "wrong-colour", "blank"):
+      data = frame(blank=name == "blank")
+      if name == "shifted":
+        data = bytearray(PITCH * H)
+        original = frame()
+        for y in range(H):
+          data[y * PITCH + 4:y * PITCH + W * 4] = original[y * PITCH:y * PITCH + (W - 1) * 4]
+      elif name == "missing":
+        put(data, 48 + ORIGIN[0], 64 + ORIGIN[1], (0, 0, 0))
+      elif name == "extra":
+        put(data, ORIGIN[0], ORIGIN[1], (53, 40, 121))
+      elif name == "wrong-colour":
+        put(data, 48 + ORIGIN[0], 64 + ORIGIN[1], (111, 61, 134))
+      with self.subTest(name=name), self.assertRaisesRegex(ValueError, "pixel"):
+        display.validate((W, H, PITCH, bytes(data)), ORIGIN, False)
+    with self.assertRaisesRegex(ValueError, "pixel"):
+      display.validate((W, H, PITCH, bytes(frame())), ORIGIN, True)
+
+  def test_calibration_rejects_missing_and_ambiguous(self):
+    with self.assertRaisesRegex(ValueError, "missing calibration"):
+      display.calibrate((W, H, PITCH, bytes(frame(True))))
+    width, height, pitch = 640, 200, 640 * 4
+    data = bytearray(pitch * height)
+    for x0 in (0, 320):
+      for x, y, colour in display.FIDUCIALS:
+        put(data, x0 + x, y, colour, pitch)
+    with self.assertRaisesRegex(ValueError, "ambiguous calibration"):
+      display.calibrate((width, height, pitch, bytes(data)))
+
+  def test_callback_identity_and_malformed_frames(self):
+    boundary = display.Observation()
+    old = boundary.begin()
+    old(*callback_args(frame()))
+    first, _ = boundary.end()
+    current = boundary.begin()
+    with self.assertRaisesRegex(ValueError, "stale"):
+      old(*callback_args(frame()))
+    current(*callback_args(frame()))
+    with self.assertRaisesRegex(ValueError, "stale"):
+      boundary.end()
+    current = boundary.begin()
+    current(*callback_args(frame()))
+    second, _ = boundary.end()
+    self.assertGreater(second, first)
+    with self.assertRaisesRegex(ValueError, "stale"):
+      current(*callback_args(frame()))
+    for events, message in (([], "missing"), ([(None, 0, 0, 0, "")], "duplicate-only"),
+                            ([callback_args(frame())] * 2, "extra"),
+                            ([callback_args(frame()), (None, 0, 0, 0, "")], "ambiguous")):
+      callback = boundary.begin()
+      for event in events:
+        callback(*event)
+      with self.assertRaisesRegex(ValueError, message):
+        boundary.end()
+    for args, message in (((bytes(4), 1, 1, 4, "RGB565"), "unsupported"),
+                          ((bytes(4), 0, 1, 4, "XRGB8888-LE"), "dimensions"),
+                          ((bytes(4), 1, 1, 3, "XRGB8888-LE"), "pitch"),
+                          ((bytes(3), 1, 1, 4, "XRGB8888-LE"), "pitch")):
+      boundary = display.Observation()
+      callback = boundary.begin()
+      with self.assertRaisesRegex(ValueError, message):
+        callback(*args)
+      callback(*callback_args(frame()))
+      with self.assertRaisesRegex(ValueError, message):
+        boundary.end()
+
+  def test_bounded_observation_and_model_evidence(self):
+    for model, (flag, lines) in display.MODELS.items():
+      for blank in (False, True):
+        calls = []
+        marker = [b""]
+
+        def run(callback):
+          calls.append(callback is not None)
+          if callback:
+            callback(*callback_args(frame(blank)))
+          else:
+            marker[0] = display.READY[blank]
+
+        ready = lambda: marker[0]
+        self.assertEqual(display.observe(run, ready, blank=blank, model=model, model_flag=flag,
+                                         raster_lines=lines, calibration=calibration(), limit=3), 3)
+        self.assertEqual(calls, [False, True, True])
+        for bad_flag, bad_lines in ((1 - flag, lines), (flag, lines + 1)):
+          with self.assertRaisesRegex(ValueError, "model marker"):
+            display.observe(run, ready, blank=blank, model=model, model_flag=bad_flag,
+                            raster_lines=bad_lines, calibration=calibration(), limit=2)
+    with self.assertRaisesRegex(TimeoutError, "not ready"):
+      display.observe(lambda cb: None, lambda: b"", blank=False, model="pal", model_flag=1,
+                      raster_lines=312, calibration=calibration(), limit=3)
+    markers = iter((b"", b"SVD1", b"SVD1"))
+    with self.assertRaisesRegex(TimeoutError, "settled"):
+      display.observe(lambda cb: cb(*callback_args(frame())), lambda: next(markers), blank=False,
+                      model="pal", model_flag=1, raster_lines=312, calibration=calibration(), limit=1)
+    markers = iter((b"", b"SVD1", b"bad!"))
+    with self.assertRaisesRegex(ValueError, "marker changed"):
+      display.observe(lambda cb: cb(*callback_args(frame())), lambda: next(markers), blank=False,
+                      model="pal", model_flag=1, raster_lines=312, calibration=calibration(), limit=2)
+    markers = iter((b"", b"SVD1"))
+    with self.assertRaisesRegex(ValueError, "missing callback"):
+      display.observe(lambda cb: None, lambda: next(markers), blank=False, model="pal", model_flag=1,
+                      raster_lines=312, calibration=calibration(), limit=2)
+    with self.assertRaisesRegex(ValueError, "already present"):
+      display.observe(lambda cb: None, lambda: b"SVD1", blank=False, model="pal", model_flag=1,
+                      raster_lines=312, calibration=calibration(), limit=2)
+
+  def test_observation_rejects_bad_frame_within_budget(self):
+    for kind in ("shifted", "missing", "extra", "wrong-colour", "blank"):
+      data = frame(blank=kind == "blank")
+      if kind == "shifted":
+        original = frame()
+        data = bytearray(PITCH * H)
+        for y in range(H):
+          data[y * PITCH + 4:y * PITCH + W * 4] = original[y * PITCH:y * PITCH + (W - 1) * 4]
+      elif kind == "missing":
+        put(data, 55, 73, (0, 0, 0))
+      elif kind == "extra":
+        put(data, 7, 9, (53, 40, 121))
+      elif kind == "wrong-colour":
+        put(data, 55, 73, (111, 61, 134))
+      calls = []
+      markers = iter((b"", b"SVD1", b"SVD1", b"SVD1", b"SVD1"))
+
+      def run(callback):
+        calls.append(1)
+        callback(*callback_args(data))
+
+      with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "pixel"):
+        display.observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
+                        raster_lines=312, calibration=calibration(), limit=10)
+      self.assertEqual(len(calls), 2)
+
+
+if __name__ == "__main__":
+  unittest.main()

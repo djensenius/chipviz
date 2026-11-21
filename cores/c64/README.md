@@ -225,6 +225,52 @@ production PRG, actual screen/colour RAM, raster IRQ or scene transitions.
 It does not demonstrate displayed output, target timing or physical flash
 safety.
 
+### Static SpectrumVolume display fixture (not yet verified)
+
+`tests/c64_spectrum_volume_display.c` is a separate, unlinked test PRG. It
+selects VIC bank 0 (CIA2 `$DD00` bits 0–1 = 3, outputs in `$DD02`), screen
+RAM `$0400` and uppercase/graphics character ROM `$1000` (`$D018 = $14`).
+It assumes the normal C64 memory map and ROM glyphs: screen code 32 is blank
+and 160 is a solid reverse space. `$D011 = $1B` and `$D016 = $08` select
+25-row, 40-column standard text, with ECM, bitmap and multicolour off.
+Sprites are disabled, colour RAM is `$D800`, and border/background are
+black. It disables IRQs and CIA interrupt sources, clears the 1000 cells,
+initializes palette 0 and makes one step with band 0 = 255, other bands = 0,
+energy = 255. A separate `SV_DISPLAY_BLANK` build skips the step. It publishes
+`SVD1` or `SVB1` in `sv_display_ready` only after all writes, then holds.
+Both builds need separately matched labels and a linker map proving program,
+stack, marker and surfaces do not overlap. These assumptions, including
+interrupt/NMI isolation and the character ROM, are **not yet verified**.
+
+`scripts/c64_spectrum_volume_display.py` is a host-only contract, not an
+emulator frontend. Its independent pixel oracle specifies black plus four
+8x8 cells at (row, column, VIC ink) (8,6,6), (15,5,4), (22,4,5),
+(22,5,5). It compares all 320x200 pixels using explicit Pepto PAL RGB:
+black `#000000`, purple `#6F3D86`, green `#588D43`, blue `#352879`.
+It accepts only little-endian libretro XRGB8888 with valid dimensions and
+pitch, including padding. A separate reference frame must contain the four
+documented fiducials at the display window corners; exactly one such window
+calibrates the origin. This reference must be independently produced and
+observed, not derived from either scene image. Matching the reference and
+exact pixel colours does not itself prove the emulator palette configuration.
+The host tests use synthetic frames only.
+
+Any future emulator adapter must prove reference provenance, pixel format and
+Pepto palette configuration; provide a fresh callback per `retro_run` with
+copied pixels; observe the fixture marker absent before boot and stable
+thereafter; and independently measure both KERNAL `$02A6` and raster lines
+(PAL 1/312, NTSC 0/263, early NTSC 0/262). A requested model option is not a
+measurement. The observation discards the first complete frame after ready,
+rejects missing, duplicate-only, extra, ambiguous and stale callbacks, and
+has a bounded frame budget. It is not wired to the older capture seam, which
+cannot establish this callback identity. A future adapter also needs a
+separate wall-clock watchdog and trusted process cleanup: the frame budget
+cannot interrupt a hung `retro_run`. No calibration PRG, independent
+raster measurement, safe lifecycle, target build or emulator execution is
+provided here; all require separately approved build/emulator ownership and
+cleanup. No PAL/NTSC display, production integration, live timing, flash
+safety or publishing claim follows from these host-only checks.
+
 ## Connection path
 
 Use Raspberry Pi USB HID keyboard/joystick output as the first C64 Ultimate live

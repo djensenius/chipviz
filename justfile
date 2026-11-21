@@ -173,7 +173,7 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test s
     @echo "chipviz C tests OK"
 
 python-lint:
-    @${PYTHON:-python3} -m py_compile {{ python_files }} tests/sms_port_trace.py tests/test_sms_port_trace.py cores/gba/homebrew/lines/fixture/harness.py cores/gba/homebrew/lines/fixture/host_tests.py
+    @${PYTHON:-python3} -m py_compile {{ python_files }} scripts/c64_spectrum_volume_display.py tests/test_c64_spectrum_volume_display.py tests/sms_port_trace.py tests/test_sms_port_trace.py cores/gba/homebrew/lines/fixture/harness.py cores/gba/homebrew/lines/fixture/host_tests.py
     @echo "chipviz Python lint OK"
 
 gba-lines-fixture-test:
