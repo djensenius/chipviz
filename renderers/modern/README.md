@@ -700,11 +700,12 @@ input files, including FIFOs, before reading.
 The entire file and every record are checked before GPU initialization or
 output-directory/file creation, including records after the last requested
 still. `--frames` must be strictly increasing and within the recording.
-Each record is applied once in order at index/60 seconds; requested stills do
-not reset replay state. The manifest includes the requested record's exact
-family, variant, sequence, tick, metadata and complete envelope (hex), plus
-the renderer's displayed scene. Native renderer transition/safety behavior
-is unchanged.
+Replay applies records from index 0 through the final requested still once in
+order at index/60 seconds; later records are validated but not replayed.
+Requested stills do not reset replay state. The manifest includes the requested
+record's exact family, variant, sequence, tick, metadata and complete envelope
+(hex), plus the renderer's displayed scene. Native renderer transition/safety
+behavior is unchanged.
 
 The file limit is 1,000,000 records, or 145,000,020 bytes. Validation copies
 the acquisition buffer, so a maximum-size file needs approximately

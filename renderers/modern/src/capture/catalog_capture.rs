@@ -1,7 +1,7 @@
 //! CLI-only catalog-v1 acquisition, preflight and ordered replay.
 
 use super::*;
-use crate::catalog_v1::Snapshot;
+use crate::catalog_v1::{Record, Snapshot};
 use std::io::Read;
 
 const MAX_BYTES: usize = 20 + 145 * 1_000_000;
@@ -251,6 +251,35 @@ fn load(path: &Path, frames: &[u64]) -> Result<(Snapshot, std::fs::Metadata), St
     Ok((snapshot, source))
 }
 
+// Called only after full snapshot and requested-frame preflight. The visitor
+// is the sole replay path for both drawn and state-only frames.
+fn replay_records<'a>(
+    snapshot: &'a Snapshot,
+    frames: &[u64],
+    mut visit: impl FnMut(usize, Record<'a>, bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(&last) = frames.last() else {
+        return Ok(());
+    };
+    let last = usize::try_from(last).map_err(|_| "--catalog-v1 frame is past the input")?;
+    if last >= snapshot.count() {
+        return Err("--catalog-v1 frame is past the input".into());
+    }
+    let mut requested = frames.iter().copied().peekable();
+    for index in 0..=last {
+        let is_requested = requested.peek() == Some(&(index as u64));
+        if is_requested {
+            requested.next();
+        }
+        visit(
+            index,
+            snapshot.record(index).expect("validated index"),
+            is_requested,
+        )?;
+    }
+    Ok(())
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut text = String::with_capacity(bytes.len() * 2);
@@ -290,14 +319,11 @@ pub(super) fn run(args: &CaptureArgs, exclusive: bool) -> Result<(), String> {
     pipeline.enable_starfield_dispatch(false);
     let mut captures = Vec::new();
     let mut outputs = OutputFiles::new(exclusive);
-    let mut requested = args.frames.iter().copied().peekable();
-    for index in 0..snapshot.count() {
-        let record = snapshot.record(index).expect("validated index");
+    replay_records(&snapshot, &args.frames, |index, record, is_requested| {
         let frame = ControlFrame::parse_wire(&record.envelope()[24..57])
             .map_err(|e| format!("record {index}: {e}"))?;
         let time = elapsed(index as u64);
-        if requested.peek() == Some(&(index as u64)) {
-            requested.next();
+        if is_requested {
             let rgb = renderer.render(frame, time).map_err(|e| e.to_string())?;
             let displayed = renderer.pipeline_mut().committed_displayed_scene();
             let entry = scenes::dispatch_configured(displayed, false);
@@ -315,7 +341,8 @@ pub(super) fn run(args: &CaptureArgs, exclusive: bool) -> Result<(), String> {
             let size = renderer.size();
             renderer.pipeline_mut().advance_state(frame, time, size);
         }
-    }
+        Ok(())
+    })?;
     let manifest = format!(
         "{{\n  \"profile\": {},\n  \"input\": {},\n  \"input_mode\": \"catalog-v1\",\n  \"mic_layers\": {},\n  \"width\": {width},\n  \"height\": {height},\n  \"fps\": {CAPTURE_FPS},\n  \"captures\": [\n{}\n  ]\n}}\n",
         json_string(args.profile.name),
@@ -416,6 +443,47 @@ mod tests {
         assert!(preflight(&snapshot, &[2, 1]).is_err());
         assert!(preflight(&snapshot, &[72]).is_err());
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn replay_visitor_stops_at_last_requested_record() {
+        let families = [0, 1, 2, 3, 4, 5];
+        let snapshot = Snapshot::validate(&fixture(&families)).unwrap();
+        for (frames, expected) in [
+            (&[0][..], &[(0, true)][..]),
+            (
+                &[1, 3][..],
+                &[(0, false), (1, true), (2, false), (3, true)][..],
+            ),
+            (
+                &[5][..],
+                &[
+                    (0, false),
+                    (1, false),
+                    (2, false),
+                    (3, false),
+                    (4, false),
+                    (5, true),
+                ][..],
+            ),
+            (&[][..], &[][..]),
+        ] {
+            preflight(&snapshot, frames).unwrap();
+            let mut observed = Vec::new();
+            replay_records(&snapshot, frames, |index, record, requested| {
+                assert_eq!(record.sequence(), index as u64);
+                assert_eq!(record.family(), families[index]);
+                observed.push((index, requested));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(observed, expected);
+        }
+        let unavailable = Snapshot::validate(&fixture(&[0, 1, 2, 3, 4, 7])).unwrap();
+        assert!(preflight(&unavailable, &[0]).is_err());
+        let mut malformed = fixture(&families);
+        malformed[20 + 145 * 5 + 50] ^= 1;
+        assert!(Snapshot::validate(&malformed).is_err());
     }
 
     #[test]
@@ -632,7 +700,7 @@ mod tests {
     fn sparse_catalog_stills_match_independent_sequential_renderer() {
         let root = root();
         let input = root.join("input");
-        let families: Vec<_> = (0..72).map(|i| [0, 2, 3, 4, 5, 1][i / 12]).collect();
+        let families: Vec<_> = (0..84).map(|i| [0, 2, 3, 4, 5, 1, 0][i / 12]).collect();
         let bytes = fixture(&families);
         std::fs::write(&input, &bytes).unwrap();
         let snapshot = Snapshot::validate(&bytes).unwrap();
