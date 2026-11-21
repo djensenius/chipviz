@@ -92,6 +92,14 @@ builds `chipviz-gba.gba` with devkitPro, `chipviz-n64.z64` with libdragon,
 `chipviz-nes.nes` with ca65. Generated C64/Genesis/NES/SMS assets remain
 SDK-free fallbacks for local packaging when those toolchains are not installed.
 
+The `chipviz-v0.1.4` modern renderer assets are x86-64 Linux binaries, as are
+the current release workflow's outputs. The `chipviz-pi5` and `chipviz-m1`
+names select rendering profiles; those files are not native ARM64 Raspberry Pi
+or macOS executables. To run on those targets, build from source as described
+in the [modern renderer guide](renderers/modern/README.md). Native release work
+is tracked in [#215](https://github.com/djensenius/chipviz/issues/215) and
+[#216](https://github.com/djensenius/chipviz/issues/216).
+
 All SNES ROMs, including the generated diagnostic seed and SDK build, are
 temporarily omitted from future individual release assets and combined zips;
 past releases are unchanged.

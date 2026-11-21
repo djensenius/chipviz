@@ -10,6 +10,13 @@ different quality budgets:
 | `chipviz-pi5` | Raspberry Pi 5 HDMI output | 4K-capable, lower instance count, simpler layering. |
 | `chipviz-m1` | Apple Silicon Mac with large memory/GPU headroom | 4K60-oriented, denser 3D fields, deeper layering. |
 
+These names select quality profiles, not operating systems or CPU architectures.
+The current GitHub release workflow builds both assets for x86-64 Linux, so
+neither is a native macOS or ARM64 Pi download. The commands below build from
+source on the host; native release artifacts are tracked in
+[#215](https://github.com/djensenius/chipviz/issues/215) and
+[#216](https://github.com/djensenius/chipviz/issues/216).
+
 The visual language should match the retro targets at the signal level: beat,
 energy, palette, scene, flags, and spectrum all map to recognizable behavior.
 Each platform then renders those controls using its native strengths.
