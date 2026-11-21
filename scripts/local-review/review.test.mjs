@@ -192,20 +192,21 @@ test('capture buttons distinguish matching titles and describe their selected st
     variant: 'abstract', scenario: 'mellow-96', collection: 'library' };
   const otherPlatform = { ...first, id: 'clip-11111111111111111111', platform: 'Pi 5 profile' };
   const draft = { ...first, id: 'clip-22222222222222222222', collection: 'draft' };
+  const sameContext = { ...first, id: 'clip-33333333333333333333' };
   globalThis.document = { getElementById: id => elements[id], createElement: tag => new Element(tag) };
   globalThis.location = { href: 'http://127.0.0.1:8000/capability/' };
   globalThis.fetch = async () => ({
-    ok: true, json: async () => ({ schema_version: 1, clips: [first, otherPlatform, draft] }),
+    ok: true, json: async () => ({ schema_version: 1, clips: [first, otherPlatform, draft, sameContext] }),
   });
   globalThis.window = { isSecureContext: false };
   await import('./app.mjs?button-labels');
   await new Promise(resolve => setImmediate(resolve));
   const buttons = () => descendants(elements.results).filter(item => item.tagName === 'button');
   const labels = buttons().map(button => button['aria-label']);
-  assert.equal(new Set(labels).size, 3);
-  for (const [index, value] of [first, otherPlatform, draft].entries()) {
+  assert.equal(new Set(labels).size, 4);
+  for (const [index, value] of [first, otherPlatform, draft, sameContext].entries()) {
     for (const part of [value.title, value.family, value.platform, value.variant, value.scenario,
-      value.collection === 'draft' ? 'Review-only draft' : 'Local library']) {
+      value.collection === 'draft' ? 'Review-only draft' : 'Local library', value.id]) {
       assert.ok(labels[index].includes(part));
     }
     assert.ok(labels[index].startsWith('View details for '));

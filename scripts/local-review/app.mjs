@@ -29,7 +29,7 @@ function render() {
     const button = node('button', selected === clip ? 'Selected' : 'View details', 'card-button');
     button.type = 'button';
     const context = [clip.title, clip.family, clip.platform, clip.variant, clip.scenario,
-      clip.collection === 'draft' ? 'Review-only draft' : 'Local library'];
+      clip.collection === 'draft' ? 'Review-only draft' : 'Local library', `Clip ID ${clip.id}`];
     button.setAttribute('aria-label', `${button.textContent} for ${context.join('; ')}`);
     button.addEventListener('click', () => selectClip(clip));
     card.append(node('p', `${clip.family} / ${clip.platform}`, 'card-label'),
