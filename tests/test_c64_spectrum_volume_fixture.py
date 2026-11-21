@@ -133,6 +133,45 @@ class FixtureOracleTests(unittest.TestCase):
         self.assertEqual(result.exception.code, 2)
         self.assertIn("--frames must be between 1 and 16000", stderr.getvalue())
 
+  def test_emulator_lifecycle(self):
+    for scenario in ("success", "load", "load-and-deinit", "run", "interrupt", "unload"):
+      with self.subTest(scenario=scenario):
+        emu = mock.Mock()
+        error = None
+        if scenario.startswith("load"):
+          error = RuntimeError("load failed")
+          emu.load.side_effect = error
+          if scenario == "load-and-deinit":
+            emu.lib.retro_deinit.side_effect = RuntimeError("deinit failed")
+        elif scenario == "run":
+          error = RuntimeError("run failed")
+        elif scenario == "interrupt":
+          error = KeyboardInterrupt()
+        elif scenario == "unload":
+          error = RuntimeError("unload failed")
+          emu.lib.retro_unload_game.side_effect = error
+        run_error = error if scenario in ("run", "interrupt") else None
+        with mock.patch.object(sys, "argv", ["fixture"]), \
+            mock.patch.object(fixture, "label", side_effect=[0x1000, 0x2000, 0x2004]), \
+            mock.patch.object(fixture, "Emulator", return_value=emu), \
+            mock.patch.object(fixture, "run_fixture", return_value=1, side_effect=run_error) as run, \
+            contextlib.redirect_stdout(io.StringIO()):
+          if error is None:
+            self.assertEqual(fixture.main(), 0)
+          else:
+            with self.assertRaises(type(error)) as raised:
+              fixture.main()
+            self.assertIs(raised.exception, error)
+        if scenario.startswith("load"):
+          run.assert_not_called()
+          self.assertEqual(emu.mock_calls, [mock.call.load(mock.ANY), mock.call.lib.retro_deinit()])
+          if scenario == "load-and-deinit":
+            self.assertIn("deinit failed", error.__notes__[0])
+        else:
+          run.assert_called_once()
+          self.assertEqual(emu.mock_calls, [mock.call.load(mock.ANY), mock.call.lib.retro_unload_game(),
+                                            mock.call.lib.retro_deinit()])
+
   def test_host_fixture_crc_and_shifted_scene_regression(self):
     class State(ctypes.Structure):
       _fields_ = [("height", ctypes.c_uint8 * 8), ("palette", ctypes.c_uint8 * 8),

@@ -165,12 +165,21 @@ def main() -> int:
     emu = Emulator(args.core, pathlib.Path(workdir))
     try:
       emu.load(args.prg.resolve())
+    except BaseException as error:
+      try:
+        emu.lib.retro_deinit()
+      except BaseException as cleanup_error:
+        error.add_note(f"retro_deinit also failed: {cleanup_error!r}")
+      raise
+    try:
       frame = run_fixture(emu, trace, done, progress, args.frames)
       print(f"c64 spectrum volume fixture: {STEPS} records matched after {frame} frames")
       return 0
     finally:
-      emu.lib.retro_unload_game()
-      emu.lib.retro_deinit()
+      try:
+        emu.lib.retro_unload_game()
+      finally:
+        emu.lib.retro_deinit()
 
 
 if __name__ == "__main__":

@@ -159,8 +159,9 @@ measurement or a guarantee about transitions.
 
 The caller must reset the state and supply an exclusively owned, blank 40x25
 screen on a black background, with the uppercase/graphics ROM selected; it
-must arrange safe entry and restoration itself. The core writes no VIC
-registers, does not clear the screen, and must run outside the raster IRQ.
+must select standard text mode with ECM, bitmap and multicolour disabled, and
+arrange safe entry and restoration itself. The core writes no VIC registers,
+does not clear the screen, and must run outside the raster IRQ.
 The caller must avoid the reserved ColourField screens at `$3000`–`$3FFF`.
 Eventual integration must preserve the existing IRQ timing and
 keyboard/joystick roles, and account for the current HID keyboard path's zero

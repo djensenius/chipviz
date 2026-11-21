@@ -14,8 +14,9 @@ typedef struct {
 } sv_state_t;
 
 /* Reset before entry. The caller must provide an exclusively owned, blank
- * 40x25 screen (code 32) on a black background, in uppercase/graphics ROM
- * mode. This does not clear screen or colour RAM. */
+ * 40x25 screen (code 32) on a black background, with the uppercase/graphics
+ * character ROM selected and standard text mode (ECM, bitmap and multicolour
+ * disabled). This does not clear screen or colour RAM. */
 void sv_init(sv_state_t *state, uint8_t palette);
 
 /* Once per accepted display step, in the main loop, not in the raster IRQ.
