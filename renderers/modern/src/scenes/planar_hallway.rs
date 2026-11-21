@@ -106,13 +106,14 @@ fn edge_mark(surface: Surface, surface_index: usize, row: usize) -> [[f32; 3]; 2
     [surface.point(u, z), surface.point(u * 0.55, z + 1.4)]
 }
 
-// A bounded, continuous camera path avoids recycling geometry past the
-// viewer. The painted marks remain fixed in world coordinates.
+// A bounded 48-second loop drifts along and across the corridor. Its
+// movement is visible over a short clip without recycling the fixed marks.
 fn camera(elapsed: f32) -> [f32; 3] {
+    let phase = elapsed * (std::f32::consts::TAU / 48.0);
     [
-        0.22 * (elapsed * 0.19).sin(),
-        0.12 * (elapsed * 0.13).sin(),
-        1.1 + 0.6 * (elapsed * 0.11).sin(),
+        0.55 * (2.0 * phase).sin(),
+        0.26 * (2.0 * phase + 0.5).sin(),
+        1.5 + 1.4 * phase.sin(),
     ]
 }
 
@@ -520,6 +521,69 @@ mod tests {
             assert_eq!(reduced.len(), count);
             assert_eq!(reduced[0].start, stroke.start);
             assert_eq!(reduced.last().unwrap().end, stroke.end);
+        }
+    }
+
+    #[test]
+    fn camera_loops_smoothly_inside_corridor_with_visible_surface_motion() {
+        let period = 48.0;
+        for i in 0..=2880 {
+            let t = i as f32 / 30.0;
+            let eye = camera(t);
+            assert!(eye[0].abs() < HALF_WIDTH && eye[1].abs() < HALF_HEIGHT);
+            assert!(eye[2] > 0.0 && eye[2] < EDGE_DEPTHS[EDGE_DEPTHS.len() - 1]);
+            let next = camera(t + 1.0 / 30.0);
+            for axis in 0..3 {
+                assert!((next[axis] - eye[axis]).abs() < 0.015);
+                close(eye[axis], camera(t + period)[axis]);
+            }
+        }
+        let before = camera(-0.001);
+        let at = camera(0.0);
+        let after = camera(0.001);
+        for axis in 0..3 {
+            assert!(((at[axis] - before[axis]) - (after[axis] - at[axis])).abs() < 0.00001);
+        }
+        assert!(camera(6.0)[2] - camera(1.0)[2] > 0.8);
+        for t in [1.0, 2.0, 6.0, 8.0, 24.0, 36.0, 48.0] {
+            for aspect in [0.1, 16.0 / 9.0, 10.0] {
+                for line in project(t, aspect, [0.0; 3], 1000) {
+                    assert!(
+                        line.start
+                            .into_iter()
+                            .chain(line.end)
+                            .all(|v| v.is_finite() && v.abs() <= 1.00001)
+                    );
+                    assert!(line.width.is_finite() && line.width > 0.0);
+                }
+            }
+        }
+
+        // Both views project the same fixed floor mark, with a large enough
+        // displacement to observe its attachment in a short capture.
+        let world = transverse(Surface::Floor, 2, 0);
+        let aspect = 16.0 / 9.0;
+        let stroke = |t| project_line(world, camera(t), aspect).unwrap();
+        let first = stroke(1.0);
+        let later = stroke(6.0);
+        assert!((first.start[0] - later.start[0]).abs() > 0.1);
+        for (t, projected) in [(1.0, first), (6.0, later)] {
+            let eye = camera(t);
+            close(
+                projected.start[0],
+                FOCAL * (world[0][0] - eye[0]) / (aspect * (world[0][2] - eye[2])),
+            );
+            close(
+                projected.start[1],
+                FOCAL * (world[0][1] - eye[1]) / (world[0][2] - eye[2]),
+            );
+            let mut parts = Vec::new();
+            append_stroke(&projected, 0.025 * 1.35, 0.35 + 0.12, 4, &mut parts);
+            assert!(
+                project(t, aspect, [0.0; 3], 1000)
+                    .windows(parts.len())
+                    .any(|window| window == parts)
+            );
         }
     }
 
