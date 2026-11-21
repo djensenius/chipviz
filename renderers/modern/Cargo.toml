@@ -16,6 +16,9 @@ rtrb = "0.4"
 wgpu = "0.20"
 winit = "0.29"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Flash/gate (colour-field palettes 3 and 7) can latch, and the mic layers
 # (whose red flashes are not yet bounded) are drawn, only with this feature.
