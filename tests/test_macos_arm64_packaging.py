@@ -325,6 +325,85 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             path.unlink()
             saved.rename(path)
 
+  def test_documented_build_overrides_inherited_cargo_directories(self) -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    snippet = readme.split("### Local Apple Silicon archive", 1)[1]
+    snippet = snippet.split("```sh\n", 1)[1].split("\n```", 1)[0]
+    tools = self.root / "fake-tools"
+    tools.mkdir()
+    mise = tools / "mise"
+    # The real CLI runs, while a fake Cargo checks the documented overrides
+    # and simulates transient artifact writes without invoking a Rust build.
+    mise.write_text(f"""#!{sys.executable}
+import os, pathlib, shutil, sys
+args = sys.argv[1:]
+if args[:3] == ["exec", "--", "python"]:
+  os.execv(sys.executable, [sys.executable] + args[3:])
+assert args[:3] == ["exec", "--", "cargo"], args
+args = args[3:]
+root = pathlib.Path(os.environ["FAKE_CARGO_DIR"])
+target, intermediate = root / "target", root / "intermediate"
+assert os.environ["CARGO_TARGET_DIR"] == str(target)
+assert os.environ["CARGO_BUILD_TARGET_DIR"] == str(target)
+assert os.environ["CARGO_BUILD_BUILD_DIR"] == str(intermediate)
+assert args[:3] == ["--config", "build.build-dir='" + str(intermediate) + "'", "build"], args
+assert args[args.index("--target-dir") + 1] == str(target)
+assert "--locked" in args
+protected = pathlib.Path(os.environ["PROTECTED"]).resolve()
+config = pathlib.Path(".cargo/config.toml").read_text()
+assert config == '[build]\\ntarget-dir = "' + str(protected) + '"\\nbuild-dir = "' + str(protected) + '"\\n'
+for path in (target, intermediate):
+  if path.resolve() == protected or protected in path.resolve().parents:
+    print("PROTECTED MUTATION", file=sys.stderr)
+    sys.exit(90)
+  path.mkdir()
+probe = intermediate / "transient"
+probe.write_bytes(b"intermediate")
+probe.unlink()
+binary = target / "aarch64-apple-darwin/release/chipviz-m1"
+binary.parent.mkdir(parents=True)
+shutil.copyfile(os.environ["FAKE_BINARY"], binary)
+binary.chmod(0o755)
+print("FAKE_CARGO_OK", file=sys.stderr)
+""", encoding="utf-8")
+    mise.chmod(0o755)
+    mktemp = tools / "mktemp"
+    mktemp.write_text(f"""#!{sys.executable}
+import os, pathlib, sys
+assert sys.argv[1:] == ["-d", "/private/tmp/chipviz-cargo.XXXXXXXX"]
+path = pathlib.Path(os.environ["FAKE_CARGO_DIR"])
+path.mkdir(mode=0o700)
+print(path)
+""", encoding="utf-8")
+    mktemp.chmod(0o755)
+    config = self.root / ".cargo/config.toml"
+    config.parent.mkdir()
+    for index, protected in enumerate((self.dist.parent, self.personal.parent)):
+      with self.subTest(protected=protected):
+        config.write_text(f'[build]\ntarget-dir = "{protected}"\n'
+                          f'build-dir = "{protected}"\n', encoding="utf-8")
+        env = os.environ.copy()
+        env.update({
+          "PATH": str(tools) + os.pathsep + env["PATH"],
+          "CARGO_TARGET_DIR": str(protected),
+          "CARGO_BUILD_TARGET_DIR": str(protected),
+          "CARGO_BUILD_BUILD_DIR": str(protected),
+          "FAKE_CARGO_DIR": str(self.root / f"private-cargo-{index}"),
+          "FAKE_BINARY": str(self.binary),
+          "PROTECTED": str(protected),
+        })
+        result = subprocess.run(["sh", "-c", snippet], cwd=self.root, env=env,
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FAKE_CARGO_OK", result.stderr)
+        self.assertNotIn("PROTECTED MUTATION", result.stderr)
+        output = self.base / "package"
+        with zipfile.ZipFile(output / "chipviz-macos-arm64.zip") as archive:
+          self.assertEqual(archive.read("chipviz-m1"), self.binary.read_bytes())
+        self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+        self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
+        output.rename(self.root / f"completed-{index}")
+
   def test_tmpdir_protected_directories_have_no_transient_writes_or_removals(self) -> None:
     original_open = os.open
     original_unlink = os.unlink

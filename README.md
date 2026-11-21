@@ -117,11 +117,14 @@ out_dir="$checkout/build/macos-arm64/package"
 export TMPDIR=/private/tmp
 mise exec -- python scripts/package-macos-arm64.py --prepare-output-dir "$out_dir"
 cargo_dir=$(mktemp -d /private/tmp/chipviz-cargo.XXXXXXXX)
-CARGO_TARGET_DIR="$cargo_dir" mise exec -- cargo build \
-  --locked --manifest-path renderers/modern/Cargo.toml --release \
+CARGO_TARGET_DIR="$cargo_dir/target" CARGO_BUILD_TARGET_DIR="$cargo_dir/target" \
+  CARGO_BUILD_BUILD_DIR="$cargo_dir/intermediate" mise exec -- cargo \
+  --config "build.build-dir='$cargo_dir/intermediate'" build \
+  --target-dir "$cargo_dir/target" --locked \
+  --manifest-path renderers/modern/Cargo.toml --release \
   --target aarch64-apple-darwin --bin chipviz-m1
 mise exec -- python scripts/package-macos-arm64.py \
-  --binary "$cargo_dir/aarch64-apple-darwin/release/chipviz-m1" \
+  --binary "$cargo_dir/target/aarch64-apple-darwin/release/chipviz-m1" \
   --output "$out_dir/chipviz-macos-arm64.zip"
 )
 ```
@@ -131,8 +134,11 @@ The existing `build` directory must be user-owned and not group/world-writable;
 creates these directories if missing and refuses an existing `package`
 directory; choose a different fresh name on retry. Preparation can leave
 created directories if it fails. The private Cargo directory is not removed
-automatically. Cargo and its build dependencies are not sandboxed. The packager rejects
-symlinks, existing targets and unsafe input permissions. It copies the
+automatically. Cargo's command-line target and build-directory overrides take
+precedence over their environment and configuration values; the corresponding
+environment variables are also set explicitly. Cargo, wrappers and build
+dependencies are not sandboxed. The packager rejects symlinks, existing targets
+and unsafe input permissions. It copies the
 owner-executable binary and `LICENSE`, `COMMERCIAL.md`, and
 `THIRD_PARTY_NOTICES/rust.md` into the ZIP. Snapshot limits are 256 MiB for
 the binary and 8 MiB per notice. If packaging fails, a partial archive may
