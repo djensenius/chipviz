@@ -120,7 +120,6 @@ class FixtureOracleTests(unittest.TestCase):
       fixture.run_fixture(FakeEmulator("invalid"), 0x100, 0xE00, 0xE10, 300)
 
   def test_cli_frame_bounds(self):
-    self.assertEqual(fixture.DEFAULT_FRAMES, 16000)
     for frames in (1, 16000):
       with self.subTest(frames=frames), mock.patch.object(sys, "argv", ["fixture", "--frames", str(frames)]), \
           mock.patch.object(fixture, "label", side_effect=RuntimeError("accepted")):

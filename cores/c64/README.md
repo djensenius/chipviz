@@ -212,15 +212,17 @@ insufficient nominal cycle budget as a diagnosis, but does not prove the
 timeout's cause. With the CRC fixture on head `a1d1ffc`, PAL matched all 112
 records after 10643 frames; NTSC and early NTSC timed out at 12000 frames,
 with matching prefixes of 108 and 106 records respectively. CRC calculation
-adds work to this test-only fixture. The default and maximum are now 16000
-frames to leave bounded headroom beyond those observations; `--frames` can
-choose a smaller limit. On timeout the script reports recent
-completed-record counts and checks the completed trace prefix, distinguishing
-some trace errors from lack of completion; a matching prefix does not prove
-the target cannot hang later. These prototype results are not exact-head
-verification. The fixture does not exercise the production PRG, actual
-screen/colour RAM, raster IRQ, hardware timing, scene transitions, visible
-output or physical flash safety.
+adds work to this test-only fixture. With the 16000-frame limit on head
+`9be9b61`, the strengthened CRC fixture matched all 112 records after 10643
+PAL frames, 12345 NTSC frames and 12603 early NTSC frames. The default and
+maximum are 16000 frames; `--frames` can choose a smaller limit. On timeout
+the script reports recent completed-record counts and checks the completed
+trace prefix, distinguishing some trace errors from lack of completion; a
+matching prefix does not prove the target cannot hang later. These prototype
+results are not exact-head verification. The fixture does not exercise the
+production PRG, actual screen/colour RAM, raster IRQ or scene transitions.
+It does not demonstrate displayed output, target timing or physical flash
+safety.
 
 ## Connection path
 
