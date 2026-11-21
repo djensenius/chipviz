@@ -8,6 +8,11 @@ proven timestamp. The fake-core tests do not establish the GX hook, cycle
 offset, ABI, or 270-unit seed spacing.
 An embedded version string and ad-hoc signature do not establish a clean build.
 
+`just c-test` includes the strict C fake-core stress check, and
+`just python-test` discovers the fake-core Python tests. Run
+`just sms-port-trace-sanitizer` separately for the ASan/UBSan stress check;
+it requires a compiler with both sanitizers.
+
 An internally vetted, hash-specific layout with a known symbol extent and
 aligned in-bounds counter offset, plus the required symbols, installed pointer
 identities and 1<<20 cycle ratio, is required before pointer installation.
