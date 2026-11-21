@@ -147,6 +147,7 @@ class Element {
       this.currentTime = 0;
       this.duration = NaN;
       this.seeking = false;
+      this.mediaActions = [];
     }
   }
   set innerHTML(_) { throw new Error('HTML parsing is forbidden'); }
@@ -154,7 +155,13 @@ class Element {
   replaceChildren(...children) { this.children = children; }
   get firstChild() { return this.children[0]; }
   setAttribute(name, value) { this[name] = value; }
+  removeAttribute(name) { this.mediaActions.push(`remove:${name}`); delete this[name]; }
   addEventListener(name, callback) { this.events[name] = callback; }
+  pause() { this.mediaActions.push('pause'); }
+  load() {
+    this.mediaActions.push('load');
+    if (this.events.error) this.events.error();
+  }
   focus() {}
   select() {}
 }
@@ -217,6 +224,8 @@ test('filters, text-only rendering, embedded seeking and copy fallback', async (
   action('Open local video').events.click();
   const secondVideo = descendants(detail).find(item => item.tagName === 'video');
   assert.notEqual(secondVideo, video);
+  assert.deepEqual(video.mediaActions, ['pause', 'remove:src', 'load']);
+  assert.equal(video.src, undefined);
   video.duration = 120;
   video.events.loadedmetadata();
   video.events.error();
@@ -226,6 +235,7 @@ test('filters, text-only rendering, embedded seeking and copy fallback', async (
   secondVideo.events.loadedmetadata();
   assert.equal(secondVideo.currentTime, 93);
   video.events.loadedmetadata();
+  assert.equal(video.currentTime, 0);
   assert.equal(secondVideo.currentTime, 93);
   action('Use current playback time').events.click();
   assert.equal(input.value, '1:33');
@@ -334,4 +344,91 @@ test('filters, text-only rendering, embedded seeking and copy fallback', async (
   await action('Copy reference').events.click();
   assert.equal(fallback.hidden, true);
   assert.match(feedback.textContent, /failed/);
+});
+
+test('closing or switching details stops discarded players and ignores stale callbacks', async () => {
+  const elements = Object.fromEntries(['count', 'message', 'detail', 'results', 'search', 'reset',
+    'filter-fields'].map(id => [id, new Element('div')]));
+  const first = clip();
+  const second = { ...clip(), id: 'clip-11111111111111111111', title: 'Second capture',
+    collection: 'library', capture: 'Unknown capture' };
+  globalThis.document = { getElementById: id => elements[id], createElement: tag => new Element(tag) };
+  globalThis.location = { href: 'http://127.0.0.1:8000/capability/' };
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ schema_version: 1, clips: [first, second] }) });
+  globalThis.window = { isSecureContext: false };
+  await import('./app.mjs?lifecycle');
+  await new Promise(resolve => setImmediate(resolve));
+  const detail = elements.detail;
+  const select = title => descendants(elements.results)
+    .find(item => item['aria-label'] === `View details for ${title}`).events.click();
+  const action = text => descendants(detail).find(item => item.textContent === text);
+  const currentVideo = () => descendants(detail).find(item => item.tagName === 'video');
+  const currentInput = () => descendants(detail).find(item => item.tagName === 'input');
+  const currentFeedback = () => descendants(detail).find(item => item.role === 'status');
+  const assertStopped = video => {
+    assert.deepEqual(video.mediaActions, ['pause', 'remove:src', 'load']);
+    assert.equal(video.src, undefined);
+  };
+  const staleEvents = video => {
+    video.duration = 30;
+    video.events.loadedmetadata();
+    video.events.seeked();
+    video.events.error();
+  };
+
+  select(first.title);
+  currentInput().value = '8';
+  action('Open local video').events.click();
+  const closed = currentVideo();
+  const closedFeedback = currentFeedback();
+  action('Close details').events.click();
+  assertStopped(closed);
+  assert.equal(detail.hidden, true);
+  const closedMessage = closedFeedback.textContent;
+  staleEvents(closed);
+  assert.equal(closed.currentTime, 0);
+  assert.equal(closedFeedback.textContent, closedMessage);
+
+  select(first.title);
+  currentInput().value = '11';
+  action('Open local video').events.click();
+  const replaced = currentVideo();
+  const oldClose = action('Close details');
+  const oldOpen = action('Open local video');
+  const oldFeedback = currentFeedback();
+  select(second.title);
+  assertStopped(replaced);
+  const oldMessage = oldFeedback.textContent;
+  currentInput().value = '22';
+  action('Open local video').events.click();
+  const active = currentVideo();
+  const activeFeedback = currentFeedback();
+  const activeSource = active.src;
+  staleEvents(replaced);
+  oldClose.events.click();
+  oldOpen.events.click();
+  assert.equal(replaced.currentTime, 0);
+  assert.equal(oldFeedback.textContent, oldMessage);
+  assert.equal(detail.hidden, false);
+  assert.equal(currentVideo(), active);
+  assert.equal(active.src, activeSource);
+  assert.deepEqual(active.mediaActions, []);
+  assert.match(activeFeedback.textContent, /Loading video metadata/);
+  active.duration = 30;
+  active.events.loadedmetadata();
+  assert.equal(active.currentTime, 22);
+  active.events.seeked();
+  action('Use current playback time').events.click();
+  assert.equal(currentInput().value, '22');
+  await action('Copy reference').events.click();
+  const fallback = descendants(detail).find(item => item.tagName === 'textarea');
+  assert.match(fallback.value, /Clip ID: clip-11111111111111111111/);
+  assert.match(fallback.value, /Time: 22 seconds/);
+
+  select(second.title);
+  assertStopped(active);
+  staleEvents(active);
+  assert.equal(active.currentTime, 22);
+  assert.equal(currentVideo(), undefined);
+  assert.equal(detail.hidden, false);
 });

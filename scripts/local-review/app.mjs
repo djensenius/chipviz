@@ -6,6 +6,7 @@ const fields = [['family', 'Visualization'], ['platform', 'Platform'], ['variant
 const filters = new Map();
 let clips = [];
 let selected = null;
+let disposeDetail = null;
 
 function node(tag, text, className) {
   const element = document.createElement(tag);
@@ -39,6 +40,7 @@ function render() {
 }
 
 function selectClip(clip) {
+  if (disposeDetail) disposeDetail();
   selected = clip;
   const detail = $('detail');
   detail.hidden = false;
@@ -49,6 +51,9 @@ function selectClip(clip) {
   const close = node('button', 'Close details', 'text-button');
   close.type = 'button';
   close.addEventListener('click', () => {
+    if (disposeDetail !== discardVideo) return;
+    discardVideo();
+    disposeDetail = null;
     selected = null;
     detail.hidden = true;
     detail.replaceChildren();
@@ -87,6 +92,17 @@ function selectClip(clip) {
   const controls = node('div', null, 'actions');
   let video = null;
   let state = 'unopened';
+  function discardVideo() {
+    const previous = video;
+    video = null;
+    state = 'unopened';
+    if (previous) {
+      previous.pause();
+      previous.removeAttribute('src');
+      previous.load();
+    }
+  }
+  disposeDetail = discardVideo;
   function getTime() {
     const seconds = parseTime(input.value);
     if (seconds === null) {
@@ -114,8 +130,10 @@ function selectClip(clip) {
   const open = node('button', 'Open local video', 'primary');
   open.type = 'button';
   open.addEventListener('click', () => {
+    if (disposeDetail !== discardVideo) return;
     const seconds = getTime();
     if (seconds === null) return;
+    discardVideo();
     player.replaceChildren();
     const openedVideo = node('video', null);
     video = openedVideo;
