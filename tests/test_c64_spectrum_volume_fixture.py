@@ -1,11 +1,14 @@
 """Host-only checks of the fixture oracle and trace validation, not VICE."""
+import contextlib
 import ctypes
+import io
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -115,6 +118,21 @@ class FixtureOracleTests(unittest.TestCase):
       fixture.run_fixture(FakeEmulator("partial"), 0x100, 0xE00, 0xE10, 300)
     with self.assertRaisesRegex(ValueError, "invalid completed-record count"):
       fixture.run_fixture(FakeEmulator("invalid"), 0x100, 0xE00, 0xE10, 300)
+
+  def test_cli_frame_bounds(self):
+    self.assertEqual(fixture.DEFAULT_FRAMES, 16000)
+    for frames in (1, 16000):
+      with self.subTest(frames=frames), mock.patch.object(sys, "argv", ["fixture", "--frames", str(frames)]), \
+          mock.patch.object(fixture, "label", side_effect=RuntimeError("accepted")):
+        with self.assertRaisesRegex(RuntimeError, "accepted"):
+          fixture.main()
+    for frames in (0, -1, 16001):
+      with self.subTest(frames=frames), mock.patch.object(sys, "argv", ["fixture", "--frames", str(frames)]), \
+          contextlib.redirect_stderr(io.StringIO()) as stderr:
+        with self.assertRaises(SystemExit) as result:
+          fixture.main()
+        self.assertEqual(result.exception.code, 2)
+        self.assertIn("--frames must be between 1 and 16000", stderr.getvalue())
 
   def test_host_fixture_crc_and_shifted_scene_regression(self):
     class State(ctypes.Structure):

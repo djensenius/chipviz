@@ -23,7 +23,8 @@ SLICES = ((8, 2, 1), (15, 1, 1), (22, 0, 2))
 THRESHOLDS = (0, 31, 32, 63, 64, 159, 160, 255)
 DONE = b"SV02"
 PROGRESS = b"SVP2"
-DEFAULT_FRAMES = 9000
+DEFAULT_FRAMES = 16000
+MAX_FRAMES = 16000
 SAMPLE_FRAMES = 300
 
 
@@ -147,10 +148,11 @@ def main() -> int:
   parser.add_argument("--prg", type=pathlib.Path, default=BUILD / "fixture.prg")
   parser.add_argument("--labels", type=pathlib.Path, default=BUILD / "fixture.lbl")
   parser.add_argument("--model", choices=sorted(MODELS), default="pal")
-  parser.add_argument("--frames", type=int, default=DEFAULT_FRAMES, help="maximum frames, including boot (1..12000)")
+  parser.add_argument("--frames", type=int, default=DEFAULT_FRAMES,
+                      help=f"maximum frames, including boot (1..{MAX_FRAMES})")
   args = parser.parse_args()
-  if not 1 <= args.frames <= 12000:
-    parser.error("--frames must be between 1 and 12000")
+  if not 1 <= args.frames <= MAX_FRAMES:
+    parser.error(f"--frames must be between 1 and {MAX_FRAMES}")
   trace = label(args.labels, "sv_fixture_trace")
   done = label(args.labels, "sv_fixture_done")
   progress = label(args.labels, "sv_fixture_progress")

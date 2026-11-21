@@ -195,9 +195,9 @@ mkdir -p build/tests/c64-spectrum-fixture
 cl65 -t c64 -Oirs --static-locals -Icores/c64/homebrew/src -c -o build/tests/c64-spectrum-fixture/fixture.o tests/c64_spectrum_volume_fixture.c
 cl65 -t c64 -Oirs --static-locals -c -o build/tests/c64-spectrum-fixture/spectrum_volume.o cores/c64/homebrew/src/spectrum_volume.c
 cl65 -t c64 -m build/tests/c64-spectrum-fixture/fixture.map -Ln build/tests/c64-spectrum-fixture/fixture.lbl -o build/tests/c64-spectrum-fixture/fixture.prg build/tests/c64-spectrum-fixture/fixture.o build/tests/c64-spectrum-fixture/spectrum_volume.o
-python3 scripts/c64_spectrum_volume_fixture.py --model pal
-python3 scripts/c64_spectrum_volume_fixture.py --model ntsc
-python3 scripts/c64_spectrum_volume_fixture.py --model ntsc-old
+python3 scripts/c64_spectrum_volume_fixture.py --model pal --frames 16000
+python3 scripts/c64_spectrum_volume_fixture.py --model ntsc --frames 16000
+python3 scripts/c64_spectrum_volume_fixture.py --model ntsc-old --frames 16000
 ```
 
 The script needs a local VICE x64sc libretro core (override with `--core`).
@@ -209,10 +209,12 @@ timeout. PAL's 5304 frames represent about 104.3 million
 nominal VIC cycles, versus 102.6 million in 6000 NTSC frames (100.6 million
 on early NTSC). Boot, IRQs and VIC bus contention vary, so this supports an
 insufficient nominal cycle budget as a diagnosis, but does not prove the
-timeout's cause. The current CRC fixture has not been run on the target, and
-its cost and completion time are unverified. The default is 9000 frames,
-still bounded and overridable with `--frames` (up to 12000); it may require
-recalibration. On timeout the script reports recent
+timeout's cause. With the CRC fixture on head `a1d1ffc`, PAL matched all 112
+records after 10643 frames; NTSC and early NTSC timed out at 12000 frames,
+with matching prefixes of 108 and 106 records respectively. CRC calculation
+adds work to this test-only fixture. The default and maximum are now 16000
+frames to leave bounded headroom beyond those observations; `--frames` can
+choose a smaller limit. On timeout the script reports recent
 completed-record counts and checks the completed trace prefix, distinguishing
 some trace errors from lack of completion; a matching prefix does not prove
 the target cannot hang later. These prototype results are not exact-head
