@@ -7,6 +7,7 @@ libretro core. It does not test the production PRG, video, timing or safety.
 from __future__ import annotations
 
 import argparse
+import binascii
 import os
 import pathlib
 import tempfile
@@ -20,8 +21,8 @@ RECORD_SIZE = 26
 INKS = (6, 4, 5, 9, 2, 11, 8, 12)
 SLICES = ((8, 2, 1), (15, 1, 1), (22, 0, 2))
 THRESHOLDS = (0, 31, 32, 63, 64, 159, 160, 255)
-DONE = b"SV01"
-PROGRESS = b"SVP1"
+DONE = b"SV02"
+PROGRESS = b"SVP2"
 DEFAULT_FRAMES = 9000
 SAMPLE_FRAMES = 300
 
@@ -43,12 +44,9 @@ def input_at(step: int) -> tuple[bool, int, tuple[int, ...], int, int]:
 
 
 def checksums(cells: bytes | bytearray) -> bytes:
-  total = 0
-  rolling = 0
-  for cell in cells:
-    total = (total + cell) & 0xFFFF
-    rolling = (((rolling << 1) | (rolling >> 15)) & 0xFFFF) ^ cell
-  return total.to_bytes(2, "little") + rolling.to_bytes(2, "little")
+  total = sum(cells) & 0xFFFF
+  crc = binascii.crc_hqx(cells, 0xFFFF)
+  return total.to_bytes(2, "little") + crc.to_bytes(2, "little")
 
 
 def expected_trace() -> bytes:

@@ -181,12 +181,14 @@ build/tests/c64_spectrum_volume_tests
 against the isolated scene. It uses guarded ordinary RAM buffers, not VIC
 screen or colour RAM. Its 112-record bounded trace covers each band rising
 and falling, band and energy thresholds, palette changes, silence and reset.
-Each record contains state, two 16-bit checksums per complete buffer and a
-guard result; checksums can collide. `scripts/c64_spectrum_volume_fixture.py`
-compares it against an independently rendered synthetic oracle through the
-existing VICE libretro RAM seam. The host-only oracle tests run with Python
-unittest discovery. Build the fixture and, when an emulator slot is available,
-run it separately:
+Each record contains state, a 16-bit sum and an order-sensitive CRC-16 per
+complete buffer, and a guard result. These are not exact comparisons:
+collisions remain possible. `scripts/c64_spectrum_volume_fixture.py` compares
+them against an independently rendered synthetic oracle through the existing
+VICE libretro RAM seam. Versioned completion and progress markers reject the
+old trace format. The host-only oracle tests run with Python unittest
+discovery. Build the fixture and, when an emulator slot is available, run it
+separately:
 
 ```sh
 mkdir -p build/tests/c64-spectrum-fixture
@@ -201,13 +203,16 @@ python3 scripts/c64_spectrum_volume_fixture.py --model ntsc-old
 The script needs a local VICE x64sc libretro core (override with `--core`).
 Always rebuild matching PRG and labels together. On prototype head `9727671`,
 the rebuilt fixture matched all 112 records after 5304 PAL frames, 6156 NTSC
-frames and 6284 early NTSC frames. A prior NTSC run did not finish within the
-old 6000-frame timeout. PAL's 5304 frames represent about 104.3 million
+frames and 6284 early NTSC frames using the earlier checksums, not the current
+CRC fixture. A prior NTSC run did not finish within the old 6000-frame
+timeout. PAL's 5304 frames represent about 104.3 million
 nominal VIC cycles, versus 102.6 million in 6000 NTSC frames (100.6 million
 on early NTSC). Boot, IRQs and VIC bus contention vary, so this supports an
 insufficient nominal cycle budget as a diagnosis, but does not prove the
-timeout's cause. The default is now 9000 frames, still bounded and
-overridable with `--frames`. On timeout the script reports recent
+timeout's cause. The current CRC fixture has not been run on the target, and
+its cost and completion time are unverified. The default is 9000 frames,
+still bounded and overridable with `--frames` (up to 12000); it may require
+recalibration. On timeout the script reports recent
 completed-record counts and checks the completed trace prefix, distinguishing
 some trace errors from lack of completion; a matching prefix does not prove
 the target cannot hang later. These prototype results are not exact-head

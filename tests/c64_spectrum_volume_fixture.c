@@ -45,16 +45,21 @@ static uint8_t guards_ok(void) {
   return 1u;
 }
 
-/* Two non-cryptographic 16-bit checksums over every byte, including stale
- * colour cells. These detect many corruptions but do not prove equality. */
+/* Sum and CRC-16/CCITT-FALSE over every byte, including stale colour cells.
+ * The nibble table avoids eight bit-at-a-time iterations on cc65. These
+ * non-cryptographic checks can still collide and do not prove equality. */
 static void checksum(const uint8_t *cells, uint16_t *sum, uint16_t *rolling) {
+  static const uint16_t crc_table[16] = {
+    0x0000u, 0x1021u, 0x2042u, 0x3063u, 0x4084u, 0x50a5u, 0x60c6u, 0x70e7u,
+    0x8108u, 0x9129u, 0xa14au, 0xb16bu, 0xc18cu, 0xd1adu, 0xe1ceu, 0xf1efu
+  };
   uint16_t i;
   uint16_t s = 0u;
-  uint16_t r = 0u;
+  uint16_t r = 0xffffu;
   for (i = 0u; i < SV_CELLS; ++i) {
     s = (uint16_t)(s + cells[i]);
-    r = (uint16_t)((uint16_t)(r << 1) | (r >> 15));
-    r ^= cells[i];
+    r = (uint16_t)((uint16_t)(r << 4) ^ crc_table[(r >> 12) ^ (cells[i] >> 4)]);
+    r = (uint16_t)((uint16_t)(r << 4) ^ crc_table[(r >> 12) ^ (cells[i] & 15u)]);
   }
   *sum = s;
   *rolling = r;
@@ -93,7 +98,7 @@ int main(void) {
   sv_fixture_progress[0] = 0x53u;
   sv_fixture_progress[1] = 0x56u;
   sv_fixture_progress[2] = 0x50u;
-  sv_fixture_progress[3] = 0x31u;
+  sv_fixture_progress[3] = 0x32u;
   for (step = 0u; step < TRACE_STEPS; ++step) {
     memset(bands, 0, sizeof(bands));
     energy = 255u;
@@ -129,7 +134,7 @@ int main(void) {
   sv_fixture_done[0] = 0x53u;
   sv_fixture_done[1] = 0x56u;
   sv_fixture_done[2] = 0x30u;
-  sv_fixture_done[3] = 0x31u;
+  sv_fixture_done[3] = 0x32u;
   for (;;) {
   }
   return 0;

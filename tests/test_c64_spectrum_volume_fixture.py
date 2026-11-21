@@ -15,7 +15,8 @@ import c64_spectrum_volume_fixture as fixture  # noqa: E402
 
 class FixtureOracleTests(unittest.TestCase):
   def test_checksums(self):
-    self.assertEqual(fixture.checksums(bytes([1, 2, 3])), bytes([6, 0, 3, 0]))
+    self.assertEqual(fixture.checksums(bytes([1, 2, 3])), bytes([6, 0, 0xad, 0xad]))
+    self.assertEqual(fixture.checksums(b"123456789")[2:], bytes([0xb1, 0x29]))
     self.assertEqual(fixture.checksums(bytes([255]) * 1000)[:2], (255000 % 65536).to_bytes(2, "little"))
 
   def test_band_and_transition_vectors(self):
@@ -76,15 +77,20 @@ class FixtureOracleTests(unittest.TestCase):
         self.frame = 0
         self.mode = mode
         self.trace = fixture.expected_trace()
-        if mode != "not-started":
+        if mode == "old-version":
+          self.memory[0xE00:0xE04] = b"SV01"
+          self.memory[0xE10:0xE14] = b"SVP1"
+          self.memory[0xE14] = 4
+        elif mode != "not-started":
           self.memory[0xE10:0xE14] = fixture.PROGRESS
 
       def run(self, frames):
         self.frame += frames
         count = min(self.frame // 150, 2 if self.mode == "stalled" else 4)
-        if self.mode != "not-started":
+        if self.mode not in ("not-started", "old-version"):
           self.memory[0xE14] = 113 if self.mode == "invalid" else count
-          self.memory[0x100:0x100 + count * 26] = self.trace[:count * 26]
+          size = count * 26 - (1 if self.mode == "partial" and count else 0)
+          self.memory[0x100:0x100 + size] = self.trace[:size]
         if self.mode == "corrupt" and count:
           self.memory[0x100] ^= 1
         if self.mode == "complete" and self.frame == 5:
@@ -101,12 +107,16 @@ class FixtureOracleTests(unittest.TestCase):
       fixture.run_fixture(FakeEmulator("stalled"), 0x100, 0xE00, 0xE10, 600)
     with self.assertRaisesRegex(RuntimeError, r"records\): \[\]"):
       fixture.run_fixture(FakeEmulator("not-started"), 0x100, 0xE00, 0xE10, 300)
+    with self.assertRaisesRegex(RuntimeError, r"records\): \[\]"):
+      fixture.run_fixture(FakeEmulator("old-version"), 0x100, 0xE00, 0xE10, 300)
     with self.assertRaisesRegex(ValueError, "completed trace prefix differs"):
       fixture.run_fixture(FakeEmulator("corrupt"), 0x100, 0xE00, 0xE10, 300)
+    with self.assertRaisesRegex(ValueError, "completed trace prefix differs"):
+      fixture.run_fixture(FakeEmulator("partial"), 0x100, 0xE00, 0xE10, 300)
     with self.assertRaisesRegex(ValueError, "invalid completed-record count"):
       fixture.run_fixture(FakeEmulator("invalid"), 0x100, 0xE00, 0xE10, 300)
 
-  def test_oracle_against_host_scene(self):
+  def test_host_fixture_crc_and_shifted_scene_regression(self):
     class State(ctypes.Structure):
       _fields_ = [("height", ctypes.c_uint8 * 8), ("palette", ctypes.c_uint8 * 8),
                   ("next_palette", ctypes.c_uint8)]
@@ -114,13 +124,33 @@ class FixtureOracleTests(unittest.TestCase):
     source = ROOT / "cores/c64/homebrew/src"
     with tempfile.TemporaryDirectory() as directory:
       library = pathlib.Path(directory) / "scene.so"
+      wrapper = pathlib.Path(directory) / "fixture_wrapper.c"
+      wrapper.write_text('#define main fixture_program_main\n#include "c64_spectrum_volume_fixture.c"\n'
+                         '#undef main\n'
+                         'void host_checksum(const uint8_t *cells, uint16_t *sum, uint16_t *crc) '
+                         '{ checksum(cells, sum, crc); }\n')
       subprocess.run([os.environ.get("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror",
-                      "-pedantic", "-shared", "-fPIC", "-I", str(source),
-                      str(source / "spectrum_volume.c"), "-o", str(library)], check=True, capture_output=True)
+                      "-pedantic", "-shared", "-fPIC", "-I", str(source), "-I", str(ROOT / "tests"),
+                      str(source / "spectrum_volume.c"), str(wrapper), "-o", str(library)],
+                     check=True, capture_output=True)
       scene = ctypes.CDLL(str(library))
       ptr = ctypes.POINTER(ctypes.c_uint8)
       scene.sv_init.argtypes = [ctypes.POINTER(State), ctypes.c_uint8]
       scene.sv_step.argtypes = [ctypes.POINTER(State), ptr, ctypes.c_uint8, ctypes.c_uint8, ptr, ptr]
+      scene.host_checksum.argtypes = [ptr, ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16)]
+
+      def c_checksums(cells):
+        buf = (ctypes.c_uint8 * 1000).from_buffer_copy(cells)
+        total, crc = ctypes.c_uint16(), ctypes.c_uint16()
+        scene.host_checksum(buf, ctypes.byref(total), ctypes.byref(crc))
+        return total.value.to_bytes(2, "little") + crc.value.to_bytes(2, "little")
+
+      def old_rolling(cells):
+        rolling = 0
+        for cell in cells:
+          rolling = (((rolling << 1) | (rolling >> 15)) & 0xFFFF) ^ cell
+        return rolling
+
       state = State()
       screen = (ctypes.c_uint8 * 1032)()
       colour = (ctypes.c_uint8 * 1032)()
@@ -140,9 +170,28 @@ class FixtureOracleTests(unittest.TestCase):
         trace.extend(state.height)
         trace.extend(state.palette)
         trace.append(state.next_palette)
-        trace.extend(fixture.checksums(bytes(screen[16:1016])))
-        trace.extend(fixture.checksums(bytes(colour[16:1016])))
+        screen_bytes, colour_bytes = bytes(screen[16:1016]), bytes(colour[16:1016])
+        trace.extend(c_checksums(screen_bytes))
+        trace.extend(c_checksums(colour_bytes))
         trace.append(int(guards))
+        if step in (0, 4, 84, 105):
+          for name, cells, blank, offset in (("screen", screen_bytes, 32, 17),
+                                             ("colour", colour_bytes, 0, 21)):
+            with self.subTest(step=step, surface=name):
+              # All affected cells fit: this moves the actual scene writes,
+              # including stale colours, 16 cells without discarding any.
+              self.assertEqual(cells[-16:], bytes([blank]) * 16)
+              shifted = cells[-16:] + cells[:-16]
+              original, moved = c_checksums(cells), c_checksums(shifted)
+              self.assertEqual(original[:2], moved[:2])
+              if step == 0:
+                self.assertEqual(old_rolling(cells), old_rolling(shifted))
+              self.assertNotEqual(original[2:], moved[2:])
+              damaged = bytearray(fixture.expected_trace())
+              start = step * fixture.RECORD_SIZE + offset
+              damaged[start:start + 4] = moved
+              with self.assertRaisesRegex(ValueError, f"trace step {step}, byte"):
+                fixture.validate_trace(bytes(damaged))
       fixture.validate_trace(bytes(trace))
 
 
