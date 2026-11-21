@@ -47,6 +47,30 @@ def stream(records):
   return frames
 
 
+class FakeVideoLibrary:
+  """Exercise the real fixture callback without loading a libretro core."""
+  def __init__(self, core, observations):
+    self.observations = iter(observations)
+    self.callback = harness.controls.libretro.VIDEO_CB(core._video)
+    self.calls = 0
+
+  def retro_run(self):
+    self.calls += 1
+    for image in next(self.observations):
+      if image is None:
+        self.callback(None, harness.WIDTH, harness.HEIGHT, harness.WIDTH * 2)
+      else:
+        buf = ctypes.create_string_buffer(image, len(image))
+        self.callback(ctypes.addressof(buf), harness.WIDTH, harness.HEIGHT, harness.WIDTH * 2)
+
+
+def fake_video_core(observations):
+  core = harness.FixtureCore.__new__(harness.FixtureCore)
+  core.pixel_format = harness.controls.libretro.PIXEL_RGB565
+  core.lib = FakeVideoLibrary(core, observations)
+  return core
+
+
 class FixtureTests(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
@@ -159,6 +183,44 @@ class FixtureTests(unittest.TestCase):
     del frames[3:5]
     with self.assertRaisesRegex(AssertionError, "out-of-order"):
       self.check_frames(frames)
+
+  def test_only_identical_latest_record_may_repeat(self):
+    frames = stream(self.records)
+    latest = frames[1]
+    self.assertTrue(self.check_frames(frames[:3] + [latest, latest] + frames[3:]).done)
+    for offset, pixel in ((24 * 2, 0), (harness.HEADER * 2, 3)):
+      damaged = bytearray(latest)
+      damaged[offset:offset + 2] = ENCODED[pixel]
+      with self.subTest(offset=offset):
+        self.assertNotEqual(bytes(damaged), latest)
+        with self.assertRaisesRegex(AssertionError, "corrupt repeated record"):
+          self.check_frames(frames[:3] + [bytes(damaged)] * 2 + frames[3:])
+    with self.assertRaisesRegex(AssertionError, "out-of-order"):
+      self.check_frames(frames[:5] + [latest, latest] + frames[5:])
+
+  def test_fresh_video_callbacks_and_stability(self):
+    image = stream(self.records)[1]
+    for missing in ([None], [], [None, image]):
+      with self.subTest(missing=missing == [], mixed=len(missing) > 1):
+        core = fake_video_core([[image], missing, [image], [image]])
+        collector = harness.Collector()
+        for expected in (0, 0, 0, 1):
+          core.run_frame()
+          collector.feed(core.pixels())
+          self.assertEqual(collector.index, expected)
+        self.assertEqual(core.lib.calls, 4)
+
+  def test_fresh_callbacks_complete_trace_and_missing_callbacks_time_out(self):
+    frames = stream(self.records)
+    core = fake_video_core([[image] for image in frames])
+    harness.consume(core, len(frames))
+    self.assertEqual(core.lib.calls, len(frames))
+    for missing in ([None], []):
+      with self.subTest(missing=missing == []):
+        core = fake_video_core([[frames[1]], missing, [frames[1]], missing, [frames[1]]])
+        with self.assertRaisesRegex(AssertionError, r"within 5 libretro frames \(accepted 0/39 chunks\)"):
+          harness.consume(core, 5)
+        self.assertEqual(core.lib.calls, 5)
 
   def test_rejects_truncated_frame_and_corrupt_transport(self):
     frames = stream(self.records)

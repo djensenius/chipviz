@@ -59,9 +59,12 @@ Page 1 is the render destination; page 0 carries the trace in three chunks
 per checkpoint (two raw page chunks and one palette chunk). The global hardware
 palette encodes byte values as RGB565 transport colors, **not displayed scene
 colors**. Headers are invalidated during copying; the harness requires two
-identical frames per ordered chunk and a completion record. A missing, corrupt
-or incomplete trace, or a timeout, is a failure, not a successful comparison.
-The libretro core must expose 240x160 RGB565 frames.
+identical fresh non-NULL observations on consecutive libretro runs per ordered
+chunk and a completion record. A run with a NULL or absent video callback
+resets stability and counts toward the timeout. Only a byte-identical repeat of
+the latest accepted chunk is allowed; older replays and corrupt repeats fail.
+A missing, corrupt or incomplete trace, or a timeout, is a failure, not a
+successful comparison. The libretro core must expose 240x160 RGB565 frames.
 
 With a C99 compiler, from the repository root, the focused host checks are:
 

@@ -6,6 +6,10 @@ import pathlib
 import struct
 import sys
 
+ROOT = pathlib.Path(__file__).resolve().parents[5]
+sys.path.insert(0, str(ROOT / "scripts"))
+import gba_native_controls_test as controls
+
 WIDTH, HEIGHT = 240, 160
 PAGE = WIDTH * HEIGHT
 HEADER = 32
@@ -106,10 +110,13 @@ class Collector:
     self.expected = oracle_events()
     self.index = 0
     self.previous = None
-    self.seen = set()
+    self.last_key = self.last_frame = None
     self.done = False
 
   def feed(self, frame):
+    if frame is None:
+      self.previous = None
+      return
     if len(frame) != PAGE * 2:
       raise AssertionError("expected 240x160 RGB565 frame")
     try:
@@ -124,7 +131,9 @@ class Collector:
       self.previous = frame
       return
     key = header[5], header[6]
-    if key in self.seen:
+    if key == self.last_key:
+      if frame != self.last_frame:
+        raise AssertionError(f"corrupt repeated record: {key}")
       return
     event, chunk = divmod(self.index, 3)
     if event == EVENTS:
@@ -132,7 +141,7 @@ class Collector:
       if header != expected:
         raise AssertionError("missing or malformed completion record")
       self.done = True
-      self.seen.add(key)
+      self.last_key, self.last_frame = key, frame
       return
     if key != (event, chunk):
       raise AssertionError(f"missing or out-of-order record: expected {(event, chunk)}, got {key}")
@@ -147,7 +156,24 @@ class Collector:
       offset = next(i for i, (a, b) in enumerate(zip(body, expected_body)) if a != b)
       raise AssertionError(f"page/palette mismatch at event {event} chunk {chunk} byte {offset}")
     self.index += 1
-    self.seen.add(key)
+    self.last_key, self.last_frame = key, frame
+
+
+class FixtureCore(controls.GbaCore):
+  def run_frame(self, buttons=()):
+    self.video_fresh = False
+    self.video_null = False
+    super().run_frame(buttons)
+
+  def _video(self, data, width, height, pitch):
+    if data:
+      super()._video(data, width, height, pitch)
+      self.video_fresh = True
+    else:
+      self.video_null = True
+
+  def pixels(self):
+    return super().pixels() if self.video_fresh and not self.video_null else None
 
 
 def consume(core, max_frames):
@@ -171,14 +197,6 @@ def main():
   args = parser.parse_args()
   if args.max_frames <= 0:
     parser.error("--max-frames must be positive")
-  root = pathlib.Path(__file__).resolve().parents[5]
-  sys.path.insert(0, str(root / "scripts"))
-  import gba_native_controls_test as controls
-
-  class FixtureCore(controls.GbaCore):
-    def pixels(self):
-      return super().pixels() if hasattr(self, "raw") else bytes(PAGE * 2)
-
   core = FixtureCore(args.rom, args.core)
   try:
     consume(core, args.max_frames)
