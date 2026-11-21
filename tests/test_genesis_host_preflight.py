@@ -156,6 +156,44 @@ class PreflightTests(unittest.TestCase):
         preflight.collect(fake)
       self.assertNotIn(("response",), fake.calls)
 
+  def test_peer_failure_categories_are_sanitized_and_fail_closed(self):
+    cases = (
+      (OSError("secret-password /private/path"), "credentials unavailable"),
+      ((123,), "credentials unavailable"),
+      ((123, 1000, 0), "non-root"),
+      ((1, 1000, 0), "non-root"),
+      ((1, 0, 0), "root init-process candidate"),
+      ((124, 0, 0), "other root mismatch"),
+    )
+    for peer, reason in cases:
+      fake = FakeHost()
+      fake.peer = mock.Mock(side_effect=peer) if isinstance(peer, Exception) else mock.Mock(return_value=peer)
+      with self.subTest(reason=reason, peer_type=type(peer)), \
+           mock.patch.object(preflight, "Host", return_value=fake):
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+          self.assertEqual(preflight.main(), 1)
+        self.assertEqual(output.getvalue(), (
+          "host metadata: UNAVAILABLE\n"
+          "failure stage: socket peer\n"
+          f"peer failure: {reason}\n"
+          "builder isolation: UNVERIFIED\n"
+          "mount isolation: UNVERIFIED\n"
+          "toolchain builds authorized: NO\n"
+        ))
+        self.assertEqual(error.getvalue(), "")
+        fake.peer.assert_called_once()
+        self.assertEqual(fake.calls.count(("snapshot",)), 1)
+        self.assertNotIn(("response",), fake.calls)
+
+  def test_matching_init_process_peer_keeps_existing_guard_behavior(self):
+    fake = FakeHost()
+    fake.snapshots = [(1, *SNAPSHOT[1:])] * 3
+    fake.peer_info = (1, 0, 0)
+    self.assertEqual(preflight.collect(fake), "28.0.4")
+    self.assertEqual(fake.calls.count(("snapshot",)), 3)
+    self.assertEqual(fake.calls.count(("response",)), 1)
+
   def test_service_or_socket_changes_after_response_fail_closed(self):
     fake = FakeHost()
     fake.snapshots[-1] = (124, *SNAPSHOT[1:])
@@ -361,11 +399,13 @@ class PreflightTests(unittest.TestCase):
     ))
 
   def test_interruption_output_is_sanitized(self):
-    for location in ("constructor", "environment", "response"):
+    for location in ("constructor", "environment", "peer", "response"):
       fake = FakeHost()
       interruption = KeyboardInterrupt("secret-password /private/path")
       if location == "environment":
         fake.environment = mock.Mock(side_effect=interruption)
+      elif location == "peer":
+        fake.peer = mock.Mock(side_effect=interruption)
       elif location == "response":
         fake.response = mock.Mock(side_effect=interruption)
       host = (mock.patch.object(preflight, "Host", side_effect=interruption)
@@ -385,6 +425,9 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(error.getvalue(), "")
         if location == "response":
           fake.response.assert_called_once()
+        elif location == "peer":
+          fake.peer.assert_called_once()
+          self.assertNotIn(("response",), fake.calls)
         else:
           self.assertNotIn(("connect",), fake.calls)
           self.assertNotIn(("response",), fake.calls)
@@ -407,9 +450,6 @@ class PreflightTests(unittest.TestCase):
     fake = FakeHost()
     fake.connect = mock.Mock(side_effect=OSError(sensitive))
     cases.append(("socket connect", fake))
-    fake = FakeHost()
-    fake.peer_info = (1, 0, 0)
-    cases.append(("socket peer", fake))
     fake = FakeHost()
     fake.snapshots[1] = (123, 10, 21, 0o140660, 0, 999, "42")
     cases.append(("socket recheck", fake))
@@ -450,6 +490,16 @@ class PreflightTests(unittest.TestCase):
       self.assertIn("failure stage: internal\n", output.getvalue())
       self.assertNotIn("secret-password", output.getvalue())
       self.assertNotIn("/private/path", output.getvalue())
+
+  def test_unknown_peer_category_is_not_printed(self):
+    error = preflight.PeerError("secret-password /private/path")
+    with mock.patch.object(preflight, "Host", side_effect=error):
+      with contextlib.redirect_stdout(io.StringIO()) as output:
+        self.assertEqual(preflight.main(), 1)
+    self.assertIn("failure stage: socket peer\n", output.getvalue())
+    self.assertNotIn("peer failure:", output.getvalue())
+    self.assertNotIn("secret-password", output.getvalue())
+    self.assertNotIn("/private/path", output.getvalue())
 
   def test_response_sends_only_one_fixed_request(self):
     class FakeSocket:

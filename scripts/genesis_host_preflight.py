@@ -32,11 +32,21 @@ STAGES = frozenset((
   "resource recheck", "internal",
 ))
 
+PEER_FAILURES = frozenset((
+  "credentials unavailable", "non-root", "root init-process candidate", "other root mismatch",
+))
+
 
 class StageError(Rejected):
   def __init__(self, stage):
     self.stage = stage if isinstance(stage, str) and stage in STAGES else "internal"
     super().__init__()
+
+
+class PeerError(StageError):
+  def __init__(self, reason):
+    self.reason = reason if isinstance(reason, str) and reason in PEER_FAILURES else None
+    super().__init__("socket peer")
 
 
 @contextlib.contextmanager
@@ -230,8 +240,16 @@ def collect(host):
   with check_stage("socket connect"):
     with host.connect() as client:
       with check_stage("socket peer"):
-        pid, uid, _gid = host.peer(client)
-        require(uid == 0 and pid == before[0])
+        try:
+          pid, uid, _gid = host.peer(client)
+        except Exception:
+          raise PeerError("credentials unavailable") from None
+        if not (uid == 0 and pid == before[0]):
+          if uid != 0:
+            raise PeerError("non-root")
+          if pid == 1:
+            raise PeerError("root init-process candidate")
+          raise PeerError("other root mismatch")
       with check_stage("socket recheck"):
         require(host.snapshot() == before)
       with check_stage("daemon response"):
@@ -252,6 +270,9 @@ def main():
     print("host metadata: UNAVAILABLE")
     stage = getattr(error, "stage", None) if isinstance(error, StageError) else None
     print("failure stage: " + (stage if isinstance(stage, str) and stage in STAGES else "internal"))
+    reason = getattr(error, "reason", None) if isinstance(error, PeerError) else None
+    if isinstance(reason, str) and reason in PEER_FAILURES:
+      print("peer failure: " + reason)
     result = 1
   else:
     print("host metadata: COLLECTED")

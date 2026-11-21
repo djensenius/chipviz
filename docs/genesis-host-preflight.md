@@ -27,6 +27,8 @@ runner would otherwise be usable. The response has bounded framing, size and
 time, and only fixed allowlisted fields are printed. On failure, a fixed
 allowlisted stage identifies the failed gate without printing its values,
 paths, raw errors or response; it does not necessarily establish a root cause.
+Peer failures also get a fixed category. An init-process candidate is only a
+possible activation explanation, not proof of listener identity or isolation.
 
 The 5 GiB free-space threshold on `/` and the expected daemon root is merely
 a preflight minimum, not a proven build budget. A GitHub-hosted job is a fresh
