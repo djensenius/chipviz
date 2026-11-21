@@ -1,3 +1,6 @@
+import contextlib
+import importlib.util
+import io
 import os
 import pathlib
 import shutil
@@ -8,18 +11,25 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/package-macos-arm64.py"
+SPEC = importlib.util.spec_from_file_location("package_macos_arm64", SCRIPT)
+PACKAGE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PACKAGE)
 
 
-def build_version(platform: int = 1) -> bytes:
-  return struct.pack("<6I", 0x32, 24, platform, 0x000b0000, 0, 0)
+def build_version(platform: int = 1, *, version: int = 0x000b0000,
+                  sdk: int = 0, tools: bytes = b"") -> bytes:
+  return struct.pack("<6I", 0x32, 24 + len(tools), platform, version, sdk,
+                     len(tools) // 8) + tools
 
 
-def legacy_version(command: int = 0x24) -> bytes:
-  return struct.pack("<4I", command, 16, 0x000b0000, 0)
+def legacy_version(command: int = 0x24, *, version: int = 0x000b0000,
+                   sdk: int = 0) -> bytes:
+  return struct.pack("<4I", command, 16, version, sdk)
 
 
 def macho(commands: bytes, *, cpu: int = 0x0100000c, kind: int = 2,
@@ -49,6 +59,7 @@ class MacosArm64PackagingTests(unittest.TestCase):
       path.write_bytes(contents)
     self.binary = self.root / "renderer"
     self.binary.write_bytes(macho(build_version()))
+    self.binary.chmod(0o755)
     self.base = self.root / "build/macos-arm64"
     self.output_dir = self.base / "fresh"
     self.output_dir.mkdir(parents=True, mode=0o700)
@@ -95,14 +106,172 @@ class MacosArm64PackagingTests(unittest.TestCase):
     self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
 
   def test_valid_platform_declarations(self) -> None:
-    for command in (build_version(), legacy_version(),
-                    build_version() + legacy_version()):
-      with self.subTest(command=command):
-        self.binary.write_bytes(macho(command, count=2 if len(command) == 40 else 1))
+    for commands in ((build_version(),), (legacy_version(),),
+                     (build_version(), legacy_version()),
+                     (legacy_version(), legacy_version()),
+                     (build_version(), build_version()),
+                     (build_version(tools=struct.pack("<2I", 1, 0x10000)),
+                      build_version(tools=struct.pack("<2I", 1, 0x10000)))):
+      with self.subTest(commands=commands):
+        self.binary.write_bytes(macho(b"".join(commands), count=len(commands)))
         result = self.run_package()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.output.unlink()
 
+  def test_conflicting_platform_declarations(self) -> None:
+    for commands in (
+      (build_version(), build_version(version=0x000c0000)),
+      (legacy_version(), legacy_version(version=0x000c0000)),
+      (legacy_version(), build_version(version=0x000c0000)),
+      (build_version(), legacy_version(sdk=0x000d0000)),
+      (build_version(), build_version(sdk=0x000d0000)),
+      (build_version(tools=struct.pack("<2I", 1, 1)),
+       build_version(tools=struct.pack("<2I", 1, 2))),
+      (build_version(), build_version(2)),
+    ):
+      with self.subTest(commands=commands):
+        self.assert_rejected(macho(b"".join(commands), count=len(commands)))
+
+  def test_binary_permissions_are_preserved_and_unsafe_modes_rejected(self) -> None:
+    for mode in (0o700, 0o750, 0o755):
+      with self.subTest(mode=oct(mode)):
+        self.binary.chmod(mode)
+        result = self.run_package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with zipfile.ZipFile(self.output) as archive:
+          self.assertEqual(archive.getinfo("chipviz-m1").external_attr >> 16,
+                           stat.S_IFREG | mode)
+        self.output.unlink()
+    for mode in (0o600, 0o644, 0o4755, 0o2755, 0o1755):
+      with self.subTest(mode=oct(mode)):
+        self.binary.chmod(mode)
+        self.assertEqual(stat.S_IMODE(self.binary.stat().st_mode), mode)
+        result = self.run_package()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.output.exists())
+
+  def test_snapshot_is_validated_and_archived_even_if_source_changes_afterward(self) -> None:
+    original = self.binary.read_bytes()
+    copy = shutil.copyfileobj
+    mutated = False
+
+    def mutate_then_copy(source, destination, length=0):
+      nonlocal mutated
+      if not mutated:
+        self.binary.write_bytes(b"not a Mach-O")
+        mutated = True
+      return copy(source, destination, length)
+
+    with mock.patch.object(PACKAGE.shutil, "copyfileobj", side_effect=mutate_then_copy):
+      PACKAGE.create_package(self.binary, self.output, root=self.root)
+    self.assertTrue(mutated)
+    with zipfile.ZipFile(self.output) as archive:
+      self.assertEqual(archive.read("chipviz-m1"), original)
+    self.assertEqual(self.binary.read_bytes(), b"not a Mach-O")
+
+  def test_source_change_during_snapshot_is_rejected(self) -> None:
+    original = macho(build_version()) + b"x" * (128 * 1024)
+    for replacement in (b"changed", b"y" * len(original)):
+      with self.subTest(same_size=len(replacement) == len(original)):
+        self.binary.write_bytes(original)
+        with self.binary.open("rb") as source, tempfile.TemporaryFile() as snapshot:
+          reader = mock.Mock(wraps=source)
+          mutated = False
+
+          def read_and_mutate(length):
+            nonlocal mutated
+            data = source.read(length)
+            if not mutated:
+              self.binary.write_bytes(replacement)
+              mutated = True
+            return data
+
+          reader.read.side_effect = read_and_mutate
+          with self.assertRaisesRegex(PACKAGE.PackageError, "changed while taking snapshot"):
+            PACKAGE.snapshot_binary(reader, snapshot)
+    self.assertFalse(self.output.exists())
+
+  def test_oversized_binary_is_rejected_before_copying(self) -> None:
+    with self.binary.open("r+b") as source:
+      source.truncate(4 * 1024 * 1024 * 1024 + 1)
+    result = self.run_package()
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    self.assertIn("4 GiB snapshot limit", result.stderr)
+    self.assertFalse(self.output.exists())
+
+  def test_renamed_output_directory_is_detected_before_and_after_creation(self) -> None:
+    moved = self.base / "moved"
+    original_listdir = os.listdir
+
+    def replace_before_create(fd):
+      result = original_listdir(fd)
+      self.output_dir.rename(moved)
+      self.output_dir.mkdir(mode=0o700)
+      (self.output_dir / "sentinel").write_bytes(b"replacement")
+      return result
+
+    with mock.patch.object(PACKAGE.os, "listdir", side_effect=replace_before_create):
+      with self.assertRaisesRegex(PACKAGE.PackageError, "directory changed"):
+        PACKAGE.create_package(self.binary, self.output, root=self.root)
+    self.assertEqual((self.output_dir / "sentinel").read_bytes(), b"replacement")
+    self.assertEqual(list(moved.iterdir()), [])
+    (self.output_dir / "sentinel").unlink()
+    self.output_dir.rmdir()
+    moved.rename(self.output_dir)
+
+    copy = shutil.copyfileobj
+    replaced = False
+
+    def replace_during_copy(source, destination, length=0):
+      nonlocal replaced
+      if not replaced:
+        self.output_dir.rename(moved)
+        self.output_dir.mkdir(mode=0o700)
+        (self.output_dir / "sentinel").write_bytes(b"replacement")
+        replaced = True
+      return copy(source, destination, length)
+
+    with contextlib.redirect_stderr(io.StringIO()), \
+         mock.patch.object(PACKAGE.shutil, "copyfileobj", side_effect=replace_during_copy):
+      with self.assertRaisesRegex(PACKAGE.PackageError, "directory changed"):
+        PACKAGE.create_package(self.binary, self.output, root=self.root)
+    self.assertTrue(replaced)
+    self.assertEqual((self.output_dir / "sentinel").read_bytes(), b"replacement")
+    self.assertTrue((moved / "local.zip").is_file())
+    self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+    self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
+
+  def test_replaced_archive_and_partial_write_are_not_removed(self) -> None:
+    copy = shutil.copyfileobj
+    replaced = False
+    moved = self.output_dir / "moved.zip"
+
+    def replace_archive(source, destination, length=0):
+      nonlocal replaced
+      if not replaced:
+        self.output.rename(moved)
+        self.output.write_bytes(b"replacement")
+        replaced = True
+      return copy(source, destination, length)
+
+    with contextlib.redirect_stderr(io.StringIO()), \
+         mock.patch.object(PACKAGE.shutil, "copyfileobj", side_effect=replace_archive):
+      with self.assertRaisesRegex(PACKAGE.PackageError, "archive changed"):
+        PACKAGE.create_package(self.binary, self.output, root=self.root)
+    self.assertEqual(self.output.read_bytes(), b"replacement")
+    self.assertTrue(moved.is_file())
+    self.output.unlink()
+    moved.unlink()
+
+    def fail_copy(source, destination, length=0):
+      destination.write(b"partial")
+      raise OSError("injected write failure")
+
+    with contextlib.redirect_stderr(io.StringIO()), \
+         mock.patch.object(PACKAGE.shutil, "copyfileobj", side_effect=fail_copy):
+      with self.assertRaisesRegex(OSError, "injected write failure"):
+        PACKAGE.create_package(self.binary, self.output, root=self.root)
+    self.assertTrue(self.output.is_file())
   def test_rejects_wrong_platform_architecture_type_and_endian(self) -> None:
     fixtures = (
       macho(build_version(2)), macho(build_version(7)),
