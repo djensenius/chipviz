@@ -77,6 +77,74 @@ fn world_point(point: GridPoint) -> Point {
     point.map(|coordinate| coordinate as f32 * HALF_WIDTH)
 }
 
+// Fixed markings live on the branch surfaces, not on the camera. The two
+// sides have different floor guides, the approach has an asymmetric rail,
+// and the vertical branches have different wall structures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Branch {
+    Left,
+    Right,
+    Forward,
+    Back,
+    Up,
+    Down,
+}
+
+fn world_details() -> &'static [(Branch, [Point; 2])] {
+    static DETAILS: OnceLock<Vec<(Branch, [Point; 2])>> = OnceLock::new();
+    DETAILS.get_or_init(|| {
+        let mut details = Vec::new();
+        let mut add = |branch, a, b| details.push((branch, [a, b]));
+        let floor = -HALF_WIDTH + 0.01;
+        // Left: a pair of floor rails with closely spaced crosspieces.
+        for z in [-0.48, 0.48] {
+            add(Branch::Left, [-1.4, floor, z], [-10.8, floor, z]);
+        }
+        for i in 0..10 {
+            let x = -2.0 - i as f32 * 0.85;
+            add(Branch::Left, [x, floor, -0.48], [x, floor, 0.48]);
+        }
+        // Right: a center guide and repeated V-shaped floor inlays.
+        add(Branch::Right, [1.4, floor, 0.0], [10.8, floor, 0.0]);
+        for i in 0..7 {
+            let x = 1.8 + i as f32 * 1.25;
+            add(Branch::Right, [x, floor, -0.65], [x + 0.55, floor, 0.0]);
+            add(Branch::Right, [x + 0.55, floor, 0.0], [x, floor, 0.65]);
+        }
+        // Matching markings on both z branches, with unequal rail offsets
+        // and occasional short crosspieces, identify the traveled route.
+        for (branch, sign) in [(Branch::Forward, 1.0), (Branch::Back, -1.0)] {
+            for x in [-0.65, 0.30] {
+                add(branch, [x, floor, 1.4 * sign], [x, floor, 10.8 * sign]);
+            }
+            for i in 0..5 {
+                let z = (2.0 + i as f32 * 1.8) * sign;
+                add(branch, [-0.65, floor, z], [0.30, floor, z]);
+            }
+        }
+        // Above: ladder rungs on the back shaft wall.
+        let wall = -HALF_WIDTH + 0.01;
+        for x in [-0.48, 0.48] {
+            add(Branch::Up, [x, 1.4, wall], [x, 10.8, wall]);
+        }
+        for i in 0..10 {
+            let y = 2.0 + i as f32 * 0.85;
+            add(Branch::Up, [-0.48, y, wall], [0.48, y, wall]);
+        }
+        // Below: a zigzag brace on a different shaft wall.
+        let wall = HALF_WIDTH - 0.01;
+        for z in [-0.55, 0.55] {
+            add(Branch::Down, [wall, -1.4, z], [wall, -10.8, z]);
+        }
+        for i in 0..9 {
+            let y = -1.8 - i as f32;
+            let z = if i % 2 == 0 { -0.55 } else { 0.55 };
+            add(Branch::Down, [wall, y, z], [wall, y - 1.0, -z]);
+        }
+        details
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Camera {
     position: Point,
@@ -98,19 +166,23 @@ fn camera(elapsed: f32) -> Camera {
     };
     // Capture windows (seconds modulo 60): forward 2–5, left 10–12,
     // right 18–20, back 26–28, up 34–36, down 42–44. Approach the
-    // junction, drift inside it while looking around, then retrace the same
+    // junction, circle inside it while looking around, then retrace the same
     // corridor. Look cues and the loop seam have zero endpoint velocity.
     let approach = cue(time, 0.0, 10.0) - cue(time, 50.0, 60.0);
-    let drift = (cue(time, 8.0, 10.0) - cue(time, 50.0, 52.0))
-        * ((time - 10.0) * std::f32::consts::TAU / 40.0).sin();
+    let drift = cue(time, 8.0, 10.0) - cue(time, 50.0, 52.0);
+    let (orbit_x, orbit_z) = sin_cos((time - 10.0) * std::f32::consts::TAU / 40.0);
     let left = cue(time, 7.0, 10.0) - cue(time, 12.0, 15.0);
     let right = cue(time, 15.0, 18.0) - cue(time, 20.0, 23.0);
     let back = cue(time, 23.0, 26.0) - cue(time, 28.0, 31.0);
     let up = cue(time, 31.0, 34.0) - cue(time, 36.0, 39.0);
     let down = cue(time, 39.0, 42.0) - cue(time, 44.0, 47.0);
     Camera {
-        position: [0.0, 0.0, -5.0 + 5.0 * approach + 0.25 * drift],
-        yaw: std::f32::consts::FRAC_PI_2 * (right - left) + std::f32::consts::PI * back,
+        position: [
+            0.8 * drift * orbit_x,
+            0.12 * drift,
+            -5.0 + 5.0 * approach + 0.8 * drift * orbit_z,
+        ],
+        yaw: 1.18 * (right - left) + (std::f32::consts::PI - 0.18) * back,
         pitch: 1.15 * (up - down),
     }
 }
@@ -213,6 +285,20 @@ pub(crate) fn project(
             ));
         }
     }
+    for &(_, edge) in world_details() {
+        if let Some((start, end, depth)) = project_edge(edge, camera, aspect) {
+            let fade = (1.0 / (1.0 + depth * 0.055)).clamp(0.2, 1.0);
+            visible.push((
+                depth,
+                ProjectedLine {
+                    start,
+                    end,
+                    width: 0.0045 + 0.001 * bass + 0.0005 * treble,
+                    intensity: (0.62 + 0.16 * energy + 0.08 * treble) * fade,
+                },
+            ));
+        }
+    }
     // Close structure wins tight budgets; stable sorting preserves ties.
     visible.sort_by(|a, b| a.0.total_cmp(&b.0));
     visible
@@ -290,6 +376,12 @@ mod tests {
             assert!((a.pitch - b.pitch).abs() < 0.02);
             assert!(a.position[0].abs() < HALF_WIDTH && a.position[1].abs() < HALF_WIDTH);
             assert!(a.position[2].abs() < (2 * REACH + 1) as f32 * HALF_WIDTH);
+            if a.position[0].abs() > 0.001 {
+                assert!(
+                    a.position[2].abs() < HALF_WIDTH,
+                    "junction orbit at {time}s"
+                );
+            }
             if a.pitch.abs() > 0.0001 {
                 assert!(a.position[2].abs() < HALF_WIDTH, "shaft look at {time}s");
             }
@@ -316,6 +408,89 @@ mod tests {
             assert!(((after.yaw - 2.0 * at.yaw + before.yaw) / 0.01).abs() < 0.05);
             assert!(((after.pitch - 2.0 * at.pitch + before.pitch) / 0.01).abs() < 0.05);
         }
+        // The views are not held at an almost fixed camera point: the camera
+        // travels around the junction throughout the look sequence.
+        for time in 10..50 {
+            assert!(
+                distance(
+                    camera(time as f32).position,
+                    camera(time as f32 + 1.0).position
+                ) > 0.12
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_branch_landmarks_are_distinct_and_visible() {
+        let near = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) < 0.0001;
+        for (branch, start, end) in [
+            (Branch::Forward, 2.0, 5.0),
+            (Branch::Left, 10.0, 12.0),
+            (Branch::Right, 18.0, 20.0),
+            (Branch::Back, 26.0, 28.0),
+            (Branch::Up, 34.0, 36.0),
+            (Branch::Down, 42.0, 44.0),
+        ] {
+            for time in [start, (start + end) * 0.5, end] {
+                let lines = project(time, 16.0 / 9.0, [0.0; 3], 128);
+                let mut count = 0;
+                let mut length = 0.0;
+                for &(_, edge) in world_details().iter().filter(|(kind, _)| {
+                    *kind == branch || (branch == Branch::Forward && *kind == Branch::Back)
+                }) {
+                    if let Some((a, b, _)) = project_edge(edge, camera(time), 16.0 / 9.0)
+                        && lines.iter().any(|line| {
+                            (near(line.start, a) && near(line.end, b))
+                                || (near(line.start, b) && near(line.end, a))
+                        })
+                    {
+                        count += 1;
+                        length += (a[0] - b[0]).hypot(a[1] - b[1]);
+                    }
+                }
+                assert!(
+                    count >= 3 && length > 0.15,
+                    "{branch:?} at {time}s: {count}, {length}"
+                );
+            }
+        }
+        // Unlike a rotated copy of the same tunnel, the two side branches
+        // and the two shafts have different fixed arrangements.
+        let count = |branch| {
+            world_details()
+                .iter()
+                .filter(|(kind, _)| *kind == branch)
+                .count()
+        };
+        assert_ne!(count(Branch::Left), count(Branch::Right));
+        assert_ne!(count(Branch::Up), count(Branch::Down));
+    }
+
+    #[test]
+    fn approach_landmark_remains_visible_on_the_way_back() {
+        let camera_before = camera(4.0);
+        let camera_after = camera(27.0);
+        let visible = |edge, time, camera| {
+            let (a, b, _) = project_edge(edge, camera, 16.0 / 9.0)?;
+            let lines = project(time, 16.0 / 9.0, [0.0; 3], 512);
+            lines
+                .iter()
+                .find(|line| line.start == a && line.end == b)
+                .map(|_| (a, b))
+        };
+        let shared = world_details()
+            .iter()
+            .filter(|(branch, _)| *branch == Branch::Back)
+            .filter_map(|&(_, edge)| {
+                let before = visible(edge, 4.0, camera_before)?;
+                let after = visible(edge, 27.0, camera_after)?;
+                Some((before, after))
+            })
+            .collect::<Vec<_>>();
+        assert!(shared.len() >= 2);
+        assert!(shared.iter().any(|(before, after)| {
+            (before.0[0] - after.0[0]).hypot(before.0[1] - after.0[1]) > 0.05
+        }));
     }
 
     #[test]
