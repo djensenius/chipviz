@@ -14,14 +14,18 @@ static const void *owner;
 static unsigned char trace_read(unsigned int port);
 static void trace_write(unsigned int port, unsigned char value);
 
-int sms_trace_healthy(void) {
+static int healthy(void) {
   return active && *read_slot == trace_read && *write_slot == trace_write &&
          *ratio == (1u << 20) && !lost;
 }
 
+int sms_trace_healthy(const void *token, read_port *rs, write_port *ws) {
+  return sms_trace_owned(token, rs, ws) && healthy();
+}
+
 static struct event *reserve(unsigned int port, uint32_t kind) {
   struct event *event;
-  if (!in_frame || !sms_trace_healthy() || count == limit) {
+  if (!in_frame || !healthy() || count == limit) {
     lost = 1;
     return NULL;
   }
@@ -71,23 +75,29 @@ int sms_trace_install(read_port *rs, write_port *ws, read_port r, write_port w,
   return 0;
 }
 
-int sms_trace_begin(uint32_t number) {
-  if (!sms_trace_healthy() || in_frame) return -1;
+int sms_trace_begin(const void *token, read_port *rs, write_port *ws, uint32_t number) {
+  if (!sms_trace_healthy(token, rs, ws) || in_frame) return -1;
   frame = number;
   in_frame = 1;
   return 0;
 }
 
-int sms_trace_end(void) {
-  if (!active || !in_frame) return -1;
+int sms_trace_end(const void *token, read_port *rs, write_port *ws) {
+  if (!sms_trace_owned(token, rs, ws) || !in_frame) return -1;
   in_frame = 0;
-  return sms_trace_healthy() ? 0 : -1;
+  return healthy() ? 0 : -1;
 }
 
-size_t sms_trace_count(void) { return count; }
-int sms_trace_lost(void) { return lost; }
-int sms_trace_event(size_t index, struct event *out) {
-  if (!active || index >= count || out == NULL) return -1;
+int sms_trace_count(const void *token, read_port *rs, write_port *ws, size_t *out) {
+  if (!sms_trace_healthy(token, rs, ws) || out == NULL) return -1;
+  *out = count;
+  return 0;
+}
+int sms_trace_lost(const void *token, read_port *rs, write_port *ws) {
+  return sms_trace_owned(token, rs, ws) ? lost : -1;
+}
+int sms_trace_event(const void *token, read_port *rs, write_port *ws, size_t index, struct event *out) {
+  if (!sms_trace_healthy(token, rs, ws) || index >= count || out == NULL) return -1;
   *out = events[index];
   return 0;
 }

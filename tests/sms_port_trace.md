@@ -30,7 +30,10 @@ fails and cleanup is interrupted, the original exception normally exposes
 `trace_owner`; call `trace_owner.retry_cleanup()` after the interruption.
 If that attribute is unavailable, inspect `retained_traces()` to identify the
 failed owner. That list also contains healthy active traces: never blindly
-clean up another owner's trace. Do not unload or run a core with unresolved
+clean up another owner's trace. A failed constructor cannot run trace
+operations, even if it acquired native ownership; only retry cleanup.
+Native trace operations also verify the owner token and both slot addresses.
+Do not unload or run a core with unresolved
 ownership. Repeated interruptions can interrupt retries; retry until cleanup
 succeeds. Interrupted frame transitions permanently invalidate the trace:
 do not use its events, and close it to restore hooks.

@@ -79,11 +79,12 @@ class Trace:
     self._invalid = False
     self.last_frame = -1
     _RETAINED[id(self)] = self
-    self.active = True
     try:
       if self._install(read, write, capacity):
         raise RuntimeError("trace installation failed")
+      self.active = True
     except BaseException as error:
+      self.active = False
       if not self._recover(error):
         try:
           error.trace_owner = self
@@ -96,17 +97,17 @@ class Trace:
     shim = self.shim
     shim.sms_trace_install.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_size_t, ctypes.c_void_p]
     shim.sms_trace_install.restype = ctypes.c_int
-    shim.sms_trace_begin.argtypes = [ctypes.c_uint32]
+    shim.sms_trace_begin.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32]
     shim.sms_trace_begin.restype = ctypes.c_int
-    shim.sms_trace_end.argtypes = []
+    shim.sms_trace_end.argtypes = [ctypes.c_void_p] * 3
     shim.sms_trace_end.restype = ctypes.c_int
-    shim.sms_trace_count.argtypes = []
-    shim.sms_trace_count.restype = ctypes.c_size_t
-    shim.sms_trace_lost.argtypes = []
+    shim.sms_trace_count.argtypes = [ctypes.c_void_p] * 3 + [ctypes.POINTER(ctypes.c_size_t)]
+    shim.sms_trace_count.restype = ctypes.c_int
+    shim.sms_trace_lost.argtypes = [ctypes.c_void_p] * 3
     shim.sms_trace_lost.restype = ctypes.c_int
-    shim.sms_trace_healthy.argtypes = []
+    shim.sms_trace_healthy.argtypes = [ctypes.c_void_p] * 3
     shim.sms_trace_healthy.restype = ctypes.c_int
-    shim.sms_trace_event.argtypes = [ctypes.c_size_t, ctypes.POINTER(Event)]
+    shim.sms_trace_event.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_size_t, ctypes.POINTER(Event)]
     shim.sms_trace_event.restype = ctypes.c_int
     shim.sms_trace_owned.argtypes = [ctypes.c_void_p] * 3
     shim.sms_trace_owned.restype = ctypes.c_int
@@ -143,39 +144,49 @@ class Trace:
         pass
       return id(self) not in _RETAINED
 
+  def _require_owner(self):
+    if not self.active:
+      raise RuntimeError("trace is not active")
+    if not self.shim.sms_trace_owned(*self._keys):
+      raise RuntimeError("trace ownership mismatch")
+
   def begin_frame(self, frame):
-    if (not self.active or self.in_frame or self._invalid or not 0 <= frame <= 0xffffffff or
+    self._require_owner()
+    if (self.in_frame or self._invalid or not 0 <= frame <= 0xffffffff or
         (self.last_frame >= 0 and frame != self.last_frame + 1)):
       raise RuntimeError("invalid frame boundary")
     self._invalid = True
-    if self.shim.sms_trace_begin(frame):
+    if self.shim.sms_trace_begin(*self._keys, frame):
       raise RuntimeError("cannot begin frame (trace loss, pointer or cycle ratio mismatch)")
     self.in_frame = True
     self.last_frame = frame
     self._invalid = False
 
   def end_frame(self):
-    if not self.active or not self.in_frame or self._invalid:
+    self._require_owner()
+    if not self.in_frame or self._invalid:
       raise RuntimeError("no active frame")
     self._invalid = True
-    if self.shim.sms_trace_end():
+    if self.shim.sms_trace_end(*self._keys):
       raise RuntimeError("trace loss, pointer or cycle ratio mismatch")
     self.in_frame = False
     self._invalid = False
 
   def events(self):
-    if not self.active:
-      raise RuntimeError("trace unavailable during frame or after close")
-    if not self.shim.sms_trace_healthy():
+    self._require_owner()
+    if not self.shim.sms_trace_healthy(*self._keys):
       raise RuntimeError("trace loss, pointer or cycle ratio mismatch")
     if self._invalid:
       raise RuntimeError("trace loss or interrupted frame transition")
     if self.in_frame:
       raise RuntimeError("trace unavailable during frame or after close")
     result = []
-    for index in range(self.shim.sms_trace_count()):
+    count = ctypes.c_size_t()
+    if self.shim.sms_trace_count(*self._keys, ctypes.byref(count)):
+      raise RuntimeError("trace ownership mismatch")
+    for index in range(count.value):
       event = Event()
-      if self.shim.sms_trace_event(index, ctypes.byref(event)):
+      if self.shim.sms_trace_event(*self._keys, index, ctypes.byref(event)):
         raise RuntimeError("missing trace event")
       result.append(event)
     for previous, current in zip(result, result[1:]):
@@ -184,12 +195,14 @@ class Trace:
     return result
 
   def close(self):
+    if not self.active and id(self) in _RETAINED:
+      raise RuntimeError("trace is not active; retry cleanup")
     if self.active:
       try:
         if not self.shim.sms_trace_owned(*self._keys):
           self.retry_cleanup()
           return
-        healthy = self.shim.sms_trace_healthy()
+        healthy = self.shim.sms_trace_healthy(*self._keys)
         incomplete = self.in_frame or self._invalid
         if self._uninstall():
           raise RuntimeError("port pointer changed while tracing")
@@ -202,6 +215,7 @@ class Trace:
         raise
 
   def __enter__(self):
+    self._require_owner()
     return self
 
   def __exit__(self, exc_type, exc, traceback):

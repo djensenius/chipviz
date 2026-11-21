@@ -57,6 +57,13 @@ class PortTraceTests(unittest.TestCase):
     self.assertEqual(ctypes.c_void_p.in_dll(self.core, "z80_writeport").value,
                      ctypes.cast(self.core.z80_ms_port_w, ctypes.c_void_p).value)
 
+  def assert_failed_trace_unusable(self, failed):
+    for action in (lambda: failed.begin_frame(0), failed.end_frame, failed.events,
+                   failed.__enter__, failed.close):
+      with self.subTest(action=action):
+        with self.assertRaisesRegex(RuntimeError, "not active"):
+          action()
+
   def test_exception_after_native_install_restores(self):
     bind = trace.Trace._bind
     def interrupted_bind(hook):
@@ -161,6 +168,8 @@ class PortTraceTests(unittest.TestCase):
     owner = caught.exception.trace_owner
     self.assertTrue(any("second interruption" in note for note in caught.exception.__notes__))
     self.assertIn(owner, trace.retained_traces())
+    self.assertTrue(owner.shim.sms_trace_owned(*owner._keys))
+    self.assert_failed_trace_unusable(owner)
     owner_ref, core_ref, shim_ref = weakref.ref(owner), weakref.ref(owner.core), weakref.ref(owner.shim)
     del owner, caught
     gc.collect()
@@ -199,12 +208,22 @@ class PortTraceTests(unittest.TestCase):
       failed = caught.exception.trace_owner
       self.assertIn(failed, trace.retained_traces())
       failed.shim.sms_trace_owned = native_query[0]
-      failed.retry_cleanup()
+      self.assertFalse(failed.shim.sms_trace_owned(*failed._keys))
+      try:
+        existing.begin_frame(0)
+        self.core.fake_write(1, 2)
+        self.assert_failed_trace_unusable(failed)
+        existing.end_frame()
+        self.assertEqual([(event.frame, event.port, event.value) for event in existing.events()],
+                         [(0, 1, 2)])
+      finally:
+        failed.retry_cleanup()
       self.assertNotIn(failed, trace.retained_traces())
-      existing.begin_frame(0)
-      self.core.fake_write(1, 2)
+      existing.begin_frame(1)
+      self.core.fake_write(3, 4)
       existing.end_frame()
-      self.assertEqual(len(existing.events()), 1)
+      self.assertEqual([(event.frame, event.port, event.value) for event in existing.events()],
+                       [(0, 1, 2), (1, 3, 4)])
 
   def test_failed_construction_registry_when_exception_rejects_attribute(self):
     class LockedError(Exception):
@@ -344,8 +363,8 @@ class PortTraceTests(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "interrupted"):
       with self.open_trace() as hook:
         native_begin = hook.shim.sms_trace_begin
-        def interrupted(frame):
-          self.assertEqual(native_begin(frame), 0)
+        def interrupted(*args):
+          self.assertEqual(native_begin(*args), 0)
           raise KeyboardInterrupt("after begin")
         with mock.patch.object(hook.shim, "sms_trace_begin", interrupted):
           with self.assertRaisesRegex(KeyboardInterrupt, "after begin"):

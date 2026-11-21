@@ -14,12 +14,12 @@ struct event {
 
 int sms_trace_install(read_port *, write_port *, read_port, write_port,
                       const uint32_t *, const uint32_t *, size_t, const void *);
-int sms_trace_begin(uint32_t frame);
-int sms_trace_end(void);
-size_t sms_trace_count(void);
-int sms_trace_lost(void);
-int sms_trace_healthy(void);
-int sms_trace_event(size_t index, struct event *out);
+int sms_trace_begin(const void *, read_port *, write_port *, uint32_t frame);
+int sms_trace_end(const void *, read_port *, write_port *);
+int sms_trace_count(const void *, read_port *, write_port *, size_t *out);
+int sms_trace_lost(const void *, read_port *, write_port *);
+int sms_trace_healthy(const void *, read_port *, write_port *);
+int sms_trace_event(const void *, read_port *, write_port *, size_t index, struct event *out);
 int sms_trace_owned(const void *, read_port *, write_port *);
 int sms_trace_uninstall(const void *, read_port *, write_port *);
 
