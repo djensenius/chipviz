@@ -371,6 +371,35 @@ class MacosArm64PackagingTests(unittest.TestCase):
       with self.assertRaisesRegex(OSError, "injected write failure"):
         PACKAGE.create_package(self.binary, self.output, root=self.root)
     self.assertTrue(self.output.is_file())
+
+  def test_cli_partial_write_failure_reports_error_without_success(self) -> None:
+    # Inject a failure in the subprocess, then run the real CLI entry point.
+    runner = """
+import runpy, shutil, sys
+script = sys.argv.pop(1)
+sys.argv[0] = script
+def fail_copy(source, destination, length=0):
+  destination.write(b"partial")
+  raise OSError("injected write failure")
+shutil.copyfileobj = fail_copy
+runpy.run_path(script, run_name="__main__")
+"""
+    result = subprocess.run(
+      [sys.executable, "-c", runner, str(self.root / "scripts" / SCRIPT.name),
+       "--binary", str(self.binary), "--output", str(self.output)],
+      cwd=self.root, capture_output=True, text=True, check=False,
+    )
+    self.assertEqual(result.returncode, 1, result.stderr)
+    self.assertEqual(result.stdout, "")
+    self.assertIn("Archive may be incomplete; no files were removed.", result.stderr)
+    self.assertIn("error: injected write failure", result.stderr)
+    self.assertTrue(self.output.is_file())
+    with zipfile.ZipFile(self.output) as archive:
+      self.assertEqual(archive.namelist(), ["chipviz-m1"])
+      self.assertEqual(archive.read("chipviz-m1"), b"partial")
+    self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+    self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
+
   def test_rejects_wrong_platform_architecture_type_and_endian(self) -> None:
     fixtures = (
       macho(build_version(2)), macho(build_version(7)),
