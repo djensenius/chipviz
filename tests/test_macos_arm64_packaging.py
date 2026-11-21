@@ -331,14 +331,24 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     snippet = snippet.split("```sh\n", 1)[1].split("\n```", 1)[0]
     tools = self.root / "fake-tools"
     tools.mkdir()
+    account_home = self.root / "account-home"
+    account_home.mkdir(mode=0o700)
+    cargo_home = account_home / ".cargo"
+    for name in ("index", "cache", "src"):
+      directory = cargo_home / "registry" / name
+      directory.mkdir(parents=True)
+      (directory / "prepopulated").write_bytes(b"fixture")
     mise = tools / "mise"
     # The real CLI runs, while a fake Cargo checks the documented overrides
     # and simulates transient artifact writes without invoking a Rust build.
     mise.write_text(f"""#!{sys.executable}
-import os, pathlib, shutil, sys
+import os, pathlib, pwd, runpy, shutil, sys, types
 args = sys.argv[1:]
 if args[:3] == ["exec", "--", "python"]:
-  os.execv(sys.executable, [sys.executable] + args[3:])
+  pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_dir=os.environ["HOME"])
+  sys.argv = args[3:]
+  runpy.run_path(sys.argv[0], run_name="__main__")
+  sys.exit(0)
 assert args[:3] == ["exec", "--", "cargo"], args
 args = args[3:]
 root = pathlib.Path(os.environ["FAKE_CARGO_DIR"])
@@ -346,9 +356,11 @@ target, intermediate = root / "target", root / "intermediate"
 assert os.environ["CARGO_TARGET_DIR"] == str(target)
 assert os.environ["CARGO_BUILD_TARGET_DIR"] == str(target)
 assert os.environ["CARGO_BUILD_BUILD_DIR"] == str(intermediate)
+assert os.environ["CARGO_HOME"] == os.environ["HOME"] + "/.cargo"
 assert args[:3] == ["--config", "build.build-dir='" + str(intermediate) + "'", "build"], args
 assert args[args.index("--target-dir") + 1] == str(target)
 assert "--locked" in args
+assert "--offline" in args
 protected = pathlib.Path(os.environ["PROTECTED"]).resolve()
 config = pathlib.Path(".cargo/config.toml").read_text()
 assert config == '[build]\\ntarget-dir = "' + str(protected) + '"\\nbuild-dir = "' + str(protected) + '"\\n'
@@ -360,6 +372,12 @@ for path in (target, intermediate):
 probe = intermediate / "transient"
 probe.write_bytes(b"intermediate")
 probe.unlink()
+cache = pathlib.Path(os.environ["CARGO_HOME"]) / "registry/cache/transient"
+if cache.resolve() == protected or protected in cache.resolve().parents:
+  print("PROTECTED MUTATION", file=sys.stderr)
+  sys.exit(91)
+cache.write_bytes(b"cache write")
+cache.unlink()
 binary = target / "aarch64-apple-darwin/release/chipviz-m1"
 binary.parent.mkdir(parents=True)
 shutil.copyfile(os.environ["FAKE_BINARY"], binary)
@@ -385,6 +403,8 @@ print(path)
         env = os.environ.copy()
         env.update({
           "PATH": str(tools) + os.pathsep + env["PATH"],
+          "HOME": str(account_home),
+          "CARGO_HOME": str(protected),
           "CARGO_TARGET_DIR": str(protected),
           "CARGO_BUILD_TARGET_DIR": str(protected),
           "CARGO_BUILD_BUILD_DIR": str(protected),
@@ -403,6 +423,76 @@ print(path)
         self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
         self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
         output.rename(self.root / f"completed-{index}")
+
+    saved = account_home / "saved-cargo"
+    cargo_home.rename(saved)
+    for index, protected in enumerate((self.dist.parent, self.personal.parent)):
+      with self.subTest(unsafe_cargo_home=protected):
+        cargo_home.symlink_to(protected, target_is_directory=True)
+        try:
+          env = os.environ.copy()
+          env.update({"PATH": str(tools) + os.pathsep + env["PATH"],
+                      "HOME": str(account_home), "CARGO_HOME": str(protected),
+                      "FAKE_CARGO_DIR": str(self.root / f"unsafe-cargo-{index}"),
+                      "FAKE_BINARY": str(self.binary), "PROTECTED": str(protected)})
+          result = subprocess.run(["sh", "-c", snippet], cwd=self.root, env=env,
+                                  capture_output=True, text=True, check=False)
+          self.assertNotEqual(result.returncode, 0)
+          self.assertIn("error:", result.stderr)
+          self.assertNotIn("FAKE_CARGO_OK", result.stderr)
+          self.assertNotIn("PROTECTED MUTATION", result.stderr)
+          self.assertFalse((self.root / f"unsafe-cargo-{index}").exists())
+          self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+          self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
+          (self.base / "package").rename(self.root / f"failed-{index}")
+        finally:
+          cargo_home.unlink()
+    saved.rename(cargo_home)
+
+  def test_cargo_home_rejects_wrong_paths_links_and_unpopulated_cache(self) -> None:
+    home = self.root / "account-home"
+    home.mkdir(mode=0o700)
+    cargo_home = home / ".cargo"
+    for name in ("index", "cache", "src"):
+      directory = cargo_home / "registry" / name
+      directory.mkdir(parents=True)
+      (directory / "prepopulated").write_bytes(b"fixture")
+    PACKAGE.check_cargo_home(cargo_home, account_home=home)
+    for path in (self.dist.parent, self.personal.parent, home / ".." / ".cargo"):
+      with self.subTest(path=path):
+        with self.assertRaises(PACKAGE.PackageError):
+          PACKAGE.check_cargo_home(path, account_home=home)
+    cache = cargo_home / "registry/cache"
+    (cache / "prepopulated").unlink()
+    with self.assertRaisesRegex(PACKAGE.PackageError, "prepopulated"):
+      PACKAGE.check_cargo_home(cargo_home, account_home=home)
+    (cache / "prepopulated").write_bytes(b"fixture")
+    for protected in (self.dist.parent, self.personal.parent):
+      with self.subTest(protected=protected):
+        link = cache / "link"
+        link.symlink_to(protected, target_is_directory=True)
+        with self.assertRaises(PACKAGE.PackageError):
+          PACKAGE.check_cargo_home(cargo_home, account_home=home)
+        link.unlink()
+    local = home / "local-file"
+    local.write_bytes(b"fixture")
+    linked = cache / "hardlink"
+    os.link(local, linked)
+    with self.assertRaises(PACKAGE.PackageError):
+      PACKAGE.check_cargo_home(cargo_home, account_home=home)
+    linked.unlink()
+    local.unlink()
+    cargo_home.chmod(0o777)
+    with self.assertRaises(PACKAGE.PackageError):
+      PACKAGE.check_cargo_home(cargo_home, account_home=home)
+    cargo_home.chmod(0o755)
+    saved = home / "saved-cargo"
+    cargo_home.rename(saved)
+    cargo_home.symlink_to(self.dist.parent, target_is_directory=True)
+    with self.assertRaises(OSError):
+      PACKAGE.check_cargo_home(cargo_home, account_home=home)
+    self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+    self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
 
   def test_tmpdir_protected_directories_have_no_transient_writes_or_removals(self) -> None:
     original_open = os.open

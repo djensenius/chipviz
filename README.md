@@ -114,13 +114,16 @@ following symlinks. The build uses a separate fresh directory in macOS's
 set -eu
 checkout=$(pwd -P)
 out_dir="$checkout/build/macos-arm64/package"
+cargo_home="$HOME/.cargo"
 export TMPDIR=/private/tmp
 mise exec -- python scripts/package-macos-arm64.py --prepare-output-dir "$out_dir"
+mise exec -- python scripts/package-macos-arm64.py --check-cargo-home "$cargo_home"
 cargo_dir=$(mktemp -d /private/tmp/chipviz-cargo.XXXXXXXX)
-CARGO_TARGET_DIR="$cargo_dir/target" CARGO_BUILD_TARGET_DIR="$cargo_dir/target" \
+CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$cargo_dir/target" \
+  CARGO_BUILD_TARGET_DIR="$cargo_dir/target" \
   CARGO_BUILD_BUILD_DIR="$cargo_dir/intermediate" mise exec -- cargo \
   --config "build.build-dir='$cargo_dir/intermediate'" build \
-  --target-dir "$cargo_dir/target" --locked \
+  --target-dir "$cargo_dir/target" --locked --offline \
   --manifest-path renderers/modern/Cargo.toml --release \
   --target aarch64-apple-darwin --bin chipviz-m1
 mise exec -- python scripts/package-macos-arm64.py \
@@ -136,8 +139,15 @@ directory; choose a different fresh name on retry. Preparation can leave
 created directories if it fails. The private Cargo directory is not removed
 automatically. Cargo's command-line target and build-directory overrides take
 precedence over their environment and configuration values; the corresponding
-environment variables are also set explicitly. Cargo, wrappers and build
-dependencies are not sandboxed. The packager rejects symlinks, existing targets
+environment variables are also set explicitly. The command ignores inherited
+`CARGO_HOME` and checks the account's own pre-existing `~/.cargo` for unsafe
+links and permissions. Its registry index, cache and sources must already be
+populated in a trusted setup; the check does not prove all locked dependencies
+are present. Cargo's offline resolution fails if required data is unavailable;
+this setup does not populate dependencies, and Cargo may modify the selected
+cache. The check does not inspect tool links inside
+`.cargo/bin`, and Cargo, its configuration, wrappers and build dependencies
+are not sandboxed. The packager rejects symlinks, existing targets
 and unsafe input permissions. It copies the
 owner-executable binary and `LICENSE`, `COMMERCIAL.md`, and
 `THIRD_PARTY_NOTICES/rust.md` into the ZIP. Snapshot limits are 256 MiB for

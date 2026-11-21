@@ -19,6 +19,7 @@ import hashlib
 import io
 import os
 import pathlib
+import pwd
 import shutil
 import stat
 import struct
@@ -246,6 +247,63 @@ def prepare_output_directory(path: pathlib.Path, *, root: pathlib.Path = ROOT) -
   return path
 
 
+def check_cargo_home(path: pathlib.Path, *, account_home: pathlib.Path | None = None) -> None:
+  """Fail closed on unsafe Cargo cache routing; this does not sandbox Cargo."""
+  if account_home is None:
+    account_home = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir)
+  path = absolute_path(path)
+  expected = absolute_path(account_home) / ".cargo"
+  if path != expected or any(part.casefold() in {"dist", "personal-starfield"}
+                             for part in path.parts):
+    raise PackageError("Cargo home must be the account's own ~/.cargo, outside protected paths")
+  fd = open_directory(path)
+  try:
+    def safe(info: os.stat_result) -> bool:
+      return info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o022
+
+      home_fd = open_directory(path.parent)
+      try:
+        if not safe(os.fstat(home_fd)):
+          raise PackageError("account home must be user-owned and not group/world-writable")
+      finally:
+        os.close(home_fd)
+
+    def scan(directory_fd: int, depth: int) -> None:
+      if depth > 64:
+        raise PackageError("Cargo home directory tree is too deep")
+      with os.scandir(directory_fd) as entries:
+        for entry in entries:
+          info = entry.stat(follow_symlinks=False)
+          if not safe(info):
+            raise PackageError(f"unsafe Cargo home ownership or permissions: {entry.name}")
+          if stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(entry.name, DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+              opened = os.fstat(child_fd)
+              if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino) or not safe(opened):
+                raise PackageError(f"Cargo home directory changed: {entry.name}")
+              # Rustup normally puts tool symlinks here; Cargo tools are not sandboxed.
+              if depth != 0 or entry.name != "bin":
+                scan(child_fd, depth + 1)
+            finally:
+              os.close(child_fd)
+          elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise PackageError(f"Cargo home contains a link or non-regular file: {entry.name}")
+
+    if not safe(os.fstat(fd)):
+      raise PackageError("Cargo home must be user-owned and not group/world-writable")
+    scan(fd, 0)
+    for name in ("index", "cache", "src"):
+      cache_fd = open_directory(path / "registry" / name)
+      try:
+        if not os.listdir(cache_fd):
+          raise PackageError(f"Cargo registry {name} must be prepopulated")
+      finally:
+        os.close(cache_fd)
+  finally:
+    os.close(fd)
+
+
 def create_package(binary_path: pathlib.Path, output_path: pathlib.Path,
                    *, root: pathlib.Path = ROOT) -> pathlib.Path:
   """The root parameter is an internal test seam, not a CLI option."""
@@ -310,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
                             help="new archive in an existing empty private directory")
   destinations.add_argument("--prepare-output-dir", type=pathlib.Path,
                             help="create a fresh private directory directly under build/macos-arm64/")
+  destinations.add_argument("--check-cargo-home", type=pathlib.Path,
+                            help="validate the account's prepopulated ~/.cargo for an offline build")
   args = parser.parse_args(argv)
   if bool(args.binary) != bool(args.output):
     parser.error("--binary and --output must be supplied together")
@@ -317,6 +377,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.prepare_output_dir:
       output = prepare_output_directory(args.prepare_output_dir)
       print(f"Created private output directory: {output}")
+      return 0
+    if args.check_cargo_home:
+      check_cargo_home(args.check_cargo_home)
+      print(f"Checked Cargo home: {args.check_cargo_home}")
       return 0
     output = create_package(args.binary, args.output)
   except (PackageError, OSError, zipfile.BadZipFile) as error:
