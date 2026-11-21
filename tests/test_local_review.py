@@ -3,10 +3,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from urllib.parse import urlsplit
@@ -49,8 +52,8 @@ class GalleryTests(unittest.TestCase):
         self.write(self.draft, f"{directory}/provenance.json", json.dumps(metadata).encode())
         return directory
 
-    def serve(self):
-        server = gallery.ReviewServer(self.roots, self.fds[2])
+    def serve(self, **options):
+        server = gallery.ReviewServer(self.roots, self.fds[2], **options)
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         self.addCleanup(thread.join)
@@ -58,13 +61,14 @@ class GalleryTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return server
 
-    def request(self, server, path, method="GET", headers=None):
-        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-        conn.request(method, path, headers=headers or {})
-        response = conn.getresponse()
-        result = response.status, dict(response.getheaders()), response.read()
-        conn.close()
-        return result
+    def request(self, server, path, method="GET", headers=None, timeout=5):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=timeout)
+        try:
+            conn.request(method, path, headers=headers or {})
+            response = conn.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            conn.close()
 
     def catalog(self, server):
         status, _, data = self.request(server, f"/{server.token}/catalog.json")
@@ -123,6 +127,232 @@ class GalleryTests(unittest.TestCase):
         self.assertIn("not human-reviewed", draft["notes"][1])
         readme.write_text("Revision: " + "b" * 40 + "\nRevision: " + "c" * 40, encoding="utf-8")
         self.assertIsNone(gallery.local_catalog(self.roots)[0]["clips"][0]["source_revision"])
+
+    def test_revision_skips_unrelated_readmes_but_not_ambiguity(self):
+        parent = self.root / "modern" / "README.md"
+        nested = self.root / "modern" / "pi5" / "README.md"
+        sibling = nested.with_suffix(".txt")
+        parent.write_text("Revision: " + "b" * 40, encoding="utf-8")
+        nested.write_text("Unrelated capture notes.", encoding="utf-8")
+        self.assertEqual(gallery.source_revision(self.fds[0], self.relative), "b" * 40)
+        sibling.write_text("Source revision: " + "c" * 40, encoding="utf-8")
+        self.assertEqual(gallery.source_revision(self.fds[0], self.relative), "c" * 40)
+        sibling.unlink()
+        nested.write_text("Revision: " + "d" * 40 + "\nSource revision: " + "e" * 40, encoding="utf-8")
+        self.assertIsNone(gallery.source_revision(self.fds[0], self.relative))
+
+    def test_incomplete_request_does_not_block_capability_request(self):
+        started = threading.Event()
+        original = gallery.Handler.handle_one_request
+
+        def mark_started(handler):
+            started.set()
+            return original(handler)
+
+        with mock.patch.object(gallery.Handler, "handle_one_request", mark_started):
+            server = self.serve(header_timeout=5)
+            with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as partial:
+                partial.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1")
+                self.assertTrue(started.wait(2))
+                status, _, _ = self.request(server, f"/{server.token}/", timeout=1)
+                self.assertEqual(status, 200)
+
+    def test_header_deadline_bounds_slow_drip(self):
+        server = self.serve(header_timeout=0.8, io_timeout=2)
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as partial:
+            partial.settimeout(2)
+            started = time.monotonic()
+            partial.sendall(b"G")
+            time.sleep(0.2)
+            partial.sendall(b"E")
+            time.sleep(0.2)
+            partial.sendall(b"T")
+            self.assertEqual(partial.recv(1), b"")
+            self.assertLess(time.monotonic() - started, 1.8)
+        self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
+
+    def test_oversized_request_headers_are_closed(self):
+        server = self.serve()
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as partial:
+            partial.settimeout(2)
+            partial.sendall(b"GET / HTTP/1.1\r\nX-Long: " + b"x" * 65536)
+            try:
+                data = partial.recv(1)
+            except ConnectionResetError:
+                data = b""
+            self.assertEqual(data, b"")
+        self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
+
+    def test_worker_limit_closes_excess_connections_and_recovers(self):
+        started = threading.Event()
+        count_lock = threading.Lock()
+        count = 0
+        original = gallery.Handler.handle_one_request
+
+        def mark_started(handler):
+            nonlocal count
+            with count_lock:
+                count += 1
+                if count == 2:
+                    started.set()
+            return original(handler)
+
+        with mock.patch.object(gallery.Handler, "handle_one_request", mark_started):
+            server = self.serve(max_workers=2, header_timeout=5)
+            held = [socket.create_connection(("127.0.0.1", server.server_port), timeout=2) for _ in range(2)]
+            try:
+                for connection in held:
+                    connection.sendall(b"GET /")
+                self.assertTrue(started.wait(2))
+                with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as excess:
+                    excess.settimeout(2)
+                    self.assertEqual(excess.recv(1), b"")
+            finally:
+                for connection in held:
+                    connection.close()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with server.connections_lock:
+                    if not server.connections:
+                        break
+                time.sleep(0.01)
+            self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
+
+    def test_worker_start_failure_releases_capacity(self):
+        server = self.serve(max_workers=1)
+        with mock.patch.object(gallery.threading.Thread, "start", side_effect=RuntimeError("unavailable")):
+            with self.assertRaises((OSError, http.client.HTTPException)):
+                self.request(server, f"/{server.token}/")
+        self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
+
+    def test_catalog_refresh_is_serialized_and_media_fails_closed(self):
+        server = self.serve()
+        prefix = f"/{server.token}/"
+        clip = self.catalog(server)["clips"][0]
+        entered = threading.Event()
+        release = threading.Event()
+        second_request = threading.Event()
+        second_scan = threading.Event()
+        guard = threading.Lock()
+        original_catalog = gallery.local_catalog
+        original_respond = gallery.Handler.respond
+        scans = 0
+        requests = 0
+        results = []
+
+        def blocked_catalog(roots):
+            nonlocal scans
+            with guard:
+                scans += 1
+                number = scans
+            if number == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise ValueError("test timed out")
+            else:
+                second_scan.set()
+            return original_catalog(roots)
+
+        def mark_request(handler, body):
+            nonlocal requests
+            if handler.path.endswith("/catalog.json"):
+                with guard:
+                    requests += 1
+                    if requests == 2:
+                        second_request.set()
+            return original_respond(handler, body)
+
+        def fetch_catalog():
+            results.append(self.request(server, prefix + "catalog.json")[0])
+
+        with mock.patch.object(gallery, "local_catalog", blocked_catalog), \
+                mock.patch.object(gallery.Handler, "respond", mark_request):
+            first = threading.Thread(target=fetch_catalog)
+            second = threading.Thread(target=fetch_catalog)
+            first.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[0], 404)
+                self.assertEqual(self.request(server, prefix)[0], 200)
+                second.start()
+                self.assertTrue(second_request.wait(2))
+                self.assertFalse(second_scan.wait(0.1))
+            finally:
+                release.set()
+                first.join(5)
+                if second.ident is not None:
+                    second.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertTrue(second_scan.is_set())
+            self.assertEqual(sorted(results), [200, 200])
+        self.assertEqual(self.request(server, prefix + "media/" + clip["id"])[2], b"0123456789")
+
+    def test_shutdown_waits_for_catalog_worker_before_closing_roots(self):
+        server = self.serve()
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        scanned = threading.Event()
+        expected_identity = gallery.directory_identity(self.fds[0])
+        original = gallery.local_catalog
+
+        def blocked_catalog(roots):
+            entered.set()
+            if not release.wait(5):
+                raise ValueError("test timed out")
+            catalog = original(roots)
+            scanned.set()
+            return catalog
+
+        def fetch():
+            try:
+                self.request(server, f"/{server.token}/catalog.json")
+            except (OSError, http.client.HTTPException):
+                pass
+
+        def close_server():
+            server.server_close()
+            closed.set()
+
+        with mock.patch.object(gallery, "local_catalog", blocked_catalog):
+            client = threading.Thread(target=fetch)
+            client.start()
+            closer = None
+            try:
+                self.assertTrue(entered.wait(2))
+                server.shutdown()
+                closer = threading.Thread(target=close_server)
+                closer.start()
+                self.assertFalse(closed.wait(0.1))
+            finally:
+                release.set()
+                client.join(5)
+                if closer is not None:
+                    closer.join(5)
+            self.assertTrue(closed.is_set())
+            self.assertTrue(scanned.is_set())
+            self.assertFalse(client.is_alive())
+            self.assertEqual(gallery.directory_identity(self.fds[0]), expected_identity)
+
+    def test_shutdown_interrupts_incomplete_connections(self):
+        started = threading.Event()
+        original = gallery.Handler.handle_one_request
+
+        def mark_started(handler):
+            started.set()
+            return original(handler)
+
+        with mock.patch.object(gallery.Handler, "handle_one_request", mark_started):
+            server = self.serve(header_timeout=10)
+            with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as partial:
+                partial.sendall(b"GET /")
+                self.assertTrue(started.wait(2))
+                server.shutdown()
+                closer = threading.Thread(target=server.server_close)
+                closer.start()
+                closer.join(2)
+                self.assertFalse(closer.is_alive())
 
     def test_capability_host_paths_symlinks_and_headers(self):
         outside = self.base / "outside.mp4"
@@ -206,6 +436,31 @@ class GalleryTests(unittest.TestCase):
         finally:
             process.terminate()
             process.communicate(timeout=5)
+
+    def test_command_line_interrupt_closes_active_connection(self):
+        process = subprocess.Popen(
+            [sys.executable, str(Path(gallery.__file__)), "--root", str(self.root)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        try:
+            url = urlsplit(process.stdout.readline().strip())
+            with socket.create_connection((url.hostname, url.port), timeout=2) as partial:
+                partial.sendall(b"GET /")
+                conn = http.client.HTTPConnection(url.hostname, url.port, timeout=2)
+                try:
+                    conn.request("GET", url.path)
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                finally:
+                    conn.close()
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=3)
+                self.assertEqual((process.returncode, stdout, stderr), (0, "", ""))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=5)
 
     def test_command_line_rejects_overlapping_roots(self):
         nested_library = self.root / "nested"

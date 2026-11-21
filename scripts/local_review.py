@@ -4,12 +4,17 @@
 import argparse
 import errno
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import signal
+import socket
 import stat
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -121,7 +126,8 @@ def source_revision(root_fd, relative):
                 r"[ \t]*:[ \t]*(?:`([0-9a-f]{40})`|([0-9a-f]{40}))(?=[.\s]|$)", text
             )
             revisions = {(first or second).lower() for first, second in matches}
-            return revisions.pop() if len(revisions) == 1 else None
+            if revisions:
+                return revisions.pop() if len(revisions) == 1 else None
     return None
 
 
@@ -252,18 +258,126 @@ def directory_contains(ancestor_fd, child_fd):
         os.close(fd)
 
 
+class HeaderReader(io.RawIOBase):
+    """Bound the entire request header, including clients that send slowly."""
+    def __init__(self, connection, timeout, io_timeout):
+        super().__init__()
+        self.connection = connection
+        self.deadline = time.monotonic() + timeout
+        self.io_timeout = io_timeout
+        self.remaining = 65536
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if self.deadline is None:
+            return self.connection.recv_into(buffer)
+        remaining_time = self.deadline - time.monotonic()
+        if remaining_time <= 0:
+            raise TimeoutError("request header deadline")
+        if self.remaining == 0:
+            raise OSError("request headers too large")
+        self.connection.settimeout(min(self.io_timeout, remaining_time))
+        count = self.connection.recv_into(memoryview(buffer)[:self.remaining])
+        self.remaining -= count
+        return count
+
+    def finish_headers(self):
+        self.deadline = None
+        self.connection.settimeout(self.io_timeout)
+
+
 class ReviewServer(HTTPServer):
-    def __init__(self, roots, site_fd, port=0):
+    def __init__(self, roots, site_fd, port=0, max_workers=16, header_timeout=5, io_timeout=10):
         self.roots, self.site_fd = roots, site_fd
         self.media = {}
+        self.media_lock = threading.Lock()
+        self.catalog_lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(max_workers)
+        self.connections_lock = threading.Condition()
+        self.connections = set()
+        self.closing = threading.Event()
+        self.header_timeout, self.io_timeout = header_timeout, io_timeout
         self.token = secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), Handler)
+
+    def process_request(self, request, client_address):
+        # A Ctrl-C between registering a connection and starting its worker
+        # must not leave an unowned slot or release FDs while that worker runs.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        try:
+            self.start_request(request, client_address)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    def start_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        with self.connections_lock:
+            if self.closing.is_set():
+                self.slots.release()
+                self.shutdown_request(request)
+                return
+            self.connections.add(request)
+        try:
+            threading.Thread(target=self.process_request_thread, args=(request, client_address)).start()
+        except BaseException:
+            try:
+                self.shutdown_request(request)
+            finally:
+                with self.connections_lock:
+                    self.connections.discard(request)
+                    self.slots.release()
+                    self.connections_lock.notify_all()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            try:
+                self.shutdown_request(request)
+            finally:
+                with self.connections_lock:
+                    self.connections.discard(request)
+                    self.slots.release()
+                    self.connections_lock.notify_all()
+
+    def server_close(self):
+        with self.connections_lock:
+            self.closing.set()
+            for connection in self.connections:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        super().server_close()
+        # Workers may still be scanning; the caller must keep root FDs open until they finish.
+        with self.connections_lock:
+            while self.connections:
+                self.connections_lock.wait()
 
     def handle_error(self, request, client_address):
         pass
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.rfile.close()
+        self.rfile = io.BufferedReader(HeaderReader(self.connection, self.server.header_timeout,
+                                                   self.server.io_timeout))
+
+    def parse_request(self):
+        try:
+            return super().parse_request()
+        finally:
+            self.rfile.raw.finish_headers()
+
     def log_message(self, format, *args):
         pass
 
@@ -300,19 +414,28 @@ class Handler(BaseHTTPRequestHandler):
             relative = unquote(url.path[len(prefix):], errors="strict") or "index.html"
             parts(relative)
             if relative == "catalog.json":
-                self.server.media = {}
-                catalog, media = local_catalog(self.server.roots)
-                data = json.dumps(catalog, ensure_ascii=True).encode("utf-8")
-                self.server.media = media
+                with self.server.catalog_lock:
+                    if self.server.closing.is_set():
+                        return
+                    with self.server.media_lock:
+                        self.server.media = {}
+                    catalog, media = local_catalog(self.server.roots)
+                    data = json.dumps(catalog, ensure_ascii=True).encode("utf-8")
+                    with self.server.media_lock:
+                        self.server.media = media
                 self.headers_for(200, "application/json; charset=utf-8", len(data))
                 if body:
                     self.wfile.write(data)
                 return
             if relative.startswith("media/"):
                 clip_id = relative.removeprefix("media/")
-                if not CLIP_ID.fullmatch(clip_id) or clip_id not in self.server.media:
+                if not CLIP_ID.fullmatch(clip_id):
                     return self.fail()
-                root_fd, name, stamp = self.server.media[clip_id]
+                with self.server.media_lock:
+                    media = self.server.media.get(clip_id)
+                if media is None:
+                    return self.fail()
+                root_fd, name, stamp = media
                 content_type = "video/mp4"
             else:
                 assets = {"index.html": "text/html; charset=utf-8", "app.mjs": "text/javascript; charset=utf-8",

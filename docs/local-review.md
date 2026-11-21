@@ -38,6 +38,14 @@ no third-party requests. These precautions do not protect against a compromised
 machine or browser. Use trusted, stable directories and stop the server when
 not in use.
 
+The server allows at most 16 simultaneous connections and closes excess ones.
+Request headers have a five-second total deadline and a 64 KiB limit; network
+I/O has a ten-second inactivity timeout. An untrusted local process can still
+temporarily exhaust the connection limit, and a slow authorized video transfer
+can occupy a slot. Catalog scans are serialized. Shutdown closes connections
+and waits for active scans before releasing the library descriptors, so a slow
+local filesystem can delay exit.
+
 Select a capture, open its embedded video, and seek using the player or the
 time field. Use **Use current playback time** and **Copy reference** to copy
 the identity, content hash, declared revision and timestamp without a URL,
@@ -47,7 +55,9 @@ other free-form metadata is omitted. The stable identity incorporates the
 collection, relative name and video bytes; renames or changed bytes produce a
 new identity. A revision from a labelled library README or a draft
 `source_commit` is a declaration, not independent proof. Other labels are
-inferred from filenames; unknown information remains unknown. File changes
+inferred from filenames; unknown information remains unknown. Library lookup
+skips READMEs without a labelled full revision and searches ancestors;
+conflicting revisions in one README leave the revision unknown. File changes
 detected between scanning and playback are rejected until refresh. Changes
 during an active transfer cannot be excluded, so do not edit footage while
 browsing.
