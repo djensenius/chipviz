@@ -17,6 +17,8 @@ const DEPTH_ROWS: usize = 10;
 const SEGMENTS_PER_STROKE: usize = 4;
 const EDGE_DEPTHS: [f32; 6] = [0.0, 4.0, 9.0, 18.0, 36.0, 64.0];
 const LANES: [f32; 3] = [-0.62, 0.0, 0.62];
+const TRANSVERSE_DEPTHS: [[f32; 2]; 4] = [[4.2, 21.0], [13.0, 32.0], [6.4, 25.0], [10.0, 39.0]];
+const TRANSVERSE_RUNS: [f32; 4] = [3.0, 3.7, 4.3, 2.8];
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {
@@ -78,6 +80,17 @@ fn stripe(surface: Surface, surface_index: usize, row: usize, lane: usize) -> [[
     let z = 1.5 + row as f32 * 6.0 + surface_index as f32 * 0.55 + lane as f32 * 0.85;
     let length = 4.0 + lane as f32 * 0.35;
     [surface.point(u, z), surface.point(u, z + length)]
+}
+
+// Two deliberately staggered diagonal marks cross each plane, ending at
+// its two real corner seams. Different depths on neighbouring surfaces
+// keep the marks from joining into a circumferential ring.
+fn transverse(surface: Surface, surface_index: usize, mark: usize) -> [[f32; 3]; 2] {
+    let z = TRANSVERSE_DEPTHS[surface_index][mark];
+    [
+        surface.point(-surface.extent(), z),
+        surface.point(surface.extent(), z + TRANSVERSE_RUNS[surface_index]),
+    ]
 }
 
 // Sparse short ticks start exactly on a corner and stop inside that plane.
@@ -251,6 +264,24 @@ pub(crate) fn project(
             }
         }
     }
+    // Interleave the four surfaces before visiting the more distant marks,
+    // making the planes legible without allowing marks to close into hoops.
+    for mark in 0..2 {
+        for (index, surface) in SURFACES.into_iter().enumerate() {
+            if lines.len() == max_lines {
+                return lines;
+            }
+            if let Some(stroke) = project_line(transverse(surface, index, mark), eye, aspect) {
+                append_stroke(
+                    &stroke,
+                    thickness * 1.35,
+                    (intensity + 0.12).min(1.0),
+                    max_lines,
+                    &mut lines,
+                );
+            }
+        }
+    }
     for row in 0..DEPTH_ROWS {
         for (index, surface) in SURFACES.into_iter().enumerate() {
             for lane in 0..LANES.len() {
@@ -328,12 +359,80 @@ mod tests {
                 }
             }
         }
-        // Full-width, depth-aligned strokes cannot join to form hoops.
+        // Most markings are longitudinal rather than short corner ticks.
         assert!(stripe_count > 7 * mark_count);
         assert_ne!(
             edge_mark(Surface::Left, 0, 3)[0][2],
             edge_mark(Surface::Floor, 2, 3)[0][2]
         );
+    }
+
+    #[test]
+    fn transverse_marks_reach_seams_without_forming_hoops() {
+        let aspect = 16.0 / 9.0;
+        let output = project(2.0, aspect, [0.0; 3], 1000);
+        for (index, surface) in SURFACES.into_iter().enumerate() {
+            for mark in 0..2 {
+                let world = transverse(surface, index, mark);
+                let (fixed, value, u) = match surface {
+                    Surface::Left => (0, -HALF_WIDTH, 1),
+                    Surface::Right => (0, HALF_WIDTH, 1),
+                    Surface::Floor => (1, -HALF_HEIGHT, 0),
+                    Surface::Ceiling => (1, HALF_HEIGHT, 0),
+                };
+                for (endpoint, sign) in world.into_iter().zip([-1.0, 1.0]) {
+                    close(endpoint[fixed], value);
+                    close(endpoint[u], sign * surface.extent());
+                    assert!(endpoint[2] >= EDGE_DEPTHS[0]);
+                    assert!(endpoint[2] <= EDGE_DEPTHS[EDGE_DEPTHS.len() - 1]);
+                    // Any mark on a neighbouring plane meeting this same
+                    // corner is separated substantially in world depth.
+                    for (other_index, other) in SURFACES.into_iter().enumerate() {
+                        if other_index == index {
+                            continue;
+                        }
+                        for other_mark in 0..2 {
+                            for other_end in transverse(other, other_index, other_mark) {
+                                if endpoint[0] == other_end[0] && endpoint[1] == other_end[1] {
+                                    assert!((endpoint[2] - other_end[2]).abs() > 2.0);
+                                }
+                            }
+                        }
+                    }
+                }
+                assert!(world[1][2] > world[0][2]);
+                let eye = camera(2.0);
+                let stroke = project_line(world, eye, aspect).unwrap();
+                for (point, projected) in world.into_iter().zip([stroke.start, stroke.end]) {
+                    close(
+                        projected[0],
+                        FOCAL * (point[0] - eye[0]) / (aspect * (point[2] - eye[2])),
+                    );
+                    close(
+                        projected[1],
+                        FOCAL * (point[1] - eye[1]) / (point[2] - eye[2]),
+                    );
+                }
+                let mut parts = Vec::new();
+                append_stroke(&stroke, 0.025 * 1.35, 0.35 + 0.12, 4, &mut parts);
+                assert!(
+                    parts
+                        .windows(2)
+                        .all(|pair| pair[0].end == pair[1].start && pair[0].width > pair[1].width)
+                );
+                assert_eq!(
+                    output
+                        .windows(parts.len())
+                        .filter(|window| *window == parts)
+                        .count(),
+                    1
+                );
+
+                let next = project_line(world, camera(2.001), aspect).unwrap();
+                assert!((stroke.start[0] - next.start[0]).abs() < 0.001);
+                assert!((stroke.start[1] - next.start[1]).abs() < 0.001);
+            }
+        }
     }
 
     #[test]
