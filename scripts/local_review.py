@@ -252,7 +252,7 @@ def entry(root_fd, relative, namespace, budget):
         code = names[1].lower()
         platform = PLATFORMS.get(code, names[1])
         family = names[2] if len(names) >= 4 else "Unknown"
-        if family.lower().startswith("colour-field"):
+        if re.match(r"^colour-field(?:[-_]|$)", family.lower()):
             family = "Colour Field"
             if len(names) >= 5:
                 variant = names[3]
@@ -271,6 +271,8 @@ def entry(root_fd, relative, namespace, budget):
                 family = "Tile Meters"
         elif code == "gba" and family.lower() == "blockscape":
             family = "Blockscape"
+            if len(names) >= 5 and names[3].lower() in ("base", "tunnel", "stripes", "stars"):
+                variant = names[3].lower()
         elif code == "n64" and family.lower() == "perspective-meters":
             family = "Perspective Meters"
         elif code == "snes" and family.lower() == "tile-meters":

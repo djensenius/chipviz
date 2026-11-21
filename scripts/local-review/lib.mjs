@@ -32,6 +32,10 @@ const CONTEXT = [
   ])],
 ];
 const DRAFT_PI_MAC = 'Pi 5 profile rendered on Mac GPU; not physical Pi hardware';
+const BLOCKSCAPE_VARIANTS = new Map([
+  ['base', 'base (Blockscape variant)'], ['tunnel', 'tunnel (Blockscape variant)'],
+  ['stripes', 'stripes (Blockscape variant)'], ['stars', 'stars (Blockscape variant)'],
+]);
 
 export function validateCatalog(catalog) {
   if (!catalog || typeof catalog !== 'object' || Array.isArray(catalog) ||
@@ -78,6 +82,9 @@ export function reference(clip, seconds) {
     }
     if (field === 'variant' && value === 'hallway' && clip.family === 'Pulse Tunnel') {
       value = 'hallway (Pulse Tunnel variant)';
+    }
+    if (field === 'variant' && clip.family === 'Blockscape') {
+      value = BLOCKSCAPE_VARIANTS.get(clip.variant) || value;
     }
     if (value) context.push(`${label} (inferred): ${value}`);
   }

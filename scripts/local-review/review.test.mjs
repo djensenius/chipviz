@@ -88,6 +88,25 @@ test('references distinguish supported Pulse Tunnel variants from draft Hallway 
   assert.doesNotMatch(other, /Pulse Tunnel variant/);
 });
 
+test('Blockscape variants are copied only for the Blockscape family', () => {
+  for (const variant of ['base', 'tunnel', 'stripes', 'stars']) {
+    const value = { ...clip(), family: 'Blockscape', platform: 'GBA', variant, collection: 'library',
+      capture: 'Unknown capture', title: 'token=secret', notes: ['/private/path'] };
+    const text = reference(value, 3);
+    assert.ok(text.includes(`Variant (inferred): ${variant} (Blockscape variant)\n`));
+    assert.doesNotMatch(text, /token=secret|\/private|Review-only draft/);
+    for (const family of ['Pulse Tunnel', 'Colour Field', 'Unknown', 'Blockscape\npassword=secret']) {
+      const other = reference({ ...value, family }, 3);
+      assert.doesNotMatch(other, /Variant \(inferred\):|Blockscape variant|password=secret/);
+    }
+    const malicious = reference({ ...value, variant: `${variant}\npassword=secret` }, 3);
+    assert.doesNotMatch(malicious, /Variant \(inferred\):|password=secret/);
+    const draft = reference({ ...value, collection: 'draft' }, 3);
+    assert.ok(draft.includes(`Variant (inferred): ${variant} (Blockscape variant)\n`));
+    assert.match(draft, /Review-only draft; not human-reviewed\. Do not publish\./);
+  }
+});
+
 test('arbitrary metadata never leaks through any optional reference field', () => {
   for (const field of ['title', 'family', 'platform', 'variant', 'scenario', 'capture']) {
     for (const payload of ['Hallway\npassword=secret', 'hallway\npassword=secret', '/Users/person/video.mp4',
