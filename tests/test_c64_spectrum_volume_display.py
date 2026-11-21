@@ -1,4 +1,5 @@
 """Synthetic-only tests: no emulator, BIOS, capture, or target execution."""
+from array import array
 import ctypes
 import functools
 import os
@@ -59,6 +60,69 @@ def native_callback(callback, *args):
 
 
 class DisplayTests(unittest.TestCase):
+  def test_settling_frame_rejects_wide_memoryview_with_wrong_byte_count(self):
+    bad = memoryview(array("H", [0]) * (PITCH * H))
+    self.assertEqual(len(bad), PITCH * H)
+    self.assertEqual(bad.nbytes, 2 * PITCH * H)
+    markers = iter((b"", b"SVD1", b"SVD1", b"SVD1", b"SVD1"))
+    calls = []
+
+    def run(callback):
+      calls.append(1)
+      data = bad if len(calls) == 1 else bytes(frame())
+      native_callback(callback, data, W, H, PITCH, "XRGB8888-LE")
+
+    with self.assertRaisesRegex(ValueError, "buffer length"):
+      observe(run, lambda: next(markers), blank=False, model="pal", model_flag=1,
+              raster_lines=312, calibration=calibration(), limit=3)
+    self.assertEqual(len(calls), 1)
+
+  def test_wide_memoryview_wrong_byte_count_rejected_everywhere(self):
+    bad = memoryview(array("H", [0]) * (PITCH * H))
+    bad_frame = (W, H, PITCH, bad)
+    for action in (lambda: display.check_frame(bad_frame), lambda: display.copy_frame(bad_frame),
+                   lambda: display.calibrate(bad_frame), lambda: display.validate(bad_frame, ORIGIN, False)):
+      with self.subTest(action=action), self.assertRaisesRegex(ValueError, "buffer length"):
+        action()
+    boundary = display.Observation()
+    callback = boundary.begin()
+    native_callback(callback, bad, W, H, PITCH, "XRGB8888-LE")
+    callback(*callback_args(frame()))
+    with self.assertRaisesRegex(ValueError, "buffer length"):
+      boundary.end()
+    with self.assertRaisesRegex(ValueError, "buffer length"):
+      boundary.begin()
+
+  def test_valid_byte_buffers_are_copied_and_interpreted_as_bytes(self):
+    scene = bytes(frame())
+    reference = calibration()[3]
+    for data in (scene, bytearray(scene), memoryview(scene), memoryview(bytearray(scene)).cast("H")):
+      with self.subTest(format=type(data).__name__):
+        boundary = display.Observation()
+        callback = boundary.begin()
+        callback(data, W, H, PITCH, "XRGB8888-LE")
+        _, copied = boundary.end()
+        self.assertIsInstance(copied[3], bytes)
+        self.assertEqual(copied[3], scene)
+        display.validate(copied, ORIGIN, False)
+    for data in (reference, bytearray(reference), memoryview(reference),
+                 memoryview(bytearray(reference)).cast("H")):
+      with self.subTest(calibration=type(data).__name__):
+        self.assertEqual(display.calibrate((W, H, PITCH, data)), ORIGIN)
+    mutable = bytearray(scene)
+    boundary = display.Observation()
+    callback = boundary.begin()
+    callback(memoryview(mutable), W, H, PITCH, "XRGB8888-LE")
+    mutable[:] = bytes(len(mutable))
+    _, copied = boundary.end()
+    self.assertEqual(copied[3], scene)
+    markers = iter((b"", b"SVD1", b"SVD1", b"SVD1", b"SVD1"))
+    wide_scene = memoryview(bytearray(scene)).cast("H")
+    wide_reference = memoryview(bytearray(reference)).cast("H")
+    self.assertEqual(observe(lambda cb: cb(wide_scene, W, H, PITCH, "XRGB8888-LE"),
+                             lambda: next(markers), blank=False, model="pal", model_flag=1,
+                             raster_lines=312, calibration=(W, H, PITCH, wide_reference), limit=2), 2)
+
   def test_frame_geometry_requires_integers_not_bool(self):
     source = calibration()
     for index in range(3):

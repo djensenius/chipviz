@@ -26,8 +26,23 @@ def check_frame(frame: tuple[int, int, int, bytes]) -> None:
     raise ValueError("dimensions and pitch must be integers")
   if not 1 <= width <= MAX_DIMENSION or not 1 <= height <= MAX_DIMENSION:
     raise ValueError("malformed dimensions")
-  if pitch < width * 4 or pitch > MAX_PITCH or len(data) != pitch * height:
+  if pitch < width * 4 or pitch > MAX_PITCH:
     raise ValueError("malformed pitch or buffer length")
+  try:
+    size = memoryview(data).nbytes
+  except (TypeError, ValueError) as error:
+    raise ValueError("malformed pitch or buffer length") from error
+  if size != pitch * height:
+    raise ValueError("malformed pitch or buffer length")
+
+
+def copy_frame(frame: tuple[int, int, int, bytes]) -> tuple[int, int, int, bytes]:
+  """Validate byte size before and after copying a buffer."""
+  check_frame(frame)
+  width, height, pitch, data = frame
+  copied = (width, height, pitch, bytes(memoryview(data)))
+  check_frame(copied)
+  return copied
 
 
 def expected_rgb(blank: bool) -> bytes:
@@ -86,8 +101,7 @@ class Observation:
       try:
         if pixel_format != "XRGB8888-LE":
           raise ValueError("unsupported pixel format")
-        check_frame((width, height, pitch, data))
-        self.events.append((self.serial, (width, height, pitch, bytes(data))))
+        self.events.append((self.serial, copy_frame((width, height, pitch, data))))
       except (ValueError, TypeError, OverflowError) as error:
         self.latch(str(error))
         return
@@ -125,7 +139,7 @@ def pixel(frame: tuple[int, int, int, bytes], x: int, y: int) -> tuple[int, int,
 
 def calibrate(frame: tuple[int, int, int, bytes]) -> tuple[int, int]:
   """Find one corner set and verify the complete independent reference."""
-  check_frame(frame)
+  frame = copy_frame(frame)
   width, height, _, _ = frame
   matches = []
   for y in range(max(0, height - HEIGHT + 1)):
@@ -155,7 +169,7 @@ def calibrate(frame: tuple[int, int, int, bytes]) -> tuple[int, int]:
 
 
 def validate(frame: tuple[int, int, int, bytes], origin: tuple[int, int], blank: bool) -> None:
-  check_frame(frame)
+  frame = copy_frame(frame)
   width, height, _, _ = frame
   x0, y0 = origin
   if x0 < 0 or y0 < 0 or x0 + WIDTH > width or y0 + HEIGHT > height:
