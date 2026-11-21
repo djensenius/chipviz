@@ -137,6 +137,39 @@ class PortTraceTests(unittest.TestCase):
     self.assertTrue(any("cleanup interruption" in note for note in caught.exception.__notes__))
     self.assert_original_slots()
 
+  def test_nested_context_rejected_without_disturbing_outer_owner(self):
+    hook = self.open_trace()
+    with hook as outer:
+      outer.begin_frame(0)
+      self.core.fake_cycle(100)
+      self.core.fake_write(0x12bf, 0x34)
+      with mock.patch.object(hook, "_abandon", wraps=hook._abandon) as abandon:
+        for _ in range(2):
+          with self.assertRaisesRegex(RuntimeError, "context already entered"):
+            with hook:
+              self.fail("nested entry must not succeed")
+        abandon.assert_not_called()
+      self.assertTrue(hook.active)
+      self.assertTrue(hook.shim.sms_trace_owned(*hook._keys))
+      self.assertIn(hook, trace.retained_traces())
+      self.core.fake_cycle(200)
+      self.assertEqual(self.core.fake_read(0x12dc), 0x89)
+      outer.end_frame()
+      self.assertEqual([(e.frame, e.cycle, e.port, e.value, e.kind) for e in outer.events()],
+                       [(0, 100, 0x12bf, 0x34, 1), (0, 200, 0x12dc, 0x89, 0)])
+      self.assertEqual(self.core.fake_count(), 2)
+      self.assertEqual([(self.core.fake_kind(i), self.core.fake_port(i), self.core.fake_value(i))
+                        for i in range(2)],
+                       [(1, 0x12bf, 0x34), (0, 0x12dc, 0x89)])
+    self.assertFalse(hook.active)
+    self.assertNotIn(hook, trace.retained_traces())
+    self.assert_original_slots()
+    with mock.patch.object(hook, "_abandon", wraps=hook._abandon) as abandon:
+      with self.assertRaisesRegex(RuntimeError, "context already entered"):
+        hook.__enter__()
+      abandon.assert_not_called()
+    self.assert_original_slots()
+
   def test_context_entry_exception_restores_installed_hooks(self):
     hook = self.open_trace()
     try:
@@ -147,6 +180,23 @@ class PortTraceTests(unittest.TestCase):
       self.assert_original_slots()
       self.assertNotIn(hook, trace.retained_traces())
       self.assertFalse(hook.active)
+    finally:
+      hook.retry_cleanup()
+
+  def test_context_entry_guard_interruption_restores_installed_hooks(self):
+    hook = self.open_trace()
+    getattribute = trace.Trace.__getattribute__
+    def interrupted(owner, name):
+      if name == "_entered":
+        raise KeyboardInterrupt("entry guard interruption")
+      return getattribute(owner, name)
+    try:
+      with mock.patch.object(trace.Trace, "__getattribute__", interrupted):
+        with self.assertRaisesRegex(KeyboardInterrupt, "entry guard interruption"):
+          with hook:
+            self.fail("entry must not succeed")
+      self.assert_original_slots()
+      self.assertNotIn(hook, trace.retained_traces())
     finally:
       hook.retry_cleanup()
 

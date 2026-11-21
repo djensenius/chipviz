@@ -17,13 +17,14 @@ their own fake-core layout. Run only on a quiescent core after
 initialization, with no other thread invoking ports or changing slots, ratio,
 or the loaded core. Bracket every core frame with `begin_frame` / `end_frame`,
 using consecutive frame numbers; read `events()` only between frames, and use
-the context manager to restore slots before unloading the core. Storage is
-bounded; overflow, calls outside frames, or ratio changes are failures. Raw
-counters may reset between frames: there is no inferred cross-frame time or
-wrap correction. A decrease within a frame fails. The shim is a singleton and
-only one trace can be active. Cleanup is owner-checked and preserves replaced
-slots; a further exception during cleanup is reported on the original error,
-and an existing trace object can retry `close()`.
+the context manager to restore slots before unloading the core. A trace context
+cannot be entered more than once. Storage is bounded; overflow, calls outside
+frames, or ratio changes are failures. Raw counters may reset between frames:
+there is no inferred cross-frame time or wrap correction. A decrease within a
+frame fails. The shim is a singleton and only one trace can be active. Cleanup
+is owner-checked and preserves replaced slots; a further exception during
+cleanup is reported on the original error, and an existing trace object can
+retry `close()`.
 
 The manager retains active owners and both library handles. If construction
 or context entry fails and cleanup is interrupted, the original exception

@@ -46,6 +46,10 @@ class Event(ctypes.Structure):
   _fields_ = [(name, ctypes.c_uint32) for name in ("frame", "cycle", "port", "value", "kind")]
 
 
+class _ContextReentryError(RuntimeError):
+  """Distinguish re-entry from failures requiring cleanup."""
+
+
 class Trace:
   """Install only after core initialization; run and inspect on one thread."""
 
@@ -76,6 +80,7 @@ class Trace:
     self._keys = (ctypes.byref(self._owner), ctypes.byref(self.read_slot), ctypes.byref(self.write_slot))
     self.active = False
     self._abandoned = False
+    self._entered = False
     self.in_frame = False
     self._invalid = False
     self.last_frame = -1
@@ -222,9 +227,15 @@ class Trace:
 
   def __enter__(self):
     try:
+      if self._entered:
+        raise _ContextReentryError("trace context already entered")
       self._require_owner()
+      self._entered = True
       return self
+    except _ContextReentryError:
+      raise
     except BaseException as error:
+      self._entered = False
       self._abandon(error)
       raise
 
