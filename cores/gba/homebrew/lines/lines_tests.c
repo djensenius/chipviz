@@ -373,7 +373,7 @@ static void batch_contract(void) {
   lines_render_t render = {0};
   size_t previous;
   unsigned i;
-  int result;
+  int result, prefix_untouched;
   lines_init(&state);
   lines_observe(&state, 0, 0);
   lines_snapshot(&state, &snapshot);
@@ -405,15 +405,24 @@ static void batch_contract(void) {
   lines_render_begin(&render, &snapshot);
   check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 17) == 0 &&
         render.next == 17 && prefix_and_canaries_match(17), "restart begins at zero");
-  /* Poison both the start and end of the earlier prefix so rewriting it
-   * with the same rendered pixels cannot pass unnoticed. */
-  guarded[1] = guarded[17] = 0xdeadu;
+  /* Poison the whole earlier prefix so rewriting any rendered pixel pair
+   * with its original value cannot pass unnoticed. */
+  for (i = 0; i < 17u; ++i) {
+    guarded[i + 1u] = (uint16_t)(expected[i] ^ 0xffffu);
+  }
   result = lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, (size_t)-1);
+  prefix_untouched = 1;
+  for (i = 0; i < 17u; ++i) {
+    if (guarded[i + 1u] != (uint16_t)(expected[i] ^ 0xffffu)) {
+      prefix_untouched = 0;
+    }
+  }
   check(result == 0 && render.next == 17 + LINES_BATCH_HALFWORDS &&
-        guarded[1] == 0xdeadu && guarded[17] == 0xdeadu,
+        prefix_untouched,
         "capped batch leaves the earlier prefix untouched");
-  guarded[1] = expected[0];
-  guarded[17] = expected[16];
+  for (i = 0; i < 17u; ++i) {
+    guarded[i + 1u] = expected[i];
+  }
   check(result == 0 &&
         render.next == 17 + LINES_BATCH_HALFWORDS &&
         prefix_and_canaries_match(17 + LINES_BATCH_HALFWORDS),
