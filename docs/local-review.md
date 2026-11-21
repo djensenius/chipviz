@@ -60,7 +60,9 @@ Select a capture, open its embedded video, and seek using the player or the
 time field. Wait for finite video metadata before copying a typed time; times
 beyond the video duration are rejected. **Use current playback time** also
 waits for the initial seek to finish. If loading or seeking fails, reopen the
-video. Use **Copy reference** to copy the identity, content hash, declared
+video. Filtering synchronously rebuilds the matching cards, so very large
+libraries may be slow; scan limits are safety bounds, not a performance
+guarantee. Use **Copy reference** to copy the identity, content hash, declared
 revision and timestamp without a URL, token or file path. Recognized
 visualization, platform, variant and scenario
 labels are included only from a strict allowlist and are marked as inferred;
