@@ -2114,6 +2114,24 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_mic_resynchronizes_after_a_counter_discontinuity() {
+        let mut synth = SynthMic::new().unwrap();
+        synth.beat_count = Some(1000);
+        let (first, _) = synth.advance(ControlFrame::procedural(0), 0);
+        assert_eq!((first.beat_count, first.flags), (0, 0));
+        let (duplicate, _) = synth.advance(ControlFrame::procedural(0), 0);
+        assert_eq!((duplicate.beat_count, duplicate.flags), (0, 0));
+        for index in 1..=120 {
+            let (frame, _) = synth.advance(ControlFrame::procedural(index), index);
+            if frame.beat_count == 1 {
+                assert_eq!(frame.flags, crate::audio::BEAT_FLAG);
+                return;
+            }
+        }
+        panic!("synthetic beat did not advance");
+    }
+
+    #[test]
     fn json_strings_are_escaped() {
         assert_eq!(json_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
     }

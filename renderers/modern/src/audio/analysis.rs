@@ -22,12 +22,13 @@
 //!   minute read as the quarter-note tempo and keeps off-beats from doubling it;
 //! - a forward-only beat clock ([`BeatTracker`]): `beat_phase` advances at the
 //!   estimated tempo and `beat_count` increments exactly when the phase wraps,
-//!   so `beat_count * 256 + beat_phase` never decreases. Onsets within a
-//!   quarter beat of the expected beat correct the clock: an early onset jumps
-//!   forward to the next beat, a late one slows the clock (to at most half
-//!   speed) until it is back in line. Off-beat onsets are ignored unless
-//!   several arrive in a row or the clock has lost lock (no on-beat onset for
-//!   two beats), in which case the next onset re-anchors the beat.
+//!   so `beat_count * 256 + beat_phase` never decreases before the 16-bit count
+//!   wraps. Onsets within a quarter beat of the expected beat correct the
+//!   clock: an early onset jumps forward to the next beat, a late one slows the
+//!   clock (to at most half speed) until it is back in line. Off-beat onsets
+//!   are ignored unless several arrive in a row or the clock has lost lock (no
+//!   on-beat onset for two beats), in which case the next onset re-anchors the
+//!   beat.
 //!
 //! Known limits: tempos outside 60-200 BPM are folded into that range (tempos
 //! within about one hop of either end are pinned to it), very fast tempos

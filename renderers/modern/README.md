@@ -121,7 +121,8 @@ as in the host bridge), `bpm` (`0` until a tempo is detected), `beat_phase`,
 follow the same timeline as procedural frames, so scenes still cycle.
 
 The beat clock only moves forward: `beat_count` increments exactly when
-`beat_phase` wraps, and `beat_count * 256 + beat_phase` never decreases. Onsets
+`beat_phase` wraps, and `beat_count * 256 + beat_phase` never decreases before
+the 16-bit count wraps. Onsets
 near the expected beat nudge the clock (jumping forward, or briefly slowing
 down) instead of rewinding it; off-beat onsets are ignored. Tempo comes from
 onset gaps folded into 60-200 BPM, so eighths faster than 200 per minute read as
@@ -131,6 +132,13 @@ it), very fast tempos (about 180 BPM and up) with loose timing can read at half
 tempo, 3/4
 and swung feels are not distinguished from straight time, and music with only
 off-beat accents is tracked on those accents.
+
+The renderer emits a beat flag when the observed count advances by one to four,
+including an ordinary 16-bit wrap; a skipped interval produces at most one
+beat. It emits a bar flag only if the current count is divisible by four, so
+missed bars are not reconstructed on a later beat. Duplicate counts and larger
+discontinuities emit no event; the new count becomes the baseline. A small
+forward reset is indistinguishable from normal progress without a source epoch.
 
 Analysis runs on its own thread; the render thread reads the latest result
 without waiting. Levels use automatic gain with a noise floor, so quiet and
