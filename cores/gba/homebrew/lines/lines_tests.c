@@ -405,10 +405,19 @@ static void batch_contract(void) {
   lines_render_begin(&render, &snapshot);
   check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 17) == 0 &&
         render.next == 17 && prefix_and_canaries_match(17), "restart begins at zero");
-  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, (size_t)-1) == 0 &&
+  /* Poison both the start and end of the earlier prefix so rewriting it
+   * with the same rendered pixels cannot pass unnoticed. */
+  guarded[1] = guarded[17] = 0xdeadu;
+  result = lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, (size_t)-1);
+  check(result == 0 && render.next == 17 + LINES_BATCH_HALFWORDS &&
+        guarded[1] == 0xdeadu && guarded[17] == 0xdeadu,
+        "capped batch leaves the earlier prefix untouched");
+  guarded[1] = expected[0];
+  guarded[17] = expected[16];
+  check(result == 0 &&
         render.next == 17 + LINES_BATCH_HALFWORDS &&
         prefix_and_canaries_match(17 + LINES_BATCH_HALFWORDS),
-        "capped batch writes exactly its budgeted prefix");
+        "capped batch writes the next span and leaves the suffix untouched");
   for (i = 0; i < LINES_PAGE_HALFWORDS / LINES_BATCH_HALFWORDS; ++i) {
     if (render.next >= LINES_PAGE_HALFWORDS ||
         LINES_PAGE_HALFWORDS - render.next <= LINES_BATCH_HALFWORDS) {
