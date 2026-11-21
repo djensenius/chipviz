@@ -239,7 +239,7 @@ fn parse_args_internal(
             let value = args
                 .next()
                 .ok_or_else(|| format!("{arg} requires a value"))?;
-            if (strict_values && is_cli_option(&value)) || value == "--house" {
+            if strict_values && is_cli_option(&value) {
                 return Err(format!(
                     "{arg} requires a value; {value} is an option (use ./{value} for a literal path)"
                 ));
@@ -1799,6 +1799,98 @@ mod tests {
             }
         }
         assert!(cli_house_tokens(["--out", "--house"].map(str::to_string).to_vec()).is_err());
+    }
+
+    #[test]
+    fn literal_house_paths_preserve_public_parser_and_cli_contract() {
+        let tokens = ["--out", "--house"].map(str::to_string);
+        let Command::Capture(legacy) = parse_args(tokens.clone()).unwrap() else {
+            panic!("unexpected help");
+        };
+        let ConfiguredCommand::Capture(configured, _) =
+            parse_args_with_options(tokens.clone()).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        let StarfieldConfiguredCommand::Capture(starfield, _) =
+            parse_args_with_starfield_options(tokens).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        for args in [legacy, configured, starfield] {
+            assert_eq!(args.out, PathBuf::from("--house"));
+        }
+
+        let tokens = ["--out", "shots", "--input", "--house"].map(str::to_string);
+        let Command::Capture(legacy) = parse_args(tokens.clone()).unwrap() else {
+            panic!("unexpected help");
+        };
+        let ConfiguredCommand::Capture(configured, _) =
+            parse_args_with_options(tokens.clone()).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        let StarfieldConfiguredCommand::Capture(starfield, _) =
+            parse_args_with_starfield_options(tokens).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        for args in [legacy, configured, starfield] {
+            assert_eq!(args.input, Input::File(PathBuf::from("--house")));
+        }
+
+        let StarfieldConfiguredCommand::Capture(_, options) = parse_args_with_starfield_options(
+            [
+                "--out",
+                "shots",
+                "--star-catalog",
+                "--house",
+                "--location",
+                "0,0",
+            ]
+            .map(str::to_string),
+        )
+        .unwrap() else {
+            panic!("unexpected help");
+        };
+        assert_eq!(
+            options.starfield.catalog_path,
+            Some(PathBuf::from("--house"))
+        );
+
+        for tokens in [
+            vec!["--out", "--house"],
+            vec!["--exclusive-output", "--out", "--house"],
+            vec!["--out", "--house", "--exclusive-output"],
+        ] {
+            let error =
+                cli_house_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(
+                error.contains("--out requires a value; --house is an option"),
+                "{error}"
+            );
+        }
+        let tokens = ["--out", "shots", "--house", "--scene", "2"].map(str::to_string);
+        assert!(
+            cli_house_tokens(tokens.to_vec())
+                .unwrap_err()
+                .contains("incompatible")
+        );
+        let tokens = ["--out", "shots", "--house", "--catalog-v1"].map(str::to_string);
+        assert!(
+            catalog_capture::cli_tokens(tokens.to_vec())
+                .unwrap_err()
+                .contains("incompatible")
+        );
+        let (tokens, house) =
+            cli_house_tokens(["--out", "./--house"].map(str::to_string).to_vec()).unwrap();
+        assert!(!house);
+        let (StarfieldConfiguredCommand::Capture(args, _), _) =
+            parse_starfield_args(tokens, true).unwrap()
+        else {
+            panic!("unexpected help");
+        };
+        assert_eq!(args.out, PathBuf::from("./--house"));
     }
 
     #[test]
