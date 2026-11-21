@@ -154,6 +154,26 @@ class GalleryTests(unittest.TestCase):
         nested.write_text("Source integration commit: `" + "C" * 40 + "`.\n", encoding="utf-8")
         self.assertEqual(gallery.source_revision(self.fds[0], self.relative), "c" * 40)
 
+    def test_revision_combines_nearest_readmes_and_rejects_ambiguous_values(self):
+        parent = self.root / "modern" / "README.md"
+        nested = self.root / "modern" / "pi5" / "README.md"
+        sibling = nested.with_suffix(".txt")
+        parent.write_text("Revision: " + "b" * 40, encoding="utf-8")
+        cases = (
+            ("Revision: " + "c" * 40 + " or " + "d" * 40, "unrelated", None),
+            ("Revision: " + "c" * 40, "Revision: " + "d" * 40, None),
+            ("Revision: " + "c" * 40, "Revision: deadbee", None),
+            ("unrelated", "Revision: nope", None),
+            ("- Source revision: `" + "C" * 40 + "`. \r\n", "Revision: " + "c" * 40, "c" * 40),
+            ("unrelated", "more unrelated notes", "b" * 40),
+            ("Revision: " + "c" * 40 + ".", "unrelated", "c" * 40),
+        )
+        for md, txt, expected in cases:
+            with self.subTest(md=md, txt=txt):
+                nested.write_text(md, encoding="utf-8")
+                sibling.write_text(txt, encoding="utf-8")
+                self.assertEqual(gallery.source_revision(self.fds[0], self.relative), expected)
+
     def test_library_capture_sources_are_unknown(self):
         self.write(self.root, "modern/m1/Lines/quiet.mp4", b"mac")
         self.write(self.root, "retro/nes/native-demo/demo.mp4", b"retro")
@@ -400,7 +420,9 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual(self.request(server, f"/{server.token}/")[0], 200)
 
     def test_overlapping_refreshes_do_not_starve_playback(self):
-        server = self.serve(header_timeout=30)
+        # Exercise the OS-overload path without relying on its default backlog.
+        with mock.patch.object(gallery.ReviewServer, "request_queue_size", 1):
+            server = self.serve(header_timeout=30)
         prefix = f"/{server.token}/"
         self.write(self.root, "other/remove.mp4", b"remove")
         clips = self.catalog(server)["clips"]
@@ -476,12 +498,18 @@ class GalleryTests(unittest.TestCase):
                 outcomes, errors = [], []
 
                 def burst():
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
                     try:
                         gate.wait(10)
-                        status, headers, _ = self.request(server, prefix + "catalog.json")
-                        outcomes.append((status, headers.get("Retry-After")))
+                        # Avoid HTTPConnection's TCP_NODELAY setup racing a reset on macOS.
+                        conn.sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+                        conn.request("GET", prefix + "catalog.json")
+                        response = conn.getresponse()
+                        outcomes.append((response.status, response.getheader("Retry-After")))
                     except Exception as exc:
-                        errors.append(str(exc))
+                        errors.append(exc)
+                    finally:
+                        conn.close()
 
                 workers = [threading.Thread(target=burst) for _ in range(8)]
                 for worker in workers:
@@ -490,8 +518,13 @@ class GalleryTests(unittest.TestCase):
                 for worker in workers:
                     worker.join(10)
                 self.assertFalse(any(worker.is_alive() for worker in workers))
-                self.assertEqual(errors, [])
-                self.assertEqual(outcomes, [(503, "1")] * 8)
+                self.assertEqual(len(outcomes) + len(errors), 8)
+                self.assertTrue(all(result == (503, "1") for result in outcomes))
+                overload = (ConnectionResetError, ConnectionRefusedError, ConnectionAbortedError,
+                            BrokenPipeError, TimeoutError, http.client.RemoteDisconnected)
+                self.assertTrue(all(isinstance(exc, overload) for exc in errors), errors)
+                with server.connections_lock:
+                    self.assertTrue(server.connections_lock.wait_for(lambda: len(server.connections) == 1, timeout=10))
                 status, headers, data = self.request(
                     server, prefix + "media/" + clip["id"], headers={"Range": "bytes=2-5"}
                 )

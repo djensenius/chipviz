@@ -177,6 +177,7 @@ def read_small(root_fd, relative, budget=None):
 def source_revision(root_fd, relative, budget=None):
     names = parts(relative)
     for length in range(len(names) - 1, -1, -1):
+        revisions = set()
         for filename in ("README.md", "README.txt"):
             try:
                 text = read_small(root_fd, "/".join(names[:length] + [filename]), budget)
@@ -188,14 +189,14 @@ def source_revision(root_fd, relative, budget=None):
                 r"(?im)^[ \t]*(?:[-*][ \t]*)?(?:source revision|source integration commit|revision)"
                 r"[ \t]*:[ \t]*(.*)$", text
             )
-            revisions = set()
             for value in declarations:
-                match = re.match(r"(?:`([0-9a-f]{40})`|([0-9a-f]{40}))(?=[.\s]|$)", value, re.I)
+                match = re.fullmatch(r"(?:`([0-9a-f]{40})`|([0-9a-f]{40}))[ \t]*[.,;:!?]*",
+                                     value.strip(), re.I)
                 if not match:
                     return None
                 revisions.add((match.group(1) or match.group(2)).lower())
-            if revisions:
-                return revisions.pop() if len(revisions) == 1 else None
+        if revisions:
+            return revisions.pop() if len(revisions) == 1 else None
     return None
 
 

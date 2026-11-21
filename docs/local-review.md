@@ -68,10 +68,11 @@ bytes produce a new identity. A revision from a labelled library README or a dra
 `source_commit` is a declaration, not independent proof. Other labels are
 inferred from filenames; library capture sources remain unknown. Library lookup
 skips unrelated READMEs and searches ancestors; invalid or conflicting labelled
-revision declarations in one README leave the revision unknown. File changes
-detected between scanning and playback are rejected until refresh. Changes
-during an active transfer cannot be excluded, so do not edit footage while
-browsing.
+revision declarations across the nearest directory's READMEs leave the revision
+unknown. A declaration must contain a single full SHA, optionally backticked
+and followed by punctuation. File changes detected between scanning and
+playback are rejected until refresh. Changes during an active transfer cannot
+be excluded, so do not edit footage while browsing.
 
 Drafts are review-only and not human-reviewed. Recognized Hallway/House draft
 names infer quiet or energetic scenarios and M1 or Pi 5 profiles; the Pi-profile
