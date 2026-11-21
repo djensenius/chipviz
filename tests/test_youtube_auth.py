@@ -22,6 +22,7 @@ from urllib.parse import parse_qs
 
 try:
   from google_auth_oauthlib.flow import InstalledAppFlow
+  from google.auth.exceptions import RefreshError
   from google.oauth2.credentials import Credentials as GoogleCredentials
   from google.oauth2 import reauth as google_reauth
   import requests
@@ -30,6 +31,7 @@ except ImportError:
   GoogleCredentials = None
   google_reauth = None
   InstalledAppFlow = None
+  RefreshError = None
   requests = None
   HTTPAdapter = object
 
@@ -282,6 +284,8 @@ class YouTubeAuthTests(unittest.TestCase):
           flow.oauth2session.close()
         self.assertEqual(error.exception.kind, "uncertain")
         self.assertNotIn("attacker.invalid", str(error.exception))
+        self.assertIsNone(error.exception.__context__)
+        self.assertIsNone(error.exception.__cause__)
         self.assertEqual(len(adapter.calls), 1)
         request, kwargs = adapter.calls[0]
         self.assertEqual(request.url, AUTH.TOKEN_URI)
@@ -342,6 +346,8 @@ class YouTubeAuthTests(unittest.TestCase):
             AUTH.load_credentials()
         self.assertEqual(error.exception.kind, "uncertain")
         self.assertNotIn(TOKEN, str(error.exception))
+        self.assertIsNone(error.exception.__context__)
+        self.assertIsNone(error.exception.__cause__)
         self.assertEqual(len(adapter.calls), 1)
         request, kwargs = adapter.calls[0]
         self.assertEqual(request.url, AUTH.TOKEN_URI)
@@ -400,8 +406,97 @@ class YouTubeAuthTests(unittest.TestCase):
       with self.assertRaises(AUTH.AuthError) as error:
         AUTH.load_credentials()
     self.assertEqual(error.exception.kind, "auth_required")
+    self.assertIsNone(error.exception.__context__)
+    self.assertIsNone(error.exception.__cause__)
     self.assertEqual(len(adapter.calls), 1)
     self.assertEqual(json.loads(state.read_text())["refresh_token"], TOKEN)
+
+  @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
+  def test_real_malformed_refresh_never_exposes_underlying_exception_chain(self):
+    self.configure()
+    state = self.app / AUTH.STATE_FILE
+    state.write_text(AUTH._state_text(CHANNEL, TOKEN))
+    state.chmod(0o600)
+    rotated = "synthetic-rotated-token"
+    payload = json.dumps({"refresh_token": rotated, "client_secret": SECRET}).encode()
+    response = types.SimpleNamespace(status=200, data=payload)
+    with self.assertRaises(RefreshError) as original:
+      google_reauth.refresh_grant(mock.Mock(return_value=response), AUTH.TOKEN_URI,
+                                  TOKEN, CLIENT, SECRET)
+    self.assertIn(rotated, repr(original.exception.args))
+    expiry = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=1)
+    initial = ("synthetic-access", TOKEN, expiry, {}, None)
+    with mock.patch.object(google_reauth, "refresh_grant", return_value=initial):
+      credentials, _ = AUTH.load_credentials()
+    for operation in (AUTH.load_credentials, lambda: credentials.refresh(None)):
+      adapter = FakeTokenAdapter(200, payload)
+      def send(_self, request, **kwargs):
+        return adapter.send(request, **kwargs)
+      with mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send):
+        try:
+          raise RuntimeError("synthetic-outer-secret")
+        except RuntimeError:
+          try:
+            operation()
+          except AUTH.AuthError as error:
+            self.assertEqual(error.kind, "uncertain")
+            self.assertIsNone(error.__context__)
+            self.assertIsNone(error.__cause__)
+            for secret in (rotated, SECRET, TOKEN, AUTH.TOKEN_URI, "synthetic-outer-secret"):
+              self.assertNotIn(secret, repr(error))
+              self.assertNotIn(secret, repr(vars(error)))
+            frame = error.__traceback__
+            while frame:
+              self.assertNotEqual(frame.tb_frame.f_code.co_filename, str(SCRIPT))
+              self.assertNotIn("/site-packages/google/", frame.tb_frame.f_code.co_filename)
+              frame = frame.tb_next
+          else:
+            self.fail("expected sanitized authorization error")
+      self.assertEqual(len(adapter.calls), 1)
+    self.assertIsNone(credentials.token)
+    self.assertEqual(json.loads(state.read_text())["refresh_token"], TOKEN)
+
+  @unittest.skipUnless(InstalledAppFlow is not None, "optional Google dependencies not installed")
+  def test_real_initial_exchange_never_exposes_underlying_exception_chain(self):
+    self.configure()
+    config = {"installed": {"client_id": CLIENT, "client_secret": SECRET,
+                            "auth_uri": AUTH.AUTH_URI, "token_uri": AUTH.TOKEN_URI,
+                            "redirect_uris": ["http://localhost"]}}
+    flow = InstalledAppFlow.from_client_config(
+      config, scopes=AUTH.SCOPES, autogenerate_code_verifier=True)
+    flow.redirect_uri = "http://127.0.0.1:12345/"
+    flow.authorization_url()
+    flow.run_local_server = mock.Mock(side_effect=lambda **_: flow.fetch_token(code="synthetic-code"))
+    rotated = "synthetic-rotated-token"
+    payload = json.dumps({"error": "server_error", "error_description": rotated}).encode()
+    adapter = FakeTokenAdapter(200, payload)
+    def send(_self, request, **kwargs):
+      return adapter.send(request, **kwargs)
+    with mock.patch.object(InstalledAppFlow, "from_client_config", return_value=flow), \
+        mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send), \
+        contextlib.redirect_stdout(io.StringIO()):
+      try:
+        raise RuntimeError("synthetic-outer-secret")
+      except RuntimeError:
+        try:
+          AUTH.authorize()
+        except AUTH.AuthError as error:
+          self.assertEqual(error.kind, "uncertain")
+          self.assertIsNone(error.__context__)
+          self.assertIsNone(error.__cause__)
+          for secret in (rotated, SECRET, "synthetic-code", flow.code_verifier,
+                         AUTH.TOKEN_URI, "synthetic-outer-secret"):
+            self.assertNotIn(secret, repr(error))
+            self.assertNotIn(secret, repr(vars(error)))
+          frame = error.__traceback__
+          while frame:
+            self.assertNotEqual(frame.tb_frame.f_code.co_filename, str(SCRIPT))
+            self.assertNotIn("/site-packages/", frame.tb_frame.f_code.co_filename)
+            frame = frame.tb_next
+        else:
+          self.fail("expected sanitized authorization error")
+    self.assertEqual(len(adapter.calls), 1)
+    self.assertFalse((self.app / AUTH.STATE_FILE).exists())
 
   @unittest.skipUnless(GoogleCredentials is not None, "optional Google dependencies not installed")
   def test_channel_confirmation_refresh_also_blocks_redirects(self):
@@ -427,6 +522,8 @@ class YouTubeAuthTests(unittest.TestCase):
       with self.assertRaises(AUTH.AuthError) as error:
         AUTH.authorize()
     self.assertEqual(error.exception.kind, "uncertain")
+    self.assertIsNone(error.exception.__context__)
+    self.assertIsNone(error.exception.__cause__)
     self.assertEqual(len(adapter.calls), 1)
     self.assertEqual(adapter.calls[0][0].url, AUTH.TOKEN_URI)
     self.assertFalse((self.app / AUTH.STATE_FILE).exists())
@@ -480,6 +577,7 @@ class YouTubeAuthTests(unittest.TestCase):
     for failure, kind in (
       (AUTH.AuthError(TOKEN, kind="auth_required"), "auth_required"),
       (AUTH.AuthError(TOKEN), "uncertain"),
+      (AUTH.AuthError(TOKEN, kind=TOKEN), "uncertain"),
       (OSError(TOKEN), "uncertain"),
     ):
       with self.subTest(kind=kind, failure=type(failure)):
@@ -490,6 +588,24 @@ class YouTubeAuthTests(unittest.TestCase):
             AUTH.load_credentials()
         self.assertEqual(error.exception.kind, kind)
         self.assertNotIn(TOKEN, str(error.exception))
+        self.assertNotIn(TOKEN, repr(vars(error.exception)))
+
+  def test_auth_failure_drops_internal_traceback_and_caller_context(self):
+    with mock.patch.object(AUTH, "_configure", side_effect=ValueError(TOKEN)):
+      try:
+        raise RuntimeError("synthetic-outer-secret")
+      except RuntimeError:
+        try:
+          AUTH.configure()
+        except AUTH.AuthError as error:
+          self.assertIsNone(error.__context__)
+          self.assertIsNone(error.__cause__)
+          frame = error.__traceback__
+          while frame:
+            self.assertNotEqual(frame.tb_frame.f_code.co_filename, str(SCRIPT))
+            frame = frame.tb_next
+        else:
+          self.fail("expected sanitized authorization error")
 
   def test_oauth_errors_and_logs_do_not_expose_secrets(self):
     self.configure()

@@ -24,6 +24,7 @@ An offset equal to total without a video_id is not completion; query status.
 An expired/lost session or unresolved completion requires quarantine, not a
 new upload. TransportError.kind is "uncertain", "auth_required", or "quota".
 No exception includes a URI, server body, or underlying exception message.
+Sanitized public errors discard internal tracebacks and exception chains.
 
 During each request, Python logging is process-wide disabled and stdout/stderr
 are redirected, including HTTP wire-debug output. This affects other threads.
@@ -34,6 +35,7 @@ not supported. Never log the returned URI or inspect/log library exceptions.
 """
 
 import contextlib
+import functools
 import io
 import json
 import logging
@@ -67,23 +69,47 @@ class TransportError(Exception):
     self.kind = kind
 
 
+def _sanitize_transport_errors(function):
+  """Remove internal tracebacks and chains, including an active caller exception."""
+  @functools.wraps(function)
+  def wrapped(*args, **kwargs):
+    try:
+      return function(*args, **kwargs)
+    except (TransportError, ValueError) as error:
+      error.__context__ = None
+      error.__cause__ = None
+      error.__traceback__ = None
+      raise
+  return wrapped
+
+
 class Progress(NamedTuple):
   offset: int
   video_id: str | None
 
 
+@_sanitize_transport_errors
 def make_session(credentials):
   """Construct a no-replay AuthorizedSession for use by these operations."""
-  from google.auth.transport.requests import AuthorizedSession
-  from requests.adapters import HTTPAdapter
+  session = None
+  try:
+    from google.auth.transport.requests import AuthorizedSession
+    from requests.adapters import HTTPAdapter
 
-  session = AuthorizedSession(credentials, max_refresh_attempts=0)
-  session.trust_env = False
-  for scheme in ("http://", "https://"):
-    session.mount(scheme, HTTPAdapter(max_retries=0))
-    session._auth_request_session.mount(scheme, HTTPAdapter(max_retries=0))
-  session._auth_request_session.trust_env = False
-  return session
+    session = AuthorizedSession(credentials, max_refresh_attempts=0)
+    session.trust_env = False
+    for scheme in ("http://", "https://"):
+      session.mount(scheme, HTTPAdapter(max_retries=0))
+      session._auth_request_session.mount(scheme, HTTPAdapter(max_retries=0))
+    session._auth_request_session.trust_env = False
+    return session
+  except Exception:
+    if session is not None:
+      try:
+        session.close()
+      except Exception:
+        pass
+  raise TransportError("uncertain", "Cannot create upload session")
 
 
 @contextlib.contextmanager
@@ -240,6 +266,7 @@ def _failure(response):
   raise TransportError("uncertain", "Upload response requires quarantine or status check")
 
 
+@_sanitize_transport_errors
 def create_session(session, metadata, total, content_type="video/mp4"):
   """Initiate an unlisted upload; return the secret URI without sending media."""
   _total(total)
@@ -299,6 +326,7 @@ def _progress(response, total, minimum, maximum, final_allowed):
   _failure(response)
 
 
+@_sanitize_transport_errors
 def upload_chunk(session, uri, total, offset, data, content_type="video/mp4"):
   """Send one bounded chunk at offset on a previously persisted session."""
   _uri(uri, session_uri=True)
@@ -319,6 +347,7 @@ def upload_chunk(session, uri, total, offset, data, content_type="video/mp4"):
   return _progress(response, total, offset, end, end == total)
 
 
+@_sanitize_transport_errors
 def query_status(session, uri, total):
   """Probe the persisted session; a completed result includes its video ID."""
   _uri(uri, session_uri=True)

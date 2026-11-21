@@ -250,6 +250,32 @@ class YouTubeTransportTests(unittest.TestCase):
     self.assertNotIn(URI, stderr.getvalue())
     self.assertNotIn("token", stderr.getvalue())
 
+  def test_sanitized_errors_clear_even_an_active_caller_exception(self):
+    try:
+      raise RuntimeError("synthetic-outer-secret")
+    except RuntimeError:
+      with self.assertRaises(transport.TransportError) as error:
+        transport.query_status(Session(), URI + "%", 1)
+      self.assertIsNone(error.exception.__context__)
+      self.assertIsNone(error.exception.__cause__)
+      with self.assertRaises(ValueError) as invalid:
+        transport.upload_chunk(Session(), URI, 1, 0, b"")
+      self.assertIsNone(invalid.exception.__context__)
+      self.assertIsNone(invalid.exception.__cause__)
+
+  def test_transport_failure_drops_internal_traceback(self):
+    try:
+      transport.query_status(Session(RuntimeError("secret " + URI)), URI, 1)
+    except transport.TransportError as error:
+      self.assertIsNone(error.__context__)
+      self.assertIsNone(error.__cause__)
+      frame = error.__traceback__
+      while frame:
+        self.assertNotEqual(frame.tb_frame.f_code.co_filename, transport.__file__)
+        frame = frame.tb_next
+    else:
+      self.fail("expected sanitized transport error")
+
   def test_auth_failure_kind_is_preserved_without_leaking(self):
     for kind in ("auth_required", "uncertain"):
       with self.subTest(kind=kind):
@@ -332,6 +358,17 @@ class RealLibraryOfflineTests(unittest.TestCase):
     self.assertEqual(caught.exception.kind, "auth_required")
     self.assertEqual(len(self.adapter.calls), 1)
     self.assertEqual(self.credentials.refreshes, 0)
+
+  def test_session_factory_failure_is_sanitized(self):
+    with mock.patch("google.auth.transport.requests.AuthorizedSession",
+                    side_effect=RuntimeError("synthetic-secret " + URI)):
+      with self.assertRaises(transport.TransportError) as error:
+        transport.make_session(self.credentials)
+    self.assertEqual(error.exception.kind, "uncertain")
+    self.assertNotIn("synthetic-secret", repr(error.exception))
+    self.assertNotIn(URI, repr(error.exception))
+    self.assertIsNone(error.exception.__context__)
+    self.assertIsNone(error.exception.__cause__)
 
   def test_logging_wire_debug_and_exceptions_never_expose_secrets(self):
     logged = io.StringIO()
@@ -471,12 +508,66 @@ class RealLibraryOfflineTests(unittest.TestCase):
             self.assertEqual(error.exception.kind, "uncertain")
             self.assertNotIn("synthetic-refresh", str(error.exception))
             self.assertNotIn("attacker.invalid", str(error.exception))
+            self.assertIsNone(error.exception.__context__)
+            self.assertIsNone(error.exception.__cause__)
             self.assertEqual(len(token.calls), 1)
             self.assertEqual(token.calls[0].url, youtube_auth.TOKEN_URI)
             self.assertEqual(upload.calls, [])
     for secret in ("synthetic-secret", "synthetic-refresh", "attacker.invalid",
                    youtube_auth.TOKEN_URI):
       self.assertNotIn(secret, output.getvalue())
+
+  def test_malformed_refresh_cannot_expose_secrets_through_transport_error(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      home = Path(temporary).resolve() / "home"
+      home.mkdir(mode=0o700)
+      with mock.patch.object(youtube_auth.Path, "home", return_value=home):
+        with mock.patch.object(youtube_auth.getpass, "getpass", side_effect=(
+            "synthetic.apps.googleusercontent.com", "synthetic-secret")):
+          youtube_auth.configure()
+        state = home / ".config" / "chipviz" / youtube_auth.STATE_FILE
+        state.write_text(youtube_auth._state_text("UC" + "a" * 22, "synthetic-refresh"))
+        state.chmod(0o600)
+        expiry = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        expiry += datetime.timedelta(hours=1)
+        initial = ("synthetic-access", "synthetic-refresh", expiry, {}, None)
+        with mock.patch.object(google_reauth, "refresh_grant", return_value=initial):
+          credentials, _ = youtube_auth.load_credentials()
+        credentials.token = None
+        session = transport.make_session(credentials)
+        self.addCleanup(session.close)
+        upload = OfflineAdapter()
+        session.mount("https://", upload)
+        token = OfflineAdapter(status=200, body=json.dumps({
+          "refresh_token": "synthetic-rotated-token",
+          "client_secret": "synthetic-secret",
+        }).encode())
+        def send_token(_adapter, request, **kwargs):
+          return token.send(request, **kwargs)
+        with mock.patch.object(HTTPAdapter, "send", autospec=True, side_effect=send_token):
+          try:
+            raise RuntimeError("synthetic-outer-secret")
+          except RuntimeError:
+            try:
+              transport.create_session(session, {"snippet": {}}, 1)
+            except transport.TransportError as error:
+              self.assertEqual(error.kind, "uncertain")
+              self.assertIsNone(error.__context__)
+              self.assertIsNone(error.__cause__)
+              for secret in ("synthetic-rotated-token", "synthetic-secret", "synthetic-refresh",
+                             youtube_auth.TOKEN_URI, "synthetic-outer-secret"):
+                self.assertNotIn(secret, repr(error))
+                self.assertNotIn(secret, repr(vars(error)))
+              frame = error.__traceback__
+              while frame:
+                self.assertNotEqual(frame.tb_frame.f_code.co_filename, transport.__file__)
+                self.assertNotEqual(frame.tb_frame.f_code.co_filename, youtube_auth.__file__)
+                self.assertNotIn("/site-packages/", frame.tb_frame.f_code.co_filename)
+                frame = frame.tb_next
+            else:
+              self.fail("expected sanitized transport error")
+        self.assertEqual(len(token.calls), 1)
+        self.assertEqual(upload.calls, [])
 
   def test_normalized_response_url_matches_requests_preparation(self):
     uri = URI + "%7E"

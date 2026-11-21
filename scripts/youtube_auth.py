@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Local, private YouTube installed-app authorization for chipviz."""
+"""Local, private YouTube installed-app authorization for chipviz.
+
+Sanitized public errors discard internal tracebacks and exception chains.
+Callers must still protect their own frame locals and credential objects.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +12,7 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import functools
 import getpass
 import io
 import json
@@ -43,6 +48,20 @@ class AuthError(Exception):
   def __init__(self, message, *, kind="uncertain"):
     super().__init__(message)
     self.kind = kind
+
+
+def _sanitize_auth_errors(function):
+  """Remove internal tracebacks and chains, including an active caller exception."""
+  @functools.wraps(function)
+  def wrapped(*args, **kwargs):
+    try:
+      return function(*args, **kwargs)
+    except AuthError as error:
+      error.__context__ = None
+      error.__cause__ = None
+      error.__traceback__ = None
+      raise
+  return wrapped
 
 
 @contextlib.contextmanager
@@ -438,6 +457,7 @@ def _authorize() -> None:
     os.close(fd)
 
 
+@_sanitize_auth_errors
 def configure() -> None:
   """Prompt without echo and create the private configuration once."""
   try:
@@ -446,6 +466,7 @@ def configure() -> None:
     raise AuthError("Cannot create private YouTube configuration.") from None
 
 
+@_sanitize_auth_errors
 def authorize() -> None:
   """Authorize and confirm a single channel, without exposing library errors."""
   try:
@@ -454,6 +475,7 @@ def authorize() -> None:
     raise AuthError("Cannot authorize and confirm the YouTube channel.") from None
 
 
+@_sanitize_auth_errors
 def load_credentials() -> tuple[object, str]:
   """Return credentials and channel; AuthError.kind distinguishes uncertain failures.
 
@@ -473,6 +495,7 @@ def load_credentials() -> tuple[object, str]:
     from google.oauth2.credentials import Credentials
 
     class DurableCredentials(Credentials):
+      @_sanitize_auth_errors
       def refresh(self, request):
         try:
           if getattr(self, "_youtube_refresh_failed", False):
@@ -502,7 +525,8 @@ def load_credentials() -> tuple[object, str]:
         except Exception as error:
           self.token = None
           self._youtube_refresh_failed = True
-          kind = error.kind if isinstance(error, AuthError) else "uncertain"
+          kind = ("auth_required" if isinstance(error, AuthError)
+                  and error.kind == "auth_required" else "uncertain")
           raise AuthError("Cannot refresh private YouTube authorization.", kind=kind) from None
 
     credentials = DurableCredentials(
@@ -511,7 +535,8 @@ def load_credentials() -> tuple[object, str]:
     credentials.refresh(None)
     return credentials, channel_id
   except Exception as error:
-    kind = error.kind if isinstance(error, AuthError) else "uncertain"
+    kind = ("auth_required" if isinstance(error, AuthError)
+            and error.kind == "auth_required" else "uncertain")
     raise AuthError("Cannot load valid private YouTube authorization.", kind=kind) from None
 
 
