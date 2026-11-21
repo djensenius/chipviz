@@ -325,6 +325,8 @@ fn run_dmg_preview(
     let size = window.inner_size();
     let mut drawable = preview_drawable(size.width, size.height);
     let mut modifiers = ModifiersState::empty();
+    // A resize wakes Wait; the next AboutToWait resumes redraws if drawable.
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run(move |event, target| match event {
         Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
             WindowEvent::CloseRequested => target.exit(),
@@ -360,7 +362,7 @@ fn run_dmg_preview(
             },
             _ => {}
         },
-        Event::AboutToWait => window.request_redraw(),
+        Event::AboutToWait => request_preview_redraw(drawable, || window.request_redraw()),
         _ => {}
     })?;
     Ok(())
@@ -369,6 +371,13 @@ fn run_dmg_preview(
 #[cfg(feature = "dmg-preview")]
 fn preview_drawable(width: u32, height: u32) -> bool {
     width != 0 && height != 0
+}
+
+#[cfg(feature = "dmg-preview")]
+fn request_preview_redraw(drawable: bool, request: impl FnOnce()) {
+    if drawable {
+        request();
+    }
 }
 
 fn set_fullscreen(window: &Window, fullscreen: bool) {
@@ -1489,6 +1498,28 @@ mod tests {
         assert_eq!((frame.scx, frame.scy), (128, 1));
         assert!(!preview_drawable(160, 0));
         assert_eq!(preview.acquired(start + Duration::from_millis(200)), frame);
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_waits_without_redraws_at_zero_size_and_resumes_after_resize() {
+        let mut redraws = 0;
+        let mut drawable = preview_drawable(160, 144);
+        request_preview_redraw(drawable, || redraws += 1);
+        assert_eq!(redraws, 1);
+
+        for size in [(0, 144), (160, 0), (0, 0)] {
+            drawable = preview_drawable(size.0, size.1);
+            for _ in 0..3 {
+                request_preview_redraw(drawable, || redraws += 1);
+            }
+        }
+        assert_eq!(redraws, 1);
+
+        drawable = preview_drawable(320, 288);
+        request_preview_redraw(drawable, || redraws += 1);
+        request_preview_redraw(drawable, || redraws += 1);
+        assert_eq!(redraws, 3);
     }
 
     #[test]
