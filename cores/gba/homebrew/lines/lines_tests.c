@@ -300,6 +300,35 @@ static void phase_boundaries(void) {
         "step 65536 moves to phase 16 without a discontinuity");
 }
 
+static void palette_energy(void) {
+  lines_state_t state;
+  lines_snapshot_t low, high;
+  unsigned i, channel;
+  int accepted;
+  lines_init(&state);
+  accepted = lines_observe(&state, 0, 0);
+  lines_snapshot(&state, &low);
+  for (i = 1; i <= 32u; ++i) {
+    accepted &= lines_observe(&state, i, LINES_KEY_L);
+  }
+  lines_snapshot(&state, &high);
+  check(accepted && high.energy > low.energy, "held L raises the sampled energy");
+  check(low.palette[1] != low.palette[0], "low-energy line 1 differs from background");
+  check(low.palette[2] != low.palette[0], "low-energy line 2 differs from background");
+  check(high.palette[1] != high.palette[0], "high-energy line 1 differs from background");
+  check(high.palette[2] != high.palette[0], "high-energy line 2 differs from background");
+  for (i = 1; i <= 2u; ++i) {
+    int brighter = 0, nondecreasing = 1;
+    for (channel = 0; channel < 3u; ++channel) {
+      unsigned low_component = (low.palette[i] >> (channel * 5u)) & 31u;
+      unsigned high_component = (high.palette[i] >> (channel * 5u)) & 31u;
+      brighter |= high_component > low_component;
+      nondecreasing &= high_component >= low_component;
+    }
+    check(brighter && nondecreasing, "higher energy brightens each line palette entry");
+  }
+}
+
 static void rendering(void) {
   lines_state_t state;
   lines_snapshot_t snapshot, frozen;
@@ -465,6 +494,7 @@ int main(void) {
   rapid_phrases();
   phase_wrap();
   phase_boundaries();
+  palette_energy();
   rendering();
   batch_contract();
   printf("gba lines tests: %u checks, %u failures\n", checks, failures);
