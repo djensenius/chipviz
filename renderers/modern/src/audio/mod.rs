@@ -21,6 +21,7 @@ pub const BEAT_FLAG: u8 = 0x01;
 pub const BAR_FLAG: u8 = 0x02;
 pub const DROP_FLAG: u8 = 0x04;
 const BEATS_PER_BAR: u16 = 4;
+const MAX_BEAT_STEP: u16 = 4;
 
 /// Latest analysed features, published without locks. Only the transport
 /// fields are guaranteed consistent with each other: `bpm`, `beat_phase`, and
@@ -69,14 +70,19 @@ impl SharedFeatures {
 
 /// Builds a mic-driven frame. `frame`, `scene`, and `palette` come from
 /// `base` (the procedural timeline), so scene selection is unchanged; the
-/// audio fields come from `features`. The beat flag is set when the beat
-/// count changed since `previous_beat_count`, the bar flag every fourth beat.
+/// audio fields come from `features`. Up to four forward beats, including
+/// counter wrap, produce one beat flag; a bar flag is emitted only when the
+/// current count is a bar boundary. Missed bars are not reconstructed.
+/// Larger jumps resynchronize without an event. A small forward reset is
+/// indistinguishable from progress without a source epoch.
 pub fn mic_frame(
     base: ControlFrame,
     features: AudioFeatures,
     previous_beat_count: Option<u16>,
 ) -> ControlFrame {
-    let beat = previous_beat_count.is_some_and(|previous| previous != features.beat_count);
+    let beats =
+        previous_beat_count.map_or(0, |previous| features.beat_count.wrapping_sub(previous));
+    let beat = (1..=MAX_BEAT_STEP).contains(&beats);
     let mut flags = 0;
     if beat {
         flags |= BEAT_FLAG;
@@ -150,18 +156,35 @@ mod tests {
     }
 
     #[test]
-    fn mic_frame_flags_beats_and_bars_on_count_change() {
+    fn mic_frame_flags_bounded_beats_and_current_bar() {
         let base = ControlFrame::procedural(0);
         let mut features = sample();
-        features.beat_count = 7;
-        assert_eq!(mic_frame(base, features, Some(7)).flags, 0);
-        assert_eq!(mic_frame(base, features, Some(6)).flags, BEAT_FLAG);
-        features.beat_count = 8;
-        assert_eq!(
-            mic_frame(base, features, Some(7)).flags,
-            BEAT_FLAG | BAR_FLAG
-        );
-        features.beat_count = 0;
-        assert!(mic_frame(base, features, Some(u16::MAX)).beat_onset());
+        for (previous, current, expected) in [
+            (None, 7, 0),
+            (Some(7), 7, 0),
+            (Some(8), 8, 0),
+            (Some(6), 7, BEAT_FLAG),
+            (Some(7), 8, BEAT_FLAG | BAR_FLAG),
+            (Some(7), 9, BEAT_FLAG),
+            (Some(7), 11, BEAT_FLAG),
+            (Some(9), 12, BEAT_FLAG | BAR_FLAG),
+            (Some(8), 10, BEAT_FLAG),
+            (Some(1), 5, BEAT_FLAG),
+            (Some(u16::MAX), 0, BEAT_FLAG | BAR_FLAG),
+            (Some(u16::MAX - 1), 1, BEAT_FLAG),
+            (Some(u16::MAX - 3), 0, BEAT_FLAG | BAR_FLAG),
+            (Some(1000), 0, 0),
+            (Some(0), 1, BEAT_FLAG),
+            (Some(3), 2, 0),
+            (Some(0), 5, 0),
+            (Some(u16::MAX - 4), 0, 0),
+        ] {
+            features.beat_count = current;
+            assert_eq!(
+                mic_frame(base, features, previous).flags,
+                expected,
+                "previous {previous:?}, current {current}"
+            );
+        }
     }
 }
