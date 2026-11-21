@@ -66,9 +66,11 @@ smaller windows use fractional scaling.
 
 The first successfully acquired surface ticks the model once; subsequent
 ticks use the monotonic DMG VBlank period (70,224 / 4,194,304 seconds), not
-redraw counts. Failed acquisitions and zero-sized windows do not tick; on
-resume, at most one tick runs and missed intervals are dropped. Resize does
-not reset the clock. Submission and `present()` do not prove display timing.
+redraw counts. A redraw can hold a frame or miss a clock interval; rates below
+native VBlank cannot keep up. Failed acquisitions and zero-sized windows do
+not tick; on resume, at most one tick runs and missed intervals are dropped.
+Resize does not reset the clock. Submission and `present()` do not prove
+display timing.
 This preview has not had physical Pi validation or visual-safety certification;
 presented-output flash assessment and normal-speed human review remain needed.
 

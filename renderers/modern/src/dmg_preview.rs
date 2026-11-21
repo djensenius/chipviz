@@ -109,4 +109,53 @@ mod tests {
             assert_eq!(preview.model.counter(), interval as u8 + 1);
         }
     }
+
+    #[test]
+    fn simulated_redraw_rates_follow_same_clock_and_bound_stall_recovery() {
+        fn simulate(hz: u64, stall: bool) -> Vec<(u32, Display)> {
+            let start = Instant::now();
+            let mut preview = DmgPreview::default();
+            let mut ticks = 0;
+            let mut checkpoints = Vec::new();
+            for redraw in 0..=10 * hz {
+                if stall && redraw > 2 * hz && redraw < 3 * hz {
+                    continue;
+                }
+                let now = start + Duration::from_nanos(redraw * 1_000_000_000 / hz);
+                let before = preview.model.counter();
+                let display = preview.acquired(now);
+                let advanced = preview.model.counter().wrapping_sub(before);
+                assert!(advanced <= 1, "{hz} Hz, redraw {redraw}");
+                ticks += u32::from(advanced);
+                if stall && redraw == 3 * hz {
+                    assert_eq!(advanced, 1, "resume advances exactly once");
+                    assert_eq!(preview.acquired(now), display);
+                    assert_eq!(preview.model.counter(), before.wrapping_add(1));
+                }
+                if redraw % hz == 0 && [0, 1, 2, 3, 10].contains(&(redraw / hz)) {
+                    checkpoints.push((ticks, display));
+                }
+            }
+            checkpoints
+        }
+
+        for stall in [false, true] {
+            let reference = simulate(60, stall);
+            let expected = if stall {
+                [1, 60, 120, 121, 539]
+            } else {
+                [1, 60, 120, 180, 598]
+            };
+            assert_eq!(
+                reference
+                    .iter()
+                    .map(|(ticks, _)| *ticks)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for hz in [120, 240] {
+                assert_eq!(simulate(hz, stall), reference, "{hz} Hz, stall={stall}");
+            }
+        }
+    }
 }
