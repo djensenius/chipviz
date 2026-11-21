@@ -11,15 +11,28 @@ RATIO = 1 << 20
 
 
 @dataclass(frozen=True)
-class Profile:
-  # Alternative profiles are for fake-core tests, not evidence about GX.
-  sha256: str
-  cycle_offset: int = 0x40
+class Layout:
+  size: int
+  cycle_offset: int
   read_symbol: str = "z80_ms_port_r"
   write_symbol: str = "z80_ms_port_w"
 
 
-GX = Profile(GX_HASH)
+# No GX layout is registered: the Z80 symbol's actual extent is not yet vetted.
+# Tests register their own compiled fake's known layout temporarily.
+_VETTED_LAYOUTS = {}
+
+
+def _layout_for_hash(digest):
+  layout = _VETTED_LAYOUTS.get(digest)
+  if not isinstance(layout, Layout):
+    raise RuntimeError("core hash has no vetted layout")
+  size, offset = layout.size, layout.cycle_offset
+  width = ctypes.sizeof(ctypes.c_uint32)
+  if (type(size) is not int or type(offset) is not int or size < width or
+      offset < 0 or offset % ctypes.alignment(ctypes.c_uint32) or offset > size - width):
+    raise RuntimeError("invalid core layout")
+  return layout
 
 
 class Event(ctypes.Structure):
@@ -29,39 +42,45 @@ class Event(ctypes.Structure):
 class Trace:
   """Install only after core initialization; run and inspect on one thread."""
 
-  def __init__(self, core_path, shim_path, *, profile=GX, capacity=4096):
+  def __init__(self, core_path, shim_path, *, capacity=4096):
     core_path = Path(core_path).resolve()
-    if hashlib.sha256(core_path.read_bytes()).hexdigest() != profile.sha256:
-      raise RuntimeError("core hash mismatch")
+    layout = _layout_for_hash(hashlib.sha256(core_path.read_bytes()).hexdigest())
     self.core = ctypes.CDLL(str(core_path))
     self.shim = ctypes.CDLL(str(Path(shim_path).resolve()))
     try:
       self.read_slot = ctypes.c_void_p.in_dll(self.core, "z80_readport")
       self.write_slot = ctypes.c_void_p.in_dll(self.core, "z80_writeport")
       self.ratio = ctypes.c_uint32.in_dll(self.core, "z80_cycle_ratio")
-      z80 = ctypes.c_uint8.in_dll(self.core, "Z80")
-      read = ctypes.cast(getattr(self.core, profile.read_symbol), ctypes.c_void_p).value
-      write = ctypes.cast(getattr(self.core, profile.write_symbol), ctypes.c_void_p).value
+      z80 = (ctypes.c_uint8 * layout.size).in_dll(self.core, "Z80")
+      read = ctypes.cast(getattr(self.core, layout.read_symbol), ctypes.c_void_p).value
+      write = ctypes.cast(getattr(self.core, layout.write_symbol), ctypes.c_void_p).value
     except (ValueError, AttributeError) as error:
       raise RuntimeError("missing core symbol") from error
     if not read or not write or self.read_slot.value != read or self.write_slot.value != write:
       raise RuntimeError("unexpected port pointer identity")
     if self.ratio.value != RATIO:
       raise RuntimeError("cycle ratio mismatch")
-    self.cycles = ctypes.c_uint32.from_address(ctypes.addressof(z80) + profile.cycle_offset)
+    if ctypes.addressof(z80) % ctypes.alignment(ctypes.c_uint32):
+      raise RuntimeError("unaligned core layout")
+    self.z80 = z80
+    self.cycles = ctypes.c_uint32.from_buffer(z80, layout.cycle_offset)
     self._bind()
+    self._owner = ctypes.c_byte()
+    self._keys = (ctypes.byref(self._owner), ctypes.byref(self.read_slot), ctypes.byref(self.write_slot))
     self.active = False
     self.in_frame = False
     self.last_frame = -1
-    if self.shim.sms_trace_install(ctypes.byref(self.read_slot), ctypes.byref(self.write_slot),
-                                   read, write, ctypes.byref(self.cycles),
-                                   ctypes.byref(self.ratio), capacity):
-      raise RuntimeError("trace installation failed")
-    self.active = True
+    try:
+      if self._install(read, write, capacity):
+        raise RuntimeError("trace installation failed")
+      self.active = True
+    except BaseException as error:
+      self._recover(error)
+      raise
 
   def _bind(self):
     shim = self.shim
-    shim.sms_trace_install.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_size_t]
+    shim.sms_trace_install.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_size_t, ctypes.c_void_p]
     shim.sms_trace_install.restype = ctypes.c_int
     shim.sms_trace_begin.argtypes = [ctypes.c_uint32]
     shim.sms_trace_begin.restype = ctypes.c_int
@@ -75,8 +94,28 @@ class Trace:
     shim.sms_trace_healthy.restype = ctypes.c_int
     shim.sms_trace_event.argtypes = [ctypes.c_size_t, ctypes.POINTER(Event)]
     shim.sms_trace_event.restype = ctypes.c_int
-    shim.sms_trace_uninstall.argtypes = []
+    shim.sms_trace_owned.argtypes = [ctypes.c_void_p] * 3
+    shim.sms_trace_owned.restype = ctypes.c_int
+    shim.sms_trace_uninstall.argtypes = [ctypes.c_void_p] * 3
     shim.sms_trace_uninstall.restype = ctypes.c_int
+    self._native_uninstall = shim.sms_trace_uninstall
+
+  def _install(self, read, write, capacity):
+    return self.shim.sms_trace_install(ctypes.byref(self.read_slot), ctypes.byref(self.write_slot),
+                                       read, write, ctypes.byref(self.cycles),
+                                       ctypes.byref(self.ratio), capacity, self._keys[0])
+
+  def _uninstall(self):
+    return self._native_uninstall(*self._keys)
+
+  def _recover(self, error):
+    try:
+      if self.shim.sms_trace_owned(*self._keys) and self._native_uninstall(*self._keys):
+        error.add_note("trace cleanup: port pointer changed while tracing")
+      return True
+    except BaseException as cleanup_error:
+      error.add_note(f"trace cleanup failed: {cleanup_error!r}")
+      return False
 
   def begin_frame(self, frame):
     if (not self.active or self.in_frame or not 0 <= frame <= 0xffffffff or
@@ -112,13 +151,18 @@ class Trace:
 
   def close(self):
     if self.active:
-      healthy = self.shim.sms_trace_healthy()
-      incomplete = self.in_frame
-      self.active = False
-      if self.shim.sms_trace_uninstall():
-        raise RuntimeError("port pointer changed while tracing")
-      if not healthy or incomplete:
-        raise RuntimeError("trace loss, pointer or cycle ratio mismatch, or unfinished frame")
+      try:
+        healthy = self.shim.sms_trace_healthy()
+        incomplete = self.in_frame
+        if self._uninstall():
+          raise RuntimeError("port pointer changed while tracing")
+        self.active = False
+        if not healthy or incomplete:
+          raise RuntimeError("trace loss, pointer or cycle ratio mismatch, or unfinished frame")
+      except BaseException as error:
+        if self._recover(error):
+          self.active = False
+        raise
 
   def __enter__(self):
     return self
@@ -126,10 +170,12 @@ class Trace:
   def __exit__(self, exc_type, exc, traceback):
     try:
       self.close()
-    except RuntimeError as error:
+    except BaseException as error:
       if exc is None:
         raise
       exc.add_note(f"trace cleanup: {error}")
+      for note in getattr(error, "__notes__", ()):
+        exc.add_note(note)
 
 
 def check_seed(events):

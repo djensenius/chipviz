@@ -1,21 +1,29 @@
 # SMS port trace foundation
 
-This host-only, single-threaded shim records raw instruction-end emulator
-cycles and forwards each read/write to the original function. It uses no Python
-callback in the port hot path. The current fake-core tests do not establish
-that the GX hook, its cycle offset, ABI, or 270-unit seed spacing is calibrated.
+This host-only, single-threaded shim samples uncalibrated raw counters before
+forwarding each read/write to the original function. It uses no Python callback
+in the port hot path. Static disassembly suggests the candidate GX counter
+reflects instruction-end cycles, but this is an unverified hypothesis, not a
+proven timestamp. The fake-core tests do not establish the GX hook, cycle
+offset, ABI, or 270-unit seed spacing.
 An embedded version string and ad-hoc signature do not establish a clean build.
 
-The pinned hash, symbols, installed pointer identities, and 1<<20 cycle ratio
-are required before pointer installation. Run only on a quiescent core after
+An internally vetted, hash-specific layout with a known symbol extent and
+aligned in-bounds counter offset, plus the required symbols, installed pointer
+identities and 1<<20 cycle ratio, is required before pointer installation.
+No GX layout is registered: the actual Z80 symbol extent is not yet verified,
+so even the pinned GX hash fails closed. The tests temporarily register only
+their own fake-core layout. Run only on a quiescent core after
 initialization, with no other thread invoking ports or changing slots, ratio,
 or the loaded core. Bracket every core frame with `begin_frame` / `end_frame`,
 using consecutive frame numbers; read `events()` only between frames, and use
 the context manager to restore slots before unloading the core. Storage is
-bounded; overflow, calls outside
-frames, or ratio changes are failures. Raw counters may reset between frames:
-there is no inferred cross-frame time or wrap correction. A decrease within a
-frame fails. The shim is a singleton and only one trace can be active.
+bounded; overflow, calls outside frames, or ratio changes are failures. Raw
+counters may reset between frames: there is no inferred cross-frame time or
+wrap correction. A decrease within a frame fails. The shim is a singleton and
+only one trace can be active. Cleanup is owner-checked and preserves replaced
+slots; a further exception during cleanup is reported on the original error,
+and an existing trace object can retry `close()`.
 The core file must remain immutable between hashing and loading, and the
 process must not already have a different image loaded under the same path;
 the file hash is not an attestation of the in-memory image.

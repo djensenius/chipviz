@@ -17,6 +17,7 @@ static uint32_t frame;
 static const uint32_t *cycles, *ratio;
 static read_port *read_slot, original_read;
 static write_port *write_slot, original_write;
+static const void *owner;
 
 static unsigned int trace_read(unsigned int port);
 static void trace_write(unsigned int port, unsigned int value);
@@ -55,9 +56,11 @@ static void trace_write(unsigned int port, unsigned int value) {
 }
 
 int sms_trace_install(read_port *rs, write_port *ws, read_port r, write_port w,
-                      const uint32_t *c, const uint32_t *q, size_t capacity) {
+                      const uint32_t *c, const uint32_t *q, size_t capacity,
+                      const void *token) {
   if (active || rs == NULL || ws == NULL || r == NULL || w == NULL ||
-      c == NULL || q == NULL || *q != (1u << 20) || *rs != r || *ws != w ||
+      c == NULL || q == NULL || token == NULL ||
+      *q != (1u << 20) || *rs != r || *ws != w ||
       capacity == 0 || capacity > CAPACITY) return -1;
   read_slot = rs;
   write_slot = ws;
@@ -65,6 +68,7 @@ int sms_trace_install(read_port *rs, write_port *ws, read_port r, write_port w,
   original_write = w;
   cycles = c;
   ratio = q;
+  owner = token;
   count = 0;
   limit = capacity;
   lost = 0;
@@ -96,14 +100,19 @@ int sms_trace_event(size_t index, struct event *out) {
   return 0;
 }
 
-int sms_trace_uninstall(void) {
+int sms_trace_owned(const void *token, read_port *rs, write_port *ws) {
+  return active && token != NULL && owner == token && read_slot == rs && write_slot == ws;
+}
+
+int sms_trace_uninstall(const void *token, read_port *rs, write_port *ws) {
   int ok;
-  if (!active) return -1;
+  if (!sms_trace_owned(token, rs, ws)) return -1;
   ok = *read_slot == trace_read && *write_slot == trace_write;
   /* Do not overwrite another owner's replacement. Restore our own slots. */
   if (*read_slot == trace_read) *read_slot = original_read;
   if (*write_slot == trace_write) *write_slot = original_write;
   active = 0;
   in_frame = 0;
+  owner = NULL;
   return ok ? 0 : -1;
 }

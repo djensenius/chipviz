@@ -1,21 +1,28 @@
 /* Fake core for the host-only trace tests; deliberately not an emulator. */
 #include <stdint.h>
+#include <limits.h>
 
 struct fake_z80 { uint32_t padding[16], cycles; } Z80;
 uint32_t z80_cycle_ratio = 1u << 20;
-static unsigned int log_kind[64], log_port[64], log_value[64], count;
+static unsigned int log_kind[64], log_port[64], log_value[64];
+static uint64_t count;
+
+static void record(unsigned int kind, unsigned int port, unsigned int value) {
+  if (count < 64) {
+    log_kind[count] = kind;
+    log_port[count] = port;
+    log_value[count] = value;
+  }
+  count++;
+}
 
 unsigned int z80_ms_port_r(unsigned int port) {
-  log_kind[count] = 0;
-  log_port[count] = port;
-  log_value[count++] = port ^ 0x55u;
+  record(0, port, port ^ 0x55u);
   return port ^ 0x55u;
 }
 
 void z80_ms_port_w(unsigned int port, unsigned int value) {
-  log_kind[count] = 1;
-  log_port[count] = port;
-  log_value[count++] = value;
+  record(1, port, value);
 }
 
 static unsigned int other_read(unsigned int port) { return port; }
@@ -33,7 +40,7 @@ void fake_replace_read(void) { z80_readport = other_read; }
 void fake_cycle(uint32_t value) { Z80.cycles = value; }
 unsigned int fake_read(unsigned int port) { return z80_readport(port); }
 void fake_write(unsigned int port, unsigned int value) { z80_writeport(port, value); }
-unsigned int fake_count(void) { return count; }
-unsigned int fake_kind(unsigned int i) { return log_kind[i]; }
-unsigned int fake_port(unsigned int i) { return log_port[i]; }
-unsigned int fake_value(unsigned int i) { return log_value[i]; }
+uint64_t fake_count(void) { return count; }
+unsigned int fake_kind(unsigned int i) { return i < 64 && i < count ? log_kind[i] : UINT_MAX; }
+unsigned int fake_port(unsigned int i) { return i < 64 && i < count ? log_port[i] : UINT_MAX; }
+unsigned int fake_value(unsigned int i) { return i < 64 && i < count ? log_value[i] : UINT_MAX; }
