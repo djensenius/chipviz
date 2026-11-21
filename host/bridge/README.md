@@ -99,6 +99,53 @@ Inputs and their expected outputs live under
 [`../fixtures/`](../fixtures). Regenerate the golden outputs after an
 intentional encoder change with `--write-fixtures`.
 
+## Offline catalog music-source producer
+
+`catalog_music_source.py` is an opt-in, stdlib-only offline producer. From the
+repository root, for example (the output must not already exist):
+
+```sh
+mkdir -p build
+python3 host/bridge/catalog_music_source.py \
+  --music host/fixtures/musical/scale.musicsource.json \
+  --family 2 --output build/scale-catalog.cvxe
+```
+
+The explicit family must be 0–5, and `--variant` defaults to and only accepts
+0. Starfield (6), ColourField (7), other families and nonzero variants are
+rejected, not substituted. The source must have an explicit integer
+`frame_rate` of 60. Its legacy scene is validated but overridden, never
+interpreted as a catalog selection; palette, audio, notes, flags and timing
+come from `encode_music_source`. Tick `n` represents `n/60` seconds.
+
+The library entry points are `encode_catalog(source_bytes, family, variant=0)`
+and `write_catalog(source_path, output_path, family, variant=0)`. Both reject
+invalid selections or sources with `ValueError`. Both require writable
+temporary storage for the candidate and validator snapshot and can raise
+`OSError` on I/O failures, such as a full temporary filesystem. The file API
+can also raise `OSError` while reading or writing its paths. The CLI reports
+these errors on stderr and exits nonzero. Input is
+limited to 1,048,576 bytes, 1–65,536 frames and a product of frame count and
+note count no greater than 1,000,000, bounding the existing encoder's
+frame-by-note work. The complete generated recording is checked by the
+offline catalog validator before exclusive output creation.
+
+Use trusted, non-mutable input and output directories: the producer is not a
+same-account isolation mechanism. It uses Unix `O_NOCTTY` and `O_NONBLOCK`
+to open input and requires a regular file, but opening arbitrary devices is not
+safe, and regular files on remote, virtual or faulty filesystems can still
+block. Do not mutate input while reading; this is not an atomic snapshot
+against concurrent mutation.
+The output is created exclusively with permissions at most `0600` (subject to
+umask); existing files, including links and source aliases, are refused.
+An I/O failure during output writing can leave a partial new file. No parent
+directories are created.
+
+The `.cvxe` format and successful validation do not imply receiver
+availability, actual hardware operation or safety. This tool neither plays
+nor sends recordings; independently establish receiver compatibility and
+safety. Do not route catalog envelopes or stripped payloads to legacy readers.
+
 ## Offline scene catalog validation
 
 `scene_catalog_v1.py` provides structural validation of complete opt-in

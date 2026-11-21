@@ -121,7 +121,8 @@ as in the host bridge), `bpm` (`0` until a tempo is detected), `beat_phase`,
 follow the same timeline as procedural frames, so scenes still cycle.
 
 The beat clock only moves forward: `beat_count` increments exactly when
-`beat_phase` wraps, and `beat_count * 256 + beat_phase` never decreases. Onsets
+`beat_phase` wraps, and `beat_count * 256 + beat_phase` never decreases before
+the 16-bit count wraps. Onsets
 near the expected beat nudge the clock (jumping forward, or briefly slowing
 down) instead of rewinding it; off-beat onsets are ignored. Tempo comes from
 onset gaps folded into 60-200 BPM, so eighths faster than 200 per minute read as
@@ -131,6 +132,13 @@ it), very fast tempos (about 180 BPM and up) with loose timing can read at half
 tempo, 3/4
 and swung feels are not distinguished from straight time, and music with only
 off-beat accents is tracked on those accents.
+
+The renderer emits a beat flag when the observed count advances by one to four,
+including an ordinary 16-bit wrap; a skipped interval produces at most one
+beat. It emits a bar flag only if the current count is divisible by four, so
+missed bars are not reconstructed on a later beat. Duplicate counts and larger
+discontinuities emit no event; the new count becomes the baseline. A small
+forward reset is indistinguishable from normal progress without a source epoch.
 
 Analysis runs on its own thread; the render thread reads the latest result
 without waiting. Levels use automatic gain with a noise floor, so quiet and
@@ -683,7 +691,55 @@ needs no screen-recording permission, only a GPU adapter.
 ```sh
 just modern-capture --profile m1 --scene 1 --frames 0,120,240 --size 1920x1080 --out build/shots
 just modern-capture --input host/fixtures/musical/groove.cvz --frames 0,30 --out build/groove
+just modern-capture --catalog-v1 --input recording.cvxe --frames 0,30 --out build/catalog-shots
 ```
+
+`--catalog-v1` is an explicit CLI-only offline mode, not extension or content
+auto-detection. It requires `--input FILE` and rejects `--scene`,
+`--tunnel-variant`, and all Starfield options. Only catalog families 0–5
+(SignalField, SpectrumVolume, PulseTunnel, Lines, Static and Object), variant
+0, are accepted on the M1 and Pi 5 profiles. Starfield, ColourField and all
+other pairs are unavailable; they are never mapped to legacy substitutes.
+The tunnel is always original, and Starfield dispatch is disabled. This is
+profile support, not evidence from physical Pi hardware. Catalog-v1 capture
+currently requires Unix: it uses a nonblocking open and rejects non-regular
+input files, including FIFOs, before reading.
+
+The entire file and every record are checked before GPU initialization or
+output-directory/file creation, including records after the last requested
+still. `--frames` must be strictly increasing and within the recording.
+Replay applies records from index 0 through the final requested still once in
+order at index/60 seconds; later records are validated but not replayed.
+Requested stills do not reset replay state. The manifest includes the requested
+record's exact family, variant, sequence, tick, metadata and complete envelope
+(hex), plus the renderer's displayed scene. Native renderer transition/safety
+behavior is unchanged.
+
+The file limit is 1,000,000 records, or 145,000,020 bytes. Validation copies
+the acquisition buffer, so a maximum-size file needs approximately
+290,000,040 bytes at peak, plus allocator and other overhead; the acquisition
+buffer is released before rendering. Output and renderer memory are additional.
+Use a trusted input and trusted, non-mutable input directory. Acquisition
+checks file identity where available and metadata before and after reading,
+and fails on detected changes; these checks cannot make arbitrary concurrent
+mutation an atomic filesystem snapshot. Replay uses only the owned validated
+bytes and never reopens the source.
+Catalog-v1 refuses output leaves that are the input file, including hard-link
+or symlink aliases. It checks the manifest before GPU setup and again before
+writing, and each PNG after its displayed scene determines the filename and
+before creating it. A later PNG collision can therefore leave earlier outputs.
+These identity checks require trusted, non-mutable input and output directories;
+they are not protection against concurrent path replacement.
+
+By default capture overwrites existing outputs. The CLI's `--exclusive-output`
+instead atomically creates each PNG and manifest, refusing existing files or
+symlinks (including dangling symlinks) and duplicate frames. It does not secure
+an untrusted or mutable parent directory. On failure, newly created files
+(including partial files) may remain; existing outputs are never deleted. With
+this opt-in, recognized options cannot be consumed as values; use `./` for a
+literal path named like an option, for example `./--out`. Default CLI parsing
+retains its legacy behavior. Catalog-v1 mode also refuses recognized options
+as values, even without `--exclusive-output`.
 
 Frame `N` renders at `elapsed = N / 60` s, with camera smoothing replayed from
 frame 0, so very large frame indices take longer to capture.

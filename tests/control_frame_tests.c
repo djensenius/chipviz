@@ -30,6 +30,38 @@ static void round_trips_procedural_frame(void) {
   require(output.notes[0].note == input.notes[0].note, "note preserved");
 }
 
+static void procedural_note_boundaries(void) {
+  /* Independently expected values, also checked by the Rust and Python tests. */
+  static const struct {
+    uint16_t index, beat;
+    uint8_t phase, scene, palette, note_count, note, velocity;
+  } cases[] = {
+      {0, 0, 0, 0, 0, 1, 48, 80},
+      {1, 0, 17, 0, 0, 0, 0, 0},
+      {4081, 255, 1, 0, 7, 1, 63, 80},
+      {4095, 255, 239, 0, 7, 0, 0, 0},
+      {4096, 256, 0, 0, 0, 1, 64, 80},
+      {4097, 256, 17, 0, 0, 0, 0, 0},
+      {65521, 4095, 1, 1, 7, 1, 63, 80},
+      {65535, 4095, 239, 1, 7, 0, 0, 0},
+  };
+  size_t index;
+  for (index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+    ChipvizFrame frame;
+    chipviz_frame_make_procedural(cases[index].index, &frame);
+    require(frame.frame == cases[index].index, "procedural frame index");
+    require(frame.beat_count == cases[index].beat, "procedural beat count");
+    require(frame.beat_phase == cases[index].phase, "procedural beat phase");
+    require(frame.scene == cases[index].scene && frame.palette == cases[index].palette,
+            "procedural scene and palette");
+    require(frame.flags == cases[index].note_count && frame.note_count == cases[index].note_count,
+            "procedural flags and note count");
+    require(frame.notes[0].note == cases[index].note &&
+                frame.notes[0].velocity == cases[index].velocity,
+            "procedural note and velocity");
+  }
+}
+
 static void rejects_invalid_frames(void) {
   ChipvizFrame frame;
   uint8_t wire[CHIPVIZ_FRAME_WIRE_SIZE];
@@ -81,6 +113,7 @@ static void rejects_invalid_wire_data(void) {
 
 int main(void) {
   round_trips_procedural_frame();
+  procedural_note_boundaries();
   rejects_invalid_frames();
   rejects_invalid_wire_data();
   printf("control frame tests passed\n");

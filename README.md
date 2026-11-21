@@ -132,6 +132,22 @@ small connection abstraction. Until a live receiver is supplied, the connection
 generates deterministic procedural frames so every target has an immediate
 visualization loop.
 
+The procedural formula is an implementation convention, not a v0 wire
+requirement. For indices 0..65535, C, Python, and the modern renderer use
+the beat count modulo 24 for the note on an onset. The modern renderer formerly
+truncated the beat to eight bits first: its fallback notes intentionally change
+starting at frame 4096 (48 becomes 64), which can change visuals and generated
+captures; frames before 4096 are unchanged.
+
+The generators retain their existing wrap behavior. The C connection restarts
+its 16-bit procedural index after 65535, so its next note is 48 with beat 0
+and scene 0. Rust and Python continue their wider index: at 65536 the wire
+frame is 0 but the beat is 4096, note 64, and scene 1. Both wrap the wire beat
+at 65536 beats; Rust calculates notes from that wrapped beat, while Python uses
+the full beat before wrapping (at frame 1048576, notes 48 and 64 respectively).
+No parity beyond C's 16-bit input domain is promised. Scene, palette, flags,
+transport, and flash behavior are unchanged.
+
 ## License
 
 Copyright David Jensenius. chipviz is dual licensed:
