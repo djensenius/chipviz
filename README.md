@@ -100,6 +100,45 @@ in the [modern renderer guide](renderers/modern/README.md). Native release work
 is tracked in [#215](https://github.com/djensenius/chipviz/issues/215) and
 [#216](https://github.com/djensenius/chipviz/issues/216).
 
+### Local Apple Silicon archive
+
+On an Apple Silicon Mac with the mise Rust toolchain, the
+`aarch64-apple-darwin` target, and Xcode command-line tools available, wait
+for the serialized build slot before running the following from the checkout
+root. This builds only `chipviz-m1` with the locked dependencies and default
+features, then creates a local archive in a fresh private directory:
+
+```sh
+(
+set -eu
+checkout=$(pwd -P)
+CARGO_TARGET_DIR="$checkout/renderers/modern/target" mise exec -- cargo build \
+  --locked --manifest-path renderers/modern/Cargo.toml --release \
+  --target aarch64-apple-darwin --bin chipviz-m1
+mkdir -p build
+mkdir -p -m 700 build/macos-arm64
+out_dir=$(mktemp -d "$checkout/build/macos-arm64/package.XXXXXXXX")
+mise exec -- python scripts/package-macos-arm64.py \
+  --binary "$checkout/renderers/modern/target/aarch64-apple-darwin/release/chipviz-m1" \
+  --output "$out_dir/chipviz-macos-arm64.zip"
+)
+```
+
+The existing `build` directory must be user-owned and not group/world-writable;
+`build/macos-arm64` must be user-owned and private. The packager rejects
+symlinks, existing targets and unsafe input permissions. It copies the
+owner-executable binary and `LICENSE`, `COMMERCIAL.md`, and
+`THIRD_PARTY_NOTICES/rust.md` into the ZIP. Snapshot limits are 256 MiB for
+the binary and 8 MiB per notice. If packaging fails, a partial archive may
+remain; inspect it and use another fresh directory before retrying.
+
+This is an opt-in, non-publishing local archive, not a release workflow or a
+personal star-catalog bundle. The packaging check is headless: Mach-O headers
+alone do not establish runtime compatibility, rendering, or visual safety.
+The archive is not signed or notarized by this tool, and its notices do not
+grant redistribution or other licensing clearance. Path and input checks
+cannot prevent races by the same account.
+
 All SNES ROMs, including the generated diagnostic seed and SDK build, are
 temporarily omitted from future individual release assets and combined zips;
 past releases are unchanged.
