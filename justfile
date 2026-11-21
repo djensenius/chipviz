@@ -391,9 +391,9 @@ rust-lint:
     @echo "chipviz Rust lint OK"
 
 rust-test:
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --features unmeasured-flash
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --features dmg-preview
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --features dmg-preview
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
