@@ -14,6 +14,7 @@ const HALF_HEIGHT: f32 = 1.5;
 const NEAR: f32 = 0.5;
 const FOCAL: f32 = 1.2;
 const DEPTH_ROWS: usize = 22;
+const SEGMENTS_PER_STROKE: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {
@@ -109,13 +110,13 @@ fn clip_screen(a: [f32; 2], b: [f32; 2]) -> Option<(f32, f32)> {
     (hi > lo).then_some((lo, hi))
 }
 
-fn project_line(
-    world: [[f32; 3]; 2],
-    eye: [f32; 3],
-    aspect: f32,
-    thickness: f32,
-    intensity: f32,
-) -> Option<ProjectedLine> {
+struct VisibleStroke {
+    start: [f32; 2],
+    end: [f32; 2],
+    inverse_depth: [f32; 2],
+}
+
+fn project_line(world: [[f32; 3]; 2], eye: [f32; 3], aspect: f32) -> Option<VisibleStroke> {
     let mut a = std::array::from_fn(|i| world[0][i] - eye[i]);
     let mut b = std::array::from_fn(|i| world[1][i] - eye[i]);
     if !clip_near(&mut a, &mut b) {
@@ -131,16 +132,53 @@ fn project_line(
             start[1] + (end[1] - start[1]) * t,
         ]
     };
-    // Reciprocal depth is linear in screen space; use the visible midpoint
-    // so distant marks stay narrow even when a segment crosses the viewport.
-    let midpoint = (lo + hi) * 0.5;
-    let inverse_depth = (1.0 - midpoint) / a[2] + midpoint / b[2];
-    Some(ProjectedLine {
+    // Reciprocal depth is linear in screen space, including after clipping.
+    let inverse_depth = |t: f32| (1.0 - t) / a[2] + t / b[2];
+    Some(VisibleStroke {
         start: point(lo),
         end: point(hi),
-        width: FOCAL * thickness * inverse_depth,
-        intensity,
+        inverse_depth: [inverse_depth(lo), inverse_depth(hi)],
     })
+}
+
+fn append_stroke(
+    stroke: &VisibleStroke,
+    thickness: f32,
+    intensity: f32,
+    max_lines: usize,
+    lines: &mut Vec<ProjectedLine>,
+) {
+    // If the budget is tight, cover the whole stroke with fewer segments
+    // rather than leaving its last end floating in the middle of a surface.
+    let count = SEGMENTS_PER_STROKE.min(max_lines - lines.len());
+    if count == 0 {
+        return;
+    }
+    let point = |t: f32| {
+        if t == 0.0 {
+            stroke.start
+        } else if t == 1.0 {
+            stroke.end
+        } else {
+            [
+                stroke.start[0] + (stroke.end[0] - stroke.start[0]) * t,
+                stroke.start[1] + (stroke.end[1] - stroke.start[1]) * t,
+            ]
+        }
+    };
+    for i in 0..count {
+        let lo = i as f32 / count as f32;
+        let hi = (i + 1) as f32 / count as f32;
+        let midpoint = (lo + hi) * 0.5;
+        let inverse_depth =
+            (1.0 - midpoint) * stroke.inverse_depth[0] + midpoint * stroke.inverse_depth[1];
+        lines.push(ProjectedLine {
+            start: point(lo),
+            end: point(hi),
+            width: FOCAL * thickness * inverse_depth,
+            intensity,
+        });
+    }
 }
 
 /// Project fixed surface strokes into screen NDC, bounded by `max_lines`.
@@ -177,14 +215,10 @@ pub(crate) fn project(
                 if lines.len() == max_lines {
                     return lines;
                 }
-                if let Some(line) = project_line(
-                    world_line(surface, index, row, across),
-                    eye,
-                    aspect,
-                    thickness,
-                    intensity,
-                ) {
-                    lines.push(line);
+                if let Some(stroke) =
+                    project_line(world_line(surface, index, row, across), eye, aspect)
+                {
+                    append_stroke(&stroke, thickness, intensity, max_lines, &mut lines);
                 }
             }
         }
@@ -198,6 +232,13 @@ mod tests {
 
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 0.00001, "{a} != {b}");
+    }
+
+    fn segments(world: [[f32; 3]; 2], eye: [f32; 3], count: usize) -> Vec<ProjectedLine> {
+        let stroke = project_line(world, eye, 1.0).unwrap();
+        let mut lines = Vec::new();
+        append_stroke(&stroke, 0.025, 0.35, count, &mut lines);
+        lines
     }
 
     #[test]
@@ -238,8 +279,8 @@ mod tests {
         let eye = [0.0; 3];
         let near = [[0.0, -1.0, 4.0], [1.0, -1.0, 4.0]];
         let far = [[0.0, -1.0, 8.0], [1.0, -1.0, 8.0]];
-        let n = project_line(near, eye, 1.0, 0.025, 0.5).unwrap();
-        let f = project_line(far, eye, 1.0, 0.025, 0.5).unwrap();
+        let n = segments(near, eye, 1)[0];
+        let f = segments(far, eye, 1)[0];
         close(n.end[0], 2.0 * f.end[0]);
         close(n.start[1], 2.0 * f.start[1]);
         close(n.width, 2.0 * f.width);
@@ -254,16 +295,53 @@ mod tests {
         close(b[2], NEAR);
         close(b[0], 4.0 / 9.0);
         assert!(!clip_near(&mut [0.0, 0.0, 0.1], &mut [0.0, 0.0, 0.2]));
-        let clipped =
-            project_line([[-4.0, 0.0, 2.0], [4.0, 0.0, 2.0]], eye, 1.0, 0.025, 0.5).unwrap();
+        let clipped = segments([[-4.0, 0.0, 2.0], [4.0, 0.0, 2.0]], eye, 1)[0];
         close(clipped.start[0], -1.0);
         close(clipped.end[0], 1.0);
     }
 
     #[test]
+    fn one_surface_stroke_tapers_continuously_with_depth() {
+        let eye = camera(0.0);
+        let world = world_line(Surface::Floor, 2, 1, false);
+        let lines = segments(world, eye, SEGMENTS_PER_STROKE);
+        assert_eq!(lines.len(), SEGMENTS_PER_STROKE);
+        for pair in lines.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+            assert!(pair[0].width > pair[1].width);
+        }
+        let stroke = project_line(world, eye, 1.0).unwrap();
+        assert_eq!(lines[0].start, stroke.start);
+        assert_eq!(lines.last().unwrap().end, stroke.end);
+        let near_inverse = 1.0 / (world[0][2] - eye[2]);
+        let far_inverse = 1.0 / (world[1][2] - eye[2]);
+        close(
+            lines[0].width,
+            FOCAL * 0.025 * (0.875 * near_inverse + 0.125 * far_inverse),
+        );
+        close(
+            lines[3].width,
+            FOCAL * 0.025 * (0.125 * near_inverse + 0.875 * far_inverse),
+        );
+        assert!(
+            project(0.0, 1.0, [0.0; 3], 1000)
+                .windows(lines.len())
+                .any(|window| window == lines)
+        );
+
+        // Even a partially available budget retains both ends of the mark.
+        for count in 1..SEGMENTS_PER_STROKE {
+            let reduced = segments(world, eye, count);
+            assert_eq!(reduced.len(), count);
+            assert_eq!(reduced[0].start, stroke.start);
+            assert_eq!(reduced.last().unwrap().end, stroke.end);
+        }
+    }
+
+    #[test]
     fn fixed_marks_follow_continuously_moving_camera() {
         let world = world_line(Surface::Floor, 2, 5, true);
-        let at = |t| project_line(world, camera(t), 1.0, 0.025, 0.35).unwrap();
+        let at = |t| project_line(world, camera(t), 1.0).unwrap();
         let a = at(2.0);
         let b = at(2.001);
         let c = at(4.0);
@@ -280,7 +358,20 @@ mod tests {
             a.start[1],
             FOCAL * (world[0][1] - eye[1]) / (world[0][2] - eye[2]),
         );
-        assert!(project(2.0, 1.0, [0.0; 3], 1000).contains(&a));
+        close(
+            a.end[0],
+            FOCAL * (world[1][0] - eye[0]) / (world[1][2] - eye[2]),
+        );
+        close(
+            a.end[1],
+            FOCAL * (world[1][1] - eye[1]) / (world[1][2] - eye[2]),
+        );
+        let parts = segments(world, eye, SEGMENTS_PER_STROKE);
+        assert!(
+            project(2.0, 1.0, [0.0; 3], 1000)
+                .windows(parts.len())
+                .any(|window| window == parts)
+        );
     }
 
     #[test]
@@ -308,7 +399,7 @@ mod tests {
         let loud = project(0.0, 1.0, [1.0; 3], 1000);
         assert!(!quiet.is_empty());
         for budget in [0, 1, 3, 16] {
-            assert_eq!(project(0.0, 1.0, [0.0; 3], budget), quiet[..budget]);
+            assert_eq!(project(0.0, 1.0, [0.0; 3], budget).len(), budget);
         }
         assert_eq!(quiet.len(), loud.len());
         for (q, l) in quiet.iter().zip(loud) {
