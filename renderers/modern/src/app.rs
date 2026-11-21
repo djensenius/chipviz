@@ -870,6 +870,60 @@ fn start_mic(selector: Option<&DeviceSelector>) -> Result<MicSource, String> {
 /// bridge streaming at about the render rate never flickers with mic frames.
 const UDP_HOLD: Duration = Duration::from_millis(500);
 
+/// Procedural observations use wall-clock 60 Hz slots, independently of
+/// catalog-v1 live pacing. The first is immediate. Later slot boundaries
+/// are shifted 4 ms early. For one redraw per nominal 60 Hz tick, deviations
+/// up to ±4 ms still emit each tick; faster nominal redraws are tested with
+/// bounded irregular jitter, not promised for every possible jitter pattern.
+/// Slots use exact nanosecond arithmetic rather than a rounded period. Any
+/// two emissions must be at least 8,333,333 ns apart.
+///
+/// A redraw emits at most one observation. If a slot was missed, it emits
+/// once and reanchors the grid at that redraw, never catching up. At less
+/// than 60 Hz this means one consecutive procedural frame per redraw, not
+/// skipped timeline frames. More extreme opposing jitter can cost a frame
+/// rather than break the minimum gap. Duplicate/backward redraw timestamps
+/// are held and cannot rewind the clock.
+const PROCEDURAL_EARLY_NS: u128 = 4_000_000;
+const PROCEDURAL_MIN_GAP: Duration = Duration::from_nanos(8_333_333);
+
+#[derive(Default)]
+struct ProceduralClock {
+    origin: Option<Instant>,
+    slot: u128,
+    last_emitted: Option<Instant>,
+    last_redraw: Option<Instant>,
+}
+
+impl ProceduralClock {
+    fn due(&mut self, now: Instant) -> bool {
+        if self.last_redraw.is_some_and(|last| now <= last) {
+            return false;
+        }
+        self.last_redraw = Some(now);
+        let Some(origin) = self.origin else {
+            self.origin = Some(now);
+            self.last_emitted = Some(now);
+            return true;
+        };
+        let elapsed = now.duration_since(origin);
+        let slot = (elapsed.as_nanos() + PROCEDURAL_EARLY_NS) * 60 / 1_000_000_000;
+        if slot <= self.slot
+            || now.duration_since(self.last_emitted.expect("started clock")) < PROCEDURAL_MIN_GAP
+        {
+            return false;
+        }
+        if slot > self.slot + 1 {
+            self.origin = Some(now);
+            self.slot = 0;
+        } else {
+            self.slot = slot;
+        }
+        self.last_emitted = Some(now);
+        true
+    }
+}
+
 /// What to render when no UDP packet arrived this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdleSource {
@@ -900,6 +954,7 @@ struct FrameSource {
     udp: UdpFrameSource,
     mic: Option<Box<dyn LatestFeatures>>,
     fallback_index: u64,
+    procedural_clock: ProceduralClock,
     latest: ControlFrame,
     last_udp: Option<Instant>,
     mic_beat_count: Option<u16>,
@@ -918,6 +973,7 @@ impl FrameSource {
             udp,
             mic,
             fallback_index: 0,
+            procedural_clock: ProceduralClock::default(),
             latest: ControlFrame::procedural(0),
             last_udp: None,
             mic_beat_count: None,
@@ -963,14 +1019,17 @@ impl FrameSource {
                 // resend until note-off), so they are kept.
                 self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
             }
-            // Generated frames number from `fallback_index`, independent of
-            // UDP counters. On a handover the first one can equal the last
-            // stepped counter; the colour field then skips that one frame
-            // (see `ColourField::has_new_frame`).
+            // Procedural fallback advances only on its own wall clock.
             IdleSource::Procedural => {
-                self.fallback_index = self.fallback_index.wrapping_add(1);
-                self.latest = ControlFrame::procedural(self.fallback_index);
-                self.fresh.push(self.latest);
+                if self.procedural_clock.due(now) {
+                    self.fallback_index = self.fallback_index.wrapping_add(1);
+                    self.latest = ControlFrame::procedural(self.fallback_index);
+                    self.fresh.push(self.latest);
+                } else {
+                    // Repeating a displayed frame must not repeat its one-shot
+                    // flags; held redraws are not observed as falling edges.
+                    self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
+                }
             }
             IdleSource::Mic => {
                 if let Some(mic) = &self.mic {
@@ -1537,6 +1596,339 @@ mod tests {
     impl LatestFeatures for FakeMic {
         fn latest(&self) -> AudioFeatures {
             self.0.get()
+        }
+    }
+
+    // First representable nanosecond at or after a rational redraw boundary.
+    fn redraw_boundary(n: u64, hz: u64) -> Duration {
+        Duration::from_nanos((n * 1_000_000_000).div_ceil(hz))
+    }
+
+    fn static_output(
+        frame: ControlFrame,
+        elapsed: Duration,
+        state: &scenes::SceneState,
+    ) -> Vec<u8> {
+        let scenes::SceneBuild::Stateful(build) = scenes::select(4).build else {
+            panic!("Static must be stateful");
+        };
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            frame,
+            elapsed.as_secs_f32(),
+            16.0 / 9.0,
+            state,
+            &mut instances,
+        );
+        bytemuck::cast_slice::<crate::scene::Instance, u8>(&instances).to_vec()
+    }
+
+    #[test]
+    fn procedural_clock_nominal_rates_and_static_match_at_common_times() {
+        fn run(hz: u64) -> Vec<Vec<u8>> {
+            let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+            let mut state = scenes::SceneState::default();
+            let mut reference = scenes::SceneState::default();
+            let mut snapshots = Vec::new();
+            let start = Instant::now();
+            for n in 0..=hz * 12 {
+                let elapsed = redraw_boundary(n, hz);
+                let frame = source.next_frame_at(start + elapsed);
+                assert!(source.fresh().len() <= 1);
+                for fresh in source.fresh() {
+                    state.observe_at(fresh, elapsed.as_secs_f64());
+                }
+                let index = n * 60 / hz + 1;
+                let expected = ControlFrame::procedural(index);
+                assert_eq!(
+                    (frame.frame, frame.beat_count, frame.scene, frame.palette),
+                    (
+                        expected.frame,
+                        expected.beat_count,
+                        expected.scene,
+                        expected.palette
+                    ),
+                    "{hz} Hz, redraw {n}"
+                );
+                if n % (hz / 60) == 0 {
+                    assert_eq!(source.fresh().len(), 1);
+                    assert_eq!(frame.flags, expected.flags);
+                    reference.observe_at(&expected, elapsed.as_secs_f64());
+                } else {
+                    assert!(source.fresh().is_empty());
+                    assert_eq!(frame.flags & 0x07, 0);
+                }
+                if n % hz == 0 {
+                    let actual = static_output(frame, elapsed, &state);
+                    let wanted = static_output(expected, elapsed, &reference);
+                    assert_eq!(actual, wanted, "Static at {hz} Hz, redraw {n}");
+                    snapshots.push(actual);
+                }
+            }
+            snapshots
+        }
+
+        assert_eq!(run(60), run(120));
+        assert_eq!(run(60), run(240));
+    }
+
+    #[test]
+    fn procedural_clock_slot_boundaries_and_minimum_gap_are_exact() {
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let start = Instant::now();
+        assert_eq!(source.next_frame_at(start).frame, 1);
+        let first = redraw_boundary(1, 60) - Duration::from_nanos(PROCEDURAL_EARLY_NS as u64);
+        source.next_frame_at(start + first - Duration::from_nanos(1));
+        assert!(source.fresh().is_empty());
+        assert_eq!(source.next_frame_at(start + first).frame, 2);
+        assert_eq!(source.fresh().len(), 1);
+
+        // A late observation in slot 1 is close to the next slot boundary.
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        source.next_frame_at(start);
+        let late = start + Duration::from_millis(26);
+        assert_eq!(source.next_frame_at(late).frame, 2);
+        let next_slot = redraw_boundary(2, 60) - Duration::from_nanos(PROCEDURAL_EARLY_NS as u64);
+        source.next_frame_at(start + next_slot);
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(late + PROCEDURAL_MIN_GAP - Duration::from_nanos(1));
+        assert!(source.fresh().is_empty());
+        assert_eq!(source.next_frame_at(late + PROCEDURAL_MIN_GAP).frame, 3);
+        assert_eq!(source.fresh().len(), 1);
+    }
+
+    #[test]
+    fn procedural_clock_stalls_duplicate_and_backwards_redraws_do_not_burst() {
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let start = Instant::now();
+        source.next_frame_at(start);
+        let stall = start + Duration::from_secs(30) + Duration::from_nanos(12_666_666);
+        assert_eq!(source.next_frame_at(stall).frame, 2);
+        assert_eq!(source.fresh().len(), 1);
+        source.next_frame_at(stall + Duration::from_nanos(1));
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(stall + PROCEDURAL_MIN_GAP);
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(stall + Duration::from_millis(10));
+        assert!(source.fresh().is_empty());
+        // Earlier than the last redraw, even though after the last emission.
+        source.next_frame_at(stall + Duration::from_millis(9));
+        assert!(source.fresh().is_empty());
+        let next =
+            stall + redraw_boundary(1, 60) - Duration::from_nanos(PROCEDURAL_EARLY_NS as u64);
+        assert_eq!(source.next_frame_at(next).frame, 3);
+        source.next_frame_at(next);
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(start);
+        assert!(source.fresh().is_empty());
+    }
+
+    #[test]
+    fn procedural_clock_jitter_is_bounded_and_extreme_jitter_can_drop_a_slot() {
+        for (hz, scale) in [
+            (60_u64, 300_000_i64),
+            (120, 300_000),
+            (144, 0),
+            (144, 100_000),
+            (240, 300_000),
+        ] {
+            let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+            let mut state = scenes::SceneState::default();
+            let mut reference = scenes::SceneState::default();
+            let start = Instant::now();
+            // Fix the redraw schedule independently of the source. The 144 Hz
+            // cases cover steady 144 Hz and ±0.3 ms (so expected observations
+            // stay beyond the minimum gap); the others exercise ±0.9 ms.
+            // Exact integer-second redraws give common wall-time checkpoints.
+            let times: Vec<_> = (0..=hz * 30)
+                .map(|n| {
+                    let nominal = redraw_boundary(n, hz);
+                    let offset = if n % hz == 0 {
+                        0
+                    } else {
+                        ((n * 17 % 7) as i64 - 3) * scale
+                    };
+                    if offset < 0 {
+                        nominal - Duration::from_nanos((-offset) as u64)
+                    } else {
+                        nominal + Duration::from_nanos(offset as u64)
+                    }
+                })
+                .collect();
+            assert!(times.windows(2).all(|pair| pair[0] < pair[1]));
+
+            // Oracle: immediate startup, then the first scheduled redraw at
+            // or after each rational 60 Hz boundary minus the specified 4 ms
+            // window. This uses no clock implementation state or actual
+            // observations. The constructed schedule never misses a slot
+            // or requires rephasing/min-gap suppression.
+            let mut scheduled = vec![0_usize];
+            let mut candidate = 1;
+            for tick in 1..=1800 {
+                let threshold = redraw_boundary(tick, 60) - Duration::from_millis(4);
+                while candidate < times.len() && times[candidate] < threshold {
+                    candidate += 1;
+                }
+                assert!(candidate < times.len());
+                scheduled.push(candidate);
+            }
+            assert!(scheduled.windows(2).all(|pair| {
+                pair[0] < pair[1]
+                    && times[pair[1]] - times[pair[0]] >= Duration::from_nanos(8_333_333)
+            }));
+
+            let mut count = 0_usize;
+            let mut previous = None;
+            for (n, &elapsed) in times.iter().enumerate() {
+                let expect_fresh = scheduled.get(count) == Some(&n);
+                if expect_fresh {
+                    count += 1;
+                    let expected = ControlFrame::procedural(count as u64);
+                    reference.observe_at(&expected, elapsed.as_secs_f64());
+                }
+                let now = start + elapsed;
+                let frame = source.next_frame_at(now);
+                assert_eq!(
+                    source.fresh().len(),
+                    usize::from(expect_fresh),
+                    "{hz} Hz, jitter scale {scale} ns, redraw {n} at {elapsed:?}"
+                );
+                let mut expected = ControlFrame::procedural(count as u64);
+                if expect_fresh {
+                    if let Some(last) = previous {
+                        assert!(now.duration_since(last) >= PROCEDURAL_MIN_GAP);
+                    }
+                    previous = Some(now);
+                    state.observe_at(&source.fresh()[0], elapsed.as_secs_f64());
+                } else {
+                    expected.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
+                }
+                assert_eq!(
+                    (
+                        frame.frame,
+                        frame.beat_count,
+                        frame.flags,
+                        frame.energy,
+                        frame.scene,
+                        frame.palette
+                    ),
+                    (
+                        expected.frame,
+                        expected.beat_count,
+                        expected.flags,
+                        expected.energy,
+                        expected.scene,
+                        expected.palette
+                    ),
+                    "{hz} Hz, jitter scale {scale} ns, redraw {n}"
+                );
+                if (n as u64).is_multiple_of(hz) {
+                    assert_eq!(count as u64, n as u64 / hz * 60 + 1);
+                    // The reference observes at the independently scheduled
+                    // jittered times, not ideal 60 Hz times: Static's energy
+                    // slew depends on elapsed time. Different redraw rates
+                    // therefore need not produce byte-identical snapshots.
+                    assert_eq!(
+                        static_output(frame, elapsed, &state),
+                        static_output(expected, elapsed, &reference),
+                        "Static at {hz} Hz, jitter scale {scale} ns, redraw {n}"
+                    );
+                }
+            }
+            assert_eq!(count, 1801, "{hz} Hz, jitter scale {scale} ns");
+        }
+
+        // Alternating 60 Hz redraws up to 4 ms early/late are in tolerance.
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let start = Instant::now();
+        for n in 0..=600 {
+            let nominal = redraw_boundary(n, 60);
+            let elapsed = if n == 0 {
+                nominal
+            } else if n % 2 == 1 {
+                nominal - Duration::from_millis(4)
+            } else {
+                nominal + Duration::from_millis(4)
+            };
+            assert_eq!(source.next_frame_at(start + elapsed).frame, n as u16 + 1);
+            assert_eq!(source.fresh().len(), 1);
+        }
+
+        // Opposing ±7 ms redraws include 2.67 ms gaps. Skip rather than burst.
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        for n in 0..=60 {
+            let nominal = redraw_boundary(n, 60);
+            let elapsed = if n == 0 {
+                nominal
+            } else if n % 2 == 1 {
+                nominal - Duration::from_millis(7)
+            } else {
+                nominal + Duration::from_millis(7)
+            };
+            assert_eq!(
+                source.next_frame_at(start + elapsed).frame,
+                (n / 2 + 1) as u16
+            );
+            assert_eq!(source.fresh().len(), usize::from(n == 0 || n % 2 == 0));
+        }
+    }
+
+    #[test]
+    fn procedural_clock_slow_redraws_and_counter_wrap_keep_consecutive_frames() {
+        let start = Instant::now();
+        for hz in [20, 30, 45, 59] {
+            let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+            for n in 0..=hz * 3 {
+                let frame = source.next_frame_at(start + redraw_boundary(n, hz));
+                assert_eq!(frame.frame, n as u16 + 1, "{hz} Hz, redraw {n}");
+                assert_eq!(source.fresh().len(), 1);
+            }
+        }
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        source.fallback_index = u16::MAX as u64 - 1;
+        let mut state = scenes::SceneState::default();
+        let mut reference = scenes::SceneState::default();
+        for (n, expected) in [(0, u16::MAX), (1, 0), (2, 1)] {
+            let elapsed = redraw_boundary(n, 60);
+            let frame = source.next_frame_at(start + elapsed);
+            assert_eq!(frame.frame, expected);
+            assert_eq!(source.fresh().len(), 1);
+            state.observe_at(&source.fresh()[0], elapsed.as_secs_f64());
+            reference.observe_at(
+                &ControlFrame::procedural(u16::MAX as u64 + n),
+                elapsed.as_secs_f64(),
+            );
+            assert_eq!(
+                static_output(frame, elapsed, &state),
+                static_output(frame, elapsed, &reference)
+            );
+        }
+    }
+
+    #[test]
+    fn procedural_held_redraws_do_not_repeat_flags_or_step_colour_field() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let mut field = ColourField::new(Config::default());
+        let start = Instant::now();
+        for n in 0..=15 {
+            let time = redraw_boundary(n, 60);
+            let frame = source.next_frame_at(start + time);
+            for fresh in source.fresh() {
+                field.observe(fresh);
+            }
+            assert_eq!(frame.beat_onset(), n == 15);
+            assert_eq!(field.pending_beat_bar(), n == 15);
+            assert!(field.has_new_frame());
+            field.step(Controls::default());
+            let held = source.next_frame_at(start + time + Duration::from_millis(1));
+            assert!(!held.beat_onset());
+            assert_eq!(held.note_count, frame.note_count);
+            assert!(source.fresh().is_empty());
+            assert!(!field.has_new_frame());
+            assert!(!field.pending_beat_bar());
         }
     }
 
