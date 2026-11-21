@@ -47,6 +47,8 @@ machine or browser. Use trusted, stable directories and stop the server when
 not in use.
 
 The server allows at most 16 simultaneous connections and closes excess ones.
+It requests a listen backlog of 32 connections; the OS may impose a lower
+limit and reject bursts before the server can reply.
 Request headers have a five-second total deadline and a 64 KiB limit; network
 I/O has a ten-second inactivity timeout. An untrusted local process can still
 temporarily exhaust the connection limit, and a slow authorized video transfer

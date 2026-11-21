@@ -472,6 +472,26 @@ class GalleryTests(unittest.TestCase):
                 self.assertEqual(outcomes, [(503, "1")] * 15)
                 with server.connections_lock:
                     self.assertTrue(server.connections_lock.wait_for(lambda: len(server.connections) == 1, timeout=10))
+                gate = threading.Barrier(9)
+                outcomes, errors = [], []
+
+                def burst():
+                    try:
+                        gate.wait(10)
+                        status, headers, _ = self.request(server, prefix + "catalog.json")
+                        outcomes.append((status, headers.get("Retry-After")))
+                    except Exception as exc:
+                        errors.append(str(exc))
+
+                workers = [threading.Thread(target=burst) for _ in range(8)]
+                for worker in workers:
+                    worker.start()
+                gate.wait(10)
+                for worker in workers:
+                    worker.join(10)
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+                self.assertEqual(errors, [])
+                self.assertEqual(outcomes, [(503, "1")] * 8)
                 status, headers, data = self.request(
                     server, prefix + "media/" + clip["id"], headers={"Range": "bytes=2-5"}
                 )

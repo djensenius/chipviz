@@ -354,6 +354,9 @@ class HeaderReader(io.RawIOBase):
 
 
 class ReviewServer(HTTPServer):
+    # Keep short refresh bursts from overrunning the default listen backlog.
+    request_queue_size = 32
+
     def __init__(self, roots, site_fd, port=0, max_workers=16, header_timeout=5, io_timeout=10,
                  scan_limits=None):
         self.roots, self.site_fd = roots, site_fd
