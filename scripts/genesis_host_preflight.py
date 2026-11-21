@@ -90,8 +90,12 @@ def listener_inode(data):
       require(re.fullmatch(r"[0-9a-fA-F]+:", fields[0]) is not None)
       require(re.fullmatch(r"[0-9a-fA-F]{8}", fields[1]) is not None and fields[2] == "00000000")
       require(re.fullmatch(r"[0-9]+", fields[6]) is not None)
+      # A queued stream has no socket inode until accept grafts it.
+      if fields[3:6] == ["00000000", "0001", "02"]:
+        require(fields[6] == "0")
+        continue
       inode = fields[6].lstrip("0") or "0"
-      require(inode not in inodes)
+      require(inode != "0" and inode not in inodes)
       inodes.add(inode)
       # Accepted stream sockets can retain the listener path.
       if fields[3:6] == ["00000000", "0001", "03"]:

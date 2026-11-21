@@ -211,14 +211,14 @@ class PreflightTests(unittest.TestCase):
       b"01: 00000003 00000000 00000000 0001 03 43 /run/docker.sock\n"
       b"00: 00000002 00000000 00010000 0001 01 42 /run/docker.sock\n"
     )
+    snapshots = iter((net.replace(b" 03 43 ", b" 02 0 "), net))
     contents = {
       "/proc/123/cgroup": b"0::/system.slice/docker.service\n",
-      "/proc/net/unix": net,
     }
 
     def fake_open(path, mode):
       self.assertEqual(mode, "rb")
-      return io.BytesIO(contents[path])
+      return io.BytesIO(next(snapshots) if path == "/proc/net/unix" else contents[path])
 
     def fake_link(path):
       return {
@@ -226,12 +226,15 @@ class PreflightTests(unittest.TestCase):
         "/proc/123/fd/7": "socket:[42]",
       }[path]
 
-    with mock.patch.object(preflight.os, "lstat", side_effect=[directory, directory, endpoint]), \
+    with mock.patch.object(preflight.os, "lstat", side_effect=[directory, directory, endpoint] * 2), \
          mock.patch.object(preflight.subprocess, "run", return_value=service) as run, \
          mock.patch.object(preflight.os, "readlink", side_effect=fake_link), \
          mock.patch.object(preflight.os, "listdir", return_value=["7"]), \
          mock.patch("builtins.open", side_effect=fake_open):
-      self.assertEqual(preflight.Host().snapshot(), SNAPSHOT)
+      host = preflight.Host()
+      self.assertEqual(host.snapshot(), SNAPSHOT)
+      self.assertEqual(host.snapshot(), SNAPSHOT)
+    self.assertEqual(run.call_count, 2)
     self.assertEqual(run.call_args.args[0], [
       "/usr/bin/systemctl", "show", "docker.service",
       "--property=MainPID,ActiveState,SubState"])
@@ -398,6 +401,38 @@ class PreflightTests(unittest.TestCase):
       for rows in (listener + row, row + listener):
         with self.subTest(rows=rows), self.assertRaises(preflight.Rejected):
           preflight.listener_inode(header + rows)
+
+  def test_listener_ignores_only_recognized_queued_streams(self):
+    header = b"Num RefCount Protocol Flags Type St Inode Path\n"
+    listener = b"00: 00000002 00000000 00010000 0001 01 42 /run/docker.sock\n"
+    queued = b"01: 00000003 00000000 00000000 0001 02 0 /run/docker.sock\n"
+    accepted = b"01: 00000003 00000000 00000000 0001 03 43 /run/docker.sock\n"
+    for rows in (listener + queued, queued + listener,
+                 queued + listener + queued.replace(b"01:", b"02:", 1),
+                 listener + accepted):
+      with self.subTest(rows=rows):
+        self.assertEqual(preflight.listener_inode(header + rows), "42")
+
+    malformed = (
+      queued.replace(b"00000000 0001 02", b"00010000 0001 02"),
+      queued.replace(b"00000000 0001 02", b"00000001 0001 02"),
+      queued.replace(b"00000000 0001 02", b"00000000 0002 02"),
+      queued.replace(b"00000000 0001 02", b"00000000 0001 04"),
+      queued.replace(b" 02 0 ", b" 02 43 "),
+      queued.replace(b" 02 0 ", b" 02 00 "),
+      queued.replace(b" 02 0 ", b" 02 bad "),
+      queued.replace(b" 0 /run/docker.sock", b" /run/docker.sock"),
+      queued.replace(b"/run/docker.sock", b"/run/docker.sock extra"),
+      accepted.replace(b" 03 43 ", b" 03 0 "),
+    )
+    for row in malformed:
+      for rows in (listener + row, row + listener):
+        with self.subTest(rows=rows), self.assertRaises(preflight.Rejected):
+          preflight.listener_inode(header + rows)
+    for rows in (queued, queued + listener.replace(b" 42 ", b" 0 "),
+                 queued + listener + listener, queued + listener + accepted + accepted):
+      with self.subTest(rows=rows), self.assertRaises(preflight.Rejected):
+        preflight.listener_inode(header + rows)
 
   def test_framing_and_sensitive_fields_fail_closed(self):
     payload = json.dumps(INFO).encode()
