@@ -35,7 +35,10 @@ def _reject_constant(value: str) -> None:
 
 
 def encode_catalog(source_bytes: bytes, family: int, variant: int = 0) -> bytes:
-  """Encode and independently validate a bounded source, returning complete bytes."""
+  """Encode and independently validate a bounded source, returning complete bytes.
+
+  Requires writable temporary storage; I/O failures may raise OSError.
+  """
   _selection(family, variant)
   if len(source_bytes) > MAX_SOURCE_BYTES:
     raise ValueError(f"source exceeds {MAX_SOURCE_BYTES} bytes")
@@ -78,7 +81,10 @@ def encode_catalog(source_bytes: bytes, family: int, variant: int = 0) -> bytes:
 
 
 def write_catalog(source_path: Path, output_path: Path, family: int, variant: int = 0) -> None:
-  """Read a regular source and exclusively create an output after validation."""
+  """Read a regular source and exclusively create an output after validation.
+
+  Requires writable temporary storage; storage I/O failures may raise OSError.
+  """
   _selection(family, variant)
   fd = os.open(source_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
   try:

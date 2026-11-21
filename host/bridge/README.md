@@ -120,8 +120,11 @@ come from `encode_music_source`. Tick `n` represents `n/60` seconds.
 
 The library entry points are `encode_catalog(source_bytes, family, variant=0)`
 and `write_catalog(source_path, output_path, family, variant=0)`. Both reject
-invalid selections or sources with `ValueError`; the file API can also raise
-`OSError`. The CLI reports these errors on stderr and exits nonzero. Input is
+invalid selections or sources with `ValueError`. Both require writable
+temporary storage for the candidate and validator snapshot and can raise
+`OSError` on I/O failures, such as a full temporary filesystem. The file API
+can also raise `OSError` while reading or writing its paths. The CLI reports
+these errors on stderr and exits nonzero. Input is
 limited to 1,048,576 bytes, 1–65,536 frames and a product of frame count and
 note count no greater than 1,000,000, bounding the existing encoder's
 frame-by-note work. The complete generated recording is checked by the
