@@ -145,17 +145,41 @@ class Trace:
       return id(self) not in _RETAINED
 
   def _abandon(self, error):
-    self.active = False
-    self._abandoned = True
-    if not self._recover(error):
+    try:
       try:
-        error.trace_owner = self
+        self.active = False
+      finally:
+        self._abandoned = True
+    except BaseException as state_error:
+      try:
+        object.__setattr__(self, "_abandoned", True)
       except BaseException:
         pass
-      BaseException.add_note(error, "trace retained: retry trace_owner.retry_cleanup() or inspect retained_traces()")
+      try:
+        BaseException.add_note(error, f"trace state update failed: {state_error!r}")
+      except BaseException:
+        pass
+    finally:
+      try:
+        recovered = self._recover(error)
+      except BaseException as cleanup_error:
+        recovered = False
+        try:
+          BaseException.add_note(error, f"trace cleanup failed: {cleanup_error!r}")
+        except BaseException:
+          pass
+      if not recovered:
+        try:
+          error.trace_owner = self
+        except BaseException:
+          pass
+        try:
+          BaseException.add_note(error, "trace retained: retry trace_owner.retry_cleanup() or inspect retained_traces()")
+        except BaseException:
+          pass
 
   def _require_owner(self):
-    if not self.active:
+    if self._abandoned or not self.active:
       raise RuntimeError("trace is not active")
     if not self.shim.sms_trace_owned(*self._keys):
       raise RuntimeError("trace ownership mismatch")
@@ -205,7 +229,7 @@ class Trace:
     return result
 
   def close(self):
-    if not self.active and (self._abandoned or id(self) in _RETAINED):
+    if self._abandoned or (not self.active and id(self) in _RETAINED):
       suffix = "; retry cleanup" if id(self) in _RETAINED else ""
       raise RuntimeError("trace is not active" + suffix)
     if self.active:
@@ -226,16 +250,20 @@ class Trace:
         raise
 
   def __enter__(self):
+    # Distinguish an existing outer owner from a failed first entry.
+    entered = None
     try:
-      if self._entered:
+      entered = self._entered
+      if entered and not self._abandoned:
         raise _ContextReentryError("trace context already entered")
       self._require_owner()
       self._entered = True
       return self
-    except _ContextReentryError:
-      raise
     except BaseException as error:
-      self._entered = False
+      if entered is None:
+        entered = object.__getattribute__(self, "_entered")
+      if entered and not object.__getattribute__(self, "_abandoned"):
+        raise
       self._abandon(error)
       raise
 

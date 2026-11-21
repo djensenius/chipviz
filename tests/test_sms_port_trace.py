@@ -200,6 +200,132 @@ class PortTraceTests(unittest.TestCase):
     finally:
       hook.retry_cleanup()
 
+  def test_nested_guard_interruption_preserves_outer_owner(self):
+    hook = self.open_trace()
+    getattribute = trace.Trace.__getattribute__
+    def interrupted(owner, name):
+      if name == "_entered":
+        raise KeyboardInterrupt("nested guard interruption")
+      return getattribute(owner, name)
+    with hook as outer:
+      outer.begin_frame(0)
+      with mock.patch.object(trace.Trace, "__getattribute__", interrupted):
+        with self.assertRaisesRegex(KeyboardInterrupt, "nested guard interruption"):
+          with hook:
+            self.fail("nested entry must not succeed")
+      self.assertTrue(hook.active)
+      self.assertTrue(hook.shim.sms_trace_owned(*hook._keys))
+      self.core.fake_write(0x12bf, 0x34)
+      outer.end_frame()
+      self.assertEqual([(e.port, e.value, e.kind) for e in outer.events()], [(0x12bf, 0x34, 1)])
+      self.assertEqual(self.core.fake_count(), 1)
+    self.assert_original_slots()
+
+  def test_entry_reset_interruption_preserves_original_and_retry(self):
+    hook = self.open_trace()
+    setattr_original = trace.Trace.__setattr__
+    def interrupted(owner, name, value):
+      if name == "_entered":
+        if value:
+          setattr_original(owner, name, value)
+          raise KeyboardInterrupt("entry interruption")
+        raise RuntimeError("reset interruption")
+      return setattr_original(owner, name, value)
+    try:
+      with mock.patch.object(hook, "_native_uninstall", side_effect=RuntimeError("cleanup interruption")):
+        with mock.patch.object(trace.Trace, "__setattr__", interrupted):
+          with self.assertRaisesRegex(KeyboardInterrupt, "entry interruption") as caught:
+            with hook:
+              self.fail("entry must not succeed")
+        self.assertIs(caught.exception.trace_owner, hook)
+        self.assertTrue(any("cleanup interruption" in note for note in caught.exception.__notes__))
+        self.assertTrue(any("retry_cleanup" in note for note in caught.exception.__notes__))
+        self.assertIn(hook, trace.retained_traces())
+        self.assert_failed_trace_unusable(hook)
+      hook.retry_cleanup()
+      self.assert_original_slots()
+    finally:
+      hook.retry_cleanup()
+
+  def test_entry_state_interruption_still_attempts_recovery(self):
+    hook = self.open_trace()
+    setattr_original = trace.Trace.__setattr__
+    def interrupted(owner, name, value):
+      if name == "active" and value is False:
+        raise RuntimeError("state interruption")
+      return setattr_original(owner, name, value)
+    try:
+      with mock.patch.object(hook, "_require_owner", side_effect=KeyboardInterrupt("entry interruption")):
+        with mock.patch.object(hook, "_native_uninstall", side_effect=RuntimeError("cleanup interruption")):
+          with mock.patch.object(trace.Trace, "__setattr__", interrupted):
+            with self.assertRaisesRegex(KeyboardInterrupt, "entry interruption") as caught:
+              with hook:
+                self.fail("entry must not succeed")
+          self.assertIs(caught.exception.trace_owner, hook)
+          self.assertTrue(any("state interruption" in note for note in caught.exception.__notes__))
+          self.assertTrue(any("cleanup interruption" in note for note in caught.exception.__notes__))
+          self.assertIn(hook, trace.retained_traces())
+          with mock.patch.object(hook, "_require_owner", wraps=trace.Trace._require_owner.__get__(hook)):
+            self.assert_failed_trace_unusable(hook)
+      hook.retry_cleanup()
+      self.assert_original_slots()
+    finally:
+      hook.retry_cleanup()
+
+  def test_entry_abandoned_flag_interruption_remains_fail_closed(self):
+    hook = self.open_trace()
+    setattr_original = trace.Trace.__setattr__
+    def interrupted(owner, name, value):
+      if name == "_abandoned" and value is True:
+        raise RuntimeError("abandoned flag interruption")
+      return setattr_original(owner, name, value)
+    try:
+      with mock.patch.object(hook, "_native_uninstall", side_effect=RuntimeError("cleanup interruption")):
+        with mock.patch.object(hook, "_require_owner", side_effect=KeyboardInterrupt("entry interruption")):
+          with mock.patch.object(trace.Trace, "__setattr__", interrupted):
+            with self.assertRaisesRegex(KeyboardInterrupt, "entry interruption") as caught:
+              with hook:
+                self.fail("entry must not succeed")
+        self.assertIs(caught.exception.trace_owner, hook)
+        self.assertTrue(any("abandoned flag interruption" in note for note in caught.exception.__notes__))
+        self.assertTrue(any("cleanup interruption" in note for note in caught.exception.__notes__))
+        self.assertTrue(hook._abandoned)
+        self.assertIn(hook, trace.retained_traces())
+        self.assert_failed_trace_unusable(hook)
+      hook.retry_cleanup()
+      self.assert_original_slots()
+    finally:
+      hook.retry_cleanup()
+
+  def test_entry_recovery_call_interruption_retains_retry_guidance(self):
+    hook = self.open_trace()
+    owner_ref = weakref.ref(hook)
+    try:
+      with mock.patch.object(hook, "_require_owner", side_effect=KeyboardInterrupt("entry interruption")):
+        with mock.patch.object(hook, "_recover", side_effect=RuntimeError("recovery call interruption")):
+          with self.assertRaisesRegex(KeyboardInterrupt, "entry interruption") as caught:
+            with hook:
+              self.fail("entry must not succeed")
+      self.assertIs(caught.exception.trace_owner, hook)
+      self.assertTrue(any("recovery call interruption" in note for note in caught.exception.__notes__))
+      self.assertTrue(any("retry_cleanup" in note for note in caught.exception.__notes__))
+      self.assertIn(hook, trace.retained_traces())
+      self.assertTrue(hook.shim.sms_trace_owned(*hook._keys))
+      core_ref, shim_ref = weakref.ref(hook.core), weakref.ref(hook.shim)
+      del caught
+      hook = None
+      gc.collect()
+      hook = owner_ref()
+      self.assertIsNotNone(hook)
+      self.assertIs(hook.core, core_ref())
+      self.assertIs(hook.shim, shim_ref())
+      hook.retry_cleanup()
+      self.assert_original_slots()
+    finally:
+      owner = owner_ref()
+      if owner is not None:
+        owner.retry_cleanup()
+
   def test_context_entry_cleanup_interruption_is_retryable(self):
     hook = self.open_trace()
     owner_ref = weakref.ref(hook)

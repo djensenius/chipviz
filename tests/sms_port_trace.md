@@ -37,9 +37,13 @@ run trace operations, even if it acquired native ownership; retry cleanup
 for any retained owner.
 Native trace operations also verify the owner token and both slot addresses.
 Do not unload or run a core with unresolved
-ownership. Repeated interruptions can interrupt retries; retry until cleanup
-succeeds. Interrupted frame transitions permanently invalidate the trace:
-do not use its events, and close it to restore hooks.
+ownership. Entry guard interruptions preserve an already-entered outer owner;
+failed first-entry cleanup is attempted even if marking the owner fails.
+Python cannot make exception handling atomic: further asynchronous interruptions
+can interrupt decisions, cleanup, exception preservation or retry guidance.
+Keep the process alive, inspect retained owners, and retry cleanup as needed.
+Interrupted frame transitions permanently invalidate the trace: do not use
+its events, and close it to restore hooks.
 
 The shim uses the matching upstream GX Z80 slot types: byte-valued port reads
 and byte-valued write data, with an unsigned-int port. The fake tests exercise
