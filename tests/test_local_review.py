@@ -218,9 +218,12 @@ class GalleryTests(unittest.TestCase):
         try:
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fds[0])
         except OSError as exc:
-            # Some filesystems reject non-UTF-8 names; the portable synthetic case still runs.
-            self.assertIn(exc.errno, (errno.EILSEQ, errno.EINVAL, errno.ENOTSUP))
-            return
+            if os.environ.get("CHIPVIZ_REQUIRE_RAW_FILENAME_TEST") == "1":
+                self.fail(f"CHIPVIZ_REQUIRE_RAW_FILENAME_TEST=1 requires invalid-byte filename creation; "
+                          f"failed with errno {exc.errno}")
+            if exc.errno in (errno.EILSEQ, errno.EINVAL, errno.ENOTSUP):
+                self.skipTest(f"filesystem does not support invalid-byte filenames (errno {exc.errno})")
+            raise
         try:
             os.write(fd, b"invalid-byte video")
         finally:
@@ -233,6 +236,24 @@ class GalleryTests(unittest.TestCase):
         status, headers, data = self.request(server, f"/{server.token}/media/{clip['id']}",
                                              headers={"Range": "bytes=0-6"})
         self.assertEqual((status, headers["Content-Range"], data), (206, "bytes 0-6/18", b"invalid"))
+
+    def test_invalid_byte_filename_requirement_is_fail_closed(self):
+        error = OSError(errno.EILSEQ, "unsupported")
+        for required in ("0", "1"):
+            with self.subTest(required=required), \
+                    mock.patch.dict(os.environ, {"CHIPVIZ_REQUIRE_RAW_FILENAME_TEST": required}), \
+                    mock.patch.object(os, "open", side_effect=error):
+                if required == "1":
+                    with self.assertRaisesRegex(AssertionError, "requires invalid-byte filename creation"):
+                        self.test_invalid_byte_filename_when_supported_by_filesystem()
+                else:
+                    with self.assertRaisesRegex(unittest.SkipTest, "filesystem does not support"):
+                        self.test_invalid_byte_filename_when_supported_by_filesystem()
+        with mock.patch.dict(os.environ, {"CHIPVIZ_REQUIRE_RAW_FILENAME_TEST": "0"}), \
+                mock.patch.object(os, "open", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaises(OSError) as raised:
+                self.test_invalid_byte_filename_when_supported_by_filesystem()
+            self.assertEqual(raised.exception.errno, errno.EACCES)
 
     def test_scenario_grouping_and_near_misses(self):
         cases = (
