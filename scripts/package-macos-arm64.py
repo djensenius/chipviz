@@ -7,6 +7,7 @@ Use an existing empty, user-owned private directory beneath a private,
 user-owned build/macos-arm64/ directory.
 The directory and source checks cannot prevent races by the same account.
 On failure, an incomplete archive may remain; no output files are removed.
+Snapshots stay in memory: at most 256 MiB for the binary and 8 MiB per notice.
 """
 
 from __future__ import annotations
@@ -14,13 +15,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import io
 import os
 import pathlib
 import shutil
 import stat
 import struct
 import sys
-import tempfile
 import zipfile
 from typing import BinaryIO
 
@@ -30,7 +31,8 @@ DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 NOTICES = ("LICENSE", "COMMERCIAL.md", "THIRD_PARTY_NOTICES/rust.md")
 MAX_COMMAND_BYTES = 16 * 1024 * 1024
 MAX_COMMANDS = 65536
-MAX_BINARY_BYTES = 4 * 1024 * 1024 * 1024
+MAX_BINARY_BYTES = 256 * 1024 * 1024
+MAX_NOTICE_BYTES = 8 * 1024 * 1024
 
 
 class PackageError(Exception):
@@ -91,28 +93,29 @@ def open_input(path: pathlib.Path) -> BinaryIO:
     raise
 
 
-def snapshot_binary(source: BinaryIO, snapshot: BinaryIO) -> int:
-  """Copy a bounded-size input to private temporary storage, checking for changes."""
+def snapshot_input(source: BinaryIO, label: str, limit: int,
+                   *, executable: bool = False) -> tuple[io.BytesIO, int]:
+  """Copy an input to bounded memory, rejecting detectable concurrent changes."""
   before = os.fstat(source.fileno())
   mode = stat.S_IMODE(before.st_mode)
-  if not mode & 0o111 or mode & 0o7000:
-    raise PackageError("binary must be executable and have no special permission bits")
-  if before.st_size > MAX_BINARY_BYTES:
-    raise PackageError("binary exceeds the 4 GiB snapshot limit")
+  if executable and (not mode & 0o100 or mode & 0o7000):
+    raise PackageError("binary must be owner-executable and have no special permission bits")
+  if before.st_size > limit:
+    raise PackageError(f"{label} exceeds the {limit}-byte snapshot limit")
+  snapshot = io.BytesIO()
   remaining = before.st_size
   while remaining:
     data = source.read(min(64 * 1024, remaining))
     if not data:
-      raise PackageError("binary changed while taking snapshot")
+      raise PackageError(f"{label} changed while taking snapshot")
     snapshot.write(data)
     remaining -= len(data)
   after = os.fstat(source.fileno())
   fields = ("st_dev", "st_ino", "st_size", "st_mode", "st_mtime_ns", "st_ctime_ns")
   if any(getattr(before, field) != getattr(after, field) for field in fields):
-    raise PackageError("binary changed while taking snapshot")
-  snapshot.flush()
+    raise PackageError(f"{label} changed while taking snapshot")
   snapshot.seek(0)
-  return mode
+  return snapshot, mode
 
 
 def validate_macho(binary: BinaryIO) -> None:
@@ -123,7 +126,8 @@ def validate_macho(binary: BinaryIO) -> None:
       raise PackageError("truncated Mach-O load command")
     return data
 
-  size = os.fstat(binary.fileno()).st_size
+  size = binary.seek(0, os.SEEK_END)
+  binary.seek(0)
   header = binary.read(32)
   if len(header) != 32:
     raise PackageError("truncated Mach-O header")
@@ -211,9 +215,13 @@ def create_package(binary_path: pathlib.Path, output_path: pathlib.Path,
 
   with contextlib.ExitStack() as stack:
     source = stack.enter_context(open_input(binary_path))
-    notices = [stack.enter_context(open_input(root / name)) for name in NOTICES]
-    binary = stack.enter_context(tempfile.TemporaryFile(mode="w+b"))
-    mode = snapshot_binary(source, binary)
+    notice_sources = [stack.enter_context(open_input(root / name)) for name in NOTICES]
+    binary, mode = snapshot_input(source, "binary", MAX_BINARY_BYTES, executable=True)
+    stack.enter_context(binary)
+    notices = []
+    for name, notice_source in zip(NOTICES, notice_sources):
+      notice, _ = snapshot_input(notice_source, name, MAX_NOTICE_BYTES)
+      notices.append(stack.enter_context(notice))
     validate_macho(binary)
     directory_fd = open_directory(output.parent, root=root)
     try:

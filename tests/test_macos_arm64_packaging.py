@@ -142,7 +142,7 @@ class MacosArm64PackagingTests(unittest.TestCase):
           self.assertEqual(archive.getinfo("chipviz-m1").external_attr >> 16,
                            stat.S_IFREG | mode)
         self.output.unlink()
-    for mode in (0o600, 0o644, 0o4755, 0o2755, 0o1755):
+    for mode in (0o600, 0o641, 0o644, 0o4755, 0o2755, 0o1755):
       with self.subTest(mode=oct(mode)):
         self.binary.chmod(mode)
         self.assertEqual(stat.S_IMODE(self.binary.stat().st_mode), mode)
@@ -174,7 +174,7 @@ class MacosArm64PackagingTests(unittest.TestCase):
     for replacement in (b"changed", b"y" * len(original)):
       with self.subTest(same_size=len(replacement) == len(original)):
         self.binary.write_bytes(original)
-        with self.binary.open("rb") as source, tempfile.TemporaryFile() as snapshot:
+        with self.binary.open("rb") as source:
           reader = mock.Mock(wraps=source)
           mutated = False
 
@@ -188,15 +188,114 @@ class MacosArm64PackagingTests(unittest.TestCase):
 
           reader.read.side_effect = read_and_mutate
           with self.assertRaisesRegex(PACKAGE.PackageError, "changed while taking snapshot"):
-            PACKAGE.snapshot_binary(reader, snapshot)
+            PACKAGE.snapshot_input(reader, "binary", 256 * 1024 * 1024, executable=True)
     self.assertFalse(self.output.exists())
 
   def test_oversized_binary_is_rejected_before_copying(self) -> None:
     with self.binary.open("r+b") as source:
-      source.truncate(4 * 1024 * 1024 * 1024 + 1)
+      source.truncate(256 * 1024 * 1024 + 1)
     result = self.run_package()
     self.assertNotEqual(result.returncode, 0, result.stdout)
-    self.assertIn("4 GiB snapshot limit", result.stderr)
+    self.assertIn("268435456-byte snapshot limit", result.stderr)
+    self.assertFalse(self.output.exists())
+
+  def test_tmpdir_protected_directories_have_no_transient_writes_or_removals(self) -> None:
+    original_open = os.open
+    original_unlink = os.unlink
+    for protected in (self.dist.parent, self.personal.parent):
+      with self.subTest(tmpdir=protected):
+        events = []
+        protected_id = (protected.stat().st_dev, protected.stat().st_ino)
+
+        def in_protected(path, dir_fd):
+          if dir_fd is not None:
+            info = os.fstat(dir_fd)
+            return (info.st_dev, info.st_ino) == protected_id
+          candidate = pathlib.Path(path)
+          return candidate.is_absolute() and (candidate == protected or protected in candidate.parents)
+
+        def watched_open(path, flags, mode=0o777, *, dir_fd=None):
+          if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC):
+            if in_protected(path, dir_fd):
+              events.append(("open", str(path)))
+          return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        def watched_unlink(path, *, dir_fd=None):
+          if in_protected(path, dir_fd):
+            events.append(("unlink", str(path)))
+          return original_unlink(path, dir_fd=dir_fd)
+
+        with mock.patch.dict(os.environ, {"TMPDIR": str(protected)}), \
+             mock.patch.object(tempfile, "tempdir", None), \
+             mock.patch.object(os, "open", side_effect=watched_open), \
+             mock.patch.object(os, "unlink", side_effect=watched_unlink):
+          PACKAGE.create_package(self.binary, self.output, root=self.root)
+        self.assertEqual(events, [])
+        self.output.unlink()
+    self.assertEqual(self.dist.read_bytes(), b"dist unchanged")
+    self.assertEqual(self.personal.read_bytes(), b"personal unchanged")
+
+  def test_notice_changes_during_snapshot_fail_without_output(self) -> None:
+    original_open = PACKAGE.open_input
+    for name in self.notices:
+      path = self.root / name
+      original = b"notice fixture" + b"x" * (128 * 1024)
+      for replacement in (b"short", b"y" * len(original)):
+        with self.subTest(name=name, same_size=len(original) == len(replacement)):
+          path.write_bytes(original)
+          mutated = False
+
+          def instrumented_open(input_path):
+            source = original_open(input_path)
+            if input_path != path:
+              return source
+            reader = mock.MagicMock(wraps=source)
+            reader.__enter__.return_value = reader
+            reader.__exit__.side_effect = lambda *args: source.close()
+
+            def read_and_mutate(length):
+              nonlocal mutated
+              data = source.read(length)
+              if not mutated:
+                path.write_bytes(replacement)
+                mutated = True
+              return data
+
+            reader.read.side_effect = read_and_mutate
+            return reader
+
+          with mock.patch.object(PACKAGE, "open_input", side_effect=instrumented_open):
+            with self.assertRaisesRegex(PACKAGE.PackageError, "changed while taking snapshot"):
+              PACKAGE.create_package(self.binary, self.output, root=self.root)
+          self.assertTrue(mutated)
+          self.assertFalse(self.output.exists())
+      path.write_bytes(self.notices[name])
+
+  def test_notice_snapshots_are_archived_after_sources_change(self) -> None:
+    copy = shutil.copyfileobj
+    mutated = False
+
+    def mutate_then_copy(source, destination, length=0):
+      nonlocal mutated
+      if not mutated:
+        for name in self.notices:
+          (self.root / name).write_bytes(b"changed")
+        mutated = True
+      return copy(source, destination, length)
+
+    with mock.patch.object(PACKAGE.shutil, "copyfileobj", side_effect=mutate_then_copy):
+      PACKAGE.create_package(self.binary, self.output, root=self.root)
+    self.assertTrue(mutated)
+    with zipfile.ZipFile(self.output) as archive:
+      for name, original in self.notices.items():
+        self.assertEqual(archive.read(name), original)
+
+  def test_oversized_notice_is_rejected_before_output(self) -> None:
+    with (self.root / "THIRD_PARTY_NOTICES/rust.md").open("r+b") as notice:
+      notice.truncate(8 * 1024 * 1024 + 1)
+    result = self.run_package()
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    self.assertIn("8388608-byte snapshot limit", result.stderr)
     self.assertFalse(self.output.exists())
 
   def test_renamed_output_directory_is_detected_before_and_after_creation(self) -> None:
