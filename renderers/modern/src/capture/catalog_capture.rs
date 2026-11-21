@@ -753,6 +753,57 @@ mod tests {
     }
 
     #[test]
+    fn catalog_cli_preserves_literal_dmg_preview_paths() {
+        for (tokens, expected_out, expected_input, expected_exclusive) in [
+            (
+                vec![
+                    "--catalog-v1",
+                    "--input",
+                    "recording",
+                    "--out",
+                    "--dmg-preview",
+                ],
+                "--dmg-preview",
+                "recording",
+                false,
+            ),
+            (
+                vec!["--catalog-v1", "--out", "shots", "--input", "--dmg-preview"],
+                "shots",
+                "--dmg-preview",
+                false,
+            ),
+            (
+                vec![
+                    "--catalog-v1",
+                    "--exclusive-output",
+                    "--out",
+                    "--dmg-preview",
+                    "--input",
+                    "--dmg-preview",
+                ],
+                "--dmg-preview",
+                "--dmg-preview",
+                true,
+            ),
+        ] {
+            let (tokens, catalog) =
+                cli_tokens(tokens.into_iter().map(str::to_string).collect()).unwrap();
+            assert!(catalog);
+            let (tokens, house) = cli_house_tokens(tokens).unwrap();
+            assert!(!house);
+            let (StarfieldConfiguredCommand::Capture(args, _), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert_eq!(args.out, PathBuf::from(expected_out));
+            assert_eq!(args.input, Input::File(expected_input.into()));
+            assert_eq!(exclusive, expected_exclusive);
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     #[ignore = "requires an allocated GPU adapter"]
     fn sparse_catalog_stills_match_independent_sequential_renderer() {

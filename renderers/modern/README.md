@@ -858,9 +858,10 @@ treats `--house` in a value position as a literal, not a selection: for example,
 `--out --house` names an output path. Select House with a standalone flag, as in
 `--out shots --house`. Once selected, recognized options cannot be used as
 values; prefix a literal path with `./` (for example `--house --out ./--house`).
-Without a standalone House flag, the legacy `--house` path remains valid even
-with `--exclusive-output` or `--catalog-v1`; other strict option-value checks
-remain in force. House is CLI-only: existing
+Without a standalone House flag, legacy `--house` and `--dmg-preview` path
+values remain valid even with `--exclusive-output` or `--catalog-v1`;
+`--dmg-preview` is not a capture flag. Other strict option-value checks remain
+in force. House is CLI-only: existing
 capture API structs and `run`/`run_with_options` semantics remain unchanged.
 Their parsers reject `--house` as a flag but retain legacy literal path values.
 The public `TunnelVariant` enum gains

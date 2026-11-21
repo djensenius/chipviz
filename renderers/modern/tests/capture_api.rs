@@ -110,7 +110,7 @@ fn public_app_error_still_supports_an_external_exhaustive_match() {
 }
 
 #[test]
-fn capture_cli_legacy_house_literal_paths_allow_help_without_outputs() {
+fn capture_cli_legacy_local_mode_literal_paths_allow_help_without_outputs() {
     let root = std::env::temp_dir().join(format!(
         "chipviz-capture-house-literal-{}-{}",
         std::process::id(),
@@ -148,6 +148,40 @@ fn capture_cli_legacy_house_literal_paths_allow_help_without_outputs() {
             "--house",
             "--help",
         ][..],
+        &["--exclusive-output", "--out", "--dmg-preview", "--help"][..],
+        &[
+            "--exclusive-output",
+            "--out",
+            "shots",
+            "--input",
+            "--dmg-preview",
+            "--help",
+        ][..],
+        &[
+            "--catalog-v1",
+            "--input",
+            "--dmg-preview",
+            "--out",
+            "shots",
+            "--help",
+        ][..],
+        &[
+            "--catalog-v1",
+            "--input",
+            "recording",
+            "--out",
+            "--dmg-preview",
+            "--help",
+        ][..],
+        &[
+            "--catalog-v1",
+            "--exclusive-output",
+            "--out",
+            "--dmg-preview",
+            "--input",
+            "--dmg-preview",
+            "--help",
+        ][..],
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_chipviz-capture"))
             .current_dir(&root)
@@ -160,6 +194,7 @@ fn capture_cli_legacy_house_literal_paths_allow_help_without_outputs() {
             "{args:?}: {output:?}"
         );
         assert!(!root.join("--house").exists());
+        assert!(!root.join("--dmg-preview").exists());
         assert!(!root.join("shots").exists());
     }
     std::fs::remove_dir(&root).unwrap();

@@ -396,8 +396,8 @@ fn parse_args_internal(
 }
 
 fn is_cli_option(value: &str) -> bool {
-    // `--house` was a literal value before the local opt-in existed. When a
-    // standalone House flag is present, cli_house_tokens checks it separately.
+    // `--house` and `--dmg-preview` were literal values before the local opt-ins.
+    // With a standalone House flag, cli_house_tokens checks them separately.
     matches!(
         value,
         "--help"
@@ -419,7 +419,6 @@ fn is_cli_option(value: &str) -> bool {
             | "--time"
             | "--follow-time"
             | "--starfield"
-            | "--dmg-preview"
     )
 }
 
@@ -1055,7 +1054,7 @@ fn cli_house_tokens(tokens: Vec<String>) -> Result<(Vec<String>, bool), String> 
     }
     for pair in tokens.windows(2) {
         if value_options.contains(&pair[0].as_str())
-            && (pair[1] == "--house" || is_cli_option(&pair[1]))
+            && (matches!(pair[1].as_str(), "--house" | "--dmg-preview") || is_cli_option(&pair[1]))
         {
             return Err(format!(
                 "{} requires a value; {} is an option",
@@ -1386,7 +1385,6 @@ mod tests {
             "--time",
             "--follow-time",
             "--starfield",
-            "--dmg-preview",
         ];
         for value_option in value_options {
             for token in option_tokens {
@@ -1891,6 +1889,41 @@ mod tests {
                 error.contains(&format!("{flag} requires a value")),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn literal_dmg_preview_paths_preserve_exclusive_cli_preprocessing() {
+        for tokens in [
+            vec!["--exclusive-output", "--out", "--dmg-preview"],
+            vec!["--out", "--dmg-preview", "--exclusive-output"],
+            vec![
+                "--exclusive-output",
+                "--out",
+                "--dmg-preview",
+                "--input",
+                "--dmg-preview",
+                "--star-catalog",
+                "--dmg-preview",
+                "--location",
+                "0,0",
+            ],
+        ] {
+            let original: Vec<String> = tokens.into_iter().map(str::to_string).collect();
+            let (tokens, house) = cli_house_tokens(original.clone()).unwrap();
+            assert!(!house);
+            assert_eq!(tokens, original);
+            let (StarfieldConfiguredCommand::Capture(args, options), exclusive) =
+                parse_starfield_args(tokens, true).unwrap()
+            else {
+                panic!("unexpected help");
+            };
+            assert!(exclusive);
+            assert_eq!(args.out, PathBuf::from("--dmg-preview"));
+            if original.iter().any(|token| token == "--input") {
+                assert_eq!(args.input, Input::File("--dmg-preview".into()));
+                assert_eq!(options.starfield.catalog_path, Some("--dmg-preview".into()));
+            }
         }
     }
 
