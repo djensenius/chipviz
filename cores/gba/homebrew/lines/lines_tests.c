@@ -25,6 +25,24 @@ static int finish(lines_render_t *render, uint16_t *page, size_t budget) {
   return result;
 }
 
+static unsigned pixel_at(const uint16_t *page, unsigned x, unsigned y) {
+  return (page[y * (LINES_WIDTH / 2u) + x / 2u] >> ((x & 1u) * 8u)) & 255u;
+}
+
+static int prefix_and_canaries_match(size_t written) {
+  size_t i;
+  if (written > LINES_PAGE_HALFWORDS ||
+      guarded[0] != 0xa5a5u || guarded[LINES_PAGE_HALFWORDS + 1u] != 0xa5a5u) {
+    return 0;
+  }
+  for (i = 0; i < LINES_PAGE_HALFWORDS; ++i) {
+    if (guarded[i + 1u] != (i < written ? expected[i] : 0xa5a5u)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 /* Scalar one-shot oracle, writing individual indices to ordinary host RAM. */
 static void render_reference(const lines_snapshot_t *snapshot) {
   unsigned x, y;
@@ -229,6 +247,59 @@ static void phase_wrap(void) {
         "pages 48 steps apart match across the former 16-bit phase wrap");
 }
 
+static void phase_boundaries(void) {
+  lines_state_t state;
+  lines_snapshot_t initial, p15 = {0}, p16 = {0}, p47 = {0}, p48 = {0};
+  lines_snapshot_t before = {0}, after = {0};
+  lines_render_t render;
+  uint32_t i;
+  int accepted, phases_correct = 1;
+  lines_init(&state);
+  accepted = lines_observe(&state, 0, 0);
+  lines_snapshot(&state, &initial);
+  for (i = 1; i <= 65536u; ++i) {
+    accepted &= lines_observe(&state, i, 0);
+    phases_correct &= state.phase == i % 48u;
+    if (i == 15u) lines_snapshot(&state, &p15);
+    if (i == 16u) lines_snapshot(&state, &p16);
+    if (i == 47u) lines_snapshot(&state, &p47);
+    if (i == 48u) lines_snapshot(&state, &p48);
+    if (i == 65535u) lines_snapshot(&state, &before);
+    if (i == 65536u) lines_snapshot(&state, &after);
+  }
+  check(accepted && phases_correct, "phase advances on every sampled step");
+  check(p15.phase == 15 && p16.phase == 16 && p47.phase == 47 && p48.phase == 0 &&
+        before.phase == 15 && after.phase == 16, "phase crosses both wrap boundaries");
+  initial.fold = p15.fold = p16.fold = p47.fold = p48.fold = before.fold = after.fold = 32;
+  check(memcmp(initial.palette, before.palette, sizeof(initial.palette)) == 0 &&
+        memcmp(initial.palette, after.palette, sizeof(initial.palette)) == 0,
+        "phase boundary pages use the same palette");
+  lines_render_begin(&render, &initial);
+  check(finish(&render, plane, LINES_BATCH_HALFWORDS) == 1, "initial phase page completed");
+  lines_render_begin(&render, &p47);
+  check(finish(&render, expected, LINES_BATCH_HALFWORDS) == 1, "phase 47 page completed");
+  lines_render_begin(&render, &p48);
+  check(finish(&render, reference, LINES_BATCH_HALFWORDS) == 1, "phase 48 page completed");
+  check(memcmp(plane, reference, sizeof(plane)) == 0 &&
+        memcmp(expected, reference, sizeof(expected)) != 0 &&
+        pixel_at(expected, 117, 79) == 2 && pixel_at(reference, 117, 79) == 0,
+        "phase 47 moves into phase 0 rather than freezing");
+  lines_render_begin(&render, &p15);
+  check(finish(&render, plane, LINES_BATCH_HALFWORDS) == 1, "phase 15 page completed");
+  lines_render_begin(&render, &before);
+  check(finish(&render, expected, LINES_BATCH_HALFWORDS) == 1, "step 65535 page completed");
+  check(memcmp(plane, expected, sizeof(plane)) == 0 &&
+        pixel_at(expected, 93, 79) == 2, "step 65535 matches phase 15");
+  lines_render_begin(&render, &p16);
+  check(finish(&render, plane, LINES_BATCH_HALFWORDS) == 1, "phase 16 page completed");
+  lines_render_begin(&render, &after);
+  check(finish(&render, reference, LINES_BATCH_HALFWORDS) == 1, "step 65536 page completed");
+  check(memcmp(plane, reference, sizeof(plane)) == 0 &&
+        memcmp(expected, reference, sizeof(expected)) != 0 &&
+        pixel_at(reference, 93, 79) == 0,
+        "step 65536 moves to phase 16 without a discontinuity");
+}
+
 static void rendering(void) {
   lines_state_t state;
   lines_snapshot_t snapshot, frozen;
@@ -296,6 +367,78 @@ static void rendering(void) {
   }
 }
 
+static void batch_contract(void) {
+  lines_state_t state;
+  lines_snapshot_t snapshot;
+  lines_render_t render = {0};
+  size_t previous;
+  unsigned i;
+  int result;
+  lines_init(&state);
+  lines_observe(&state, 0, 0);
+  lines_snapshot(&state, &snapshot);
+  render_reference(&snapshot);
+  memcpy(expected, reference, sizeof(expected));
+  memset(guarded, 0xa5, sizeof(guarded));
+
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 17) == 0 &&
+        render.next == 0 && prefix_and_canaries_match(0), "fresh render is incomplete");
+  lines_render_cancel(&render);
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 17) == 0 &&
+        render.next == 0 && prefix_and_canaries_match(0), "cancelled fresh render is incomplete");
+  lines_render_begin(&render, &snapshot);
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS - 1u, 17) == -1 &&
+        render.next == 0 && prefix_and_canaries_match(0), "short destination leaves whole page untouched");
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 0) == 0 &&
+        render.next == 0 && prefix_and_canaries_match(0), "zero batch leaves whole page untouched");
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 17) == 0 &&
+        render.next == 17 && prefix_and_canaries_match(17), "small batch writes exactly its prefix");
+  guarded[18] = 0;
+  check(!prefix_and_canaries_match(17), "prefix check detects an out-of-budget write");
+  guarded[18] = 0xa5a5u;
+  lines_render_cancel(&render);
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 240) == 0 &&
+        render.next == 17 && prefix_and_canaries_match(17),
+        "cancelled partial render remains incomplete without writes");
+
+  memset(guarded, 0xa5, sizeof(guarded));
+  lines_render_begin(&render, &snapshot);
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 17) == 0 &&
+        render.next == 17 && prefix_and_canaries_match(17), "restart begins at zero");
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, (size_t)-1) == 0 &&
+        render.next == 17 + LINES_BATCH_HALFWORDS &&
+        prefix_and_canaries_match(17 + LINES_BATCH_HALFWORDS),
+        "capped batch writes exactly its budgeted prefix");
+  for (i = 0; i < LINES_PAGE_HALFWORDS / LINES_BATCH_HALFWORDS; ++i) {
+    if (render.next >= LINES_PAGE_HALFWORDS ||
+        LINES_PAGE_HALFWORDS - render.next <= LINES_BATCH_HALFWORDS) {
+      break;
+    }
+    previous = render.next;
+    result = lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, LINES_BATCH_HALFWORDS);
+    check(result == 0 && render.next == previous + LINES_BATCH_HALFWORDS &&
+          prefix_and_canaries_match(previous + LINES_BATCH_HALFWORDS),
+          "intermediate batch writes exactly its prefix");
+    if (result != 0 || render.next != previous + LINES_BATCH_HALFWORDS) {
+      break;
+    }
+  }
+  check(render.next == LINES_PAGE_HALFWORDS - 223u && prefix_and_canaries_match(render.next),
+        "last partial batch starts at the expected progress");
+  result = lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, LINES_BATCH_HALFWORDS);
+  check(result == 1 && render.next == LINES_PAGE_HALFWORDS &&
+        prefix_and_canaries_match(LINES_PAGE_HALFWORDS), "final partial batch completes the page");
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 0) == 1 &&
+        render.next == LINES_PAGE_HALFWORDS && prefix_and_canaries_match(LINES_PAGE_HALFWORDS),
+        "completed render stays complete on repeated calls");
+  check(lines_render_batch(&render, NULL, LINES_PAGE_HALFWORDS, 1) == -1 &&
+        lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS - 1u, 1) == -1 &&
+        prefix_and_canaries_match(LINES_PAGE_HALFWORDS), "completed render still validates destination");
+  lines_render_cancel(&render);
+  check(lines_render_batch(&render, guarded + 1, LINES_PAGE_HALFWORDS, 1) == 1 &&
+        prefix_and_canaries_match(LINES_PAGE_HALFWORDS), "cancelling a complete render preserves completion");
+}
+
 int main(void) {
   samples();
   regular_phrases(96);
@@ -303,7 +446,9 @@ int main(void) {
   regular_phrases(126);
   rapid_phrases();
   phase_wrap();
+  phase_boundaries();
   rendering();
+  batch_contract();
   printf("gba lines tests: %u checks, %u failures\n", checks, failures);
   return failures ? 1 : 0;
 }

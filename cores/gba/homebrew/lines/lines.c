@@ -116,7 +116,7 @@ int lines_render_batch(lines_render_t *render, volatile uint16_t *page,
     return -1;
   }
   if (!render->active) {
-    return 0;
+    return render->next == LINES_PAGE_HALFWORDS ? 1 : 0;
   }
   if (budget > LINES_BATCH_HALFWORDS) {
     budget = LINES_BATCH_HALFWORDS;

@@ -38,11 +38,14 @@ void lines_init(lines_state_t *state);
  * an A rising edge to the final step; unsampled edges cannot be recovered. */
 int lines_observe(lines_state_t *state, uint32_t step, uint16_t keys);
 void lines_snapshot(const lines_state_t *state, lines_snapshot_t *snapshot);
-/* Restart discards partial progress; cancel never touches the destination. */
+/* Zero-initialize a fresh render before calling batch or cancel. Begin
+ * restarts at zero; cancel never touches the destination and leaves a
+ * completed render complete. */
 void lines_render_begin(lines_render_t *render, const lines_snapshot_t *snapshot);
 void lines_render_cancel(lines_render_t *render);
 /* Writes at most min(budget, LINES_BATCH_HALFWORDS) halfwords. Returns -1
- * on invalid destination/size, 0 while incomplete, 1 when complete.
+ * on invalid destination/size, 0 while incomplete (including a fresh or
+ * cancelled partial render), 1 when complete, including subsequent calls.
  * The same aligned destination must be supplied until completion or restart. */
 int lines_render_batch(lines_render_t *render, volatile uint16_t *page,
                        size_t page_halfwords, size_t budget);

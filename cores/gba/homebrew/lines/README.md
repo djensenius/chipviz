@@ -24,8 +24,12 @@ A snapshot freezes state and all 256 staged palette entries. Rendering writes
 at most 240 packed halfwords per batch into a caller-owned, explicitly sized
 240x160 page; a complete render replaces the whole page. The caller must keep
 the same aligned destination until completion or restart. Cancellation leaves
-partial pixels; restart begins again at zero. The model uses no heap, display
-registers, palette hardware or page flips.
+partial pixels; restart begins again at zero. Zero-initialize a fresh render
+before calling batch or cancel. A valid batch returns 0 for a fresh or
+cancelled partial render and 1 for a completed render, including later calls;
+cancelling after completion preserves completion. An invalid destination or
+size returns -1 even after completion. The model uses no heap, display registers,
+palette hardware or page flips.
 
 ## Host tests
 
