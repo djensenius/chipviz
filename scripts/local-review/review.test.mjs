@@ -143,6 +143,8 @@ class Element {
     this.events = {};
     this.textContent = '';
     this.value = '';
+    this.focusCount = 0;
+    this.selectCount = 0;
     if (tag === 'video') {
       this.currentTime = 0;
       this.duration = NaN;
@@ -162,8 +164,8 @@ class Element {
     this.mediaActions.push('load');
     if (this.events.error) this.events.error();
   }
-  focus() {}
-  select() {}
+  focus() { this.focusCount += 1; }
+  select() { this.selectCount += 1; }
 }
 function descendants(element) {
   return [element, ...element.children.flatMap(descendants)];
@@ -431,4 +433,155 @@ test('closing or switching details stops discarded players and ignores stale cal
   assert.equal(active.currentTime, 22);
   assert.equal(currentVideo(), undefined);
   assert.equal(detail.hidden, false);
+});
+
+test('delayed clipboard completions cannot replace newer UI state', async t => {
+  const elements = Object.fromEntries(['count', 'message', 'detail', 'results', 'search', 'reset',
+    'filter-fields'].map(id => [id, new Element('div')]));
+  const first = clip();
+  const second = { ...clip(), id: 'clip-11111111111111111111', title: 'Second capture',
+    collection: 'library', capture: 'Unknown capture' };
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  t.after(() => {
+    if (previousNavigator) Object.defineProperty(globalThis, 'navigator', previousNavigator);
+    else delete globalThis.navigator;
+  });
+  const writes = [];
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {
+    clipboard: { writeText(text) {
+      let resolve, reject;
+      const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+      writes.push({ text, resolve, reject });
+      return promise;
+    } },
+  } });
+  globalThis.document = { getElementById: id => elements[id], createElement: tag => new Element(tag) };
+  globalThis.location = { href: 'http://127.0.0.1:8000/capability/' };
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ schema_version: 1, clips: [first, second] }) });
+  globalThis.window = { isSecureContext: true };
+  await import('./app.mjs?clipboard');
+  await new Promise(resolve => setImmediate(resolve));
+  const detail = elements.detail;
+  const select = title => descendants(elements.results)
+    .find(item => item['aria-label'] === `View details for ${title}`).events.click();
+  const action = text => descendants(detail).find(item => item.textContent === text);
+  const input = () => descendants(detail).find(item => item.tagName === 'input');
+  const video = () => descendants(detail).find(item => item.tagName === 'video');
+  const feedback = () => descendants(detail).find(item => item.role === 'status');
+  const fallback = () => descendants(detail).find(item => item.tagName === 'textarea');
+  const begin = () => {
+    select(first.title);
+    input().value = '0';
+    action('Open local video').events.click();
+    video().duration = 43;
+    video().events.loadedmetadata();
+    input().value = '5';
+    const oldFeedback = feedback();
+    const oldFallback = fallback();
+    const promise = action('Copy reference').events.click();
+    const write = writes.at(-1);
+    assert.match(write.text, /Time: 5 seconds/);
+    return { promise, write, oldFeedback, oldFallback };
+  };
+  const finish = async (copy, outcome) => {
+    if (outcome === 'resolve') copy.write.resolve();
+    else copy.write.reject(new Error('clipboard rejected'));
+    await copy.promise;
+  };
+  for (const outcome of ['resolve', 'reject']) {
+    for (const change of ['invalid', 'out-of-range', 'edit', 'silent-edit',
+      'reopen', 'close', 'switch', 'current', 'error']) {
+      const copy = begin();
+      if (change === 'invalid') {
+        input().value = 'invalid';
+        await action('Copy reference').events.click();
+        assert.match(feedback().textContent, /valid time/);
+      } else if (change === 'out-of-range') {
+        input().value = '44';
+        await action('Copy reference').events.click();
+        assert.match(feedback().textContent, /exceeds/);
+      } else if (change === 'edit') {
+        input().value = '9';
+        input().events.input();
+      } else if (change === 'silent-edit') {
+        input().value = '9';
+      } else if (change === 'reopen') {
+        input().value = '4';
+        action('Open local video').events.click();
+        assert.match(feedback().textContent, /Loading video metadata/);
+      } else if (change === 'close') {
+        action('Close details').events.click();
+        assert.equal(detail.hidden, true);
+      } else if (change === 'switch') {
+        select(second.title);
+      } else if (change === 'current') {
+        video().currentTime = 8;
+        action('Use current playback time').events.click();
+        assert.equal(input().value, '8');
+      } else {
+        video().events.error();
+        assert.match(feedback().textContent, /failed/);
+      }
+      const oldMessage = copy.oldFeedback.textContent;
+      const activeFeedback = change === 'close' ? null : feedback();
+      const activeMessage = activeFeedback?.textContent;
+      const focusCount = copy.oldFallback.focusCount;
+      const selectCount = copy.oldFallback.selectCount;
+      await finish(copy, outcome);
+      assert.equal(copy.oldFeedback.textContent, oldMessage, `${change}: ${outcome}`);
+      if (activeFeedback) assert.equal(activeFeedback.textContent, activeMessage, `${change}: ${outcome}`);
+      assert.equal(copy.oldFallback.hidden, true, `${change}: ${outcome}`);
+      assert.equal(copy.oldFallback.focusCount, focusCount, `${change}: ${outcome}`);
+      assert.equal(copy.oldFallback.selectCount, selectCount, `${change}: ${outcome}`);
+    }
+
+    const copy = begin();
+    const count = writes.length;
+    await action('Copy reference').events.click();
+    assert.equal(writes.length, count);
+    assert.match(feedback().textContent, /still in progress/);
+    const blockedMessage = feedback().textContent;
+    await finish(copy, outcome);
+    assert.equal(feedback().textContent, blockedMessage);
+    assert.equal(fallback().hidden, true);
+    const retry = action('Copy reference').events.click();
+    assert.equal(writes.length, count + 1);
+    if (outcome === 'resolve') writes.at(-1).resolve();
+    else writes.at(-1).reject(new Error('clipboard rejected'));
+    await retry;
+    if (outcome === 'resolve') {
+      assert.equal(feedback().textContent, 'Reference copied.');
+      assert.equal(fallback().hidden, true);
+    } else {
+      assert.match(feedback().textContent, /Clipboard unavailable/);
+      assert.equal(fallback().hidden, false);
+      assert.match(fallback().value, /Time: 5 seconds/);
+      assert.equal(fallback().focusCount, 1);
+      assert.equal(fallback().selectCount, 1);
+      input().value = '6';
+      input().events.input();
+      assert.equal(fallback().hidden, true);
+    }
+
+    const switched = begin();
+    const countBeforeSwitch = writes.length;
+    select(second.title);
+    input().value = '0';
+    action('Open local video').events.click();
+    video().duration = 43;
+    video().events.loadedmetadata();
+    input().value = '12';
+    await action('Copy reference').events.click();
+    assert.equal(writes.length, countBeforeSwitch);
+    assert.match(feedback().textContent, /still in progress/);
+    const switchedMessage = feedback().textContent;
+    await finish(switched, outcome);
+    assert.equal(feedback().textContent, switchedMessage);
+    assert.equal(fallback().hidden, true);
+    const newCopy = action('Copy reference').events.click();
+    assert.match(writes.at(-1).text, /Clip ID: clip-11111111111111111111/);
+    writes.at(-1).resolve();
+    await newCopy;
+    assert.equal(feedback().textContent, 'Reference copied.');
+  }
 });

@@ -7,6 +7,7 @@ const filters = new Map();
 let clips = [];
 let selected = null;
 let disposeDetail = null;
+let clipboardWritePending = false;
 
 function node(tag, text, className) {
   const element = document.createElement(tag);
@@ -90,9 +91,19 @@ function selectClip(clip) {
   feedback.setAttribute('role', 'status');
   const player = node('div', null, 'player');
   const controls = node('div', null, 'actions');
+  const fallback = node('textarea', null, 'fallback');
+  fallback.readOnly = true;
+  fallback.hidden = true;
+  fallback.setAttribute('aria-label', 'Reference to copy');
   let video = null;
   let state = 'unopened';
+  let copyVersion = 0;
+  function invalidateCopy() {
+    copyVersion += 1;
+    fallback.hidden = true;
+  }
   function discardVideo() {
+    invalidateCopy();
     const previous = video;
     video = null;
     state = 'unopened';
@@ -131,6 +142,7 @@ function selectClip(clip) {
   open.type = 'button';
   open.addEventListener('click', () => {
     if (disposeDetail !== discardVideo) return;
+    invalidateCopy();
     const seconds = getTime();
     if (seconds === null) return;
     discardVideo();
@@ -142,11 +154,13 @@ function selectClip(clip) {
     openedVideo.preload = 'metadata';
     openedVideo.addEventListener('error', () => {
       if (video !== openedVideo) return;
+      invalidateCopy();
       state = 'error';
       feedback.textContent = 'Video metadata or seek failed. Reopen the video and try again.';
     });
     openedVideo.addEventListener('seeked', () => {
       if (video !== openedVideo || !['seeking', 'invalid'].includes(state) || openedVideo.seeking) return;
+      invalidateCopy();
       if (!Number.isFinite(openedVideo.duration) || openedVideo.duration < 0 ||
           !Number.isFinite(openedVideo.currentTime) || openedVideo.currentTime < 0 ||
           openedVideo.currentTime > openedVideo.duration) {
@@ -159,6 +173,7 @@ function selectClip(clip) {
     });
     openedVideo.addEventListener('loadedmetadata', () => {
       if (video !== openedVideo || state !== 'loading') return;
+      invalidateCopy();
       if (!Number.isFinite(openedVideo.duration) || openedVideo.duration < 0) {
         state = 'error';
         feedback.textContent = 'Video duration is unavailable. Reopen the video and try again.';
@@ -187,6 +202,7 @@ function selectClip(clip) {
   const current = node('button', 'Use current playback time', 'secondary');
   current.type = 'button';
   current.addEventListener('click', () => {
+    invalidateCopy();
     if (!hasDuration()) return;
     if (state === 'invalid') {
       feedback.textContent = 'Enter a valid time and reopen the video, or seek with the player.';
@@ -201,21 +217,39 @@ function selectClip(clip) {
   });
   const copy = node('button', 'Copy reference', 'secondary');
   copy.type = 'button';
-  const fallback = node('textarea', null, 'fallback');
-  fallback.readOnly = true;
-  fallback.hidden = true;
-  fallback.setAttribute('aria-label', 'Reference to copy');
+  input.addEventListener('input', () => {
+    invalidateCopy();
+    feedback.textContent = '';
+  });
   copy.addEventListener('click', async () => {
-    fallback.hidden = true;
+    if (disposeDetail !== discardVideo) return;
+    invalidateCopy();
     const seconds = getTime();
     if (seconds === null || !inDuration(seconds)) return;
     const text = reference(clip, seconds);
+    const version = copyVersion;
+    const inputValue = input.value;
+    const copiedVideo = video;
+    const isCurrent = () => disposeDetail === discardVideo && version === copyVersion &&
+      input.value === inputValue && video === copiedVideo && state !== 'error' &&
+      Number.isFinite(video.duration) && video.duration >= seconds;
+    if (clipboardWritePending) {
+      feedback.textContent = 'A clipboard write is still in progress. Wait and try copying again.';
+      return;
+    }
     try {
       if (!navigator.clipboard || !window.isSecureContext) throw new Error('Clipboard unavailable');
-      await navigator.clipboard.writeText(text);
+      clipboardWritePending = true;
+      try {
+        await navigator.clipboard.writeText(text);
+      } finally {
+        clipboardWritePending = false;
+      }
+      if (!isCurrent()) return;
       fallback.hidden = true;
       feedback.textContent = 'Reference copied.';
     } catch {
+      if (!isCurrent()) return;
       fallback.value = text;
       fallback.hidden = false;
       feedback.textContent = 'Clipboard unavailable. Select and copy the reference below.';

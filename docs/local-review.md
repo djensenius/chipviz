@@ -78,6 +78,11 @@ and followed by punctuation. File changes detected between scanning and
 playback are rejected until refresh. Changes during an active transfer cannot
 be excluded, so do not edit footage while browsing.
 
+A clipboard write already requested from the OS cannot be cancelled. If you
+change the time or player while it is pending, its result is ignored by the
+page but it may still change the clipboard. Wait for it to finish before
+copying again; if it remains stuck, refresh the page.
+
 Scenario filters group recognized quiet/energetic filename suffixes and the
 modern library's `mellow-96` and `driving-126` tokens. Ambiguous or conflicting
 recognized scenarios are unknown; other descriptive filenames retain their
