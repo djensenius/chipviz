@@ -362,8 +362,8 @@ def _configure() -> None:
       raise AuthError("Private configuration already exists.")
     with warnings.catch_warnings():
       warnings.simplefilter("error", getpass.GetPassWarning)
-      client_id = getpass.getpass("Desktop OAuth client ID: ")
-      client_secret = getpass.getpass("Desktop OAuth client secret: ")
+      client_id = getpass.getpass("Desktop OAuth client ID: ").strip()
+      client_secret = getpass.getpass("Desktop OAuth client secret: ").strip()
     text = f"YOUTUBE_CLIENT_ID={client_id}\nYOUTUBE_CLIENT_SECRET={client_secret}\n"
     _client_values(text)
     _write_once(fd, ENV_FILE, text)
@@ -441,7 +441,7 @@ def _authorize_locked(fd: int) -> None:
       or not title.isprintable()):
     raise AuthError("YouTube channel is invalid.")
   print(f"Resolved channel: {title} ({channel_id})")
-  if input("Type the exact channel ID to confirm: ") != channel_id:
+  if input("Type the exact channel ID to confirm: ").strip() != channel_id:
     raise AuthError("Channel was not confirmed.")
   if not _token_valid(credentials.refresh_token):
     raise AuthError("Google did not provide a durable refresh token.")
@@ -462,6 +462,8 @@ def configure() -> None:
   """Prompt without echo and create the private configuration once."""
   try:
     _configure()
+  except AuthError:
+    raise
   except Exception:
     raise AuthError("Cannot create private YouTube configuration.") from None
 
@@ -471,6 +473,8 @@ def authorize() -> None:
   """Authorize and confirm a single channel, without exposing library errors."""
   try:
     _authorize()
+  except AuthError:
+    raise
   except Exception:
     raise AuthError("Cannot authorize and confirm the YouTube channel.") from None
 
@@ -557,6 +561,10 @@ def main() -> int:
       authorize()
     print("YouTube setup step complete.")
     return 0
+  except AuthError as error:
+    # AuthError messages are fixed strings without secrets.
+    print(f"YouTube setup failed: {error}", file=sys.stderr)
+    return 1
   except Exception:
     # Library and OS exceptions can contain credentials or OAuth URLs.
     print("YouTube setup failed; check private storage, consent, and channel selection.",

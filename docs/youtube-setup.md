@@ -13,10 +13,13 @@ set video privacy.
    client secret private. Do not copy them into chat, the repository, shell
    history, or command-line arguments.
 3. In your own terminal, prepare a virtual environment and run the setup from
-   the repository root:
+   the repository root. Use the mise-managed Python (3.10 or newer); macOS's
+   built-in Python 3.9 cannot import the upload transport. Git must be
+   installed, because setup verifies the private storage is outside any Git
+   worktree.
 
    ```sh
-   python3 -m venv .venv
+   mise exec -- python -m venv .venv
    .venv/bin/python -m pip install -r scripts/requirements-youtube.txt
    .venv/bin/python scripts/youtube_auth.py configure
    .venv/bin/python scripts/youtube_auth.py authorize
@@ -24,7 +27,10 @@ set video privacy.
 
    Paste the ID and secret only into the non-echoing local prompts. The second
    command opens a browser for Google consent and asks for upload and read-only
-   YouTube access. Check the displayed channel title and type its **exact
+   YouTube access. Run it on the Mac's own desktop session: the authorization
+   URL is intentionally not printed, so if no browser opens, press Control-C
+   (or wait for the five-minute timeout) and retry from a local session. Leading
+   or trailing whitespace in pasted values is ignored. Check the displayed channel title and type its **exact
    channel ID** to confirm. Do not confirm an unexpected channel.
 
 The configuration lives in `~/.config/chipviz/.env.youtube` and the refresh

@@ -42,7 +42,7 @@ import logging
 import re
 import sys
 import threading
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 if __package__:
@@ -85,7 +85,7 @@ def _sanitize_transport_errors(function):
 
 class Progress(NamedTuple):
   offset: int
-  video_id: str | None
+  video_id: Optional[str]
 
 
 @_sanitize_transport_errors
@@ -252,7 +252,7 @@ def _failure(response):
   code = response.status_code
   if code == 401:
     raise TransportError("auth_required", "YouTube authorization required")
-  if code == 403:
+  if code in (400, 403):
     try:
       body = response.json()
       errors = body.get("error", {}).get("errors", [])

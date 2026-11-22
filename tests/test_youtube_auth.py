@@ -146,6 +146,22 @@ class YouTubeAuthTests(unittest.TestCase):
     self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
     self.assertEqual(env.read_text(), f"YOUTUBE_CLIENT_ID={CLIENT}\nYOUTUBE_CLIENT_SECRET={SECRET}\n")
 
+  def test_configure_strips_pasted_whitespace(self):
+    self.configure(values=(f" {CLIENT}\n", f"{SECRET} "))
+    env = self.app / AUTH.ENV_FILE
+    self.assertEqual(env.read_text(), f"YOUTUBE_CLIENT_ID={CLIENT}\nYOUTUBE_CLIENT_SECRET={SECRET}\n")
+
+  def test_cli_reports_fixed_diagnostic_without_secrets(self):
+    output = io.StringIO()
+    with mock.patch.object(sys, "argv", ["youtube_auth.py", "configure"]), \
+        mock.patch.object(AUTH.getpass, "getpass", side_effect=("bad id", SECRET)), \
+        contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+      self.assertEqual(AUTH.main(), 1)
+    self.assertIn("Malformed private configuration.", output.getvalue())
+    self.assertNotIn(SECRET, output.getvalue())
+    self.assertNotIn("bad id", output.getvalue())
+    self.assertFalse((self.app / AUTH.ENV_FILE).exists())
+
   def test_no_terminal_fallback_does_not_read_or_echo(self):
     def warning(_prompt):
       import warnings
@@ -264,6 +280,7 @@ class YouTubeAuthTests(unittest.TestCase):
         flow.redirect_uri = "http://127.0.0.1:12345/"
         url, _ = flow.authorization_url()
         self.assertIn("code_challenge=", url)
+        self.assertIn("code_challenge_method=S256", url)
         AUTH._protect_token_session(flow.oauth2session)
         adapter = FakeTokenAdapter(status)
         flow.oauth2session.mount("https://", adapter)
