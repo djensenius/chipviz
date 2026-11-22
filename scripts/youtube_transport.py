@@ -261,7 +261,7 @@ def _failure(response):
       reasons = set()
     if reasons & {"quotaExceeded", "dailyLimitExceeded", "uploadLimitExceeded"}:
       raise TransportError("quota", "YouTube upload quota exceeded") from None
-    if reasons & {"authError", "required", "insufficientPermissions"}:
+    if code == 403 and reasons & {"authError", "required", "insufficientPermissions"}:
       raise TransportError("auth_required", "YouTube authorization required") from None
   raise TransportError("uncertain", "Upload response requires quarantine or status check")
 

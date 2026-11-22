@@ -204,6 +204,7 @@ class YouTubeTransportTests(unittest.TestCase):
       (403, {"error": {"errors": [{"reason": "uploadLimitExceeded"}]}}, "quota"),
       (400, {"error": {"errors": [{"reason": "uploadLimitExceeded"}]}}, "quota"),
       (400, {"error": {"message": URI}}, "uncertain"),
+      (400, {"error": {"errors": [{"reason": "required"}]}}, "uncertain"),
       (403, {"error": {"message": URI}}, "uncertain"),
       (404, {"secret": URI}, "uncertain"),
       (410, {"secret": URI}, "uncertain"),
