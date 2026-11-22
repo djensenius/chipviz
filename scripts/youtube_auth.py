@@ -26,6 +26,10 @@ import subprocess
 import sys
 import warnings
 
+# Exception sanitization relies on Python 3.11+ re-raise traceback semantics.
+if sys.version_info < (3, 11):
+  raise ImportError("YouTube tooling requires Python 3.11 or newer.")
+
 
 SCOPES = (
   "https://www.googleapis.com/auth/youtube.upload",

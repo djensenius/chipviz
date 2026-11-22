@@ -13,8 +13,9 @@ set video privacy.
    client secret private. Do not copy them into chat, the repository, shell
    history, or command-line arguments.
 3. In your own terminal, prepare a virtual environment and run the setup from
-   the repository root. Use the mise-managed Python (3.10 or newer); macOS's
-   built-in Python 3.9 cannot import the upload transport. Git must be
+   the repository root. Use the mise-managed Python (3.11 or newer). The scripts
+   refuse to load on older versions, including macOS's built-in Python 3.9,
+   because error sanitization depends on Python 3.11 re-raise behavior. Git must be
    installed, because setup verifies the private storage is outside any Git
    worktree.
 
