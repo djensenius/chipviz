@@ -976,9 +976,9 @@ mod tests {
                         let point = flow_point(time, stream, tracer, audio);
                         assert!(point.iter().all(|v| v.is_finite() && v.abs() < 10.8));
                         assert!(point.iter().filter(|v| v.abs() > HALF_WIDTH).count() <= 1);
-                        for axis in 0..3 {
-                            if point[axis].abs() > 5.0 {
-                                visited.insert((axis, point[axis].is_sign_positive()));
+                        for (axis, coordinate) in point.iter().enumerate() {
+                            if coordinate.abs() > 5.0 {
+                                visited.insert((axis, coordinate.is_sign_positive()));
                             }
                         }
                         let next = flow_point(time + 0.01, stream, tracer, audio);
