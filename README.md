@@ -43,6 +43,9 @@ assets/
   scenes/   Shared scene sketches and data-driven visual definitions.
 ```
 
+For private local video browsing, see the
+[local review gallery](docs/local-review.md). It does not publish recordings.
+
 ## Shared control model
 
 The first common interface is a compact frame that every platform can interpret in its own way:
@@ -99,6 +102,71 @@ or macOS executables. To run on those targets, build from source as described
 in the [modern renderer guide](renderers/modern/README.md). Native release work
 is tracked in [#215](https://github.com/djensenius/chipviz/issues/215) and
 [#216](https://github.com/djensenius/chipviz/issues/216).
+
+### Local Apple Silicon archive
+
+On an Apple Silicon Mac with the mise Rust toolchain, the
+`aarch64-apple-darwin` target, and Xcode command-line tools available, wait
+for the serialized build slot before running the following from the checkout
+root. The packager first creates a fresh private output directory without
+following symlinks. The build uses a separate fresh directory in macOS's
+`/private/tmp`, not the checkout's potentially symlinked Cargo target path:
+
+```sh
+(
+set -eu
+checkout=$(pwd -P)
+out_dir="$checkout/build/macos-arm64/package"
+cargo_home="$HOME/.cargo"
+export TMPDIR=/private/tmp
+mise exec -- python scripts/package-macos-arm64.py --prepare-output-dir "$out_dir"
+mise exec -- python scripts/package-macos-arm64.py --check-cargo-home "$cargo_home"
+cargo_dir=$(mktemp -d /private/tmp/chipviz-cargo.XXXXXXXX)
+CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$cargo_dir/target" \
+  CARGO_BUILD_TARGET_DIR="$cargo_dir/target" \
+  CARGO_BUILD_BUILD_DIR="$cargo_dir/intermediate" mise exec -- cargo \
+  --config "build.build-dir='$cargo_dir/intermediate'" build \
+  --target-dir "$cargo_dir/target" --locked --offline \
+  --manifest-path renderers/modern/Cargo.toml --release \
+  --target aarch64-apple-darwin --bin chipviz-m1
+mise exec -- python scripts/package-macos-arm64.py \
+  --binary "$cargo_dir/target/aarch64-apple-darwin/release/chipviz-m1" \
+  --output "$out_dir/chipviz-macos-arm64.zip"
+)
+```
+
+The existing `build` directory must be user-owned and not group/world-writable;
+`build/macos-arm64` must be user-owned and private. The preparation command
+creates these directories if missing and refuses an existing `package`
+directory; choose a different fresh name on retry. Preparation can leave
+created directories if it fails. The private Cargo directory is not removed
+automatically. Cargo's command-line target and build-directory overrides take
+precedence over their environment and configuration values; the corresponding
+environment variables are also set explicitly. The command ignores inherited
+`CARGO_HOME` and checks the account's own pre-existing `~/.cargo` for unsafe
+links and permissions; it must not overlap the checkout. Every ancestor from
+`/` through the account home must be root- or user-owned and not group/world
+writable, including sticky directories. The account and Cargo homes must be
+user-owned. ACLs are not checked. Its registry index,
+cache and sources must already be populated in a trusted setup; the check
+does not prove all locked dependencies
+are present. Cargo's offline resolution fails if required data is unavailable;
+this setup does not populate dependencies, and Cargo may modify the selected
+cache. The check does not inspect tool links inside
+`.cargo/bin`, and Cargo, its configuration, wrappers and build dependencies
+are not sandboxed. The packager rejects symlinks, existing targets
+and unsafe input permissions. It copies the
+owner-executable binary and `LICENSE`, `COMMERCIAL.md`, and
+`THIRD_PARTY_NOTICES/rust.md` into the ZIP. Snapshot limits are 256 MiB for
+the binary and 8 MiB per notice. If packaging fails, a partial archive may
+remain; inspect it and use another fresh directory before retrying.
+
+This is an opt-in, non-publishing local archive, not a release workflow or a
+personal star-catalog bundle. The packaging check is headless: Mach-O headers
+alone do not establish runtime compatibility, rendering, or visual safety.
+The archive is not signed or notarized by this tool, and its notices do not
+grant redistribution or other licensing clearance. Path and input checks
+cannot prevent races by the same account.
 
 All SNES ROMs, including the generated diagnostic seed and SDK build, are
 temporarily omitted from future individual release assets and combined zips;

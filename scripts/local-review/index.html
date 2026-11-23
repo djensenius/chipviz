@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>chipviz · local video review</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.mjs"></script>
+</head>
+<body>
+  <a class="skip" href="#gallery">Skip to gallery</a>
+  <header class="hero">
+    <div class="wrap">
+      <p class="eyebrow">CHIPVIZ / PRIVATE REVIEW LIBRARY</p>
+      <h1>See the signal<span class="accent">.</span></h1>
+      <p class="intro">Compare local captures, platforms and revisions. Find a moment and copy a precise reference.</p>
+      <div class="notice"><strong>Viewing &amp; safety notice</strong><p>Some visualizations contain abrupt changes. Drafts are review-only and not human-reviewed. Normal-speed review and safety/flash assessment remain required. Pi profiles on a Mac GPU are not physical Pi validation.</p></div>
+      <p class="privacy">Private local viewer. The address is a secret; do not share it. Metadata and declared revisions are not independent proof.</p>
+    </div>
+  </header>
+  <main id="gallery" class="wrap">
+    <div class="section-head"><div><p class="eyebrow">THE COLLECTION</p><h2>Explore captures</h2></div><p id="count" aria-live="polite">Loading catalog…</p></div>
+    <div class="layout">
+      <aside class="filters" aria-label="Filter captures">
+        <div class="filter-head"><h3>Refine</h3><button id="reset" class="text-button" type="button">Clear all</button></div>
+        <label for="search">Search metadata</label>
+        <input id="search" type="search" placeholder="Title or revision">
+        <div id="filter-fields"></div>
+      </aside>
+      <div>
+        <p id="message" class="message" role="status" hidden></p>
+        <section id="detail" class="detail" aria-label="Selected capture" hidden></section>
+        <div id="results" class="results" aria-label="Captures"></div>
+      </div>
+    </div>
+  </main>
+  <footer class="wrap">chipviz / local video review</footer>
+</body>
+</html>
