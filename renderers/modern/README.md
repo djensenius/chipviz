@@ -850,6 +850,19 @@ just modern-m1 -- --house
 just modern-capture --out build/house --house --input synth-mic --frames 60,120
 ```
 
+The surface Hallway keeps fixed planar markings and adds curved, flowing trails
+across the walls, floor and ceiling at different depths. The trails move within
+their surfaces independently of the camera; smoothed audio levels gently vary
+their motion and appearance. They are not moving rectangular hoops.
+
+House keeps its connected six-way structure and identifiable branch markings.
+Multiple world-space tracers move through the corridors and vertical branches
+on differing clocks and lanes, with wall occlusion and smooth turnarounds.
+Both looks use deterministic, bounded animation rather than only a camera tour
+of fixed geometry. Quiet and energetic inputs vary the activity without enabling
+the gated flash feature. Geometry tests and sampled luminance checks are not a
+substitute for normal-speed visual review or an independent safety assessment.
+
 House is a local override of native displays, including those from recordings;
 it never assigns a wire byte. Scene 7 remains governed by ColourField's gates.
 `--house` rejects `--dmg-preview`, any `--scene` or `--tunnel-variant`,
