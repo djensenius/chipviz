@@ -1,4 +1,4 @@
-//! A single six-way corridor junction, viewed from a continuous camera path.
+//! A single six-way corridor junction with world-space flow and a continuous camera path.
 
 use std::sync::OnceLock;
 
@@ -219,6 +219,78 @@ fn world_details() -> &'static [(Branch, [Point; 2])] {
     })
 }
 
+const FLOW_STREAMS: usize = 3;
+const TRACERS_PER_STREAM: usize = 6;
+const TRAIL_SEGMENTS: usize = 2;
+const MOTION_EDGES: usize = FLOW_STREAMS * TRACERS_PER_STREAM * (TRAIL_SEGMENTS + 1);
+
+fn phase(elapsed: f32, period: f32) -> f32 {
+    if elapsed.is_finite() {
+        elapsed.rem_euclid(period) / period
+    } else {
+        0.0
+    }
+}
+
+// Each circuit visits all six arms, returning through the junction between
+// excursions. A cosine out-and-back has zero velocity at both the far turn
+// and the central axis change: no teleports or corner cutting through walls.
+// The circuits have different periods, lanes and phases, independent of the
+// camera's 60-second tour. Audio gently widens the flow, not its clock, so
+// changing levels cannot jump a tracer to a different part of its route.
+fn flow_point(elapsed: f32, stream: usize, tracer: usize, audio: [f32; 3]) -> Point {
+    let period = [73.0, 89.0, 107.0][stream];
+    let route =
+        (phase(elapsed, period) * 6.0 + tracer as f32 + stream as f32 * 0.37).rem_euclid(6.0);
+    let leg = route.floor() as usize;
+    let (_, turn) = sin_cos((route - leg as f32) * std::f32::consts::TAU);
+    let axis = [2, 0, 1, 2, 0, 1][leg];
+    let sign = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0][leg];
+    let (sway, drift) = sin_cos(
+        phase(elapsed, 31.0 + stream as f32 * 11.0) * std::f32::consts::TAU + tracer as f32 * 0.7,
+    );
+    let lane = [-0.42, 0.0, 0.42][stream];
+    let [energy, bass, treble] = audio;
+    let mut point = [
+        lane + (0.10 + 0.035 * energy) * sway,
+        lane * 0.6 + (0.12 + 0.035 * bass) * drift,
+        -lane + (0.10 + 0.035 * treble) * sway,
+    ];
+    point[axis] += sign * 10.2 * (1.0 - turn) * 0.5;
+    point
+}
+
+fn moving_edges(elapsed: f32, audio: [f32; 3]) -> Vec<[Point; 2]> {
+    // Sanitize before subtracting tail delays, so invalid time is exactly the
+    // same frame as zero (including its history), rather than collapsed tails.
+    let time = if elapsed.is_finite() { elapsed } else { 0.0 };
+    let mut edges = Vec::with_capacity(MOTION_EDGES);
+    for stream in 0..FLOW_STREAMS {
+        for tracer in 0..TRACERS_PER_STREAM {
+            let mut previous = flow_point(time - 0.48, stream, tracer, audio);
+            for segment in 1..=TRAIL_SEGMENTS {
+                let next = flow_point(
+                    time - 0.48 + segment as f32 * (0.48 / TRAIL_SEGMENTS as f32),
+                    stream,
+                    tracer,
+                    audio,
+                );
+                edges.push([previous, next]);
+                previous = next;
+            }
+            // A small diagonal head stays legible when the trail points into
+            // the screen or slows at a turnaround. It remains strictly inside
+            // the corridor, and goes through the same wall/near-plane clipping.
+            let radius = [0.09, 0.07, 0.08];
+            edges.push([
+                std::array::from_fn(|i| previous[i] - radius[i]),
+                std::array::from_fn(|i| previous[i] + radius[i]),
+            ]);
+        }
+    }
+    edges
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Camera {
     position: Point,
@@ -404,9 +476,9 @@ fn project_edge(
     Some((start, end, depth))
 }
 
-/// Projects the same world at every time. Audio only changes line styling;
-/// it never moves the camera or geometry. Inputs outside their documented
-/// ranges are sanitized to keep the returned instances finite.
+/// Projects a fixed connected structure and evolving world-space tracers.
+/// Audio changes styling and gently widens flow, never the camera or walls.
+/// Inputs outside their documented ranges are sanitized to keep instances finite.
 pub(crate) fn project(
     elapsed_seconds: f32,
     aspect_ratio: f32,
@@ -430,7 +502,8 @@ pub(crate) fn project(
     });
     let camera = camera(elapsed_seconds);
     let mut visible = Vec::new();
-    let mut add_edge = |edge, width, intensity| {
+    let mut activity = Vec::new();
+    let mut add_edge = |edge, width, intensity, moving| {
         // A wholly off-screen edge cannot contribute any visible subsegment.
         if project_edge(edge, camera, aspect).is_none() {
             return;
@@ -440,7 +513,8 @@ pub(crate) fn project(
                 continue;
             };
             let fade = (1.0 / (1.0 + depth * 0.055)).clamp(0.2, 1.0);
-            visible.push((
+            let target = if moving { &mut activity } else { &mut visible };
+            target.push((
                 depth,
                 ProjectedLine {
                     start,
@@ -456,6 +530,7 @@ pub(crate) fn project(
             edge.map(world_point),
             0.003 + 0.001 * bass + 0.0005 * treble,
             0.48 + 0.16 * energy + 0.08 * treble,
+            false,
         );
     }
     for &(_, edge) in world_details() {
@@ -463,13 +538,33 @@ pub(crate) fn project(
             edge,
             0.0045 + 0.001 * bass + 0.0005 * treble,
             0.62 + 0.16 * energy + 0.08 * treble,
+            false,
         );
     }
-    // Close structure wins tight budgets; stable sorting preserves ties.
+    for edge in moving_edges(elapsed_seconds, [energy, bass, treble]) {
+        add_edge(
+            edge,
+            0.0055 + 0.001 * bass + 0.0005 * treble,
+            0.64 + 0.14 * energy + 0.06 * treble,
+            true,
+        );
+    }
+    // Preserve structural landmarks while giving flow a quarter of tight
+    // budgets. Both layers use stable near-first order, independent of the
+    // requested limit, so smaller budgets remain prefixes of larger ones.
     visible.sort_by(|a, b| a.0.total_cmp(&b.0));
-    visible
-        .into_iter()
-        .take(max_lines)
+    activity.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let count = max_lines.min(visible.len() + activity.len());
+    let mut structure = visible.into_iter();
+    let mut motion = activity.into_iter();
+    (0..count)
+        .filter_map(|index| {
+            if index % 4 == 3 {
+                motion.next().or_else(|| structure.next())
+            } else {
+                structure.next().or_else(|| motion.next())
+            }
+        })
         .map(|(_, line)| line)
         .collect()
 }
@@ -570,6 +665,11 @@ mod tests {
                 .iter()
                 .map(|edge| edge.map(world_point))
                 .chain(world_details().iter().map(|(_, edge)| *edge))
+                .chain(
+                    [0.0, 11.0, 35.0, 43.0]
+                        .into_iter()
+                        .flat_map(|time| moving_edges(time, [0.25, 0.5, 0.75])),
+                )
             {
                 let pieces = visible_segments(edge, eye);
                 let axis = (0..3)
@@ -848,25 +948,174 @@ mod tests {
     }
 
     #[test]
+    fn flow_routes_connect_all_six_arms_and_stay_inside_the_world() {
+        for audio in [[0.0; 3], [1.0; 3]] {
+            for stream in 0..FLOW_STREAMS {
+                for tracer in 0..TRACERS_PER_STREAM {
+                    let mut visited = HashSet::new();
+                    for sample in 0..=720 {
+                        let time = sample as f32 * 0.2;
+                        let point = flow_point(time, stream, tracer, audio);
+                        assert!(point.iter().all(|v| v.is_finite() && v.abs() < 10.8));
+                        assert!(point.iter().filter(|v| v.abs() > HALF_WIDTH).count() <= 1);
+                        for axis in 0..3 {
+                            if point[axis].abs() > 5.0 {
+                                visited.insert((axis, point[axis].is_sign_positive()));
+                            }
+                        }
+                        let next = flow_point(time + 0.01, stream, tracer, audio);
+                        assert!(ray_inside_world(point, next), "{point:?} -> {next:?}");
+                        assert!(distance(point, next) < 0.03);
+                    }
+                    assert_eq!(visited.len(), 6, "stream {stream}, tracer {tracer}");
+                }
+            }
+            for sample in 0..=240 {
+                let edges = moving_edges(sample as f32 * 0.5, audio);
+                assert_eq!(edges.len(), MOTION_EDGES);
+                for edge in edges {
+                    assert!(ray_inside_world(edge[0], edge[1]));
+                    assert!(distance(edge[0], edge[1]) < 0.7);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flow_is_smooth_at_turns_axis_changes_and_camera_loop_seams() {
+        for stream in 0..FLOW_STREAMS {
+            let period = [73.0, 89.0, 107.0][stream];
+            for tracer in 0..TRACERS_PER_STREAM {
+                for audio in [[0.0; 3], [1.0; 3]] {
+                    let mut times = vec![-60.0, 0.0, 60.0, 120.0, period];
+                    // Every central axis change and far turnaround.
+                    for half_leg in -12..=24 {
+                        times.push(
+                            (half_leg as f32 * 0.5 - tracer as f32 - stream as f32 * 0.37) * period
+                                / 6.0,
+                        );
+                    }
+                    for time in times {
+                        let before = flow_point(time - 0.01, stream, tracer, audio);
+                        let at = flow_point(time, stream, tracer, audio);
+                        let after = flow_point(time + 0.01, stream, tracer, audio);
+                        assert!(distance(before, after) < 0.06, "{time}s");
+                        let velocity_before = std::array::from_fn(|i| (at[i] - before[i]) / 0.01);
+                        let velocity_after = std::array::from_fn(|i| (after[i] - at[i]) / 0.01);
+                        assert!(
+                            distance(velocity_before, velocity_after) < 0.05,
+                            "stream {stream}, tracer {tracer} at {time}s"
+                        );
+                    }
+                }
+            }
+        }
+        // Flow does not restart when the camera completes its tour.
+        assert_ne!(moving_edges(0.0, [0.0; 3]), moving_edges(60.0, [0.0; 3]));
+    }
+
+    #[test]
+    fn activity_moves_with_a_frozen_camera_and_reaches_budgeted_output() {
+        for time in [
+            2.0, 3.5, 5.0, 10.0, 11.0, 12.0, 18.0, 19.0, 20.0, 26.0, 27.0, 28.0, 34.0, 35.0, 36.0,
+            42.0, 43.0, 44.0,
+        ] {
+            let eye = camera(time);
+            for audio in [[0.0; 3], [1.0; 3]] {
+                let projected = |time| {
+                    moving_edges(time, audio)
+                        .into_iter()
+                        .flat_map(|edge| visible_segments(edge, eye.position))
+                        .filter_map(|edge| project_edge(edge, eye, 16.0 / 9.0))
+                        .collect::<Vec<_>>()
+                };
+                let before = projected(time);
+                let after = projected(time + 0.25);
+                assert!(!before.is_empty(), "no flow visible at {time}s");
+                assert_ne!(before, after, "flow must move without camera displacement");
+                // Check the actual caller-budgeted frame contains projected,
+                // occluded world flow, not only the unbounded source geometry.
+                for budget in [64, 128] {
+                    let lines = project(time, 16.0 / 9.0, audio, budget);
+                    let width = 0.0055 + 0.001 * audio[1] + 0.0005 * audio[2];
+                    let motion: Vec<_> = lines.iter().filter(|line| line.width == width).collect();
+                    assert!(!motion.is_empty(), "{time}s, budget {budget}");
+                    for line in motion {
+                        assert!(
+                            before
+                                .iter()
+                                .any(|&(a, b, _)| { line.start == a && line.end == b })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audio_gently_varies_flow_without_phase_jumps_or_stopping_quiet_motion() {
+        for time in [-60.0, 0.0, 11.0, 35.0, 60.0, 107.0] {
+            let quiet = moving_edges(time, [0.0; 3]);
+            let loud = moving_edges(time, [1.0; 3]);
+            assert_ne!(quiet, loud);
+            assert_ne!(quiet, moving_edges(time + 0.25, [0.0; 3]));
+            assert_ne!(loud, moving_edges(time + 0.25, [1.0; 3]));
+            assert_eq!(loud, moving_edges(time, [1.0; 3]));
+            let nearby = moving_edges(time, [0.01; 3]);
+            for ((a, b), c) in quiet.iter().zip(&loud).zip(&nearby) {
+                for endpoint in 0..2 {
+                    assert!(distance(a[endpoint], b[endpoint]) < 0.065);
+                    assert!(distance(a[endpoint], c[endpoint]) < 0.00065);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn audio_is_deterministic_and_budgets_are_hard_limits() {
-        for time in [0.0, 4.0, 11.0, 19.0, 27.0, 35.0, 43.0, 59.99, f32::NAN] {
+        for time in [
+            0.0,
+            4.0,
+            11.0,
+            19.0,
+            27.0,
+            35.0,
+            43.0,
+            59.99,
+            -60.0,
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
             for aspect in [0.0, 0.3, 1.0, 16.0 / 9.0, 100.0, f32::INFINITY] {
                 let quiet = project(time, aspect, [0.0; 3], 512);
                 let loud = project(time, aspect, [1.0; 3], 512);
                 assert!(!quiet.is_empty());
+                assert!(!loud.is_empty());
                 assert_eq!(quiet, project(time, aspect, [0.0; 3], 512));
-                assert_eq!(quiet.len(), loud.len());
-                for (a, b) in quiet.iter().zip(&loud) {
-                    assert_eq!((a.start, a.end), (b.start, b.end));
+                assert_eq!(loud, project(time, aspect, [1.0; 3], 512));
+                assert_ne!(quiet, loud);
+                // Walls and fixed landmarks keep identical projected geometry
+                // and still become thicker/brighter, regardless of flow order.
+                for a in quiet.iter().filter(|line| line.width < 0.0055) {
+                    let b = loud
+                        .iter()
+                        .find(|line| line.start == a.start && line.end == a.end)
+                        .expect("audio must not move or remove structural landmarks");
                     assert!(b.width > a.width && b.intensity > a.intensity);
+                }
+                // Audio now gently moves tracers, so clipping can change
+                // their count/order; all lines retain their styling bounds.
+                for a in quiet.iter().chain(&loud) {
                     assert!(
                         a.start
                             .into_iter()
                             .chain(a.end)
                             .all(|v| v.is_finite() && v.abs() <= 1.00001)
                     );
+                    assert!(a.width.is_finite() && (0.003..=0.0071).contains(&a.width));
                     assert!((0.0..=1.0).contains(&a.intensity));
-                    assert!((0.0..=1.0).contains(&b.intensity));
                 }
                 for budget in [0, 1, 2, 7] {
                     let limited = project(time, aspect, [0.0; 3], budget);
@@ -878,6 +1127,12 @@ mod tests {
             project(0.0, 1.0, [f32::NAN; 3], 10),
             project(0.0, 1.0, [0.0; 3], 10)
         );
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                project(invalid, 1.0, [0.5; 3], 512),
+                project(0.0, 1.0, [0.5; 3], 512)
+            );
+        }
     }
 
     #[test]
@@ -887,6 +1142,8 @@ mod tests {
         assert_eq!(world_faces().len(), 126);
         assert!(world_occluders().len() <= 32);
         assert!(world_edges().len() + world_details().len() <= 320);
+        assert_eq!(MOTION_EDGES, 54);
+        assert!(world_edges().len() + world_details().len() + MOTION_EDGES <= 374);
         for sample in 0..=120 {
             let time = sample as f32 * 0.5;
             let all = project(time, 16.0 / 9.0, [0.25, 0.5, 0.75], 512);
