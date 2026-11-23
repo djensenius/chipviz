@@ -1,4 +1,4 @@
-//! Perspective linework fixed to the four interior surfaces of a corridor.
+//! Fixed perspective markings and flowing trails on the corridor's four planes.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ProjectedLine {
@@ -19,6 +19,8 @@ const EDGE_DEPTHS: [f32; 6] = [0.0, 4.0, 9.0, 18.0, 36.0, 64.0];
 const LANES: [f32; 3] = [-0.62, 0.0, 0.62];
 const TRANSVERSE_DEPTHS: [[f32; 2]; 4] = [[4.2, 21.0], [13.0, 32.0], [6.4, 25.0], [10.0, 39.0]];
 const TRANSVERSE_RUNS: [f32; 4] = [3.0, 3.7, 4.3, 2.8];
+const FLOW_ROWS: usize = 4;
+const FLOW_PIECES: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {
@@ -104,6 +106,66 @@ fn edge_mark(surface: Surface, surface_index: usize, row: usize) -> [[f32; 3]; 2
     let u = surface.extent() * sign;
     let z = 2.0 + row as f32 * 6.0 + surface_index as f32 * 1.35;
     [surface.point(u, z), surface.point(u * 0.55, z + 1.4)]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FlowPiece {
+    world: [[f32; 3]; 2],
+    intensity: f32,
+}
+
+// Curved, staggered trails slide both along and across each plane, independently
+// of the camera. Each depth band has its own phase and rate; neighbouring planes
+// never join into hoops. Bounded oscillators need neither respawns nor wrap cuts.
+fn flow_piece(
+    surface: Surface,
+    surface_index: usize,
+    row: usize,
+    piece: usize,
+    elapsed: f32,
+    [energy, bass, treble]: [f32; 3],
+) -> FlowPiece {
+    let direction = if (surface_index + row).is_multiple_of(2) {
+        -1.0
+    } else {
+        1.0
+    };
+    let rate = 0.18 + 0.035 * surface_index as f32 + 0.017 * row as f32;
+    let clock = direction * elapsed * rate;
+    // A bounded phase warp changes instantaneous speed without multiplying
+    // elapsed time by audio: tiny level changes must stay gentle in long runs.
+    let phase = clock
+        + surface_index as f32 * 1.13
+        + row as f32 * 1.79
+        + (0.22 * energy + 0.10 * bass) * clock.sin();
+    let point = |age: f32| {
+        let p = phase - direction * age * (0.22 + 0.06 * treble);
+        let u = surface.extent() * (0.70 + 0.18 * treble) * (0.83 * p + row as f32 * 0.71).sin();
+        let z = 8.0 + row as f32 * 14.0 + 4.5 * p.sin() - direction * age * (0.55 + 0.22 * bass);
+        surface.point(u, z)
+    };
+    let world = [point(piece as f32), point((piece + 1) as f32)];
+    let midpoint = point(piece as f32 + 0.5);
+    let u = match surface {
+        Surface::Left | Surface::Right => midpoint[1],
+        Surface::Floor | Surface::Ceiling => midpoint[0],
+    };
+    let smooth = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        v * v * (3.0 - 2.0 * v)
+    };
+    // Fade toward real corners and depth boundaries, with a soft trailing end.
+    // Audio lengthens and brightens tails rather than switching instances on.
+    let boundary = (1.0 - (u / surface.extent()).powi(2)).powi(2)
+        * smooth((midpoint[2] - 3.0) / 4.0)
+        * smooth((64.0 - midpoint[2]) / 8.0);
+    let tail = 1.0 - (piece as f32 + 0.5) / FLOW_PIECES as f32;
+    FlowPiece {
+        world,
+        intensity: (0.30 + 0.12 * energy + 0.06 * bass)
+            * boundary
+            * (0.22 + (0.78 + 0.12 * treble) * tail),
+    }
 }
 
 // A bounded 48-second loop drifts along and across the corridor. Its
@@ -225,7 +287,7 @@ fn append_stroke(
     }
 }
 
-/// Project fixed surface strokes into screen NDC, bounded by `max_lines`.
+/// Project fixed markings and moving surface trails, bounded by `max_lines`.
 pub(crate) fn project(
     elapsed_seconds: f32,
     aspect_ratio: f32,
@@ -254,14 +316,37 @@ pub(crate) fn project(
     let intensity = 0.35 + 0.20 * energy + 0.10 * bass;
     let mut lines = Vec::new();
     // Visit each corner at every depth before adding surface marks, so even
-    // a limited budget favours the corridor's actual perspective boundaries.
-    for interval in 0..EDGE_DEPTHS.len() - 1 {
+    // a limited budget retains perspective boundaries. Reserve room for motion
+    // and painted reference marks rather than letting seams consume it all.
+    let edge_budget = (max_lines / 3).min(4 * (EDGE_DEPTHS.len() - 1) * SEGMENTS_PER_STROKE);
+    'edges: for interval in 0..EDGE_DEPTHS.len() - 1 {
         for corner in 0..4 {
-            if lines.len() == max_lines {
-                return lines;
+            if lines.len() == edge_budget {
+                break 'edges;
             }
             if let Some(stroke) = project_line(edge_line(corner, interval), eye, aspect) {
-                append_stroke(&stroke, thickness, intensity, max_lines, &mut lines);
+                append_stroke(&stroke, thickness, intensity, edge_budget, &mut lines);
+            }
+        }
+    }
+    let flow_budget = lines.len() + (max_lines - lines.len()).div_ceil(2);
+    'flow: for row in 0..FLOW_ROWS {
+        // Interleave surfaces before extending tails or visiting farther bands.
+        for piece in 0..FLOW_PIECES {
+            for (index, surface) in SURFACES.into_iter().enumerate() {
+                if lines.len() == flow_budget {
+                    break 'flow;
+                }
+                let flow = flow_piece(surface, index, row, piece, elapsed, [energy, bass, treble]);
+                if let Some(stroke) = project_line(flow.world, eye, aspect) {
+                    append_stroke(
+                        &stroke,
+                        thickness * 0.85,
+                        flow.intensity,
+                        flow_budget,
+                        &mut lines,
+                    );
+                }
             }
         }
     }
@@ -624,6 +709,153 @@ mod tests {
     }
 
     #[test]
+    fn trails_move_on_every_plane_and_depth_with_a_stationary_camera() {
+        let eye = [0.0, 0.0, 1.5];
+        for audio in [[0.0; 3], [1.0; 3]] {
+            for row in 0..FLOW_ROWS {
+                for (index, surface) in SURFACES.into_iter().enumerate() {
+                    let a = flow_piece(surface, index, row, 0, 2.0, audio);
+                    let b = flow_piece(surface, index, row, 0, 6.0, audio);
+                    assert_ne!(a.world, b.world);
+                    let first = project_line(a.world, eye, 1.0).unwrap();
+                    let later = project_line(b.world, eye, 1.0).unwrap();
+                    let displacement = (first.start[0] - later.start[0]).abs()
+                        + (first.start[1] - later.start[1]).abs();
+                    assert!(
+                        displacement > 0.001,
+                        "{surface:?}, row {row}: {displacement}"
+                    );
+
+                    // The public projection really includes these moving marks,
+                    // not merely test-only world geometry.
+                    let stroke = project_line(a.world, camera(2.0), 1.0).unwrap();
+                    let mut parts = Vec::new();
+                    append_stroke(
+                        &stroke,
+                        (0.025 + 0.008 * audio[2]) * 0.85,
+                        a.intensity,
+                        SEGMENTS_PER_STROKE,
+                        &mut parts,
+                    );
+                    assert!(
+                        project(2.0, 1.0, audio, 1000)
+                            .windows(parts.len())
+                            .any(|window| window == parts)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trails_are_confined_connected_deterministic_and_continuous() {
+        for audio in [[0.0; 3], [1.0; 3]] {
+            for frame in 0..960 {
+                let t = frame as f32 * 0.1 - 48.0;
+                for (index, surface) in SURFACES.into_iter().enumerate() {
+                    let (fixed, value, u) = match surface {
+                        Surface::Left => (0, -HALF_WIDTH, 1),
+                        Surface::Right => (0, HALF_WIDTH, 1),
+                        Surface::Floor => (1, -HALF_HEIGHT, 0),
+                        Surface::Ceiling => (1, HALF_HEIGHT, 0),
+                    };
+                    for row in 0..FLOW_ROWS {
+                        for piece in 0..FLOW_PIECES {
+                            let at = flow_piece(surface, index, row, piece, t, audio);
+                            assert_eq!(at, flow_piece(surface, index, row, piece, t, audio));
+                            let next = flow_piece(surface, index, row, piece, t + 0.001, audio);
+                            assert!((next.intensity - at.intensity).abs() < 0.002);
+                            assert!((0.0..=0.5).contains(&at.intensity));
+                            for (point, next_point) in at.world.into_iter().zip(next.world) {
+                                close(point[fixed], value);
+                                assert!(point[u].abs() < surface.extent());
+                                assert!((0.0..64.0).contains(&point[2]));
+                                for axis in 0..3 {
+                                    assert!((next_point[axis] - point[axis]).abs() < 0.003);
+                                }
+                            }
+                            if piece + 1 < FLOW_PIECES {
+                                assert_eq!(
+                                    at.world[1],
+                                    flow_piece(surface, index, row, piece + 1, t, audio).world[0]
+                                );
+                            }
+                            // Since both ends belong to this convex plane, the
+                            // entire segment ends before its real corner seams.
+                            // Pull this fixed test camera back so every band
+                            // stays visible, even at its nearest turning point.
+                            let projected = project_line(at.world, [0.0, 0.0, -4.0], 1.0).unwrap();
+                            let later = project_line(next.world, [0.0, 0.0, -4.0], 1.0).unwrap();
+                            for (a, b) in projected.start.into_iter().zip(later.start) {
+                                assert!((a - b).abs() < 0.003);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audio_gently_changes_trail_shape_speed_and_density_without_switches() {
+        let mut quiet_motion = 0.0;
+        let mut energetic_motion = 0.0;
+        for (index, surface) in SURFACES.into_iter().enumerate() {
+            for row in 0..FLOW_ROWS {
+                let flow = |t, audio| flow_piece(surface, index, row, 1, t, audio);
+                let quiet = flow(0.0, [0.0; 3]);
+                let energy = flow(0.0, [1.0, 0.0, 0.0]);
+                assert_eq!(quiet.world, energy.world);
+                assert!(energy.intensity > quiet.intensity);
+                assert_ne!(quiet.world, flow(0.0, [0.0, 1.0, 1.0]).world);
+                for (audio, movement) in [
+                    ([0.0; 3], &mut quiet_motion),
+                    ([1.0; 3], &mut energetic_motion),
+                ] {
+                    let a = flow(2.0, audio);
+                    let b = flow(2.01, audio);
+                    *movement += a.world[0]
+                        .into_iter()
+                        .zip(b.world[0])
+                        .map(|(a, b)| (b - a).abs())
+                        .sum::<f32>();
+                }
+                for t in [2.0, 10000.0, 1_000_000.0] {
+                    let a = flow(t, [0.5; 3]);
+                    let b = flow(t, [0.5001; 3]);
+                    assert!((a.intensity - b.intensity).abs() < 0.001);
+                    for (a, b) in a
+                        .world
+                        .into_iter()
+                        .flatten()
+                        .zip(b.world.into_iter().flatten())
+                    {
+                        assert!((a - b).abs() < 0.002);
+                    }
+                }
+            }
+        }
+        assert!(quiet_motion > 0.01);
+        assert!(energetic_motion > quiet_motion * 1.05);
+    }
+
+    #[test]
+    fn motion_is_budgeted_before_optional_reference_marks() {
+        for budget in [1, 3, 16, 64, 128, 256, 1000, usize::MAX] {
+            let a = project(2.0, 1.0, [0.0; 3], budget);
+            let b = project(6.0, 1.0, [0.0; 3], budget);
+            assert!(a.len() <= budget && a.len() <= 912);
+            assert!(b.len() <= budget && b.len() <= 912);
+            assert_ne!(a, b);
+            let edge_budget = (budget / 3).min(80);
+            assert!(
+                a.iter().skip(edge_budget).any(|line| line.intensity < 0.30),
+                "missing flow at budget {budget}"
+            );
+        }
+    }
+
+    #[test]
     fn budgets_audio_aspects_and_invalid_inputs_are_safe() {
         for aspect in [0.001, 0.5, 1.0, 1.777, 4.0, f32::NAN, f32::INFINITY, -1.0] {
             for budget in [0, 1, 3, 16, 1000] {
@@ -650,11 +882,39 @@ mod tests {
         for budget in [0, 1, 3, 16] {
             assert_eq!(project(0.0, 1.0, [0.0; 3], budget).len(), budget);
         }
-        assert_eq!(quiet.len(), loud.len());
-        for (q, l) in quiet.iter().zip(loud) {
+        // Fixed seams retain their geometry; audio now also shapes moving trails.
+        assert_ne!(quiet, loud);
+        let visible_edges = (0..EDGE_DEPTHS.len() - 1)
+            .flat_map(|interval| (0..4).map(move |corner| (interval, corner)))
+            .filter(|&(interval, corner)| {
+                project_line(edge_line(corner, interval), camera(0.0), 1.0).is_some()
+            })
+            .count()
+            * SEGMENTS_PER_STROKE;
+        assert!(visible_edges > 0);
+        for (q, l) in quiet.iter().zip(loud).take(visible_edges) {
             assert_eq!(q.start, l.start);
             assert_eq!(q.end, l.end);
             assert!(l.width > q.width && l.intensity > q.intensity);
+        }
+        for t in [
+            f32::MIN,
+            -10000.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            let lines = project(t, 1.0, [1.0; 3], 1000);
+            assert!(!lines.is_empty() && lines.len() <= 912);
+            for line in lines {
+                assert!(
+                    line.start
+                        .into_iter()
+                        .chain(line.end)
+                        .chain([line.width, line.intensity])
+                        .all(f32::is_finite)
+                );
+            }
         }
         assert_eq!(
             project(f32::NAN, 1.0, [0.0; 3], 10),
