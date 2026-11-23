@@ -503,7 +503,25 @@ pub(crate) fn project(
     let camera = camera(elapsed_seconds);
     let mut visible = Vec::new();
     let mut activity = Vec::new();
-    let mut add_edge = |edge, width, intensity, moving| {
+    let mut add_edge = |edge: [Point; 2], width, intensity, moving| {
+        // Fade the whole moving source edge before either endpoint reaches
+        // NEAR. Use unclipped depths: clipping would pin depth to NEAR while
+        // magnifying a bright head, then reject it in a single frame. The
+        // zero-opacity margin also covers the last near-plane crossing frames.
+        let proximity = if moving {
+            let closest_depth = edge
+                .map(|point| camera_space(point, camera)[2])
+                .into_iter()
+                .fold(f32::INFINITY, f32::min);
+            cue(closest_depth, NEAR + 0.25, NEAR + 1.5)
+        } else {
+            1.0
+        };
+        // Fully transparent near-camera flow must not consume the motion
+        // budget and displace still-visible tracers farther down a branch.
+        if proximity == 0.0 {
+            return;
+        }
         // A wholly off-screen edge cannot contribute any visible subsegment.
         if project_edge(edge, camera, aspect).is_none() {
             return;
@@ -520,7 +538,7 @@ pub(crate) fn project(
                     start,
                     end,
                     width,
-                    intensity: intensity * fade,
+                    intensity: intensity * fade * proximity,
                 },
             ));
         }
@@ -1038,7 +1056,10 @@ mod tests {
                 for budget in [64, 128] {
                     let lines = project(time, 16.0 / 9.0, audio, budget);
                     let width = 0.0055 + 0.001 * audio[1] + 0.0005 * audio[2];
-                    let motion: Vec<_> = lines.iter().filter(|line| line.width == width).collect();
+                    let motion: Vec<_> = lines
+                        .iter()
+                        .filter(|line| line.width == width && line.intensity > 0.01)
+                        .collect();
                     assert!(!motion.is_empty(), "{time}s, budget {budget}");
                     for line in motion {
                         assert!(
@@ -1069,6 +1090,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn moving_head_fades_before_consecutive_near_plane_crossing_frames() {
+        let aspect = 16.0 / 9.0;
+        // Review repro: stream 1 / tracer 1's diagonal head becomes a large,
+        // bright line at frame 518, then both endpoints cross NEAR at 519.
+        let head_index = (TRACERS_PER_STREAM + 1) * (TRAIL_SEGMENTS + 1) + TRAIL_SEGMENTS;
+        let mut previous_alpha = 0.0_f32;
+        let mut peak_alpha = 0.0_f32;
+        for frame in 480..=525 {
+            let time = frame as f32 / 60.0;
+            let edge = moving_edges(time, [0.0; 3])[head_index];
+            let projected = project_edge(edge, camera(time), aspect);
+            let lines = project(time, aspect, [0.0; 3], 512);
+            let line = projected.and_then(|(start, end, _)| {
+                lines
+                    .iter()
+                    .find(|line| line.width == 0.0055 && line.start == start && line.end == end)
+            });
+            let alpha = line.map_or(0.0, |line| line.intensity);
+            if frame > 480 {
+                assert!(
+                    (alpha - previous_alpha).abs() < 0.05,
+                    "frame {frame}: alpha {previous_alpha} -> {alpha}"
+                );
+            }
+            if frame == 518 {
+                assert!(projected.is_some(), "repro head must still project at 518");
+                assert!(
+                    alpha < 0.01,
+                    "large near-plane head must already be faded: {line:?}"
+                );
+            }
+            if frame == 519 {
+                assert!(
+                    projected.is_none(),
+                    "repro must exercise near-plane rejection"
+                );
+            }
+            previous_alpha = alpha;
+            peak_alpha = peak_alpha.max(alpha);
+        }
+        assert!(
+            peak_alpha > 0.1,
+            "the head must fade, not be permanently hidden"
+        );
     }
 
     #[test]
