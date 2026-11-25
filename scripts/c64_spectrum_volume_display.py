@@ -85,8 +85,14 @@ class Observation:
     self.generation += 1
     generation = self.generation
     self.events = []
-    return lambda data, width, height, pitch, pixel_format: self.video(
-      generation, data, width, height, pitch, pixel_format)
+
+    def callback(*args, **kwargs):
+      try:
+        self.video(generation, *args, **kwargs)
+      except TypeError:
+        self.latch("malformed callback arguments")
+
+    return callback
 
   def video(self, generation: int, data: bytes | None, width: int, height: int, pitch: int,
             pixel_format: str) -> None:

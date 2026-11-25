@@ -57,9 +57,9 @@ def callback_args(data):
   return (bytes(data), W, H, PITCH, "XRGB8888-LE")
 
 
-def native_callback(callback, *args):
+def native_callback(callback, *args, **kwargs):
   # ctypes swallows exceptions crossing this callback boundary.
-  ctypes.CFUNCTYPE(None)(lambda: callback(*args))()
+  ctypes.CFUNCTYPE(None)(lambda: callback(*args, **kwargs))()
 
 
 class FailingBuffer:
@@ -89,6 +89,37 @@ class ReentrantBuffer:
 
 
 class DisplayTests(unittest.TestCase):
+  def test_malformed_callback_arguments_are_latched_in_both_orders(self):
+    good = callback_args(frame())
+    invalid = ((good[:-1], {}), (good + (0,), {}), (good, {"unexpected": 0}))
+    for bad_args, bad_kwargs in invalid:
+      for malformed_first in (True, False):
+        with self.subTest(bad_args=len(bad_args), bad_kwargs=bad_kwargs,
+                          malformed_first=malformed_first):
+          boundary = display.Observation()
+          callback = boundary.begin()
+          events = [(bad_args, bad_kwargs), (good, {})]
+          if not malformed_first:
+            events.reverse()
+          stderr = io.StringIO()
+          with contextlib.redirect_stderr(stderr):
+            for args, kwargs in events:
+              native_callback(callback, *args, **kwargs)
+          with self.assertRaisesRegex(ValueError, "malformed callback arguments"):
+            boundary.end()
+          with self.assertRaisesRegex(ValueError, "malformed callback arguments"):
+            boundary.begin()
+          self.assertEqual(stderr.getvalue(), "")
+
+  def test_callback_accepts_valid_keyword_arguments(self):
+    data, width, height, pitch, pixel_format = callback_args(frame())
+    boundary = display.Observation()
+    callback = boundary.begin()
+    native_callback(callback, data=data, width=width, height=height, pitch=pitch,
+                    pixel_format=pixel_format)
+    _, captured = boundary.end()
+    self.assertEqual(captured, (width, height, pitch, data))
+
   def test_reentrant_buffer_callbacks_are_rejected_in_both_observation_frames(self):
     for frame_number in (1, 2):  # settling frame and frame to be validated
       for trigger in (1, 2):  # initial size check and subsequent copy
