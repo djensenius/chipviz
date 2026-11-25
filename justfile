@@ -117,6 +117,12 @@ sms-port-trace-c-test:
     @build/tests/sms_port_trace_test
     @echo "SMS port trace C tests OK"
 
+sms-gx-port-hook-test:
+    @mkdir -p build/tests
+    @${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic tests/sms_gx_port_hook_test.c tests/sms_port_trace.c tests/sms_port_trace_fake.c -o build/tests/sms_gx_port_hook_test
+    @build/tests/sms_gx_port_hook_test
+    @echo "SMS GX poll hook C tests OK"
+
 sms-port-trace-sanitizer:
     @mkdir -p build/tests
     @${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer tests/sms_port_trace.c tests/sms_port_trace_fake.c tests/sms_port_trace_sanitizer.c -o build/tests/sms_port_trace_sanitizer
@@ -138,7 +144,7 @@ scene-catalog-v1-ring-test:
     @build/tests/scene_catalog_v1_pairs_used
     @echo "scene catalog v1 pair consumer tests passed"
 
-c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test sms-port-trace-c-test
+c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test sms-port-trace-c-test sms-gx-port-hook-test
     @mkdir -p build/tests
     @${CC:-cc} {{ cflags }} tests/control_frame_tests.c shared/src/control_frame.c -o build/tests/control_frame_tests
     @${CC:-cc} {{ cflags }} tests/connection_tests.c {{ shared_srcs }} -o build/tests/connection_tests

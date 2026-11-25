@@ -253,8 +253,8 @@ fn pad_trace(detailed: bool) {
             input.flags = (buttons >> 4) & 3;
             input
         } else {
-            // SMS uses the shared C generator's wrapping 16-bit counter and
-            // full-width beat count for notes, unlike Rust's u8 note cast.
+            // SMS and the shared C generator use a wrapping 16-bit counter
+            // and full-width beat count for notes.
             let counter = step as u16;
             let mut input = ControlFrame::procedural(u64::from(counter));
             if input.note_count != 0 {
