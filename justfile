@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_host_bridge.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py scripts/c64_colour_field_capture.py cores/sms/homebrew/build_candidate.py cores/sms/homebrew/field_assets.py tests/sms_candidate_smoke.py tests/sms_capture_check.py tests/sms_capture_oracle.py tests/sms_control_smoke.py tests/sms_detector_fixtures.py tests/sms_f18_rom_build.py tests/sms_fixture_build.py tests/sms_gx_f18_capture.py tests/sms_gx_poll_capture.py tests/sms_libretro_capture.py tests/sms_trace_tool.py tests/test_sms_capture_oracle.py tests/test_sms_detector_fixtures.py tests/test_sms_field_assets.py tests/test_sms_libretro_capture.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/test_sms_spectral.py tests/test_sms_trace_tool.py tests/sms_procedural_test.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/catalog_music_source.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gb_dmg_parity_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py scripts/package-macos-arm64.py scripts/personal-starfield-bundle.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_macos_arm64_packaging.py tests/test_personal_starfield_bundle.py tests/personal_starfield_capture_smoke.py tests/test_personal_starfield_capture_smoke.py tests/test_host_bridge.py tests/test_catalog_music_source.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_gb_dmg_parity_helpers.py tests/test_gb_lines.py tests/test_gb_lines_execution.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py scripts/c64_spectrum_volume_fixture.py tests/test_c64_spectrum_volume_fixture.py cores/sms/homebrew/build_candidate.py cores/sms/homebrew/field_assets.py tests/sms_candidate_smoke.py tests/sms_capture_check.py tests/sms_capture_oracle.py tests/sms_control_smoke.py tests/sms_detector_fixtures.py tests/sms_f18_rom_build.py tests/sms_fixture_build.py tests/sms_gx_f18_capture.py tests/sms_gx_poll_capture.py tests/sms_libretro_capture.py tests/sms_trace_tool.py tests/test_sms_capture_oracle.py tests/test_sms_detector_fixtures.py tests/test_sms_field_assets.py tests/test_sms_libretro_capture.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/test_sms_trace_tool.py tests/sms_procedural_test.py renderers/modern/tests/catalog_v1_reference.py scripts/local_review.py tests/test_local_review.py"
 
 default:
     just --list
@@ -15,10 +15,10 @@ default:
 check: lint test
     @echo "chipviz check OK"
 
-lint: scaffold-check c-lint python-lint docs-lint rust-lint third-party-notices-check
+lint: scaffold-check c-lint python-lint local-review-js-lint docs-lint rust-lint third-party-notices-check
     @echo "chipviz lint OK"
 
-test: c-test python-test rust-test build-sim simulate host-sample target-arrays homebrew-artifacts
+test: c-test python-test local-review-js-test rust-test build-sim simulate host-sample target-arrays homebrew-artifacts
     @just host-fixtures
     @echo "chipviz tests OK"
 
@@ -111,13 +111,41 @@ simulate: build-sim
 sms-procedural-test:
     @${PYTHON:-python3} tests/sms_procedural_test.py ${CC:-cc} {{ cflags }}
 
-c-test: sms-procedural-test
+sms-port-trace-c-test:
+    @mkdir -p build/tests
+    @${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic tests/sms_port_trace.c tests/sms_port_trace_fake.c tests/sms_port_trace_sanitizer.c -o build/tests/sms_port_trace_test
+    @build/tests/sms_port_trace_test
+    @echo "SMS port trace C tests OK"
+
+sms-port-trace-sanitizer:
+    @mkdir -p build/tests
+    @${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer tests/sms_port_trace.c tests/sms_port_trace_fake.c tests/sms_port_trace_sanitizer.c -o build/tests/sms_port_trace_sanitizer
+    @build/tests/sms_port_trace_sanitizer
+    @echo "SMS port trace ASan/UBSan tests OK"
+
+scene-catalog-v1-c-test:
+    @mkdir -p build/tests
+    @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_tests.c host/scene_catalog_v1.c -o build/tests/scene_catalog_v1_tests
+    @build/tests/scene_catalog_v1_tests
+
+scene-catalog-v1-ring-test:
+    @mkdir -p build/tests
+    @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_ring_tests.c shared/src/scene_catalog_v1_ring.c -o build/tests/scene_catalog_v1_ring_tests
+    @build/tests/scene_catalog_v1_ring_tests
+    @${CC:-cc} {{ cflags }} tests/scene_catalog_v1_pairs_consumer.c -o build/tests/scene_catalog_v1_pairs_unused
+    @${CC:-cc} {{ cflags }} -DCHIPVIZ_TEST_USE_PAIR tests/scene_catalog_v1_pairs_consumer.c -o build/tests/scene_catalog_v1_pairs_used
+    @build/tests/scene_catalog_v1_pairs_unused
+    @build/tests/scene_catalog_v1_pairs_used
+    @echo "scene catalog v1 pair consumer tests passed"
+
+c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test sms-port-trace-c-test
     @mkdir -p build/tests
     @${CC:-cc} {{ cflags }} tests/control_frame_tests.c shared/src/control_frame.c -o build/tests/control_frame_tests
     @${CC:-cc} {{ cflags }} tests/connection_tests.c {{ shared_srcs }} -o build/tests/connection_tests
     @${CC:-cc} {{ cflags }} tests/interface_tests.c shared/src/control_frame.c shared/src/interface.c -o build/tests/interface_tests
     @${CC:-cc} {{ cflags }} -Ifirmware/pico/include tests/pico_joybus_tests.c firmware/pico/src/joybus_bridge.c -o build/tests/pico_joybus_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_input_tests.c -o build/tests/gba_input_tests
+    @${CC:-cc} {{ cflags }} cores/gba/homebrew/lines/lines_tests.c cores/gba/homebrew/lines/lines.c -o build/tests/gba_lines_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_native_prefetch_tests.c cores/gba/homebrew/source/native_prefetch.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_native_prefetch_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_native_render_tests.c cores/gba/homebrew/source/native_prefetch.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_native_render_tests
     @${CC:-cc} {{ cflags }} -Icores/gba/homebrew/source tests/gba_colour_field_tests.c cores/gba/homebrew/source/colour_field.c -o build/tests/gba_colour_field_tests
@@ -126,11 +154,13 @@ c-test: sms-procedural-test
     @${CC:-cc} {{ cflags }} -Icores/n64/homebrew tests/n64_joybus_link_tests.c -o build/tests/n64_joybus_link_tests
     @${CC:-cc} {{ cflags }} -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_tests
     @${CC:-cc} {{ cflags }} -DCF_UNMEASURED_FLASH -Icores/c64/homebrew/src tests/c64_colour_field_tests.c cores/c64/homebrew/src/colour_field.c -o build/tests/c64_colour_field_flash_tests
+    @${CC:-cc} {{ cflags }} -Icores/c64/homebrew/src tests/c64_spectrum_volume_tests.c cores/c64/homebrew/src/spectrum_volume.c -o build/tests/c64_spectrum_volume_tests
     @build/tests/control_frame_tests
     @build/tests/connection_tests
     @build/tests/interface_tests
     @build/tests/pico_joybus_tests
     @build/tests/gba_input_tests
+    @build/tests/gba_lines_tests
     @build/tests/gba_native_prefetch_tests
     @build/tests/gba_native_render_tests
     @build/tests/gba_colour_field_tests
@@ -139,13 +169,32 @@ c-test: sms-procedural-test
     @build/tests/n64_joybus_link_tests
     @build/tests/c64_colour_field_tests
     @build/tests/c64_colour_field_flash_tests
+    @build/tests/c64_spectrum_volume_tests
     @echo "chipviz C tests OK"
 
 python-lint:
-    @${PYTHON:-python3} -m py_compile {{ python_files }}
+    @${PYTHON:-python3} -m py_compile {{ python_files }} tests/sms_port_trace.py tests/test_sms_port_trace.py cores/gba/homebrew/lines/fixture/harness.py cores/gba/homebrew/lines/fixture/host_tests.py
+    @${PYTHON:-python3} -m py_compile scripts/youtube_auth.py scripts/youtube_transport.py tests/test_youtube_auth.py tests/test_youtube_transport.py
     @echo "chipviz Python lint OK"
 
-python-test:
+local-review-js-lint:
+    @node --check scripts/local-review/app.mjs
+    @node --check scripts/local-review/lib.mjs
+    @node --check scripts/local-review/review.test.mjs
+    @echo "chipviz local review JavaScript syntax OK"
+
+local-review-js-test:
+    @node --test scripts/local-review/review.test.mjs
+    @echo "chipviz local review JavaScript tests OK"
+
+gba-lines-fixture-test:
+    @mkdir -p build/lines-fixture
+    @${CC:-cc} {{ cflags }} -O2 -shared -fPIC cores/gba/homebrew/lines/fixture/fixture.c cores/gba/homebrew/lines/lines.c -o build/lines-fixture/fixture.so
+    @${CC:-cc} {{ cflags }} -fsyntax-only cores/gba/homebrew/lines/fixture/main.c cores/gba/homebrew/lines/fixture/fixture.c cores/gba/homebrew/lines/lines.c
+    @${PYTHON:-python3} cores/gba/homebrew/lines/fixture/host_tests.py build/lines-fixture/fixture.so
+    @echo "GBA Lines fixture host tests OK"
+
+python-test: gba-lines-fixture-test
     @${PYTHON:-python3} -m unittest discover -s tests -p 'test_*.py'
     @echo "chipviz Python tests OK"
 
@@ -339,11 +388,13 @@ rust-lint:
     @cargo fmt --manifest-path {{ modern_manifest }} -- --check
     @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests -- -D warnings
     @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests --features unmeasured-flash -- -D warnings
+    @cargo clippy --manifest-path {{ modern_manifest }} --bins --tests --features dmg-preview -- -D warnings
     @echo "chipviz Rust lint OK"
 
 rust-test:
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --features dmg-preview
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins

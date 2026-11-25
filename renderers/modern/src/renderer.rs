@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,12 +7,17 @@ use winit::dpi::PhysicalSize;
 
 use crate::audio::scope::ScopeSnapshot;
 use crate::control_frame::ControlFrame;
+#[cfg(feature = "dmg-preview")]
+use crate::dmg_preview::{DmgPresenter, DmgTarget};
 use crate::phosphor;
 use crate::profile::RenderProfile;
 use crate::scene::{
-    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances, scene_uniforms,
+    Camera, Instance, QUAD_VERTICES, Uniforms, Vertex, build_instances_for_viewport, scene_uniforms,
 };
 use crate::scenes::{self, CameraMode, SceneConfig, SceneState, colour_field, mic_layers};
+
+const MAX_STARFIELD_CROSSINGS_PER_SECOND: usize = 2;
+const STARFIELD_CROSSING_WINDOW_SECONDS: f64 = 1.0;
 
 /// Offscreen capture format; sRGB like the window's preferred surface format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -23,6 +29,11 @@ pub struct ScenePipeline {
     camera: Camera,
     colour_field: colour_field::ColourField,
     colour_controls: colour_field::Controls,
+    /// One-frame scene fallback requested after displayed-scene validation.
+    next_native_fallback: Option<u8>,
+    /// Starfield is kept out of legacy wire-byte dispatch unless explicitly
+    /// selected by the local `--scene 6` override or capture option.
+    starfield_dispatch_enabled: bool,
     /// Wall-clock step cap for live rendering; `None` steps every new frame.
     step_clock: Option<(colour_field::StepClock, Instant)>,
     /// Waveform/onset overlay over native scenes; see `scenes::mic_layers`.
@@ -53,6 +64,8 @@ pub struct ScenePipeline {
     phosphor: Option<phosphor::Phosphor>,
     /// Holds off remaking the phosphor while the target is being resized.
     settle: phosphor::Settle,
+    /// Rate-limits Starfield crossings using post-`present()` monotonic times.
+    crossing_gate: StarfieldCrossingGate,
 }
 
 pub struct Renderer {
@@ -60,6 +73,23 @@ pub struct Renderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     pipeline: ScenePipeline,
+    /// Monotonic clock for accounting rendered surface crossings. The
+    /// timestamp is sampled after `present()` returns, not by the caller
+    /// before surface acquisition.
+    presentation_clock: Instant,
+    #[cfg(feature = "dmg-preview")]
+    dmg_preview: Option<DmgPresenter>,
+}
+
+/// Shared live observation path, independent of GPU presentation.
+pub(crate) fn observe_live_states(
+    field: &mut colour_field::ColourField,
+    scenes: &mut SceneState,
+    frame: &ControlFrame,
+    elapsed: f64,
+) {
+    field.observe(frame);
+    scenes.observe_live_at(frame, elapsed);
 }
 
 /// Renders the same pipeline into a texture and reads it back as RGB8.
@@ -71,6 +101,15 @@ pub struct OffscreenRenderer {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     readback: wgpu::Buffer,
+}
+
+#[derive(Clone, Copy)]
+struct EncodeFrameOptions {
+    elapsed: f64,
+    gate_elapsed: f64,
+    size: (u32, u32),
+    mic_layers: bool,
+    commit_gate: bool,
 }
 
 #[derive(Debug)]
@@ -115,6 +154,130 @@ impl std::fmt::Display for RendererError {
 }
 
 impl std::error::Error for RendererError {}
+
+#[derive(Debug)]
+struct StarfieldCrossingGate {
+    displayed: colour_field::Display,
+    recent_crossings: VecDeque<f64>,
+    last_elapsed: f64,
+}
+
+impl Default for StarfieldCrossingGate {
+    fn default() -> Self {
+        Self {
+            displayed: colour_field::Display::Native(0),
+            recent_crossings: VecDeque::new(),
+            last_elapsed: 0.0,
+        }
+    }
+}
+
+impl StarfieldCrossingGate {
+    fn resolve(
+        &mut self,
+        requested: colour_field::Display,
+        elapsed: f64,
+        commit: bool,
+    ) -> colour_field::Display {
+        let now = if elapsed.is_finite() {
+            elapsed.max(self.last_elapsed)
+        } else {
+            self.last_elapsed
+        };
+        let crossing = is_starfield_display(self.displayed) != is_starfield_display(requested);
+        let recent_count = self
+            .recent_crossings
+            .iter()
+            .filter(|&&time| now - time <= STARFIELD_CROSSING_WINDOW_SECONDS)
+            .count();
+        let allowed = !crossing || recent_count < MAX_STARFIELD_CROSSINGS_PER_SECOND;
+        let displayed = if allowed { requested } else { self.displayed };
+        if commit {
+            if crossing && allowed {
+                while self
+                    .recent_crossings
+                    .front()
+                    .is_some_and(|&time| now - time > STARFIELD_CROSSING_WINDOW_SECONDS)
+                {
+                    self.recent_crossings.pop_front();
+                }
+                self.recent_crossings.push_back(now);
+            }
+            if allowed {
+                self.displayed = requested;
+            }
+            self.last_elapsed = now;
+        }
+        displayed
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn is_starfield_display(display: colour_field::Display) -> bool {
+    matches!(display, colour_field::Display::Native(scene) if scene == scenes::starfield::SCENE)
+}
+
+fn mic_layers_shown(mode: mic_layers::Mode, display: colour_field::Display) -> bool {
+    mic_layers::shown(mode, display) && !is_starfield_display(display)
+}
+
+fn displayed_scene_byte(display: colour_field::Display) -> u8 {
+    match display {
+        colour_field::Display::Native(scene) => scene,
+        colour_field::Display::ColourField(_) => colour_field::SCENE,
+    }
+}
+
+fn prepare_starfield_attachment_colors(
+    instances: &mut [Instance],
+    srgb_target: bool,
+    is_starfield: bool,
+) {
+    if srgb_target || !is_starfield {
+        return;
+    }
+    for instance in instances {
+        for channel in &mut instance.color[..3] {
+            *channel = if *channel <= 0.003_130_8 {
+                *channel * 12.92
+            } else {
+                1.055 * channel.powf(1.0 / 2.4) - 0.055
+            };
+        }
+    }
+}
+
+fn resolve_dispatch_frame(
+    mut frame: ControlFrame,
+    display: colour_field::Display,
+    fallback: Option<u8>,
+    starfield_enabled: bool,
+) -> (ControlFrame, colour_field::Display, bool) {
+    match display {
+        colour_field::Display::Native(scene) => {
+            let fallback_applied =
+                starfield_enabled && scene == scenes::starfield::SCENE && fallback.is_some();
+            let selected_scene = scenes::normalize_scene_byte(scene, starfield_enabled);
+            let scene = if fallback_applied {
+                fallback.unwrap_or(selected_scene)
+            } else {
+                selected_scene
+            };
+            frame.scene = scene;
+            (
+                frame,
+                colour_field::Display::Native(scene),
+                fallback_applied,
+            )
+        }
+        colour_field::Display::ColourField(trace) => {
+            (frame, colour_field::Display::ColourField(trace), false)
+        }
+    }
+}
 
 impl From<wgpu::CreateSurfaceError> for RendererError {
     fn from(error: wgpu::CreateSurfaceError) -> Self {
@@ -273,12 +436,13 @@ impl ScenePipeline {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
         Self {
             profile,
             camera: Camera::default(),
             colour_field: colour_field::ColourField::new(colour_field::Config::default()),
             colour_controls: colour_field::Controls::default(),
+            next_native_fallback: None,
+            starfield_dispatch_enabled: false,
             step_clock: None,
             mic_layers: mic_layers::MicLayers::new(mic_layers::Mode::Off),
             live_scope: None,
@@ -298,36 +462,56 @@ impl ScenePipeline {
             phosphor_pipelines,
             phosphor: None,
             settle: phosphor::Settle::default(),
+            crossing_gate: StarfieldCrossingGate::default(),
         }
     }
 
     /// Restarts camera smoothing, the colour field and scene state, as at
     /// renderer start-up.
     pub fn reset_state(&mut self) {
+        let starfield = self.scene_state.starfield().cloned();
+        let starfield_dispatch_enabled = self.starfield_dispatch_enabled;
         self.camera = Camera::default();
         self.colour_field = colour_field::ColourField::new(self.colour_field.config());
         self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
         self.scene_state = SceneState::new(self.scene_state.config());
+        self.scene_state.configure_starfield(starfield);
+        self.scene_state
+            .configure_starfield_dispatch(starfield_dispatch_enabled);
+        self.next_native_fallback = None;
         self.phosphor = None;
         self.settle = phosphor::Settle::default();
+        self.crossing_gate.reset();
     }
 
-    /// Steps camera smoothing, the colour field and the mic layers for a
-    /// frame that is not drawn, at a target of `size` pixels.
+    /// Advances a frame that is not drawn, at a target of `size` pixels.
     ///
-    /// The mic layers are built and run through the phosphor as when drawn
-    /// (only the final composite is skipped), so the ribbon's limiter and
-    /// the afterglow of a later drawn frame (a capture still) match a live
-    /// run.
+    /// Advances scene, camera, debounce, crossing-gate and any active
+    /// mic-layer/phosphor state without constructing an unused scene image.
     ///
     /// `elapsed` is f64 seconds: the mic layers time bursts with it exactly
     /// however long the renderer runs; scenes take it as f32.
     pub fn advance_state(&mut self, frame: ControlFrame, elapsed: f64, size: (u32, u32)) {
         self.observe(&frame, elapsed);
         self.scene_state.advance_tunnel(&frame, elapsed);
-        let (frame, display) = self.dispatch(frame);
-        self.camera
-            .build_uniforms(&self.profile, frame, elapsed as f32, size_aspect(size));
+        let (frame, display, _) = self.dispatch(frame, true, elapsed);
+        let aspect = size_aspect(size);
+        let camera = match display {
+            colour_field::Display::ColourField(_) => CameraMode::ScreenSpace,
+            colour_field::Display::Native(_) => scenes::selected_camera_configured(
+                frame.scene,
+                self.starfield_dispatch_enabled,
+                self.scene_state.config(),
+            ),
+        };
+        let _ = scene_uniforms(
+            camera,
+            &mut self.camera,
+            &self.profile,
+            frame,
+            elapsed as f32,
+            aspect,
+        );
         if let Some(count) = self.prepare_mic_layers(frame, display, elapsed, size) {
             let mut encoder = self.command_encoder();
             self.encode_phosphor(&mut encoder, None, count, elapsed);
@@ -364,6 +548,20 @@ impl ScenePipeline {
     /// Replaces the registry scenes' options and restarts their state.
     pub fn configure_scenes(&mut self, config: SceneConfig) {
         self.scene_state = SceneState::new(config);
+        self.scene_state
+            .configure_starfield_dispatch(self.starfield_dispatch_enabled);
+    }
+
+    /// Supplies the optional catalog and observer setup for registry scene 6.
+    pub fn configure_starfield(&mut self, config: Option<scenes::starfield::StarfieldConfig>) {
+        self.scene_state.configure_starfield(config);
+    }
+
+    /// Enables the opt-in scene-byte-6 dispatch. Without this explicit flag,
+    /// all wire bytes retain their original modulo-six mappings.
+    pub fn enable_starfield_dispatch(&mut self, enabled: bool) {
+        self.starfield_dispatch_enabled = enabled;
+        self.scene_state.configure_starfield_dispatch(enabled);
     }
 
     /// Caps colour-field steps at 60 in any wall-clock second (live window).
@@ -386,10 +584,71 @@ impl ScenePipeline {
         self.scene_state.observe_at(frame, elapsed);
     }
 
+    /// Observe a live input, retaining Lines DROP edges on duplicate counters.
+    pub(crate) fn observe_live(&mut self, frame: &ControlFrame, elapsed: f64) {
+        observe_live_states(
+            &mut self.colour_field,
+            &mut self.scene_state,
+            frame,
+            elapsed,
+        );
+    }
+
+    /// Previews dispatch without consuming a fallback or recording a
+    /// Starfield crossing. Surface acquisition can fail after this query.
+    #[cfg(test)]
+    pub fn displayed_scene(&mut self, frame: ControlFrame, elapsed: f64) -> u8 {
+        let (_, requested, _) = self.preview_requested_display(frame);
+        let display = self.crossing_gate.resolve(requested, elapsed, false);
+        displayed_scene_byte(display)
+    }
+
+    /// Scene selected after ColourField debounce, before the live crossing
+    /// gate. Used to validate required scene inputs without a stale clock
+    /// sample affecting the decision.
+    pub fn requested_scene(&mut self, frame: ControlFrame) -> u8 {
+        let (_, display, _) = self.preview_requested_display(frame);
+        displayed_scene_byte(display)
+    }
+
+    /// Scene byte of the last successfully presented/replayed frame.
+    pub fn committed_displayed_scene(&self) -> u8 {
+        displayed_scene_byte(self.crossing_gate.displayed)
+    }
+
+    /// Uses a safe native scene for the next encode if scene dispatch selects
+    /// Starfield without a configured catalog.
+    pub fn fallback_next_missing_starfield(&mut self) {
+        self.next_native_fallback = Some(0);
+    }
+
     /// Scene dispatch: the colour field steps once per new observed frame
     /// and owns scene 7; otherwise the native scene goes through the
-    /// registry unchanged. `frame` is only drawn, never observed here.
-    fn dispatch(&mut self, frame: ControlFrame) -> (ControlFrame, colour_field::Display) {
+    /// registry unchanged. Live surface rendering previews the gate and
+    /// commits after `present()` returns; replay commits on its frame clock.
+    /// `frame` is never observed here.
+    fn dispatch(
+        &mut self,
+        frame: ControlFrame,
+        commit: bool,
+        elapsed: f64,
+    ) -> (ControlFrame, colour_field::Display, bool) {
+        let (frame, requested, fallback_applied) = self.resolve_requested_display(frame);
+        let display = self.crossing_gate.resolve(requested, elapsed, commit);
+        let mut frame = frame;
+        if let colour_field::Display::Native(scene) = display {
+            frame.scene = scene;
+        }
+        if commit && fallback_applied && !is_starfield_display(display) {
+            self.next_native_fallback = None;
+        }
+        (frame, display, fallback_applied)
+    }
+
+    fn resolve_requested_display(
+        &mut self,
+        frame: ControlFrame,
+    ) -> (ControlFrame, colour_field::Display, bool) {
         let (clock, now) = match &mut self.step_clock {
             Some((clock, start)) => (Some(clock), start.elapsed()),
             None => (None, Duration::ZERO),
@@ -400,10 +659,39 @@ impl ScenePipeline {
             now,
             &mut self.colour_controls,
         );
-        match display {
-            colour_field::Display::Native(scene) => (ControlFrame { scene, ..frame }, display),
-            colour_field::Display::ColourField(_) => (frame, display),
-        }
+        resolve_dispatch_frame(
+            frame,
+            display,
+            self.next_native_fallback,
+            self.starfield_dispatch_enabled,
+        )
+    }
+
+    /// Predicts dispatch without consuming debounce or colour-field step
+    /// budget. This is safe before surface acquisition, which may fail.
+    fn preview_requested_display(
+        &self,
+        frame: ControlFrame,
+    ) -> (ControlFrame, colour_field::Display, bool) {
+        let mut colour_field = self.colour_field.clone();
+        let mut colour_controls = self.colour_controls;
+        let mut clock = self
+            .step_clock
+            .as_ref()
+            .map(|(clock, start)| (clock.clone(), start.elapsed()));
+        let now = clock.as_ref().map_or(Duration::ZERO, |(_, now)| *now);
+        let display = colour_field::step_capped(
+            &mut colour_field,
+            clock.as_mut().map(|(clock, _)| clock),
+            now,
+            &mut colour_controls,
+        );
+        resolve_dispatch_frame(
+            frame,
+            display,
+            self.next_native_fallback,
+            self.starfield_dispatch_enabled,
+        )
     }
 
     /// Uploads this frame's instances and uniforms, then records its render pass.
@@ -415,7 +703,43 @@ impl ScenePipeline {
         elapsed: f64,
         size: (u32, u32),
     ) {
-        self.encode_frame(encoder, view, frame, elapsed, size, true);
+        let _ = self.encode_frame(
+            encoder,
+            view,
+            frame,
+            EncodeFrameOptions {
+                elapsed,
+                gate_elapsed: elapsed,
+                size,
+                mic_layers: true,
+                commit_gate: true,
+            },
+        );
+    }
+
+    /// Encodes a window frame using acquisition time only for the gate.
+    /// Commits the selected display after the surface `present()` call returns.
+    fn encode_live(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame: ControlFrame,
+        elapsed: f64,
+        acquired_elapsed: f64,
+        size: (u32, u32),
+    ) -> (colour_field::Display, bool) {
+        self.encode_frame(
+            encoder,
+            view,
+            frame,
+            EncodeFrameOptions {
+                elapsed,
+                gate_elapsed: acquired_elapsed,
+                size,
+                mic_layers: true,
+                commit_gate: false,
+            },
+        )
     }
 
     /// `encode` as it was before the mic layers: neither steps nor draws
@@ -429,7 +753,18 @@ impl ScenePipeline {
         elapsed: f64,
         size: (u32, u32),
     ) {
-        self.encode_frame(encoder, view, frame, elapsed, size, false);
+        let _ = self.encode_frame(
+            encoder,
+            view,
+            frame,
+            EncodeFrameOptions {
+                elapsed,
+                gate_elapsed: elapsed,
+                size,
+                mic_layers: false,
+                commit_gate: true,
+            },
+        );
     }
 
     fn encode_frame(
@@ -437,27 +772,48 @@ impl ScenePipeline {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         frame: ControlFrame,
-        elapsed: f64,
-        size: (u32, u32),
-        mic_layers: bool,
-    ) {
+        options: EncodeFrameOptions,
+    ) -> (colour_field::Display, bool) {
+        let EncodeFrameOptions {
+            elapsed,
+            gate_elapsed,
+            size,
+            mic_layers,
+            commit_gate,
+        } = options;
         self.scene_state.advance_tunnel(&frame, elapsed);
         let overlay_elapsed = elapsed;
         let elapsed = elapsed as f32;
         let (width, height) = size;
         let aspect = size_aspect(size);
-        let (frame, display) = self.dispatch(frame);
-        let (instances, camera) = match display {
+        let (frame, display, fallback_applied) = self.dispatch(frame, commit_gate, gate_elapsed);
+        let (mut instances, camera) = match display {
             colour_field::Display::ColourField(trace) => {
                 let mut instances = Vec::new();
                 colour_field::build(&trace, width, height, self.srgb_target, &mut instances);
                 (instances, CameraMode::ScreenSpace)
             }
             colour_field::Display::Native(_) => (
-                build_instances(&self.profile, frame, elapsed, aspect, &self.scene_state),
-                scenes::selected_camera(frame.scene, self.scene_state.config()),
+                build_instances_for_viewport(
+                    &self.profile,
+                    frame,
+                    elapsed,
+                    aspect,
+                    size,
+                    &self.scene_state,
+                ),
+                scenes::selected_camera_configured(
+                    frame.scene,
+                    self.starfield_dispatch_enabled,
+                    self.scene_state.config(),
+                ),
             ),
         };
+        prepare_starfield_attachment_colors(
+            &mut instances,
+            self.srgb_target,
+            is_starfield_display(display),
+        );
         let uniforms = scene_uniforms(
             camera,
             &mut self.camera,
@@ -473,7 +829,7 @@ impl ScenePipeline {
         };
         match glow {
             // The scene goes into the phosphor's copy, which the composite
-            // then writes to `view` with the layers added.
+            // writes to the acquired surface with the layers added.
             Some(count) => {
                 let phosphor = self.phosphor.take().expect("prepared above");
                 self.encode_layers(encoder, phosphor.scene(), &instances, &uniforms);
@@ -481,6 +837,23 @@ impl ScenePipeline {
                 self.encode_phosphor(encoder, Some(view), count, overlay_elapsed);
             }
             None => self.encode_layers(encoder, view, &instances, &uniforms),
+        }
+        (display, fallback_applied)
+    }
+
+    fn commit_presented_display(
+        &mut self,
+        display: colour_field::Display,
+        fallback_applied: bool,
+        elapsed: f64,
+    ) {
+        let committed = self.crossing_gate.resolve(display, elapsed, true);
+        debug_assert_eq!(
+            committed, display,
+            "a display selected during encode must remain allowed at commit"
+        );
+        if fallback_applied && !is_starfield_display(display) {
+            self.next_native_fallback = None;
         }
     }
 
@@ -508,13 +881,14 @@ impl ScenePipeline {
             size,
             elapsed,
         );
-        let shown = mic_layers::shown(self.mic_layers.mode(), display) && drawable;
+        let shown = mic_layers_shown(self.mic_layers.mode(), display) && drawable;
         self.mic_layers
             .step(frame, self.live_scope.as_ref(), elapsed, shown);
-        // Entering the colour field is already a full-screen change; its
-        // colours must follow its trace alone, so no afterglow lingers. The
-        // drop holds the layers dark as a resize's does.
-        if matches!(display, colour_field::Display::ColourField(_)) {
+        // The colour field must follow its trace alone, and Starfield keeps
+        // its per-pixel luminance bound without an overlay or lingering
+        // afterglow. The drop holds layers dark as a resize's does.
+        if matches!(display, colour_field::Display::ColourField(_)) || is_starfield_display(display)
+        {
             if let Some(glow) = self.phosphor.take() {
                 self.settle.drop_lit(glow.fading(), elapsed);
             }
@@ -596,6 +970,7 @@ impl ScenePipeline {
     }
 
     /// What the latest colour-field step shows.
+    #[cfg(test)]
     pub fn colour_field_display(&self) -> colour_field::Display {
         self.colour_field.display()
     }
@@ -690,6 +1065,9 @@ impl Renderer {
             surface,
             config,
             pipeline,
+            presentation_clock: Instant::now(),
+            #[cfg(feature = "dmg-preview")]
+            dmg_preview: None,
         })
     }
 
@@ -707,6 +1085,37 @@ impl Renderer {
         &mut self.pipeline
     }
 
+    #[cfg(feature = "dmg-preview")]
+    pub(crate) fn enable_dmg_preview(&mut self) {
+        self.dmg_preview = Some(DmgPresenter::new(&self.pipeline.device, self.config.format));
+    }
+
+    /// Acquire before stepping; each upload is submitted before the next encode.
+    #[cfg(feature = "dmg-preview")]
+    pub(crate) fn render_dmg_preview(&mut self) -> Result<(), RendererError> {
+        self.dmg_preview
+            .as_mut()
+            .expect("preview enabled")
+            .render(
+                &self.pipeline.device,
+                &self.pipeline.queue,
+                (self.config.width, self.config.height),
+                DmgTarget {
+                    acquire: || self.surface.get_current_texture(),
+                    view: |output: &wgpu::SurfaceTexture| {
+                        output
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default())
+                    },
+                    present: wgpu::SurfaceTexture::present,
+                },
+                Instant::now,
+                std::thread::sleep,
+            )
+            .map(|_| ())
+            .map_err(RendererError::Surface)
+    }
+
     pub fn resize_to_current_window(&mut self) {
         let size = self.window.inner_size();
         self.resize(size.width, size.height);
@@ -716,17 +1125,22 @@ impl Renderer {
     /// [`ScenePipeline::observe`] first, so held redraws repeat its last step.
     pub fn render(&mut self, frame: ControlFrame, elapsed: f64) -> Result<(), RendererError> {
         let output = self.surface.get_current_texture()?;
+        let acquired_elapsed = self.presentation_clock.elapsed().as_secs_f64();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let size = (self.config.width, self.config.height);
         let mut encoder = self.pipeline.command_encoder();
-        self.pipeline
-            .encode(&mut encoder, &view, frame, elapsed, size);
+        let (display, fallback_applied) =
+            self.pipeline
+                .encode_live(&mut encoder, &view, frame, elapsed, acquired_elapsed, size);
         self.pipeline
             .queue
             .submit(std::iter::once(encoder.finish()));
         output.present();
+        let presented_elapsed = self.presentation_clock.elapsed().as_secs_f64();
+        self.pipeline
+            .commit_presented_display(display, fallback_applied, presented_elapsed);
         Ok(())
     }
 }
@@ -928,6 +1342,39 @@ fn size_aspect((width, height): (u32, u32)) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dmg-preview")]
+    use crate::dmg_preview::{DmgPreview, acquired_dmg_frame};
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn failed_dmg_acquisition_does_not_start_or_advance_the_model() {
+        let mut preview = DmgPreview::default();
+        let start = Instant::now();
+        let failed = acquired_dmg_frame::<(), _>(Err("lost"), &mut preview, || {
+            panic!("clock must not be sampled on failure")
+        });
+        assert_eq!(failed, Err("lost"));
+        let (_, first) = acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start).unwrap();
+        preview.submitted(start);
+        preview.presented(start);
+        let failed = acquired_dmg_frame::<(), _>(Err("timeout"), &mut preview, || {
+            panic!("clock must not be sampled on failure")
+        });
+        assert_eq!(failed, Err("timeout"));
+        let (_, held) = acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start).unwrap();
+        assert_eq!(held, first);
+        let (_, next) =
+            acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start + Duration::from_secs(10))
+                .unwrap();
+        preview.submitted(start + Duration::from_secs(10));
+        preview.presented(start + Duration::from_secs(10));
+        assert_eq!(next.scx, 128);
+        assert_eq!(next.scy, 1);
+        let (_, held) =
+            acquired_dmg_frame::<_, ()>(Ok(()), &mut preview, || start + Duration::from_secs(10))
+                .unwrap();
+        assert_eq!(held, next);
+    }
 
     #[test]
     fn target_size_check_follows_device_limits() {
@@ -949,6 +1396,431 @@ mod tests {
         };
         assert!(check_target_size(64, 4, &tight).is_ok());
         assert!(check_target_size(64, 5, &tight).is_err());
+    }
+
+    #[test]
+    fn crossing_gate_limits_starfield_reversals_and_leaves_native_changes_alone() {
+        let mut gate = StarfieldCrossingGate::default();
+        let starfield = colour_field::Display::Native(6);
+        let native = colour_field::Display::Native(0);
+        assert_eq!(gate.resolve(starfield, 0.0, true), starfield);
+        assert_eq!(gate.resolve(native, 0.1, true), native);
+
+        // A third transition inside the rolling second is denied. Preview is
+        // non-consuming, and changes between native scenes remain immediate.
+        assert_eq!(gate.resolve(starfield, 0.5, true), native);
+        assert_eq!(gate.resolve(starfield, 0.6, false), native);
+        assert_eq!(gate.displayed, native);
+        assert_eq!(
+            gate.resolve(colour_field::Display::Native(4), 0.7, true),
+            colour_field::Display::Native(4)
+        );
+        assert_eq!(
+            gate.resolve(starfield, 1.100_01, true),
+            starfield,
+            "old crossings expire only after the closed one-second boundary"
+        );
+
+        let colour = colour_field::Display::ColourField(colour_field::Trace {
+            mode: 0,
+            family: 0,
+            layout: 0,
+            combo: 0,
+            rot: 0,
+            lvl: [0; 3],
+        });
+        assert_eq!(gate.resolve(colour, 1.2, true), colour);
+        assert_eq!(gate.resolve(starfield, 1.21, true), colour);
+        assert_eq!(gate.resolve(starfield, 2.200_02, true), starfield);
+    }
+
+    #[test]
+    fn crossing_gate_accounts_for_surface_and_present_stalls() {
+        let mut gate = StarfieldCrossingGate::default();
+        let starfield = colour_field::Display::Native(6);
+        let native = colour_field::Display::Native(0);
+        let attempts = [
+            (0.0, 0.60, starfield),
+            (1.01, 1.01, native),
+            (1.03, 1.03, starfield),
+        ];
+        let mut shown = Vec::new();
+
+        for (acquired_at, present_returned_at, requested) in attempts {
+            let selected = gate.resolve(requested, acquired_at, false);
+            let committed = gate.resolve(selected, present_returned_at, true);
+            shown.push(committed);
+        }
+
+        assert_eq!(shown.as_slice(), &[starfield, native, native]);
+        let crossings: Vec<_> = gate.recent_crossings.iter().copied().collect();
+        assert_eq!(
+            crossings.as_slice(),
+            &[0.60, 1.01],
+            "crossings use the monotonic time after presentation returns"
+        );
+    }
+
+    #[test]
+    fn optional_mic_layers_are_not_composited_over_starfield() {
+        let mode = mic_layers::Mode::Both;
+        assert!(mic_layers_shown(mode, colour_field::Display::Native(4)));
+        assert!(!mic_layers_shown(mode, colour_field::Display::Native(6)));
+        assert!(mic_layers_shown(mode, colour_field::Display::Native(13)));
+        assert!(!mic_layers_shown(
+            mode,
+            colour_field::Display::ColourField(colour_field::Trace {
+                mode: 0,
+                family: 0,
+                layout: 0,
+                combo: 0,
+                rot: 0,
+                lvl: [0; 3],
+            }),
+        ));
+    }
+
+    #[test]
+    fn fallback_is_not_counted_as_a_starfield_display_and_preserves_frame_events() {
+        let mut field = colour_field::ColourField::new(colour_field::Config::default());
+        let frame = ControlFrame {
+            scene: 6,
+            flags: 0x05,
+            beat_count: 7,
+            ..ControlFrame::procedural(9)
+        };
+        // Match live dispatch: observe before previewing the frame.
+        field.observe(&frame);
+        if field.has_new_frame() {
+            field.step(colour_field::Controls::default());
+        }
+        let fallback = Some(0);
+        let (preview_frame, preview, fallback_applied) =
+            resolve_dispatch_frame(frame, field.display(), fallback, true);
+        assert!(fallback_applied);
+        assert_eq!(preview_frame.flags, frame.flags);
+        assert_eq!(preview_frame.beat_count, frame.beat_count);
+        assert_eq!(preview, colour_field::Display::Native(0));
+        assert!(!is_starfield_display(preview));
+
+        let mut gate = StarfieldCrossingGate::default();
+        assert_eq!(gate.resolve(preview, 0.0, false), preview);
+        assert_eq!(gate.displayed, colour_field::Display::Native(0));
+        // A surface-acquisition failure commits neither the fallback nor a
+        // crossing. The successful retry observes the same input first.
+        assert_eq!(fallback, Some(0));
+        field.observe(&frame);
+        if field.has_new_frame() {
+            field.step(colour_field::Controls::default());
+        }
+        let (_, retry, applied) = resolve_dispatch_frame(frame, field.display(), fallback, true);
+        let committed = gate.resolve(retry, 0.0, true);
+        assert!(applied);
+        assert_eq!(committed, colour_field::Display::Native(0));
+
+        assert!(is_starfield_display(colour_field::Display::Native(6)));
+        assert!(!is_starfield_display(colour_field::Display::Native(13)));
+        assert_eq!(scenes::dispatch(7).name(), "ColourField");
+    }
+
+    #[test]
+    fn wrapped_bytes_keep_legacy_dispatch_without_opt_in() {
+        for (byte, expected) in [(6, 0), (13, 1), (20, 2), (255, 3)] {
+            let frame = ControlFrame {
+                scene: byte,
+                ..ControlFrame::procedural(0)
+            };
+            let (resolved, display, fallback) =
+                resolve_dispatch_frame(frame, colour_field::Display::Native(byte), None, false);
+            assert!(!fallback);
+            assert_eq!(resolved.scene, expected);
+            assert_eq!(display, colour_field::Display::Native(expected));
+        }
+
+        let frame = ControlFrame {
+            scene: 6,
+            ..ControlFrame::procedural(0)
+        };
+        let (resolved, display, fallback) =
+            resolve_dispatch_frame(frame, colour_field::Display::Native(6), None, true);
+        assert!(!fallback);
+        assert_eq!(resolved.scene, 6);
+        assert_eq!(display, colour_field::Display::Native(6));
+    }
+
+    #[test]
+    fn faint_star_unorm_is_encoded_before_attachment_quantization() {
+        let linear = [0.01, 0.02, 0.05];
+        let make_instance = || Instance {
+            center: [0.0; 3],
+            size: [0.0; 2],
+            color: [linear[0], linear[1], linear[2], 1.0],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern: [0.0; 2],
+        };
+        let mut instance = make_instance();
+        prepare_starfield_attachment_colors(std::slice::from_mut(&mut instance), false, true);
+        for (encoded, expected_linear) in instance.color[..3].iter().zip(linear) {
+            let code = (encoded * 255.0).round() as u8;
+            assert!(code > 0, "faint channel was rounded to black");
+            let readback = f32::from(code) / 255.0;
+            let decoded = if readback <= 0.04045 {
+                readback / 12.92
+            } else {
+                ((readback + 0.055) / 1.055).powf(2.4)
+            };
+            assert!((decoded - expected_linear).abs() < 0.002);
+        }
+
+        let mut srgb_instance = make_instance();
+        prepare_starfield_attachment_colors(std::slice::from_mut(&mut srgb_instance), true, true);
+        assert_eq!(&srgb_instance.color[..3], &linear);
+
+        let mut unrelated = make_instance();
+        prepare_starfield_attachment_colors(std::slice::from_mut(&mut unrelated), false, false);
+        assert_eq!(&unrelated.color[..3], &linear);
+    }
+
+    /// Exercises the rendered output (not only per-instance color) with
+    /// overlapping brightest stars and maximum audio input on both attachment
+    /// formats. This is a regression bound, not photosensitivity certification.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn starfield_gpu_output_stays_bounded_under_hostile_audio_and_overlap() {
+        let csv = b"ra,dec,mag\n18.7,45,-10\n18.7,45,1\n18.7,45,6\n";
+        let catalog =
+            Arc::new(scenes::starfield::StarCatalog::from_reader(csv.as_slice()).unwrap());
+        let config = scenes::starfield::StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        let frame = ControlFrame {
+            scene: scenes::starfield::SCENE,
+            energy: u8::MAX,
+            bass: u8::MAX,
+            mid: u8::MAX,
+            treble: u8::MAX,
+            spectrum: [u8::MAX; 8],
+            flags: crate::audio::BEAT_FLAG | crate::audio::DROP_FLAG,
+            ..ControlFrame::procedural(0)
+        };
+        let decode_srgb = |code: u8| {
+            let value = f32::from(code) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                160,
+                90,
+                format,
+            ))
+            .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(config.clone()));
+            renderer.pipeline_mut().enable_starfield_dispatch(true);
+            let pixels = renderer.render(frame, 0.0).unwrap();
+            let maximum = pixels
+                .chunks_exact(3)
+                .flat_map(|pixel| pixel.iter().copied())
+                .map(decode_srgb)
+                .fold(0.0_f32, f32::max);
+            assert!(
+                (0.019..=0.021).contains(&maximum) && maximum <= 0.05,
+                "{format:?}: expected overlapping white stars at normalized Rec.709 luminance 0.02 under the 0.05 channel cap, got {maximum}"
+            );
+        }
+    }
+
+    /// Reads back one isolated limiting-magnitude white star on both
+    /// attachment formats. Its Rec.709 luminance should remain near 0.0052
+    /// linear after tint normalization and sRGB encoding.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn isolated_faint_star_is_visible_on_srgb_and_unorm_attachments() {
+        let csv = b"ra,dec,mag\n18.7,45,6.5\n";
+        let catalog =
+            Arc::new(scenes::starfield::StarCatalog::from_reader(csv.as_slice()).unwrap());
+        let config = scenes::starfield::StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        let frame = ControlFrame {
+            scene: scenes::starfield::SCENE,
+            ..ControlFrame::procedural(0)
+        };
+        let decode_srgb = |code: u8| {
+            let value = f32::from(code) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                160,
+                90,
+                format,
+            ))
+            .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(config.clone()));
+            renderer.pipeline_mut().enable_starfield_dispatch(true);
+            let pixels = renderer.render(frame, 0.0).unwrap();
+            let lit_pixels = pixels
+                .chunks_exact(3)
+                .filter(|pixel| pixel.iter().any(|&channel| channel != 0))
+                .count();
+            let maximum_luminance = pixels
+                .chunks_exact(3)
+                .map(|pixel| {
+                    0.2126 * decode_srgb(pixel[0])
+                        + 0.7152 * decode_srgb(pixel[1])
+                        + 0.0722 * decode_srgb(pixel[2])
+                })
+                .fold(0.0_f32, f32::max);
+            assert!(
+                lit_pixels > 0,
+                "{format:?}: isolated limiting-magnitude star read back black"
+            );
+            assert!(
+                (0.0045..=0.0058).contains(&maximum_luminance),
+                "{format:?}: expected isolated faint-star readback near 0.0052 linear luminance, got {maximum_luminance}"
+            );
+        }
+    }
+
+    /// Checks independently calculated sRGB code bounds for mixed-colour
+    /// stars on both attachment formats. The bright pair's close luminances
+    /// can tie or invert after 8-bit encoding, so only their individual
+    /// colours are bounded; the distinguishable faint pair must remain
+    /// ordered after readback.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn mixed_colour_star_readback_allows_bright_quantization_inversion() {
+        let csv = b"ra,dec,mag,ci\n\
+                    18.7,0,-1.9,-0.07700189271005747\n\
+                    16.7,0,-1.4,1.0179712403282242\n\
+                    20.7,0,5.5,100\n\
+                    21.7,0,6.5,\n";
+        let catalog =
+            Arc::new(scenes::starfield::StarCatalog::from_reader(csv.as_slice()).unwrap());
+        let config = scenes::starfield::StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        };
+        let frame = ControlFrame {
+            scene: scenes::starfield::SCENE,
+            ..ControlFrame::procedural(0)
+        };
+
+        // Independently calculated center-pixel sRGB codes, with a ±1-code
+        // tolerance for rasterization and attachment quantization. The first
+        // two stars' expected quantized luminances are 0.0192846 and 0.0197899
+        // (inverted), despite their pre-quantization luminances being ordered;
+        // check them independently rather than imposing a false output order.
+        let samples = [
+            ((80, 45), [36, 38, 42]),
+            ((97, 52), [41, 38, 35]),
+            ((62, 52), [34, 14, 0]),
+            ((55, 60), [16, 16, 16]),
+        ];
+        let mut attachment_samples = Vec::new();
+        let decode_srgb = |code: u8| {
+            let value = f32::from(code) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = |pixel: [u8; 3]| {
+            0.2126 * decode_srgb(pixel[0])
+                + 0.7152 * decode_srgb(pixel[1])
+                + 0.0722 * decode_srgb(pixel[2])
+        };
+
+        for format in [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            let mut renderer = pollster::block_on(OffscreenRenderer::with_format(
+                RenderProfile::pi5(),
+                160,
+                90,
+                format,
+            ))
+            .unwrap();
+            renderer
+                .pipeline_mut()
+                .configure_starfield(Some(config.clone()));
+            renderer.pipeline_mut().enable_starfield_dispatch(true);
+            let pixels = renderer.render(frame, 0.0).unwrap();
+            let read_pixel = |(x, y): (usize, usize)| {
+                let offset = (y * 160 + x) * 3;
+                [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+            };
+            let format_samples: Vec<_> = samples
+                .iter()
+                .map(|(position, _)| read_pixel(*position))
+                .collect();
+
+            for ((position, expected), actual) in samples.iter().zip(&format_samples) {
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(&actual, &expected)| actual.abs_diff(expected) <= 1),
+                    "{format:?} at {position:?}: expected sRGB codes near {expected:?}, got {actual:?}"
+                );
+            }
+
+            let brighter_faint = luminance(format_samples[2]);
+            let fainter_white = luminance(format_samples[3]);
+            assert!(
+                brighter_faint > fainter_white,
+                "{format:?}: distinguishable faint stars should retain readback luminance order ({brighter_faint} <= {fainter_white})"
+            );
+            attachment_samples.push(format_samples);
+        }
+
+        for (sample, (srgb, unorm)) in samples
+            .iter()
+            .zip(attachment_samples[0].iter().zip(&attachment_samples[1]))
+        {
+            assert!(
+                srgb.iter()
+                    .zip(unorm)
+                    .all(|(&srgb, &unorm)| srgb.abs_diff(unorm) <= 1),
+                "sRGB and UNORM readbacks differ by more than one code at {sample:?}: {srgb:?} vs {unorm:?}"
+            );
+        }
     }
 
     #[test]

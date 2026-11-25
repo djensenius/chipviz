@@ -13,7 +13,7 @@ use crate::audio::{self, AudioFeatures, InputDevices, MicSource};
 use crate::control_frame::{ControlFrame, WIRE_SIZE};
 use crate::profile::RenderProfile;
 use crate::renderer::{Renderer, RendererError};
-use crate::scenes::{SceneConfig, TunnelVariant, colour_field, mic_layers};
+use crate::scenes::{SceneConfig, TunnelVariant, colour_field, mic_layers, starfield};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -75,6 +75,17 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         }
         ArgsCommand::Run(args) => args,
     };
+    // Load and validate a selected catalog before enumerating audio devices,
+    // opening UDP, creating a window, or initializing the GPU.
+    let mut starfield = if args.scene == Some(starfield::SCENE) {
+        args.starfield_config()?
+    } else {
+        None
+    };
+    let live_starfield = args.unix_seconds.is_none() && starfield.is_some();
+    if let Some(config) = &mut starfield {
+        config.follow_elapsed = false;
+    }
 
     // Both list flags may be given together; each list gets a heading then.
     let both_lists = args.list_audio_devices && args.list_monitors;
@@ -110,6 +121,11 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         }
         None => None,
     };
+
+    #[cfg(feature = "dmg-preview")]
+    if args.dmg_preview {
+        return run_dmg_preview(profile, &args, event_loop, target_monitor);
+    }
 
     if args.allow_flash {
         eprintln!("{}", colour_field::allow_flash_notice());
@@ -151,6 +167,12 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
         lines_drop_cuts: args.lines_drop_cuts,
         tunnel_variant: args.tunnel_variant,
     });
+    renderer
+        .pipeline_mut()
+        .configure_starfield(starfield.clone());
+    renderer
+        .pipeline_mut()
+        .enable_starfield_dispatch(args.scene == Some(starfield::SCENE));
     renderer.pipeline_mut().limit_colour_field_steps();
     if mic_layers::allowed(args.mic_layers) != args.mic_layers {
         eprintln!("{}", mic_layers::NO_LAYERS_NOTICE);
@@ -161,6 +183,21 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     let mut frame_source = FrameSource::new(udp, mic);
     let mut modifiers = ModifiersState::empty();
     let start = Instant::now();
+    if live_starfield && let Some(config) = &mut starfield {
+        config.unix_seconds = system_utc_seconds();
+        renderer
+            .pipeline_mut()
+            .configure_starfield(Some(config.clone()));
+    }
+    let mut utc_clock = starfield
+        .as_ref()
+        .filter(|_| live_starfield)
+        .map(|config| starfield::UtcClock::new(config.unix_seconds));
+    let mut last_starfield_snapshot = 0.0_f64;
+    if let Some(frame) = initial_scene_override(args.scene) {
+        renderer.pipeline_mut().observe(&frame, 0.0);
+    }
+    let mut missing_starfield_warning = false;
 
     event_loop.run(move |event, target| match event {
         Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
@@ -198,11 +235,37 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
             }
             WindowEvent::RedrawRequested => {
                 let elapsed = start.elapsed().as_secs_f64();
-                let frame = frame_source.next_frame();
+                if let (Some(clock), Some(config)) = (&mut utc_clock, &mut starfield) {
+                    let utc_now = clock.update(system_utc_seconds(), elapsed);
+                    if starfield::snapshot_due(elapsed, last_starfield_snapshot) {
+                        config.unix_seconds = utc_now;
+                        renderer
+                            .pipeline_mut()
+                            .configure_starfield(Some(config.clone()));
+                        last_starfield_snapshot = elapsed;
+                    }
+                }
+                let frame = with_scene_override(frame_source.next_frame(), args.scene);
                 // The colour field sees each received or generated frame once;
                 // held redraws only repeat its last step.
-                for fresh in frame_source.fresh() {
-                    renderer.pipeline_mut().observe(fresh, elapsed);
+                observe_fresh_frames(
+                    frame_source.fresh(),
+                    args.scene,
+                    elapsed,
+                    |fresh, elapsed| {
+                        renderer.pipeline_mut().observe_live(fresh, elapsed);
+                    },
+                );
+                let requested_scene = renderer.pipeline_mut().requested_scene(frame);
+                if needs_starfield_catalog(requested_scene) && starfield.is_none() {
+                    if !missing_starfield_warning {
+                        eprintln!(
+                            "scene 6 (Starfield) needs --star-catalog PATH and --location LAT,LON; \
+                             rendering scene 0 until both options are supplied."
+                        );
+                        missing_starfield_warning = true;
+                    }
+                    renderer.pipeline_mut().fallback_next_missing_starfield();
                 }
                 // The waveform side channel only describes mic frames; UDP
                 // and procedural frames make the layers fall back.
@@ -231,6 +294,92 @@ pub fn run(profile: RenderProfile) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(feature = "dmg-preview")]
+fn run_dmg_preview(
+    profile: RenderProfile,
+    args: &AppArgs,
+    event_loop: EventLoop<()>,
+    target_monitor: Option<MonitorHandle>,
+) -> Result<(), AppError> {
+    eprintln!(
+        "Experimental DMG preview: not audio reactive; presented-output safety and physical Pi behavior are unvalidated."
+    );
+    let mut builder = WindowBuilder::new()
+        .with_title(profile.window_title)
+        .with_inner_size(LogicalSize::new(
+            profile.target_width,
+            profile.target_height,
+        ));
+    if let Some(monitor) = &target_monitor {
+        builder = builder.with_position(monitor.position());
+    }
+    if args.fullscreen {
+        builder = builder.with_fullscreen(Some(Fullscreen::Borderless(
+            target_monitor.or_else(|| event_loop.primary_monitor()),
+        )));
+    }
+    let window = Arc::new(builder.build(&event_loop)?);
+    window.set_cursor_visible(cursor_visible(args.fullscreen));
+    let mut renderer = pollster::block_on(Renderer::new(window.clone(), profile))?;
+    renderer.enable_dmg_preview();
+    let size = window.inner_size();
+    let mut drawable = preview_drawable(size.width, size.height);
+    let mut modifiers = ModifiersState::empty();
+    // A resize wakes Wait; the next AboutToWait resumes redraws if drawable.
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+    event_loop.run(move |event, target| match event {
+        Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
+            WindowEvent::CloseRequested => target.exit(),
+            WindowEvent::Resized(size) => {
+                window.set_cursor_visible(cursor_visible(window.fullscreen().is_some()));
+                drawable = preview_drawable(size.width, size.height);
+                renderer.resize(size.width, size.height);
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => modifiers = new_modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                let input = KeyInput::from_winit(&event.logical_key, event.physical_key);
+                let mods = KeyModifiers {
+                    command: modifiers.super_key(),
+                    control: modifiers.control_key(),
+                    alt: modifiers.alt_key(),
+                };
+                let fullscreen = window.fullscreen().is_some();
+                match preview_key_action(input, mods, fullscreen) {
+                    Some(KeyAction::ToggleFullscreen) => set_fullscreen(&window, !fullscreen),
+                    Some(KeyAction::ExitFullscreen) => set_fullscreen(&window, false),
+                    _ => {}
+                }
+            }
+            WindowEvent::RedrawRequested if drawable => match renderer.render_dmg_preview() {
+                Ok(()) => {}
+                Err(RendererError::Surface(
+                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
+                )) => renderer.resize_to_current_window(),
+                Err(RendererError::Surface(wgpu::SurfaceError::OutOfMemory)) => target.exit(),
+                Err(error) => eprintln!("{error}"),
+            },
+            _ => {}
+        },
+        Event::AboutToWait => request_preview_redraw(drawable, || window.request_redraw()),
+        _ => {}
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "dmg-preview")]
+fn preview_drawable(width: u32, height: u32) -> bool {
+    width != 0 && height != 0
+}
+
+#[cfg(feature = "dmg-preview")]
+fn request_preview_redraw(drawable: bool, request: impl FnOnce()) {
+    if drawable {
+        request();
+    }
+}
+
 fn set_fullscreen(window: &Window, fullscreen: bool) {
     if fullscreen {
         window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
@@ -257,15 +406,33 @@ fn print_monitors(monitors: &[MonitorHandle]) {
     }
 }
 
+fn system_utc_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_else(|error| -error.duration().as_secs_f64())
+}
+
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} [--udp LISTEN_ADDR:PORT] [--mic [--audio-device INDEX|NAME]] [--fullscreen] [--monitor INDEX|NAME]
+       [--dmg-preview]
        [--layout auto|v2|h2|v3|h3] [--allow-flash] [--mic-layers off|scope|bursts|both]
        [--lines-drop-cuts] [--tunnel-variant original|hallway|abstract]
+       [--scene N]
        {program} --list-monitors | --list-audio-devices
 
 Options:
+  --dmg-preview           development-only; requires the dmg-preview Cargo feature,
+                          no audio or overlays, incompatible with source and scene options
   --udp LISTEN_ADDR:PORT  consume control-frame-v0 packets (default: procedural frames)
+  --star-catalog PATH     HYG-compatible star CSV for scene 6 (not bundled)
+  --catalog FILE          alias for --star-catalog
+  --location LAT,LON      observer position in decimal degrees (longitude east)
+  --time UNIX_SECONDS     UTC observation time for scene 6 (1800..2200; default: current UTC)
+  --scene N               override the displayed scene byte (0-255), including UDP;
+                          byte 7 is ColourField, byte 6 opts into Starfield, and other
+                          bytes keep the original modulo-six mapping
   --mic                   drive frames from live microphone analysis instead of
                           procedural frames; UDP packets, when they arrive, still win
   --audio-device INDEX|NAME
@@ -290,6 +457,7 @@ Options:
   --lines-drop-cuts       Lines (scene 3) cuts between plane and hallway on a drop
                           flag, at most once per bar (default: drops are ignored)
   --tunnel-variant MODE   PulseTunnel look: original (default), hallway or abstract
+  Scene 6 requires both --star-catalog and --location; scene 7 remains ColourField
   -h, --help              print this help
 
 Keys:
@@ -466,14 +634,23 @@ fn key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<K
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "dmg-preview")]
+fn preview_key_action(input: KeyInput, mods: KeyModifiers, fullscreen: bool) -> Option<KeyAction> {
+    match key_action(input, mods, fullscreen) {
+        action @ (Some(KeyAction::ToggleFullscreen) | Some(KeyAction::ExitFullscreen)) => action,
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq)]
 enum ArgsCommand {
     Run(AppArgs),
     Help,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 struct AppArgs {
+    dmg_preview: bool,
     udp_endpoint: Option<String>,
     fullscreen: bool,
     monitor: Option<DeviceSelector>,
@@ -486,6 +663,10 @@ struct AppArgs {
     allow_flash: bool,
     mic_layers: mic_layers::Mode,
     lines_drop_cuts: bool,
+    scene: Option<u8>,
+    catalog_path: Option<std::path::PathBuf>,
+    location: Option<(f64, f64)>,
+    unix_seconds: Option<f64>,
     tunnel_variant: TunnelVariant,
 }
 
@@ -518,37 +699,117 @@ fn parse_layout(value: &str) -> Result<Option<u8>, AppError> {
 }
 
 impl AppArgs {
+    fn starfield_config(&self) -> Result<Option<starfield::StarfieldConfig>, AppError> {
+        let (Some(path), Some((latitude_degrees, longitude_degrees))) =
+            (&self.catalog_path, self.location)
+        else {
+            return Ok(None);
+        };
+        let catalog =
+            starfield::StarCatalog::load(path).map_err(|error| invalid_input(error.to_string()))?;
+        let unix_seconds = match self.unix_seconds {
+            Some(seconds) => seconds,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs_f64())
+                .unwrap_or_else(|error| -error.duration().as_secs_f64()),
+        };
+        Ok(Some(starfield::StarfieldConfig {
+            catalog: std::sync::Arc::new(catalog),
+            latitude_degrees,
+            longitude_degrees,
+            unix_seconds,
+            follow_elapsed: self.unix_seconds.is_none(),
+        }))
+    }
+
     fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<ArgsCommand, AppError> {
         let mut parsed = Self::default();
+        let args: Vec<String> = args.into_iter().collect();
+        let preview_requested = args.iter().any(|arg| arg == "--dmg-preview");
         let mut args = args.into_iter();
+        let mut preview_conflict = None;
 
         let mut first = true;
         while let Some(arg) = args.next() {
             let is_first = std::mem::replace(&mut first, false);
+            if matches!(
+                arg.as_str(),
+                "--udp"
+                    | "--mic"
+                    | "--audio-device"
+                    | "--list-audio-devices"
+                    | "--list-monitors"
+                    | "--mic-layers"
+                    | "--scene"
+                    | "--layout"
+                    | "--allow-flash"
+                    | "--lines-drop-cuts"
+                    | "--tunnel-variant"
+                    | "--catalog"
+                    | "--star-catalog"
+                    | "--location"
+                    | "--time"
+            ) && preview_conflict.is_none()
+            {
+                preview_conflict = Some(arg.clone());
+            }
             match arg.as_str() {
+                "--dmg-preview" => {
+                    #[cfg(feature = "dmg-preview")]
+                    {
+                        parsed.dmg_preview = true;
+                    }
+                    #[cfg(not(feature = "dmg-preview"))]
+                    {
+                        return Err(invalid_input(
+                            "--dmg-preview requires the dmg-preview Cargo feature".to_string(),
+                        ));
+                    }
+                }
                 "--udp" => {
-                    parsed.udp_endpoint =
-                        Some(required_value(&mut args, "--udp", "LISTEN_ADDR:PORT")?)
+                    parsed.udp_endpoint = Some(required_value(
+                        &mut args,
+                        "--udp",
+                        "LISTEN_ADDR:PORT",
+                        preview_requested,
+                    )?)
                 }
                 "--fullscreen" => parsed.fullscreen = true,
                 "--monitor" => {
-                    let value = required_value(&mut args, "--monitor", "INDEX or NAME")?;
+                    let value =
+                        required_value(&mut args, "--monitor", "INDEX or NAME", preview_requested)?;
                     parsed.monitor = Some(DeviceSelector::parse(&value));
                 }
                 "--list-monitors" => parsed.list_monitors = true,
                 "--mic" => parsed.mic = true,
                 "--audio-device" => {
-                    let value = required_value(&mut args, "--audio-device", "INDEX or NAME")?;
+                    let value = required_value(
+                        &mut args,
+                        "--audio-device",
+                        "INDEX or NAME",
+                        preview_requested,
+                    )?;
                     parsed.audio_device = Some(DeviceSelector::parse(&value));
                 }
                 "--list-audio-devices" => parsed.list_audio_devices = true,
                 "--layout" => {
-                    let value = required_value(&mut args, "--layout", "auto|v2|h2|v3|h3")?;
+                    let value = required_value(
+                        &mut args,
+                        "--layout",
+                        "auto|v2|h2|v3|h3",
+                        preview_requested,
+                    )?;
                     parsed.layout = parse_layout(&value)?;
                 }
                 "--allow-flash" => parsed.allow_flash = true,
                 "--mic-layers" => {
-                    let value = required_value(&mut args, "--mic-layers", "off|scope|bursts|both")?;
+                    let value = required_value(
+                        &mut args,
+                        "--mic-layers",
+                        "off|scope|bursts|both",
+                        preview_requested,
+                    )?;
                     parsed.mic_layers = mic_layers::Mode::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
                             "--mic-layers expects off|scope|bursts|both, got {value}"
@@ -556,9 +817,47 @@ impl AppArgs {
                     })?;
                 }
                 "--lines-drop-cuts" => parsed.lines_drop_cuts = true,
-                "--tunnel-variant" => {
+                "--scene" => {
+                    let value = required_value(&mut args, "--scene", "0-255", preview_requested)?;
+                    parsed.scene = Some(value.parse::<u8>().map_err(|_| {
+                        invalid_input(format!("--scene expects 0-255, got {value}"))
+                    })?);
+                }
+                "--catalog" | "--star-catalog" => {
+                    parsed.catalog_path = Some(std::path::PathBuf::from(required_value(
+                        &mut args,
+                        arg.as_str(),
+                        "PATH",
+                        preview_requested,
+                    )?));
+                }
+                "--location" => {
                     let value =
-                        required_value(&mut args, "--tunnel-variant", "original|hallway|abstract")?;
+                        required_value(&mut args, "--location", "LAT,LON", preview_requested)?;
+                    parsed.location = Some(parse_location(&value)?);
+                }
+                "--time" => {
+                    let value =
+                        required_value(&mut args, "--time", "UNIX_SECONDS", preview_requested)?;
+                    let seconds = value.parse::<f64>().map_err(|_| {
+                        invalid_input(format!("--time must be finite UNIX seconds, got {value}"))
+                    })?;
+                    if !seconds.is_finite()
+                        || !(-5_364_662_400.0..7_289_654_400.0).contains(&seconds)
+                    {
+                        return Err(invalid_input(format!(
+                            "--time must be finite UNIX seconds in the UTC year 1800..2200 range, got {value}"
+                        )));
+                    }
+                    parsed.unix_seconds = Some(seconds);
+                }
+                "--tunnel-variant" => {
+                    let value = required_value(
+                        &mut args,
+                        "--tunnel-variant",
+                        "original|hallway|abstract",
+                        preview_requested,
+                    )?;
                     parsed.tunnel_variant = TunnelVariant::parse(&value).ok_or_else(|| {
                         invalid_input(format!(
                             "--tunnel-variant expects original|hallway|abstract, got {value}"
@@ -572,21 +871,141 @@ impl AppArgs {
             }
         }
 
+        if parsed.dmg_preview
+            && let Some(conflict) = preview_conflict
+        {
+            return Err(invalid_input(format!(
+                "--dmg-preview cannot be combined with {conflict}"
+            )));
+        }
         if parsed.audio_device.is_some() && !parsed.mic && !parsed.list_audio_devices {
             return Err(invalid_input("--audio-device requires --mic".to_string()));
+        }
+        if parsed.catalog_path.is_some() != parsed.location.is_some() {
+            return Err(invalid_input(
+                "--star-catalog and --location must be supplied together for scene 6".to_string(),
+            ));
+        }
+        if parsed.unix_seconds.is_some() && parsed.catalog_path.is_none() {
+            return Err(invalid_input(
+                "--time requires --star-catalog and --location".to_string(),
+            ));
+        }
+        if parsed.scene.is_some_and(needs_starfield_catalog) && parsed.catalog_path.is_none() {
+            return Err(invalid_input(
+                "--scene 6 (Starfield) requires --star-catalog PATH and --location LAT,LON"
+                    .to_string(),
+            ));
         }
 
         Ok(ArgsCommand::Run(parsed))
     }
 }
 
+fn with_scene_override(mut frame: ControlFrame, scene: Option<u8>) -> ControlFrame {
+    if let Some(scene) = scene {
+        frame.scene = scene;
+    }
+    frame
+}
+
+fn initial_scene_override(scene: Option<u8>) -> Option<ControlFrame> {
+    scene.map(|scene| with_scene_override(ControlFrame::procedural(0), Some(scene)))
+}
+
+fn observe_fresh_frames(
+    frames: &[ControlFrame],
+    scene_override: Option<u8>,
+    elapsed: f64,
+    mut observe: impl FnMut(&ControlFrame, f64),
+) {
+    for frame in frames {
+        let frame = with_scene_override(*frame, scene_override);
+        observe(&frame, elapsed);
+    }
+}
+
+fn needs_starfield_catalog(scene: u8) -> bool {
+    scene == starfield::SCENE
+}
+
+fn parse_location(value: &str) -> Result<(f64, f64), AppError> {
+    let Some((latitude, longitude)) = value.split_once(',') else {
+        return Err(invalid_input(format!(
+            "--location expects LAT,LON decimal degrees, got {value}"
+        )));
+    };
+    if longitude.contains(',') {
+        return Err(invalid_input(format!(
+            "--location expects exactly LAT,LON, got {value}"
+        )));
+    }
+    let latitude = latitude.parse::<f64>().map_err(|_| {
+        invalid_input(format!(
+            "--location latitude must be finite, got {latitude}"
+        ))
+    })?;
+    let longitude = longitude.parse::<f64>().map_err(|_| {
+        invalid_input(format!(
+            "--location longitude must be finite, got {longitude}"
+        ))
+    })?;
+    if !latitude.is_finite() || !(-90.0..=90.0).contains(&latitude) {
+        return Err(invalid_input(format!(
+            "--location latitude must be finite and in [-90, 90], got {latitude}"
+        )));
+    }
+    if !longitude.is_finite() || !(-180.0..=180.0).contains(&longitude) {
+        return Err(invalid_input(format!(
+            "--location longitude must be finite and in [-180, 180] (east positive), got {longitude}"
+        )));
+    }
+    Ok((latitude, longitude))
+}
+
 fn required_value(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
     expected: &str,
+    preview_requested: bool,
 ) -> Result<String, AppError> {
-    args.next()
-        .ok_or_else(|| invalid_input(format!("{flag} requires {expected}")))
+    match args.next() {
+        Some(value) if value == "--dmg-preview" => Err(invalid_input(format!(
+            "{flag} requires {expected}; --dmg-preview is not a value"
+        ))),
+        Some(value) if preview_requested && is_app_option(&value) => Err(invalid_input(format!(
+            "{flag} requires {expected}; {value} is an option, not a value"
+        ))),
+        Some(value) => Ok(value),
+        None => Err(invalid_input(format!("{flag} requires {expected}"))),
+    }
+}
+
+fn is_app_option(value: &str) -> bool {
+    matches!(
+        value,
+        "--udp"
+            | "--fullscreen"
+            | "--monitor"
+            | "--list-monitors"
+            | "--mic"
+            | "--audio-device"
+            | "--list-audio-devices"
+            | "--layout"
+            | "--allow-flash"
+            | "--mic-layers"
+            | "--lines-drop-cuts"
+            | "--scene"
+            | "--catalog"
+            | "--star-catalog"
+            | "--location"
+            | "--time"
+            | "--tunnel-variant"
+            | "--dmg-preview"
+            | "--help"
+            | "-h"
+            | "--"
+    )
 }
 
 fn invalid_input(message: String) -> AppError {
@@ -660,6 +1079,60 @@ fn start_mic(selector: Option<&DeviceSelector>) -> Result<MicSource, String> {
 /// bridge streaming at about the render rate never flickers with mic frames.
 const UDP_HOLD: Duration = Duration::from_millis(500);
 
+/// Procedural observations use wall-clock 60 Hz slots, independently of
+/// catalog-v1 live pacing. The first is immediate. Later slot boundaries
+/// are shifted 4 ms early. For one redraw per nominal 60 Hz tick, deviations
+/// up to ±4 ms still emit each tick; faster nominal redraws are tested with
+/// bounded irregular jitter, not promised for every possible jitter pattern.
+/// Slots use exact nanosecond arithmetic rather than a rounded period. Any
+/// two emissions must be at least 8,333,333 ns apart.
+///
+/// A redraw emits at most one observation. If a slot was missed, it emits
+/// once and reanchors the grid at that redraw, never catching up. At less
+/// than 60 Hz this means one consecutive procedural frame per redraw, not
+/// skipped timeline frames. More extreme opposing jitter can cost a frame
+/// rather than break the minimum gap. Duplicate/backward redraw timestamps
+/// are held and cannot rewind the clock.
+const PROCEDURAL_EARLY_NS: u128 = 4_000_000;
+const PROCEDURAL_MIN_GAP: Duration = Duration::from_nanos(8_333_333);
+
+#[derive(Default)]
+struct ProceduralClock {
+    origin: Option<Instant>,
+    slot: u128,
+    last_emitted: Option<Instant>,
+    last_redraw: Option<Instant>,
+}
+
+impl ProceduralClock {
+    fn due(&mut self, now: Instant) -> bool {
+        if self.last_redraw.is_some_and(|last| now <= last) {
+            return false;
+        }
+        self.last_redraw = Some(now);
+        let Some(origin) = self.origin else {
+            self.origin = Some(now);
+            self.last_emitted = Some(now);
+            return true;
+        };
+        let elapsed = now.duration_since(origin);
+        let slot = (elapsed.as_nanos() + PROCEDURAL_EARLY_NS) * 60 / 1_000_000_000;
+        if slot <= self.slot
+            || now.duration_since(self.last_emitted.expect("started clock")) < PROCEDURAL_MIN_GAP
+        {
+            return false;
+        }
+        if slot > self.slot + 1 {
+            self.origin = Some(now);
+            self.slot = 0;
+        } else {
+            self.slot = slot;
+        }
+        self.last_emitted = Some(now);
+        true
+    }
+}
+
 /// What to render when no UDP packet arrived this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdleSource {
@@ -690,6 +1163,7 @@ struct FrameSource {
     udp: UdpFrameSource,
     mic: Option<Box<dyn LatestFeatures>>,
     fallback_index: u64,
+    procedural_clock: ProceduralClock,
     latest: ControlFrame,
     last_udp: Option<Instant>,
     mic_beat_count: Option<u16>,
@@ -708,6 +1182,7 @@ impl FrameSource {
             udp,
             mic,
             fallback_index: 0,
+            procedural_clock: ProceduralClock::default(),
             latest: ControlFrame::procedural(0),
             last_udp: None,
             mic_beat_count: None,
@@ -753,14 +1228,17 @@ impl FrameSource {
                 // resend until note-off), so they are kept.
                 self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
             }
-            // Generated frames number from `fallback_index`, independent of
-            // UDP counters. On a handover the first one can equal the last
-            // stepped counter; the colour field then skips that one frame
-            // (see `ColourField::has_new_frame`).
+            // Procedural fallback advances only on its own wall clock.
             IdleSource::Procedural => {
-                self.fallback_index = self.fallback_index.wrapping_add(1);
-                self.latest = ControlFrame::procedural(self.fallback_index);
-                self.fresh.push(self.latest);
+                if self.procedural_clock.due(now) {
+                    self.fallback_index = self.fallback_index.wrapping_add(1);
+                    self.latest = ControlFrame::procedural(self.fallback_index);
+                    self.fresh.push(self.latest);
+                } else {
+                    // Repeating a displayed frame must not repeat its one-shot
+                    // flags; held redraws are not observed as falling edges.
+                    self.latest.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
+                }
             }
             IdleSource::Mic => {
                 if let Some(mic) = &self.mic {
@@ -782,6 +1260,9 @@ impl FrameSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dmg-preview")]
+    use crate::dmg_preview::DmgPreview;
+    use crate::scenes;
 
     fn parse(args: &[&str]) -> Result<ArgsCommand, AppError> {
         AppArgs::parse_from(args.iter().map(|arg| arg.to_string()))
@@ -802,6 +1283,355 @@ mod tests {
     fn default_args_are_windowed() {
         assert_eq!(parse_run(&[]), AppArgs::default());
         assert!(!AppArgs::default().fullscreen);
+        assert_eq!(AppArgs::default().scene, None);
+    }
+
+    #[cfg(not(feature = "dmg-preview"))]
+    #[test]
+    fn preview_flag_requires_feature_before_input_or_window_setup() {
+        for args in [
+            &["--dmg-preview"][..],
+            &["--dmg-preview", "--mic"][..],
+            &["--mic", "--dmg-preview"][..],
+            &["--dmg-preview", "--list-monitors"][..],
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            assert!(
+                error.contains("--dmg-preview requires the dmg-preview Cargo feature"),
+                "{args:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_run(&["--monitor", "--mic"]).monitor,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+        assert_eq!(parse_run(&["--scene", "7"]).scene, Some(7));
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_rejects_explicit_source_scene_and_overlay_options_in_either_order() {
+        let conflicts: &[&[&str]] = &[
+            &["--udp", "127.0.0.1:6464"],
+            &["--mic"],
+            &["--audio-device", "0"],
+            &["--list-audio-devices"],
+            &["--list-monitors"],
+            &["--mic-layers", "off"],
+            &["--mic-layers", "both"],
+            &["--scene", "7"],
+            &["--scene", "6"],
+            &["--layout", "auto"],
+            &["--allow-flash"],
+            &["--lines-drop-cuts"],
+            &["--tunnel-variant", "original"],
+            &["--catalog", "stars.csv"],
+            &["--star-catalog", "stars.csv"],
+            &["--location", "0,0"],
+            &["--time", "0"],
+        ];
+        for conflict in conflicts {
+            for preview_first in [true, false] {
+                let mut args = conflict.to_vec();
+                if preview_first {
+                    args.insert(0, "--dmg-preview");
+                } else {
+                    args.push("--dmg-preview");
+                }
+
+                let error = parse(&args).unwrap_err().to_string();
+                assert!(
+                    error.contains("--dmg-preview cannot be combined with"),
+                    "{error}"
+                );
+                assert!(error.contains(conflict[0]), "{error}");
+            }
+        }
+        let args = parse_run(&["--dmg-preview", "--fullscreen", "--monitor", "1"]);
+        assert!(args.dmg_preview);
+        assert!(!args.mic);
+        assert!(args.udp_endpoint.is_none());
+    }
+
+    #[test]
+    fn preview_token_cannot_be_consumed_as_a_value_before_input_setup() {
+        for flag in [
+            "--udp",
+            "--monitor",
+            "--audio-device",
+            "--layout",
+            "--mic-layers",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+        ] {
+            let error = parse(&[flag, "--dmg-preview"]).unwrap_err().to_string();
+            assert!(error.contains(&format!("{flag} requires")), "{error}");
+            assert!(error.contains("--dmg-preview is not a value"), "{error}");
+        }
+        let error = parse(&["--mic", "--audio-device", "--dmg-preview"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--audio-device requires"), "{error}");
+        // Other flag-like legacy values retain their old parsing behavior.
+        assert_eq!(
+            parse_run(&["--mic", "--audio-device", "--mic"]).audio_device,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_rejects_recognized_options_as_missing_values_in_either_order() {
+        let flags = [
+            "--udp",
+            "--monitor",
+            "--audio-device",
+            "--layout",
+            "--mic-layers",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+        ];
+        let options = [
+            "--udp",
+            "--fullscreen",
+            "--monitor",
+            "--list-monitors",
+            "--mic",
+            "--audio-device",
+            "--list-audio-devices",
+            "--layout",
+            "--allow-flash",
+            "--mic-layers",
+            "--lines-drop-cuts",
+            "--scene",
+            "--catalog",
+            "--star-catalog",
+            "--location",
+            "--time",
+            "--tunnel-variant",
+            "--help",
+            "-h",
+            "--",
+        ];
+        for flag in flags {
+            for option in options {
+                for args in [
+                    vec!["--dmg-preview", flag, option],
+                    vec![flag, option, "--dmg-preview"],
+                ] {
+                    let error = parse(&args).unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("{flag} requires")),
+                        "{args:?}: {error}"
+                    );
+                    assert!(
+                        error.contains("is an option, not a value"),
+                        "{args:?}: {error}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            parse_run(&["--monitor", "--mic"]).monitor,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+        assert_eq!(
+            parse_run(&["--mic", "--audio-device", "--mic"]).audio_device,
+            Some(DeviceSelector::Name("--mic".into()))
+        );
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_keys_cannot_toggle_overlays_or_layout_and_legacy_keys_are_unchanged() {
+        let mods = KeyModifiers::default();
+        for (key, action) in [
+            ('m', KeyAction::CycleMicLayers),
+            ('l', KeyAction::CycleLayoutPin),
+        ] {
+            assert_eq!(
+                key_action(KeyInput::Character(key), mods, false),
+                Some(action)
+            );
+            assert_eq!(
+                preview_key_action(KeyInput::Character(key), mods, false),
+                None
+            );
+        }
+        assert_eq!(
+            preview_key_action(KeyInput::Character('f'), mods, false),
+            Some(KeyAction::ToggleFullscreen)
+        );
+        assert_eq!(
+            preview_key_action(KeyInput::Escape, mods, true),
+            Some(KeyAction::ExitFullscreen)
+        );
+        assert!(
+            !parse_run(&["--udp", "127.0.0.1:6464", "--mic", "--mic-layers", "both"]).dmg_preview
+        );
+        assert_eq!(parse_run(&["--scene", "7"]).scene, Some(7));
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_zero_size_skips_acquisition_and_resize_keeps_clock() {
+        let start = Instant::now();
+        let mut preview = DmgPreview::default();
+        let mut frame = None;
+        for (size, millis) in [((160, 144), 0), ((0, 144), 100), ((320, 288), 200)] {
+            if preview_drawable(size.0, size.1) {
+                let now = start + Duration::from_millis(millis);
+                frame = Some(preview.acquired(now));
+                preview.submitted(now);
+                preview.presented(now);
+            }
+        }
+        let frame = frame.unwrap();
+        assert_eq!((frame.scx, frame.scy), (128, 1));
+        assert!(!preview_drawable(160, 0));
+        assert_eq!(preview.acquired(start + Duration::from_millis(200)), frame);
+    }
+
+    #[cfg(feature = "dmg-preview")]
+    #[test]
+    fn preview_waits_without_redraws_at_zero_size_and_resumes_after_resize() {
+        let mut redraws = 0;
+        let mut drawable = preview_drawable(160, 144);
+        request_preview_redraw(drawable, || redraws += 1);
+        assert_eq!(redraws, 1);
+
+        for size in [(0, 144), (160, 0), (0, 0)] {
+            drawable = preview_drawable(size.0, size.1);
+            for _ in 0..3 {
+                request_preview_redraw(drawable, || redraws += 1);
+            }
+        }
+        assert_eq!(redraws, 1);
+
+        drawable = preview_drawable(320, 288);
+        request_preview_redraw(drawable, || redraws += 1);
+        request_preview_redraw(drawable, || redraws += 1);
+        assert_eq!(redraws, 3);
+    }
+
+    #[test]
+    fn public_app_error_remains_exhaustively_matchable() {
+        // Mirrors a downstream exhaustive match: adding a public enum variant
+        // would make this compile-time compatibility check fail.
+        fn downstream_match(error: AppError) -> &'static str {
+            match error {
+                AppError::Window(_) => "window",
+                AppError::EventLoop(_) => "event loop",
+                AppError::Io(_) => "io",
+                AppError::Renderer(_) => "renderer",
+                AppError::Monitor(_) => "monitor",
+                AppError::Audio(_) => "audio",
+            }
+        }
+
+        assert_eq!(
+            downstream_match(invalid_input("invalid Starfield catalog".into())),
+            "io"
+        );
+    }
+
+    #[test]
+    fn scene_override_changes_only_the_displayed_scene() {
+        let frame = ControlFrame {
+            scene: 13,
+            ..ControlFrame::procedural(12)
+        };
+        let unchanged = with_scene_override(frame, None);
+        assert_eq!(unchanged.scene, 13);
+        assert_eq!(unchanged.energy, frame.energy);
+        assert_eq!(unchanged.spectrum, frame.spectrum);
+        assert_eq!(scenes::select(unchanged.scene).name, "SpectrumVolume");
+        let overridden = with_scene_override(frame, Some(6));
+        assert_eq!(overridden.scene, 6);
+        assert_eq!(overridden.energy, frame.energy);
+        assert_eq!(overridden.spectrum, frame.spectrum);
+        assert_eq!(
+            scenes::select_configured(overridden.scene, true).name,
+            "Starfield"
+        );
+
+        let legacy_six = with_scene_override(ControlFrame { scene: 6, ..frame }, None);
+        assert_eq!(scenes::select(legacy_six.scene).name, "SignalField");
+        let forced_six = with_scene_override(legacy_six, Some(6));
+        assert_eq!(
+            scenes::select_configured(forced_six.scene, true).name,
+            "Starfield"
+        );
+    }
+
+    #[test]
+    fn scene_override_is_observed_before_a_silent_udp_source_receives_a_packet() {
+        let frame = initial_scene_override(Some(6)).expect("scene override seed");
+        let mut field = colour_field::ColourField::new(colour_field::Config::default());
+        field.observe(&frame);
+        field.step(colour_field::Controls::default());
+        assert_eq!(field.display(), colour_field::Display::Native(6));
+        assert_eq!(
+            scenes::select_configured(
+                match field.display() {
+                    colour_field::Display::Native(scene) => scene,
+                    colour_field::Display::ColourField(_) => unreachable!(),
+                },
+                true,
+            )
+            .name,
+            "Starfield"
+        );
+        assert!(initial_scene_override(None).is_none());
+    }
+
+    #[test]
+    fn only_explicit_scene_six_requires_catalog() {
+        assert!(needs_starfield_catalog(6));
+        assert!(!needs_starfield_catalog(13));
+        assert!(!needs_starfield_catalog(7));
+        assert_eq!(parse_run(&["--scene", "13"]).scene, Some(13));
+        assert!(parse(&["--scene", "6"]).is_err());
+        assert!(parse(&["--udp", "127.0.0.1:6464"]).is_ok());
+    }
+
+    #[test]
+    fn help_documents_starfield_and_tunnel_options() {
+        let help = usage("chipviz");
+        assert!(help.contains("--star-catalog PATH"));
+        assert!(help.contains("--scene N"));
+        assert!(help.contains("byte 6 opts into Starfield"));
+        assert!(help.contains("--tunnel-variant MODE"));
+    }
+
+    #[test]
+    fn missing_starfield_fallback_does_not_skip_earlier_udp_batch_events() {
+        let frames = [
+            ControlFrame {
+                flags: audio::BEAT_FLAG | audio::DROP_FLAG,
+                ..ControlFrame::procedural(1)
+            },
+            ControlFrame {
+                scene: 6,
+                ..ControlFrame::procedural(2)
+            },
+        ];
+        let mut observed = Vec::new();
+        observe_fresh_frames(&frames, Some(6), 1.5, |frame, elapsed| {
+            observed.push((frame.scene, frame.flags, elapsed));
+        });
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0], (6, audio::BEAT_FLAG | audio::DROP_FLAG, 1.5));
+        assert_eq!(observed[1], (6, 0, 1.5));
+        assert!(needs_starfield_catalog(observed[1].0));
     }
 
     #[test]
@@ -811,6 +1641,148 @@ mod tests {
         assert_eq!(args.monitor, Some(DeviceSelector::Index(1)));
         assert_eq!(args.udp_endpoint.as_deref(), Some("127.0.0.1:6464"));
         assert!(!args.list_monitors);
+    }
+
+    #[test]
+    fn parses_starfield_catalog_location_and_time() {
+        assert_eq!(parse_run(&["--scene", "13"]).scene, Some(13));
+        let args = parse_run(&[
+            "--scene",
+            "6",
+            "--star-catalog",
+            "stars.csv",
+            "--location",
+            "45.5,-73.25",
+            "--time",
+            "946728000",
+        ]);
+        assert_eq!(
+            args.catalog_path.as_deref(),
+            Some(std::path::Path::new("stars.csv"))
+        );
+        assert_eq!(args.location, Some((45.5, -73.25)));
+        assert_eq!(args.unix_seconds, Some(946_728_000.0));
+        assert_eq!(args.scene, Some(6));
+        assert_eq!(
+            parse_run(&["--catalog", "stars.csv", "--location", "0,0"]).location,
+            Some((0.0, 0.0))
+        );
+        assert_eq!(
+            parse_run(&["--catalog", "stars.csv", "--location", "0,180"]).location,
+            Some((0.0, 180.0))
+        );
+        assert_eq!(
+            parse_run(&[
+                "--catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+                "--time",
+                "7289654399",
+            ])
+            .unix_seconds,
+            Some(7_289_654_399.0)
+        );
+        assert!(
+            parse(&[
+                "--catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+                "--time",
+                "7289654400",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn starfield_cli_loads_a_local_csv_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chipviz-starfield-{}-{unique}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "ra,dec,mag,ci,proper\n0,90,1,,\n").expect("write fixture");
+        let args = parse_run(&[
+            "--scene",
+            "6",
+            "--star-catalog",
+            path.to_str().expect("UTF-8 temp path"),
+            "--location",
+            "45,-73",
+            "--time",
+            "946728000",
+        ]);
+        let loaded = args.starfield_config();
+        let _ = std::fs::remove_file(&path);
+        let config = loaded
+            .expect("catalog setup")
+            .expect("configured starfield");
+        assert_eq!(config.catalog.stars().len(), 1);
+        assert_eq!(config.latitude_degrees, 45.0);
+        assert_eq!(config.longitude_degrees, -73.0);
+    }
+
+    #[test]
+    fn invalid_selected_catalog_fails_during_preflight() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chipviz-invalid-starfield-{}-{unique}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "ra,dec,mag\nnot-a-number,0,1\n").expect("write fixture");
+        let args = parse_run(&[
+            "--scene",
+            "6",
+            "--star-catalog",
+            path.to_str().expect("UTF-8 temp path"),
+            "--location",
+            "45,-73",
+        ]);
+        let result = args.starfield_config();
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "invalid catalog must fail preflight");
+    }
+
+    #[test]
+    fn rejects_incomplete_and_invalid_starfield_options() {
+        for args in [
+            &["--catalog", "stars.csv"][..],
+            &["--location", "0,0"][..],
+            &["--scene", "6"][..],
+            &["--scene", "256"][..],
+            &["--scene"][..],
+            &["--time", "1"][..],
+            &["--catalog", "stars.csv", "--location", "91,0"][..],
+            &["--catalog", "stars.csv", "--location", "0,181"][..],
+            &["--catalog", "stars.csv", "--location", "nan,0"][..],
+            &[
+                "--catalog",
+                "stars.csv",
+                "--location",
+                "0,0",
+                "--time",
+                "inf",
+            ][..],
+        ] {
+            let error = parse(args).expect_err("invalid starfield options");
+            assert!(
+                matches!(error, AppError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput),
+                "{args:?}: {error}"
+            );
+        }
+        let error = parse(&["--scene", "6"]).unwrap_err().to_string();
+        assert!(
+            error.contains("--star-catalog PATH and --location LAT,LON"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1074,6 +2046,339 @@ mod tests {
         }
     }
 
+    // First representable nanosecond at or after a rational redraw boundary.
+    fn redraw_boundary(n: u64, hz: u64) -> Duration {
+        Duration::from_nanos((n * 1_000_000_000).div_ceil(hz))
+    }
+
+    fn static_output(
+        frame: ControlFrame,
+        elapsed: Duration,
+        state: &scenes::SceneState,
+    ) -> Vec<u8> {
+        let scenes::SceneBuild::Stateful(build) = scenes::select(4).build else {
+            panic!("Static must be stateful");
+        };
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            frame,
+            elapsed.as_secs_f32(),
+            16.0 / 9.0,
+            state,
+            &mut instances,
+        );
+        bytemuck::cast_slice::<crate::scene::Instance, u8>(&instances).to_vec()
+    }
+
+    #[test]
+    fn procedural_clock_nominal_rates_and_static_match_at_common_times() {
+        fn run(hz: u64) -> Vec<Vec<u8>> {
+            let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+            let mut state = scenes::SceneState::default();
+            let mut reference = scenes::SceneState::default();
+            let mut snapshots = Vec::new();
+            let start = Instant::now();
+            for n in 0..=hz * 12 {
+                let elapsed = redraw_boundary(n, hz);
+                let frame = source.next_frame_at(start + elapsed);
+                assert!(source.fresh().len() <= 1);
+                for fresh in source.fresh() {
+                    state.observe_at(fresh, elapsed.as_secs_f64());
+                }
+                let index = n * 60 / hz + 1;
+                let expected = ControlFrame::procedural(index);
+                assert_eq!(
+                    (frame.frame, frame.beat_count, frame.scene, frame.palette),
+                    (
+                        expected.frame,
+                        expected.beat_count,
+                        expected.scene,
+                        expected.palette
+                    ),
+                    "{hz} Hz, redraw {n}"
+                );
+                if n % (hz / 60) == 0 {
+                    assert_eq!(source.fresh().len(), 1);
+                    assert_eq!(frame.flags, expected.flags);
+                    reference.observe_at(&expected, elapsed.as_secs_f64());
+                } else {
+                    assert!(source.fresh().is_empty());
+                    assert_eq!(frame.flags & 0x07, 0);
+                }
+                if n % hz == 0 {
+                    let actual = static_output(frame, elapsed, &state);
+                    let wanted = static_output(expected, elapsed, &reference);
+                    assert_eq!(actual, wanted, "Static at {hz} Hz, redraw {n}");
+                    snapshots.push(actual);
+                }
+            }
+            snapshots
+        }
+
+        assert_eq!(run(60), run(120));
+        assert_eq!(run(60), run(240));
+    }
+
+    #[test]
+    fn procedural_clock_slot_boundaries_and_minimum_gap_are_exact() {
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let start = Instant::now();
+        assert_eq!(source.next_frame_at(start).frame, 1);
+        let first = redraw_boundary(1, 60) - Duration::from_nanos(PROCEDURAL_EARLY_NS as u64);
+        source.next_frame_at(start + first - Duration::from_nanos(1));
+        assert!(source.fresh().is_empty());
+        assert_eq!(source.next_frame_at(start + first).frame, 2);
+        assert_eq!(source.fresh().len(), 1);
+
+        // A late observation in slot 1 is close to the next slot boundary.
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        source.next_frame_at(start);
+        let late = start + Duration::from_millis(26);
+        assert_eq!(source.next_frame_at(late).frame, 2);
+        let next_slot = redraw_boundary(2, 60) - Duration::from_nanos(PROCEDURAL_EARLY_NS as u64);
+        source.next_frame_at(start + next_slot);
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(late + PROCEDURAL_MIN_GAP - Duration::from_nanos(1));
+        assert!(source.fresh().is_empty());
+        assert_eq!(source.next_frame_at(late + PROCEDURAL_MIN_GAP).frame, 3);
+        assert_eq!(source.fresh().len(), 1);
+    }
+
+    #[test]
+    fn procedural_clock_stalls_duplicate_and_backwards_redraws_do_not_burst() {
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let start = Instant::now();
+        source.next_frame_at(start);
+        let stall = start + Duration::from_secs(30) + Duration::from_nanos(12_666_666);
+        assert_eq!(source.next_frame_at(stall).frame, 2);
+        assert_eq!(source.fresh().len(), 1);
+        source.next_frame_at(stall + Duration::from_nanos(1));
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(stall + PROCEDURAL_MIN_GAP);
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(stall + Duration::from_millis(10));
+        assert!(source.fresh().is_empty());
+        // Earlier than the last redraw, even though after the last emission.
+        source.next_frame_at(stall + Duration::from_millis(9));
+        assert!(source.fresh().is_empty());
+        let next =
+            stall + redraw_boundary(1, 60) - Duration::from_nanos(PROCEDURAL_EARLY_NS as u64);
+        assert_eq!(source.next_frame_at(next).frame, 3);
+        source.next_frame_at(next);
+        assert!(source.fresh().is_empty());
+        source.next_frame_at(start);
+        assert!(source.fresh().is_empty());
+    }
+
+    #[test]
+    fn procedural_clock_jitter_is_bounded_and_extreme_jitter_can_drop_a_slot() {
+        for (hz, scale) in [
+            (60_u64, 300_000_i64),
+            (120, 300_000),
+            (144, 0),
+            (144, 100_000),
+            (240, 300_000),
+        ] {
+            let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+            let mut state = scenes::SceneState::default();
+            let mut reference = scenes::SceneState::default();
+            let start = Instant::now();
+            // Fix the redraw schedule independently of the source. The 144 Hz
+            // cases cover steady 144 Hz and ±0.3 ms (so expected observations
+            // stay beyond the minimum gap); the others exercise ±0.9 ms.
+            // Exact integer-second redraws give common wall-time checkpoints.
+            let times: Vec<_> = (0..=hz * 30)
+                .map(|n| {
+                    let nominal = redraw_boundary(n, hz);
+                    let offset = if n % hz == 0 {
+                        0
+                    } else {
+                        ((n * 17 % 7) as i64 - 3) * scale
+                    };
+                    if offset < 0 {
+                        nominal - Duration::from_nanos((-offset) as u64)
+                    } else {
+                        nominal + Duration::from_nanos(offset as u64)
+                    }
+                })
+                .collect();
+            assert!(times.windows(2).all(|pair| pair[0] < pair[1]));
+
+            // Oracle: immediate startup, then the first scheduled redraw at
+            // or after each rational 60 Hz boundary minus the specified 4 ms
+            // window. This uses no clock implementation state or actual
+            // observations. The constructed schedule never misses a slot
+            // or requires rephasing/min-gap suppression.
+            let mut scheduled = vec![0_usize];
+            let mut candidate = 1;
+            for tick in 1..=1800 {
+                let threshold = redraw_boundary(tick, 60) - Duration::from_millis(4);
+                while candidate < times.len() && times[candidate] < threshold {
+                    candidate += 1;
+                }
+                assert!(candidate < times.len());
+                scheduled.push(candidate);
+            }
+            assert!(scheduled.windows(2).all(|pair| {
+                pair[0] < pair[1]
+                    && times[pair[1]] - times[pair[0]] >= Duration::from_nanos(8_333_333)
+            }));
+
+            let mut count = 0_usize;
+            let mut previous = None;
+            for (n, &elapsed) in times.iter().enumerate() {
+                let expect_fresh = scheduled.get(count) == Some(&n);
+                if expect_fresh {
+                    count += 1;
+                    let expected = ControlFrame::procedural(count as u64);
+                    reference.observe_at(&expected, elapsed.as_secs_f64());
+                }
+                let now = start + elapsed;
+                let frame = source.next_frame_at(now);
+                assert_eq!(
+                    source.fresh().len(),
+                    usize::from(expect_fresh),
+                    "{hz} Hz, jitter scale {scale} ns, redraw {n} at {elapsed:?}"
+                );
+                let mut expected = ControlFrame::procedural(count as u64);
+                if expect_fresh {
+                    if let Some(last) = previous {
+                        assert!(now.duration_since(last) >= PROCEDURAL_MIN_GAP);
+                    }
+                    previous = Some(now);
+                    state.observe_at(&source.fresh()[0], elapsed.as_secs_f64());
+                } else {
+                    expected.flags &= !(audio::BEAT_FLAG | audio::BAR_FLAG | audio::DROP_FLAG);
+                }
+                assert_eq!(
+                    (
+                        frame.frame,
+                        frame.beat_count,
+                        frame.flags,
+                        frame.energy,
+                        frame.scene,
+                        frame.palette
+                    ),
+                    (
+                        expected.frame,
+                        expected.beat_count,
+                        expected.flags,
+                        expected.energy,
+                        expected.scene,
+                        expected.palette
+                    ),
+                    "{hz} Hz, jitter scale {scale} ns, redraw {n}"
+                );
+                if (n as u64).is_multiple_of(hz) {
+                    assert_eq!(count as u64, n as u64 / hz * 60 + 1);
+                    // The reference observes at the independently scheduled
+                    // jittered times, not ideal 60 Hz times: Static's energy
+                    // slew depends on elapsed time. Different redraw rates
+                    // therefore need not produce byte-identical snapshots.
+                    assert_eq!(
+                        static_output(frame, elapsed, &state),
+                        static_output(expected, elapsed, &reference),
+                        "Static at {hz} Hz, jitter scale {scale} ns, redraw {n}"
+                    );
+                }
+            }
+            assert_eq!(count, 1801, "{hz} Hz, jitter scale {scale} ns");
+        }
+
+        // Alternating 60 Hz redraws up to 4 ms early/late are in tolerance.
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let start = Instant::now();
+        for n in 0..=600 {
+            let nominal = redraw_boundary(n, 60);
+            let elapsed = if n == 0 {
+                nominal
+            } else if n % 2 == 1 {
+                nominal - Duration::from_millis(4)
+            } else {
+                nominal + Duration::from_millis(4)
+            };
+            assert_eq!(source.next_frame_at(start + elapsed).frame, n as u16 + 1);
+            assert_eq!(source.fresh().len(), 1);
+        }
+
+        // Opposing ±7 ms redraws include 2.67 ms gaps. Skip rather than burst.
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        for n in 0..=60 {
+            let nominal = redraw_boundary(n, 60);
+            let elapsed = if n == 0 {
+                nominal
+            } else if n % 2 == 1 {
+                nominal - Duration::from_millis(7)
+            } else {
+                nominal + Duration::from_millis(7)
+            };
+            assert_eq!(
+                source.next_frame_at(start + elapsed).frame,
+                (n / 2 + 1) as u16
+            );
+            assert_eq!(source.fresh().len(), usize::from(n == 0 || n % 2 == 0));
+        }
+    }
+
+    #[test]
+    fn procedural_clock_slow_redraws_and_counter_wrap_keep_consecutive_frames() {
+        let start = Instant::now();
+        for hz in [20, 30, 45, 59] {
+            let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+            for n in 0..=hz * 3 {
+                let frame = source.next_frame_at(start + redraw_boundary(n, hz));
+                assert_eq!(frame.frame, n as u16 + 1, "{hz} Hz, redraw {n}");
+                assert_eq!(source.fresh().len(), 1);
+            }
+        }
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        source.fallback_index = u16::MAX as u64 - 1;
+        let mut state = scenes::SceneState::default();
+        let mut reference = scenes::SceneState::default();
+        for (n, expected) in [(0, u16::MAX), (1, 0), (2, 1)] {
+            let elapsed = redraw_boundary(n, 60);
+            let frame = source.next_frame_at(start + elapsed);
+            assert_eq!(frame.frame, expected);
+            assert_eq!(source.fresh().len(), 1);
+            state.observe_at(&source.fresh()[0], elapsed.as_secs_f64());
+            reference.observe_at(
+                &ControlFrame::procedural(u16::MAX as u64 + n),
+                elapsed.as_secs_f64(),
+            );
+            assert_eq!(
+                static_output(frame, elapsed, &state),
+                static_output(frame, elapsed, &reference)
+            );
+        }
+    }
+
+    #[test]
+    fn procedural_held_redraws_do_not_repeat_flags_or_step_colour_field() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        let mut source = FrameSource::with_feed(UdpFrameSource::bind(None).unwrap(), None);
+        let mut field = ColourField::new(Config::default());
+        let start = Instant::now();
+        for n in 0..=15 {
+            let time = redraw_boundary(n, 60);
+            let frame = source.next_frame_at(start + time);
+            for fresh in source.fresh() {
+                field.observe(fresh);
+            }
+            assert_eq!(frame.beat_onset(), n == 15);
+            assert_eq!(field.pending_beat_bar(), n == 15);
+            assert!(field.has_new_frame());
+            field.step(Controls::default());
+            let held = source.next_frame_at(start + time + Duration::from_millis(1));
+            assert!(!held.beat_onset());
+            assert_eq!(held.note_count, frame.note_count);
+            assert!(source.fresh().is_empty());
+            assert!(!field.has_new_frame());
+            assert!(!field.pending_beat_bar());
+        }
+    }
+
     /// A valid wire packet with optional single `(note, velocity)`.
     fn wire_packet(energy: u8, flags: u8, note: Option<(u8, u8)>) -> [u8; WIRE_SIZE] {
         let mut packet = [0; WIRE_SIZE];
@@ -1087,6 +2392,319 @@ mod tests {
         }
         packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
         packet
+    }
+
+    #[test]
+    fn live_lines_drop_edges_follow_received_duplicates_without_ticks() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        struct Live {
+            source: FrameSource,
+            sender: UdpSocket,
+            address: std::net::SocketAddr,
+            now: Instant,
+            field: ColourField,
+            reference: ColourField,
+            scenes: scenes::SceneState,
+        }
+
+        impl Live {
+            fn new(cuts: bool) -> Self {
+                let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+                let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+                Self {
+                    source: FrameSource::with_feed(udp, None),
+                    sender: UdpSocket::bind("127.0.0.1:0").unwrap(),
+                    address,
+                    now: Instant::now(),
+                    field: ColourField::new(Config::default()),
+                    reference: ColourField::new(Config::default()),
+                    scenes: scenes::SceneState::new(scenes::SceneConfig {
+                        lines_drop_cuts: cuts,
+                        ..Default::default()
+                    }),
+                }
+            }
+
+            fn batch(&mut self, frames: &[(u16, u16, u8)]) {
+                for &(counter, beat, flags) in frames {
+                    let mut packet = wire_packet(90, flags, None);
+                    packet[2..4].copy_from_slice(&counter.to_le_bytes());
+                    packet[4] = 240; // one-bar guard is 60 frames
+                    packet[6..8].copy_from_slice(&beat.to_le_bytes());
+                    packet[20] = 7;
+                    packet[21] = 3;
+                    packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+                    self.sender.send_to(&packet, self.address).unwrap();
+                }
+                // Loopback delivery can span several polls. Collect the real
+                // FrameSource observations in receive order, then observe
+                // them together as one redraw batch.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut received = Vec::new();
+                while received.len() < frames.len() {
+                    self.source.next_frame_at(self.now);
+                    received.extend_from_slice(self.source.fresh());
+                    if received.len() < frames.len() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out receiving UDP batch: got {} of {} frames",
+                            received.len(),
+                            frames.len()
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                assert_eq!(
+                    received
+                        .iter()
+                        .map(|f| (f.frame, f.beat_count, f.flags))
+                        .collect::<Vec<_>>(),
+                    frames
+                );
+                self.observe_batch(&received);
+            }
+
+            fn held_redraw(&mut self) {
+                self.source.next_frame_at(self.now);
+                assert!(self.source.fresh().is_empty());
+                self.observe_batch(&[]);
+            }
+
+            fn observe_batch(&mut self, frames: &[ControlFrame]) {
+                observe_fresh_frames(frames, None, 0.0, |frame, elapsed| {
+                    crate::renderer::observe_live_states(
+                        &mut self.field,
+                        &mut self.scenes,
+                        frame,
+                        elapsed,
+                    );
+                    self.reference.observe(frame);
+                });
+                assert_eq!(self.field.has_new_frame(), self.reference.has_new_frame());
+                if self.field.has_new_frame() {
+                    assert_eq!(
+                        self.field.step(Controls::default()),
+                        self.reference.step(Controls::default())
+                    );
+                }
+                // Includes the debounce, onset history and all safety gates.
+                assert_eq!(format!("{:?}", self.field), format!("{:?}", self.reference));
+            }
+        }
+
+        let drop = audio::DROP_FLAG;
+        // After the first rising edge and its guard, a duplicate low re-arms
+        // the next frame's high even though the last distinct frame was high.
+        let mut second_edge = Live::new(true);
+        second_edge.batch(&[(9, 0, 0), (10, 0, drop)]);
+        assert_eq!(second_edge.scenes.lines.section(), 1);
+        for counter in [18, 26, 34, 42, 50, 58, 66, 70] {
+            second_edge.batch(&[(counter, 0, drop)]);
+        }
+        second_edge.batch(&[(70, 0, 0), (71, 0, drop)]);
+        assert_eq!(second_edge.scenes.lines.section(), 2);
+
+        // A duplicate low is observed before the next counter's high, even in
+        // one receive batch. A held redraw's cleared flags are not observed.
+        let mut live = Live::new(true);
+        live.batch(&[(10, 15, drop)]);
+        live.batch(&[(10, 16, 0), (11, 15, drop)]);
+        assert_eq!(
+            (live.scenes.lines.section(), live.scenes.lines.morph()),
+            (1, 1.0)
+        );
+        live.held_redraw();
+        // Advance 60 frames without a new edge, including the held redraw.
+        for counter in [19, 27, 35, 43, 51, 59, 67, 71] {
+            live.batch(&[(counter, 15, drop)]);
+        }
+        assert_eq!(live.scenes.lines.section(), 1);
+        let static_before = format!("{:?}", live.scenes.static_noise);
+        live.batch(&[(71, 16, 0), (71, 16, drop)]);
+        assert_eq!(
+            (live.scenes.lines.section(), live.scenes.lines.morph()),
+            (2, 0.0)
+        );
+        assert_eq!(format!("{:?}", live.scenes.static_noise), static_before);
+        assert!(!live.field.has_new_frame());
+
+        // A duplicate edge inside the guard is discarded, not delayed. It
+        // cannot earn a frame or beat tick, including at the boundary.
+        live.batch(&[(71, 16, 0), (71, 16, drop)]);
+        for counter in [79, 87, 95, 103, 111, 119, 127, 130] {
+            live.batch(&[(counter, 15, drop)]);
+        }
+        for _ in 0..3 {
+            live.batch(&[(130, 16, 0), (130, 16, drop)]);
+        }
+        assert_eq!(live.scenes.lines.section(), 2);
+        live.batch(&[(131, 15, drop)]);
+        assert_eq!(live.scenes.lines.section(), 2);
+        live.batch(&[(131, 16, 0), (131, 16, drop)]);
+        assert_eq!(live.scenes.lines.section(), 3);
+
+        // Disabled cuts ignore both duplicate and ordinary DROP rises; a
+        // duplicate beat boundary alone must not trigger a phrase.
+        let mut disabled = Live::new(false);
+        disabled.batch(&[(10, 15, 0)]);
+        let static_before = format!("{:?}", disabled.scenes.static_noise);
+        disabled.batch(&[(10, 16, drop), (10, 16, 0), (10, 16, drop)]);
+        assert_eq!(disabled.scenes.lines.section(), 0);
+        assert_eq!(format!("{:?}", disabled.scenes.static_noise), static_before);
+        assert!(!disabled.field.has_new_frame());
+        disabled.batch(&[(11, 15, 0), (12, 15, drop)]);
+        assert_eq!(disabled.scenes.lines.section(), 0);
+        disabled.batch(&[(13, 16, 0)]);
+        assert_eq!(disabled.scenes.lines.section(), 1);
+
+        // Legacy/replay observation retains its duplicate-counter behavior.
+        let mut replay = scenes::SceneState::new(scenes::SceneConfig {
+            lines_drop_cuts: true,
+            ..Default::default()
+        });
+        for (counter, flags) in [(10, drop), (10, 0), (11, drop)] {
+            replay.observe_at(
+                &ControlFrame {
+                    frame: counter,
+                    beat_count: 0,
+                    flags,
+                    ..ControlFrame::procedural(0)
+                },
+                0.0,
+            );
+        }
+        assert_eq!(replay.lines.section(), 0);
+    }
+
+    #[test]
+    fn live_mic_counter_collision_rearms_lines_drop_without_ticks() {
+        use crate::scenes::colour_field::{ColourField, Config, Controls};
+
+        // Wait for the datagram without polling FrameSource: an empty poll
+        // after the hold expires would itself generate a fresh mic frame.
+        fn receive_udp(
+            source: &mut FrameSource,
+            sender: &UdpSocket,
+            address: std::net::SocketAddr,
+            now: Instant,
+        ) {
+            let mut packet = wire_packet(90, audio::DROP_FLAG, None);
+            packet[2..4].copy_from_slice(&1u16.to_le_bytes());
+            packet[6..8].copy_from_slice(&15u16.to_le_bytes());
+            packet[WIRE_SIZE - 1] = packet[..WIRE_SIZE - 1].iter().fold(0, |a, b| a ^ b);
+            sender.send_to(&packet, address).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut peek = [0; WIRE_SIZE];
+            loop {
+                match source.udp.socket.as_ref().unwrap().peek_from(&mut peek) {
+                    Ok((size, _)) => {
+                        assert_eq!(size, WIRE_SIZE);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for UDP packet"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("UDP peek failed: {error}"),
+                }
+            }
+            source.next_frame_at(now);
+            assert!(!source.showing_mic());
+            assert_eq!(source.fresh().len(), 1);
+            let frame = source.fresh()[0];
+            assert_eq!(
+                (frame.frame, frame.beat_count, frame.flags),
+                (1, 15, audio::DROP_FLAG)
+            );
+        }
+
+        fn observe(source: &FrameSource, field: &mut ColourField, scenes: &mut scenes::SceneState) {
+            observe_fresh_frames(source.fresh(), None, 0.0, |frame, elapsed| {
+                crate::renderer::observe_live_states(field, scenes, frame, elapsed);
+            });
+        }
+
+        let udp = UdpFrameSource::bind(Some("127.0.0.1:0")).unwrap();
+        let address = udp.socket.as_ref().unwrap().local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures {
+            beat_count: 16,
+            ..AudioFeatures::default()
+        }));
+        let mut source = FrameSource::with_feed(udp, Some(Box::new(FakeMic(feed))));
+        let mut field = ColourField::new(Config::default());
+        let mut scenes = scenes::SceneState::new(scenes::SceneConfig {
+            lines_drop_cuts: true,
+            ..Default::default()
+        });
+        let start = Instant::now();
+
+        // UDP does not advance the fallback index, so the first mic frame
+        // naturally collides with this UDP counter of 1.
+        receive_udp(&mut source, &sender, address, start);
+        observe(&source, &mut field, &mut scenes);
+        assert!(field.has_new_frame());
+        field.step(Controls::default());
+        let lines_before = format!("{:?}", scenes.lines);
+        assert!(lines_before.contains("flags: 4"));
+        let static_before = format!("{:?}", scenes.static_noise);
+
+        source.next_frame_at(start + UDP_HOLD + Duration::from_millis(1));
+        assert!(source.showing_mic());
+        assert_eq!(source.fresh().len(), 1);
+        let mic = source.fresh()[0];
+        assert_eq!((mic.frame, mic.beat_count, mic.flags), (1, 16, 0));
+        observe(&source, &mut field, &mut scenes);
+        // Only flag history changed: no frame or beat tick, including the
+        // apparent 15 -> 16 phrase boundary, and no Static or field step.
+        assert_eq!(
+            format!("{:?}", scenes.lines),
+            lines_before.replace("flags: 4", "flags: 0")
+        );
+        assert_eq!(format!("{:?}", scenes.static_noise), static_before);
+        assert!(!field.has_new_frame());
+
+        receive_udp(
+            &mut source,
+            &sender,
+            address,
+            start + UDP_HOLD + Duration::from_millis(1),
+        );
+        observe(&source, &mut field, &mut scenes);
+        assert_eq!((scenes.lines.section(), scenes.lines.morph()), (1, 1.0));
+        assert_eq!(format!("{:?}", scenes.static_noise), static_before);
+        assert!(!field.has_new_frame());
+    }
+
+    #[test]
+    fn mic_counter_discontinuity_resynchronizes_the_live_source() {
+        let feed = std::rc::Rc::new(std::cell::Cell::new(AudioFeatures::default()));
+        let mut source = FrameSource::with_feed(
+            UdpFrameSource::bind(None).unwrap(),
+            Some(Box::new(FakeMic(feed.clone()))),
+        );
+        let now = Instant::now();
+        for (count, flags) in [
+            (1000, 0),
+            (0, 0),
+            (1, audio::BEAT_FLAG),
+            (8, 0),
+            (9, audio::BEAT_FLAG),
+            (12, audio::BEAT_FLAG | audio::BAR_FLAG),
+            (u16::MAX, 0),
+            (0, audio::BEAT_FLAG | audio::BAR_FLAG),
+        ] {
+            feed.set(AudioFeatures {
+                beat_count: count,
+                ..AudioFeatures::default()
+            });
+            let frame = source.next_frame_at(now);
+            assert_eq!((frame.beat_count, frame.flags), (count, flags), "{count}");
+        }
     }
 
     #[test]
@@ -1430,6 +3048,12 @@ mod tests {
             "--allow-flash",
             "--mic-layers off|scope|bursts|both",
             "--lines-drop-cuts",
+            "--star-catalog PATH",
+            "--catalog FILE",
+            "--location LAT,LON",
+            "--time UNIX_SECONDS",
+            "--scene N",
+            "Scene 6 requires both --star-catalog and --location",
             "cycle the colour-field layout pin",
             "cycle the mic layers",
             "Esc",

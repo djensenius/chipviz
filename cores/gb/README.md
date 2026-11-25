@@ -136,6 +136,72 @@ source on the operator build must use the same path.
 DMG-style scroll/window/sprite-lane parameters for host simulation.
 `cores/gb/homebrew` contains the RGBDS project for `chipviz-gb.gb`.
 
+### Isolated Lines scene
+
+`homebrew/lines.asm` is not included in the ROM or selected by the existing
+controls. Its mirrored plane uses receding grid bars; its hallway uses nested
+frames. Energy changes vertical scroll speed, while the grayscale palette
+stays fixed. It does not implement the modern renderer's continuous fold,
+spectral lines or beat-count sections. The pad has no spectrum, and there is
+no GB beat-count or BPM input. A caller requests a look; changes within one
+visit are at least 240 steps apart, including the first after load. These
+changes are still abrupt map switches, not an animated fold. A gradual
+transition needs a safe VRAM ownership and VBlank update design. No control
+mapping or automatic selection is defined here.
+
+`LinesLoad` requires the LCD off and copies 32 2bpp tiles (512 bytes) to
+`$8000` and two 1024-byte maps to `$9800` and `$9C00`. The assembled scene
+uses 4 bytes of state and 2560 bytes of asset ROM; the current RGBDS object
+has 164 bytes of code before linking. `LinesStep` takes the requested look in
+A and energy in B and prepares the existing four display shadows; it makes
+no VRAM writes. The existing VBlank path would write those four registers.
+
+This is **not** an integration protocol: loading destroys native tiles and
+both native and colour-field maps, including the operator warning. The
+future adapter must safely load and restore all overwritten VRAM, preserve
+the scene-7 debounce, warning and data/operator palette gates, and bound
+transitions across visits (reloading resets the look guard). It must not
+repurpose controls before #140. Disabling the LCD or switching scenes may
+itself cause an unmeasured full-field change. Runtime cycle/VBlank budgets,
+actual ROM placement and RAM coexistence also require verification.
+
+`tests/test_gb_lines.py` compares assembled tile and map bytes against a
+pixel oracle and checks all three source configurations. The test-only
+`tests/fixtures/gb_lines_execution.asm` links the actual scene into a separate
+mailbox fixture; it is not included in production. Its execution tests check
+the look hold, speed boundaries, scroll, display shadows and reload. The
+fixture deliberately corrupts the Lines VRAM before reloading with the LCD
+off; it does not implement safe restoration of the other scenes. A test-only
+present command writes the prepared BGP, scroll and LCDC shadows immediately
+after waiting for VBlank, without writing VRAM. A prepared pixel test waits
+two frames after each present, then compares plane and hallway frames against
+a host decoder of the fixture's copied tile/map bytes and actual shadows.
+The decoder assumes unsigned BG tiles, no window or sprites, and SameBoy's
+fixed DMG greyscale shades (255, 170, 85, 0). Fixture build and host-oracle
+checks run without an emulator in the RGBDS-equipped Game Boy ROM CI job;
+the Python job skips RGBDS-dependent tests, and CI skips SameBoy execution.
+When a SameBoy libretro core is available and the emulator slot is free, run:
+
+```sh
+CHIPVIZ_GB_LINES_EXECUTION=1 python3 -m unittest discover -s tests -p test_gb_lines_execution.py -v
+```
+
+The separate roundtrip fixture interposes on the real routines for both roles,
+restores native VRAM and prepared registers, and compares native pixels before
+and after a Lines visit. Its still-frame comparisons freeze all steps,
+including scene-7 clocks and budgets; they do not compare active colour-field
+restoration pixels. The signed-tile fixture stages repeated diagnostic stripes
+with the LCD off, not Lines artwork, and checks native restoration, VRAM
+ownership and field/warning priority. Its inspection also uses LCD-off
+staging and its still comparisons freeze steps and budgets.
+
+These fixtures and the separate present command and frame delay are test
+assumptions, not evidence of a production handoff, live VBlank staging or
+timing, visual safety, or physical hardware behavior. Production dispatch,
+VRAM ownership/restoration and physical timing remain unverified. Integration,
+flash measurement and hardware testing remain necessary; this is not a
+physical-hardware safety certification.
+
 ## Connection path
 
 Start with baked/procedural playback and Pocket Dock controller input. A link

@@ -43,6 +43,9 @@ assets/
   scenes/   Shared scene sketches and data-driven visual definitions.
 ```
 
+For private local video browsing, see the
+[local review gallery](docs/local-review.md). It does not publish recordings.
+
 ## Shared control model
 
 The first common interface is a compact frame that every platform can interpret in its own way:
@@ -80,7 +83,7 @@ Build one self-running demo per platform before live input:
 6. `chipviz-genesis`: VDP plane and palette visualizer for YM2612 plus SN76489.
 7. `chipviz-nes`: NROM tile/palette visualizer for 2A03 telemetry.
 8. `chipviz-sms`: SMS VDP channel-meter visualizer for SN76489 telemetry.
-9. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets.
+9. `chipviz-pi5` / `chipviz-m1`: 4K data fields, layered planes, and camera motion using the same scene controls at different quality budgets; the modern renderer also offers catalog-driven Starfield scene 6.
 
 ## Releases
 
@@ -91,6 +94,79 @@ builds `chipviz-gba.gba` with devkitPro, `chipviz-n64.z64` with libdragon,
 `chipviz-c64.prg` with cc65, `chipviz-gb.gb` with RGBDS, and
 `chipviz-nes.nes` with ca65. Generated C64/Genesis/NES/SMS assets remain
 SDK-free fallbacks for local packaging when those toolchains are not installed.
+
+The `chipviz-v0.1.4` modern renderer assets are x86-64 Linux binaries, as are
+the current release workflow's outputs. The `chipviz-pi5` and `chipviz-m1`
+names select rendering profiles; those files are not native ARM64 Raspberry Pi
+or macOS executables. To run on those targets, build from source as described
+in the [modern renderer guide](renderers/modern/README.md). Native release work
+is tracked in [#215](https://github.com/djensenius/chipviz/issues/215) and
+[#216](https://github.com/djensenius/chipviz/issues/216).
+
+### Local Apple Silicon archive
+
+On an Apple Silicon Mac with the mise Rust toolchain, the
+`aarch64-apple-darwin` target, and Xcode command-line tools available, wait
+for the serialized build slot before running the following from the checkout
+root. The packager first creates a fresh private output directory without
+following symlinks. The build uses a separate fresh directory in macOS's
+`/private/tmp`, not the checkout's potentially symlinked Cargo target path:
+
+```sh
+(
+set -eu
+checkout=$(pwd -P)
+out_dir="$checkout/build/macos-arm64/package"
+cargo_home="$HOME/.cargo"
+export TMPDIR=/private/tmp
+mise exec -- python scripts/package-macos-arm64.py --prepare-output-dir "$out_dir"
+mise exec -- python scripts/package-macos-arm64.py --check-cargo-home "$cargo_home"
+cargo_dir=$(mktemp -d /private/tmp/chipviz-cargo.XXXXXXXX)
+CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$cargo_dir/target" \
+  CARGO_BUILD_TARGET_DIR="$cargo_dir/target" \
+  CARGO_BUILD_BUILD_DIR="$cargo_dir/intermediate" mise exec -- cargo \
+  --config "build.build-dir='$cargo_dir/intermediate'" build \
+  --target-dir "$cargo_dir/target" --locked --offline \
+  --manifest-path renderers/modern/Cargo.toml --release \
+  --target aarch64-apple-darwin --bin chipviz-m1
+mise exec -- python scripts/package-macos-arm64.py \
+  --binary "$cargo_dir/target/aarch64-apple-darwin/release/chipviz-m1" \
+  --output "$out_dir/chipviz-macos-arm64.zip"
+)
+```
+
+The existing `build` directory must be user-owned and not group/world-writable;
+`build/macos-arm64` must be user-owned and private. The preparation command
+creates these directories if missing and refuses an existing `package`
+directory; choose a different fresh name on retry. Preparation can leave
+created directories if it fails. The private Cargo directory is not removed
+automatically. Cargo's command-line target and build-directory overrides take
+precedence over their environment and configuration values; the corresponding
+environment variables are also set explicitly. The command ignores inherited
+`CARGO_HOME` and checks the account's own pre-existing `~/.cargo` for unsafe
+links and permissions; it must not overlap the checkout. Every ancestor from
+`/` through the account home must be root- or user-owned and not group/world
+writable, including sticky directories. The account and Cargo homes must be
+user-owned. ACLs are not checked. Its registry index,
+cache and sources must already be populated in a trusted setup; the check
+does not prove all locked dependencies
+are present. Cargo's offline resolution fails if required data is unavailable;
+this setup does not populate dependencies, and Cargo may modify the selected
+cache. The check does not inspect tool links inside
+`.cargo/bin`, and Cargo, its configuration, wrappers and build dependencies
+are not sandboxed. The packager rejects symlinks, existing targets
+and unsafe input permissions. It copies the
+owner-executable binary and `LICENSE`, `COMMERCIAL.md`, and
+`THIRD_PARTY_NOTICES/rust.md` into the ZIP. Snapshot limits are 256 MiB for
+the binary and 8 MiB per notice. If packaging fails, a partial archive may
+remain; inspect it and use another fresh directory before retrying.
+
+This is an opt-in, non-publishing local archive, not a release workflow or a
+personal star-catalog bundle. The packaging check is headless: Mach-O headers
+alone do not establish runtime compatibility, rendering, or visual safety.
+The archive is not signed or notarized by this tool, and its notices do not
+grant redistribution or other licensing clearance. Path and input checks
+cannot prevent races by the same account.
 
 All SNES ROMs, including the generated diagnostic seed and SDK build, are
 temporarily omitted from future individual release assets and combined zips;
@@ -114,14 +190,39 @@ just lint
 just test
 just simulate
 just modern-m1 -- --udp 127.0.0.1:6464
+just modern-m1 -- --scene 6 --star-catalog /path/to/stars.csv --location 45.5,-73.25
 python3 host/bridge/chipviz_bridge.py --frames 120 --output build/demo.cvz
 python3 host/bridge/chipviz_encode.py --verify-fixtures
 ```
+
+The modern renderer's scene 6 requires a user-supplied HYG-compatible CSV via
+`--star-catalog PATH` (`--catalog` is an alias) and
+observer coordinates (`--location LAT,LON`, decimal degrees, longitude east).
+An optional `--time UNIX_SECONDS` selects a UTC observation time; otherwise it
+uses current UTC. No star catalog is bundled while catalog licensing research
+is unresolved. See [`renderers/modern/README.md`](renderers/modern/README.md)
+for the CSV schema and the projection's accuracy limits.
 
 Each platform entrypoint consumes the shared `control-frame-v0` shape through a
 small connection abstraction. Until a live receiver is supplied, the connection
 generates deterministic procedural frames so every target has an immediate
 visualization loop.
+
+The procedural formula is an implementation convention, not a v0 wire
+requirement. For indices 0..65535, C, Python, and the modern renderer use
+the beat count modulo 24 for the note on an onset. The modern renderer formerly
+truncated the beat to eight bits first: its fallback notes intentionally change
+starting at frame 4096 (48 becomes 64), which can change visuals and generated
+captures; frames before 4096 are unchanged.
+
+The generators retain their existing wrap behavior. The C connection restarts
+its 16-bit procedural index after 65535, so its next note is 48 with beat 0
+and scene 0. Rust and Python continue their wider index: at 65536 the wire
+frame is 0 but the beat is 4096, note 64, and scene 1. Both wrap the wire beat
+at 65536 beats; Rust calculates notes from that wrapped beat, while Python uses
+the full beat before wrapping (at frame 1048576, notes 48 and 64 respectively).
+No parity beyond C's 16-bit input domain is promised. Scene, palette, flags,
+transport, and flash behavior are unchanged.
 
 ## License
 
@@ -143,8 +244,9 @@ Contributions are accepted under the contributor licence agreement in
 Third-party components keep their own licences. Toolchains and SDKs fetched at
 build time, such as libdragon, devkitPro, cc65, PVSnesLib, RGBDS, and the
 Raspberry Pi pico-sdk, are not redistributed in this repository. Rust crates
-are fetched by Cargo under their own licences. Future embedded data, such as
-the HYG star catalog (CC BY-SA 4.0), will carry its own notices.
+are fetched by Cargo under their own licences. The modern Starfield scene
+accepts a user-supplied catalog; HYG/catalog redistribution licensing research
+is unresolved, so no star data is bundled.
 
 Notices for third-party code shipped in release binaries are in
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES): [rust.md](THIRD_PARTY_NOTICES/rust.md)

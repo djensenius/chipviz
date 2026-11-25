@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from dataclasses import replace
 from unittest import mock
 
 
@@ -90,6 +91,62 @@ class CatalogTests(unittest.TestCase):
     with self.assertRaises(ValueError, msg=message):
       self.open_bytes(data)
 
+  def test_direct_catalog_and_record_construction_is_rejected(self) -> None:
+    for wire in (record(family=6, metadata=star_metadata()), b"malformed"):
+      with self.subTest(wire=wire):
+        stream = io.BytesIO(wire)
+        self.addCleanup(stream.close)
+        for kwargs in ({}, {"_capability": object()}):
+          with self.assertRaisesRegex(TypeError, "open_catalog"):
+            catalog.Catalog(stream, header(1), 1, **kwargs)
+          self.assertFalse(stream.closed)
+          self.assertEqual(stream.tell(), 0)
+          self.assertEqual(stream.getvalue(), wire)
+          with self.assertRaisesRegex(TypeError, "open_catalog"):
+            catalog.Record(wire, 0, 0, 6, 0, bytes(84), **kwargs)
+
+  def test_catalog_creation_failure_closes_snapshot_and_preserves_error(self) -> None:
+    failure = RuntimeError("injected construction failure")
+
+    class CloseFailingSnapshot(io.BytesIO):
+      def close(self) -> None:
+        if not self.closed:
+          super().close()
+          raise OSError(errno.EIO, "injected snapshot close failure")
+
+    snapshot = CloseFailingSnapshot()
+    copies = []
+    real_open = catalog._open_regular
+
+    def capture_input(fd: int):
+      copy = real_open(fd)
+      copies.append(copy)
+      return copy
+
+    self.path.write_bytes(GOLDEN_HEADER + GOLDEN_RECORD)
+    with self.path.open("rb", buffering=0) as source:
+      with mock.patch.object(catalog, "_open_regular", side_effect=capture_input):
+        with mock.patch.object(catalog.tempfile, "TemporaryFile", return_value=snapshot):
+          with mock.patch.object(catalog, "Catalog", side_effect=failure):
+            with self.assertRaises(RuntimeError) as error:
+              catalog.open_catalog(source.fileno())
+      self.assertIs(error.exception, failure)
+      self.assertTrue(snapshot.closed)
+      self.assertEqual(len(copies), 1)
+      self.assertTrue(copies[0].closed)
+      source.seek(0)
+      self.assertEqual(source.read(4), b"CVXE")
+
+  def test_record_replace_is_unsupported(self) -> None:
+    with self.open_bytes(GOLDEN_HEADER + GOLDEN_RECORD) as result:
+      item = result.record(0)
+      for changes in ({}, {"family": 6}):
+        with self.subTest(changes=changes):
+          with self.assertRaisesRegex(TypeError, "records must come from open_catalog"):
+            replace(item, **changes)
+      self.assertEqual(item.envelope, GOLDEN_RECORD)
+      self.assertEqual(result.record(0), item)
+
   def test_normative_golden_and_crc(self) -> None:
     self.assertEqual(zlib.crc32(b"123456789"), 0xCBF43926)
     self.assertEqual(record(), GOLDEN_RECORD)
@@ -148,13 +205,16 @@ class CatalogTests(unittest.TestCase):
       metadata = star_metadata() if family == 6 else bytes(84)
       for variant in range(limit + 1):
         with self.subTest(family=family, variant=variant):
-          with self.open_bytes(header(1) + record(family=family, variant=variant,
-                                                  metadata=metadata)) as result:
+          data = header(1) + record(family=family, variant=variant, metadata=metadata)
+          if family == 6:
+            with self.assertRaises(catalog.UnavailableSceneError):
+              self.open_bytes(data)
+            continue
+          with self.open_bytes(data) as result:
             item = result.record(0)
             self.assertEqual((item.family, item.variant), (family, variant))
             self.assertEqual(item.metadata, metadata)
-            self.assertEqual(item.renderer_availability,
-                             "unavailable" if family == 6 else "unassessed")
+            self.assertEqual(item.renderer_availability, "unassessed")
       self.assert_invalid(header(1) + record(family=family, variant=limit + 1,
                                               metadata=metadata))
 
@@ -228,16 +288,27 @@ class CatalogTests(unittest.TestCase):
       self.assertEqual(result.record(65_536).envelope[26:28], b"\x00\x00")
       self.assertEqual(result.record(65_536).tick, 65_536)
 
+  def test_starfield_unavailable_rejection(self) -> None:
+    for data in (
+      header(1) + record(family=6, metadata=star_metadata()),
+      header(2) + record() + record(1, family=6, metadata=star_metadata()),
+    ):
+      with self.subTest(count=int.from_bytes(data[8:16], "little")):
+        with self.assertRaisesRegex(catalog.UnavailableSceneError, "Starfield.*unavailable"):
+          with self.open_bytes(data):
+            pass
+
   def test_starfield_structure_without_claiming_availability(self) -> None:
     metadata = star_metadata(latitude=900_000_000, longitude=-1_800_000_000,
                              elevation=100_000_000)
     sequence = record(0, family=6, metadata=metadata) + record(1) + record(
       2, family=6, metadata=metadata
     )
-    with self.open_bytes(header(3) + sequence) as result:
-      self.assertEqual(result.record(2).metadata, metadata)
-      self.assertEqual(result.record(2).renderer_availability, "unavailable")
-    self.assert_invalid(header(1) + record(family=6))
+    with self.assertRaises(catalog.UnavailableSceneError):
+      self.open_bytes(header(3) + sequence)
+    with self.assertRaisesRegex(ValueError, "missing Starfield digest") as error:
+      self.open_bytes(header(1) + record(family=6))
+    self.assertIs(type(error.exception), ValueError)
     for metadata in (
       bytes(32) + star_metadata()[32:],
       star_metadata()[:52] + bytes(32),
@@ -248,11 +319,62 @@ class CatalogTests(unittest.TestCase):
       star_metadata(elevation=-12_000_001),
       star_metadata(elevation=100_000_001),
     ):
-      self.assert_invalid(header(1) + record(family=6, metadata=metadata))
-    self.assert_invalid(header(2) + record(family=6, metadata=star_metadata()) +
-                        record(1, family=6, metadata=star_metadata(latitude=1)))
-    self.assert_invalid(header(2) + record() +
-                        record(1, family=6, metadata=star_metadata(epoch=4_102_444_799_999)))
+      with self.subTest(metadata=metadata):
+        with self.assertRaises(ValueError) as error:
+          self.open_bytes(header(1) + record(family=6, metadata=metadata))
+        self.assertIs(type(error.exception), ValueError)
+    with self.assertRaisesRegex(ValueError, "Starfield metadata changed") as error:
+      self.open_bytes(header(2) + record(family=6, metadata=star_metadata()) +
+                      record(1, family=6, metadata=star_metadata(latitude=1)))
+    self.assertIs(type(error.exception), ValueError)
+    with self.assertRaisesRegex(ValueError, "Starfield sky time out of range") as error:
+      self.open_bytes(header(2) + record() +
+                      record(1, family=6, metadata=star_metadata(epoch=4_102_444_799_999)))
+    self.assertIs(type(error.exception), ValueError)
+
+  def test_structural_errors_after_starfield_precede_unavailability(self) -> None:
+    star = record(family=6, metadata=star_metadata())
+    bad = bytearray(record(1))
+    bad[-1] ^= 1
+    for data, message in (
+      (header(2) + star + bad, "invalid record CRC"),
+      (header(1) + star + b"x", "trailing bytes"),
+      (header(2) + record() + record(1, family=6, metadata=bytes(84)),
+       "missing Starfield digest"),
+    ):
+      with self.subTest(message=message):
+        with self.assertRaisesRegex(ValueError, message) as error:
+          self.open_bytes(data)
+        self.assertIs(type(error.exception), ValueError)
+
+  def test_unavailable_and_malformed_cleanup(self) -> None:
+    for metadata, error_type in (
+      (star_metadata(), catalog.UnavailableSceneError),
+      (bytes(84), ValueError),
+    ):
+      with self.subTest(error_type=error_type):
+        self.path.write_bytes(header(2) + record() + record(1, family=6, metadata=metadata))
+        snapshot = tempfile.TemporaryFile(mode="w+b")
+        self.addCleanup(snapshot.close)
+        copies = []
+        real_open = catalog._open_regular
+
+        def capture_input(fd: int):
+          copy = real_open(fd)
+          copies.append(copy)
+          return copy
+
+        with self.path.open("rb", buffering=0) as source:
+          with mock.patch.object(catalog, "_open_regular", side_effect=capture_input):
+            with mock.patch.object(catalog.tempfile, "TemporaryFile", return_value=snapshot):
+              with self.assertRaises(error_type) as error:
+                catalog.open_catalog(source.fileno())
+          self.assertIs(type(error.exception), error_type)
+          self.assertTrue(snapshot.closed)
+          self.assertEqual(len(copies), 1)
+          self.assertTrue(copies[0].closed)
+          source.seek(0)
+          self.assertEqual(source.read(4), b"CVXE")
 
   def test_reads_are_bounded(self) -> None:
     class GuardedInput(io.BytesIO):

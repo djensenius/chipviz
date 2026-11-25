@@ -1,0 +1,2013 @@
+//! Catalog-driven local-sky star field.
+
+use std::io::{Cursor, Read};
+use std::sync::Arc;
+
+use super::{CameraMode, SceneBuild, SceneEntry};
+use crate::control_frame::ControlFrame;
+use crate::profile::RenderProfile;
+use crate::scene::Instance;
+use crate::scenes::SceneState;
+
+pub const ENTRY: SceneEntry = SceneEntry {
+    name: "Starfield",
+    camera: CameraMode::ScreenSpace,
+    build: SceneBuild::ViewportStateful(build),
+};
+pub const SCENE: u8 = 6;
+pub const MAX_RENDERED_MAGNITUDE: f64 = 6.5;
+pub const STARFIELD_SNAPSHOT_PERIOD_SECONDS: f64 = 10.0;
+const MAX_STAR_LINEAR_LUMINANCE: f32 = 0.05;
+const MAX_RENDERED_STARS: usize = 200;
+const MAX_CATALOG_ROWS: usize = 131_072;
+const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CSV_RECORD_BYTES: usize = 1024 * 1024;
+const RIGHT_ASCENSION_BINS: usize = 48;
+const DECLINATION_BINS: usize = 18;
+const MIN_STAR_MAGNITUDE: f64 = -2.0;
+const BRIGHTNESS_DECADES_PER_MAGNITUDE: f64 = 0.23;
+const LINEAR_LIGHT_TONE_EXPONENT: f64 = 0.5;
+const MAX_STAR_OUTPUT_LUMINANCE: f32 = 0.02;
+const MIN_STAR_TINT_LUMINANCE_BOUND: f32 = 0.403;
+
+#[derive(Clone, Debug)]
+pub struct StarfieldConfig {
+    pub catalog: Arc<StarCatalog>,
+    pub latitude_degrees: f64,
+    pub longitude_degrees: f64,
+    pub unix_seconds: f64,
+    /// Advance from the base UTC epoch with the renderer's monotonic clock.
+    pub follow_elapsed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionKey {
+    catalog: usize,
+    latitude: u64,
+    longitude: u64,
+    epoch: u64,
+    viewport: (u32, u32),
+    aspect: u32,
+    instance_budget: usize,
+    existing_instances: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectionCache {
+    key: ProjectionKey,
+    instances: Vec<Instance>,
+    /// Monotonic rebuild count used to verify cache hits in unit tests.
+    rebuilds: u64,
+}
+
+impl ProjectionKey {
+    fn new(
+        config: &StarfieldConfig,
+        profile: &RenderProfile,
+        viewport: (u32, u32),
+        aspect: f32,
+        existing_instances: usize,
+        elapsed: f32,
+    ) -> Self {
+        Self {
+            catalog: Arc::as_ptr(&config.catalog) as usize,
+            latitude: config.latitude_degrees.to_bits(),
+            longitude: config.longitude_degrees.to_bits(),
+            epoch: config.epoch_at(elapsed).to_bits(),
+            viewport,
+            aspect: aspect.to_bits(),
+            instance_budget: profile.instance_count,
+            existing_instances,
+        }
+    }
+}
+
+fn star_brightness(magnitude: f64) -> f32 {
+    // Keep this square-root magnitude scalar for the existing point-size
+    // curve. The output luminance is compressed separately below.
+    let relative_brightness =
+        10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (magnitude - MIN_STAR_MAGNITUDE));
+    (f64::from(MAX_STAR_LINEAR_LUMINANCE) * relative_brightness.powf(LINEAR_LIGHT_TONE_EXPONENT))
+        .clamp(0.0, f64::from(MAX_STAR_LINEAR_LUMINANCE)) as f32
+}
+
+fn star_output_luminance(brightness: f32) -> f32 {
+    MAX_STAR_OUTPUT_LUMINANCE * (brightness / MAX_STAR_OUTPUT_LUMINANCE).tanh()
+}
+
+fn star_size_pixels(brightness: f32) -> f32 {
+    2.5 + (brightness / MAX_STAR_LINEAR_LUMINANCE).sqrt()
+}
+
+impl StarfieldConfig {
+    pub fn epoch_at(&self, elapsed: f32) -> f64 {
+        self.unix_seconds
+            + if self.follow_elapsed {
+                (f64::from(elapsed.max(0.0)) / STARFIELD_SNAPSHOT_PERIOD_SECONDS).floor()
+                    * STARFIELD_SNAPSHOT_PERIOD_SECONDS
+            } else {
+                0.0
+            }
+    }
+}
+
+/// The latest valid wall-clock UTC reading, sampled on the monotonic render
+/// clock. The app publishes it only at the Starfield snapshot cadence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UtcClock {
+    unix_seconds: f64,
+    monotonic_seconds: f64,
+}
+
+impl UtcClock {
+    pub fn new(unix_seconds: f64) -> Self {
+        Self {
+            unix_seconds,
+            monotonic_seconds: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, wall_unix_seconds: f64, monotonic_seconds: f64) -> f64 {
+        if !wall_unix_seconds.is_finite() || !monotonic_seconds.is_finite() {
+            return self.unix_seconds;
+        }
+        if monotonic_seconds < self.monotonic_seconds {
+            return self.unix_seconds;
+        }
+        self.unix_seconds = wall_unix_seconds;
+        self.monotonic_seconds = monotonic_seconds;
+        self.unix_seconds
+    }
+}
+
+pub fn snapshot_due(elapsed: f64, last_snapshot: f64) -> bool {
+    elapsed.is_finite()
+        && last_snapshot.is_finite()
+        && elapsed - last_snapshot >= STARFIELD_SNAPSHOT_PERIOD_SECONDS
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Star {
+    pub right_ascension_hours: f64,
+    pub declination_degrees: f64,
+    pub magnitude: f64,
+    pub colour_index: Option<f64>,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StarCatalog {
+    /// Brightest-first, so the profile's instance cap retains the most visible stars.
+    stars: Vec<Star>,
+    /// All in-limit stars, spatially indexed so wholly-below-horizon bins can be skipped.
+    candidate_bins: Vec<Vec<usize>>,
+}
+
+impl StarCatalog {
+    pub fn from_reader(reader: impl Read) -> Result<Self, CatalogError> {
+        let mut input = Vec::new();
+        reader
+            .take((MAX_CATALOG_BYTES + 1) as u64)
+            .read_to_end(&mut input)
+            .map_err(|error| CatalogError(format!("could not read catalog CSV: {error}")))?;
+        if input.len() > MAX_CATALOG_BYTES {
+            return Err(CatalogError(format!(
+                "catalog CSV exceeds the supported size of {MAX_CATALOG_BYTES} bytes; reduce the file and retry"
+            )));
+        }
+        if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            let input_len = input.len();
+            input.copy_within(3.., 0);
+            input.truncate(input_len - 3);
+        }
+        let record_lines = scan_csv_records(&input)?;
+        let mut reader = csv::ReaderBuilder::new()
+            .flexible(false)
+            .from_reader(Cursor::new(input.as_slice()));
+        let header_line = record_lines.first().copied().unwrap_or(1);
+        let headers = reader.headers().map_err(|error| {
+            let detail = csv_record_error_detail(&error);
+            CatalogError(format!(
+                "could not read CSV header row on line {header_line}: {detail}"
+            ))
+        })?;
+        let mut columns = std::collections::HashMap::new();
+        for (index, name) in headers.iter().enumerate() {
+            if columns.insert(name.to_string(), index).is_some() {
+                return Err(CatalogError(format!(
+                    "duplicate CSV header {name:?}; each column name must be unique"
+                )));
+            }
+        }
+
+        for required in ["ra", "dec", "mag"] {
+            if !columns.contains_key(required) {
+                return Err(CatalogError(format!(
+                    "catalog is missing required CSV column {required:?} (required: ra, dec, mag)"
+                )));
+            }
+        }
+        let ra_column = columns["ra"];
+        let dec_column = columns["dec"];
+        let magnitude_column = columns["mag"];
+        let colour_column = columns.get("ci").copied();
+        let name_column = columns.get("proper").copied();
+        let distance_column = columns.get("dist").copied();
+
+        let mut stars = Vec::new();
+        for (record_index, result) in reader.records().enumerate() {
+            let fallback_line = record_index + 2;
+            let line = record_lines
+                .get(record_index + 1)
+                .copied()
+                .unwrap_or(fallback_line);
+            let record = match result {
+                Ok(record) => record,
+                Err(error) => {
+                    let detail = csv_record_error_detail(&error);
+                    return Err(CatalogError(format!(
+                        "malformed CSV record on line {line}: {detail}"
+                    )));
+                }
+            };
+            if record_index >= MAX_CATALOG_ROWS {
+                return Err(CatalogError(format!(
+                    "catalog exceeds the supported limit of {MAX_CATALOG_ROWS} CSV data rows; reduce the catalog and retry"
+                )));
+            }
+            let ra = parse_field(&record, ra_column, "ra", line)?;
+            if !(0.0..24.0).contains(&ra) {
+                return Err(CatalogError(format!(
+                    "line {line}: ra must be finite and in [0, 24) hours, got {ra}"
+                )));
+            }
+            let dec = parse_field(&record, dec_column, "dec", line)?;
+            if !(-90.0..=90.0).contains(&dec) {
+                return Err(CatalogError(format!(
+                    "line {line}: dec must be finite and in [-90, 90] degrees, got {dec}"
+                )));
+            }
+            let magnitude = parse_field(&record, magnitude_column, "mag", line)?;
+            let observer_distance = distance_column
+                .filter(|&column| !record.get(column).unwrap_or_default().trim().is_empty())
+                .map(|column| parse_field(&record, column, "dist", line))
+                .transpose()?;
+            if observer_distance == Some(0.0) {
+                continue;
+            }
+            let colour_index = colour_column
+                .filter(|&column| !record.get(column).unwrap_or_default().trim().is_empty())
+                .map(|column| parse_field(&record, column, "ci", line))
+                .transpose()?;
+            let name = name_column
+                .and_then(|column| record.get(column))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            stars.push(Star {
+                right_ascension_hours: ra,
+                declination_degrees: dec,
+                magnitude,
+                colour_index,
+                name,
+            });
+        }
+        if stars.is_empty() {
+            return Err(CatalogError(
+                "catalog contains no star records; provide at least one data row".to_string(),
+            ));
+        }
+        stars.sort_by(|left, right| left.magnitude.total_cmp(&right.magnitude));
+        stars.retain(|star| star.magnitude <= MAX_RENDERED_MAGNITUDE);
+        if stars.is_empty() {
+            return Err(CatalogError(format!(
+                "catalog has no stars with magnitude <= {MAX_RENDERED_MAGNITUDE}; the renderer's visibility limit is magnitude {MAX_RENDERED_MAGNITUDE}"
+            )));
+        }
+        let candidate_bins = Self::build_candidate_bins(&stars);
+        Ok(Self {
+            stars,
+            candidate_bins,
+        })
+    }
+
+    fn build_candidate_bins(stars: &[Star]) -> Vec<Vec<usize>> {
+        let mut bins = vec![Vec::new(); RIGHT_ASCENSION_BINS * DECLINATION_BINS];
+        for (index, star) in stars.iter().enumerate() {
+            let ra_bin = ((star.right_ascension_hours / 24.0 * RIGHT_ASCENSION_BINS as f64)
+                as usize)
+                .min(RIGHT_ASCENSION_BINS - 1);
+            let dec_bin = (((star.declination_degrees + 90.0) / 180.0 * DECLINATION_BINS as f64)
+                as usize)
+                .min(DECLINATION_BINS - 1);
+            let bin_index = dec_bin * RIGHT_ASCENSION_BINS + ra_bin;
+            bins[bin_index].push(index);
+        }
+        bins
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self, CatalogError> {
+        let file = std::fs::File::open(path).map_err(|error| {
+            CatalogError(format!("cannot open catalog {}: {error}", path.display()))
+        })?;
+        Self::from_reader(file)
+            .map_err(|error| CatalogError(format!("invalid catalog {}: {error}", path.display())))
+    }
+
+    #[cfg(test)]
+    pub fn stars(&self) -> &[Star] {
+        &self.stars
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogError(pub String);
+
+impl std::fmt::Display for CatalogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CatalogError {}
+
+fn scan_csv_records(input: &[u8]) -> Result<Vec<usize>, CatalogError> {
+    #[derive(Clone, Copy)]
+    enum FieldState {
+        Start,
+        Unquoted,
+        Quoted,
+        AfterQuote,
+    }
+
+    let mut state = FieldState::Start;
+    let mut record_bytes = 0usize;
+    let mut index = 0usize;
+    let mut line = 1usize;
+    let mut record_start_line = 1usize;
+    let mut has_record_content = false;
+    let mut record_lines = Vec::new();
+    let mut quoted_field_line = None;
+    while index < input.len() {
+        let byte = input[index];
+        let line_ending_len = match byte {
+            b'\r' if input.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => 0,
+        };
+        if line_ending_len > 0 {
+            record_bytes += line_ending_len;
+            if record_bytes > MAX_CSV_RECORD_BYTES {
+                return Err(CatalogError(format!(
+                    "CSV record exceeds the supported size of {MAX_CSV_RECORD_BYTES} bytes; reduce long fields and retry"
+                )));
+            }
+            let ends_record = !matches!(state, FieldState::Quoted);
+            if ends_record {
+                if has_record_content && record_lines.len() < MAX_CATALOG_ROWS + 2 {
+                    record_lines.push(record_start_line);
+                }
+                state = FieldState::Start;
+                record_bytes = 0;
+                has_record_content = false;
+            }
+            line += 1;
+            index += line_ending_len;
+            if ends_record {
+                record_start_line = line;
+            }
+            continue;
+        }
+
+        record_bytes += 1;
+        if record_bytes > MAX_CSV_RECORD_BYTES {
+            return Err(CatalogError(format!(
+                "CSV record exceeds the supported size of {MAX_CSV_RECORD_BYTES} bytes; reduce long fields and retry"
+            )));
+        }
+        has_record_content = true;
+        match state {
+            FieldState::Start => match byte {
+                b'"' => {
+                    state = FieldState::Quoted;
+                    quoted_field_line = Some(line);
+                }
+                b',' => {}
+                _ => state = FieldState::Unquoted,
+            },
+            FieldState::Unquoted => match byte {
+                b'"' => {
+                    return Err(CatalogError(format!(
+                        "malformed CSV: quote found inside an unquoted field on line {line}"
+                    )));
+                }
+                b',' => state = FieldState::Start,
+                _ => {}
+            },
+            FieldState::Quoted => {
+                if byte == b'"' {
+                    if input.get(index + 1) == Some(&b'"') {
+                        record_bytes += 1;
+                        if record_bytes > MAX_CSV_RECORD_BYTES {
+                            return Err(CatalogError(format!(
+                                "CSV record exceeds the supported size of {MAX_CSV_RECORD_BYTES} bytes; reduce long fields and retry"
+                            )));
+                        }
+                        index += 1;
+                    } else {
+                        state = FieldState::AfterQuote;
+                        quoted_field_line = None;
+                    }
+                }
+            }
+            FieldState::AfterQuote => match byte {
+                b',' => state = FieldState::Start,
+                b' ' | b'\t' => {}
+                _ => {
+                    return Err(CatalogError(format!(
+                        "malformed CSV: unexpected data after a quoted field on line {line}"
+                    )));
+                }
+            },
+        }
+        index += 1;
+    }
+    if matches!(state, FieldState::Quoted) {
+        return Err(CatalogError(format!(
+            "malformed CSV: quoted field is not terminated before end of file (opened on line {})",
+            quoted_field_line.unwrap_or(line)
+        )));
+    }
+    if has_record_content && record_lines.len() < MAX_CATALOG_ROWS + 2 {
+        record_lines.push(record_start_line);
+    }
+    Ok(record_lines)
+}
+
+fn csv_record_error_detail(error: &csv::Error) -> String {
+    match error.kind() {
+        csv::ErrorKind::Io(error) => format!("I/O error: {error}"),
+        csv::ErrorKind::Utf8 { err, .. } => format!("invalid UTF-8: {err}"),
+        csv::ErrorKind::UnequalLengths {
+            expected_len, len, ..
+        } => format!("found {len} fields, expected {expected_len}"),
+        _ => "invalid CSV record".to_string(),
+    }
+}
+
+fn parse_field(
+    record: &csv::StringRecord,
+    column: usize,
+    name: &str,
+    line: usize,
+) -> Result<f64, CatalogError> {
+    let value = record.get(column).unwrap_or_default().trim();
+    let parsed = value.parse::<f64>().map_err(|_| {
+        CatalogError(format!(
+            "line {line}: {name} must be a finite number, got {value:?}"
+        ))
+    })?;
+    if !parsed.is_finite() {
+        return Err(CatalogError(format!(
+            "line {line}: {name} must be finite, got {value:?}"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Returns (azimuth, altitude) in radians. Azimuth is clockwise from north.
+pub fn horizontal_coordinates(
+    star: &Star,
+    latitude_degrees: f64,
+    longitude_degrees: f64,
+    unix_seconds: f64,
+) -> (f64, f64) {
+    let julian_date = unix_seconds / 86_400.0 + 2_440_587.5;
+    let (right_ascension, declination) = precess_j2000(
+        (star.right_ascension_hours * 15.0).to_radians(),
+        star.declination_degrees.to_radians(),
+        julian_date,
+    );
+    let gmst_degrees = greenwich_mean_sidereal_degrees(julian_date);
+    let local_sidereal = (gmst_degrees + longitude_degrees)
+        .rem_euclid(360.0)
+        .to_radians();
+    let latitude = latitude_degrees.to_radians();
+    let hour_angle = local_sidereal - right_ascension;
+
+    let sin_altitude =
+        declination.sin() * latitude.sin() + declination.cos() * latitude.cos() * hour_angle.cos();
+    let altitude = sin_altitude.clamp(-1.0, 1.0).asin();
+    let azimuth = (-hour_angle.sin() * declination.cos())
+        .atan2(
+            declination.sin() * latitude.cos()
+                - declination.cos() * latitude.sin() * hour_angle.cos(),
+        )
+        .rem_euclid(std::f64::consts::TAU);
+    (azimuth, altitude)
+}
+
+fn greenwich_mean_sidereal_degrees(julian_date: f64) -> f64 {
+    let centuries = (julian_date - 2_451_545.0) / 36_525.0;
+    280.460_618_37
+        + 360.985_647_366_29 * (julian_date - 2_451_545.0)
+        + 0.000_387_933 * centuries * centuries
+        - centuries * centuries * centuries / 38_710_000.0
+}
+
+/// IAU 1976 precession from mean equatorial J2000 coordinates to the date.
+fn precess_j2000(right_ascension: f64, declination: f64, julian_date: f64) -> (f64, f64) {
+    let centuries = (julian_date - 2_451_545.0) / 36_525.0;
+    let t2 = centuries * centuries;
+    let t3 = t2 * centuries;
+    let arcseconds_to_radians = std::f64::consts::PI / (180.0 * 3_600.0);
+    let zeta = (2_306.218_1 * centuries + 0.301_88 * t2 + 0.017_998 * t3) * arcseconds_to_radians;
+    let z = (2_306.218_1 * centuries + 1.094_68 * t2 + 0.018_203 * t3) * arcseconds_to_radians;
+    let theta = (2_004.310_9 * centuries - 0.426_65 * t2 - 0.041_833 * t3) * arcseconds_to_radians;
+    let a = right_ascension + zeta;
+    let sin_declination = declination.sin();
+    let cos_declination = declination.cos();
+    let x = cos_declination * a.sin();
+    let y = theta.cos() * cos_declination * a.cos() - theta.sin() * sin_declination;
+    let zed = theta.sin() * cos_declination * a.cos() + theta.cos() * sin_declination;
+    (
+        (x.atan2(y) + z).rem_euclid(std::f64::consts::TAU),
+        zed.clamp(-1.0, 1.0).asin(),
+    )
+}
+
+/// Projects the visible local sky to an azimuth/altitude panorama. North wraps
+/// across the left and right edges; east, south and west lie at x=-0.5, 0, 0.5.
+pub fn project_star(
+    star: &Star,
+    latitude_degrees: f64,
+    longitude_degrees: f64,
+    unix_seconds: f64,
+) -> Option<[f32; 2]> {
+    let (azimuth, altitude) =
+        horizontal_coordinates(star, latitude_degrees, longitude_degrees, unix_seconds);
+    if altitude <= 0.0 {
+        return None;
+    }
+    Some([
+        (azimuth / std::f64::consts::PI - 1.0) as f32,
+        (altitude / std::f64::consts::FRAC_PI_2 * 2.0 - 1.0) as f32,
+    ])
+}
+
+fn build(
+    profile: &RenderProfile,
+    _frame: ControlFrame,
+    elapsed: f32,
+    aspect: f32,
+    viewport: (u32, u32),
+    state: &SceneState,
+    instances: &mut Vec<Instance>,
+) {
+    let Some(config) = state.starfield() else {
+        return;
+    };
+    let key = ProjectionKey::new(config, profile, viewport, aspect, instances.len(), elapsed);
+    if let Some(snapshot) = state
+        .starfield_projection()
+        .as_ref()
+        .filter(|snapshot| snapshot.key == key)
+    {
+        instances.extend(snapshot.instances.iter().copied());
+        return;
+    }
+
+    let mut projected = Vec::new();
+    let rebuilds = state
+        .starfield_projection()
+        .as_ref()
+        .map_or(1, |snapshot| snapshot.rebuilds.saturating_add(1));
+    let available_budget = profile.instance_count.saturating_sub(instances.len());
+    if available_budget == 0 {
+        *state.starfield_projection_mut() = Some(ProjectionCache {
+            key,
+            instances: projected,
+            rebuilds,
+        });
+        return;
+    }
+    build_uncached(
+        elapsed,
+        aspect,
+        viewport,
+        available_budget,
+        config,
+        &mut projected,
+    );
+    *state.starfield_projection_mut() = Some(ProjectionCache {
+        key,
+        instances: projected.clone(),
+        rebuilds,
+    });
+    instances.extend(projected);
+}
+
+fn build_uncached(
+    elapsed: f32,
+    aspect: f32,
+    viewport: (u32, u32),
+    instance_budget: usize,
+    config: &StarfieldConfig,
+    instances: &mut Vec<Instance>,
+) {
+    let unix_seconds = config.epoch_at(elapsed);
+    let mut visible = Vec::with_capacity(MAX_RENDERED_STARS.min(instance_budget) * 4);
+    for (bin_index, bin) in config.catalog.candidate_bins.iter().enumerate() {
+        if bin.is_empty() {
+            continue;
+        }
+        let dec_bin = bin_index / RIGHT_ASCENSION_BINS;
+        let ra_bin = bin_index % RIGHT_ASCENSION_BINS;
+        let cell_center = Star {
+            right_ascension_hours: (ra_bin as f64 + 0.5) * 24.0 / RIGHT_ASCENSION_BINS as f64,
+            declination_degrees: (dec_bin as f64 + 0.5) * 180.0 / DECLINATION_BINS as f64 - 90.0,
+            magnitude: 0.0,
+            colour_index: None,
+            name: None,
+        };
+        // A 13-degree margin covers each cell's angular radius plus J2000
+        // precession across the supported date range.
+        if horizontal_coordinates(
+            &cell_center,
+            config.latitude_degrees,
+            config.longitude_degrees,
+            unix_seconds,
+        )
+        .1 < -13.0_f64.to_radians()
+        {
+            continue;
+        }
+        for (rank, &star_index) in bin.iter().enumerate() {
+            let star = &config.catalog.stars[star_index];
+            let Some(center) = project_star(
+                star,
+                config.latitude_degrees,
+                config.longitude_degrees,
+                unix_seconds,
+            ) else {
+                continue;
+            };
+            visible.push((star, center, bin_index, rank, star_index));
+        }
+    }
+
+    // The catalog's magnitude-sorted spatial bins bound the work and preserve
+    // candidates across the whole sky. Preserve one candidate per visible
+    // screen-space quarter before filling the remaining budget globally, so
+    // a dense bright region cannot erase the rest of the panorama.
+    visible.sort_by(
+        |(left, _, left_bin, left_rank, _), (right, _, right_bin, right_rank, _)| {
+            left.magnitude
+                .total_cmp(&right.magnitude)
+                .then_with(|| left_rank.cmp(right_rank))
+                .then_with(|| spatial_order_key(*left_bin).cmp(&spatial_order_key(*right_bin)))
+        },
+    );
+    let mut candidate_order = Vec::with_capacity(visible.len());
+    let mut reserved = vec![false; visible.len()];
+    for quarter in 0..4 {
+        if let Some((index, _)) = visible.iter().enumerate().find(|(index, candidate)| {
+            !reserved[*index] && screen_quarter(candidate.1[0]) == quarter
+        }) {
+            reserved[index] = true;
+            candidate_order.push(index);
+        }
+    }
+    for (index, is_reserved) in reserved.iter().enumerate() {
+        if !is_reserved {
+            candidate_order.push(index);
+        }
+    }
+    let mut selected = Vec::with_capacity(MAX_RENDERED_STARS.min(instance_budget));
+    let mut selected_instances = 0;
+    for index in candidate_order {
+        if selected_instances >= instance_budget {
+            break;
+        }
+        let (star, center, _, _, _) = visible[index];
+        if selected.len() >= MAX_RENDERED_STARS {
+            break;
+        }
+        let brightness = star_brightness(star.magnitude);
+        let tint = star
+            .colour_index
+            .map(color_index_rgb)
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let color = tint_at_luminance(tint, star_output_luminance(brightness));
+        // The size curve preserves magnitude ordering while keeping points
+        // discernible at small output sizes.
+        let size_pixels = star_size_pixels(brightness);
+        let point_size = 2.0 * size_pixels / viewport.1.max(1) as f32;
+        let size = [point_size / aspect.max(f32::MIN_POSITIVE), point_size];
+        let instance = Instance {
+            center: [center[0], center[1], 0.0],
+            size,
+            color: [color[0], color[1], color[2], 1.0],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern: [0.0; 2],
+        };
+        let wrapped = crosses_horizontal_seam(instance);
+        if let Some(draw_wrap) =
+            seam_wrap_within_budget(wrapped, instance_budget.saturating_sub(selected_instances))
+        {
+            selected.push((star.magnitude, instance, draw_wrap));
+            selected_instances += if draw_wrap { 2 } else { 1 };
+        }
+    }
+    selected.sort_by(|(left, _, _), (right, _, _)| left.total_cmp(right));
+    for (_, instance, wrapped) in selected.into_iter().rev() {
+        append_wrapped(instance, wrapped, instance_budget, instances);
+    }
+}
+
+fn spatial_order_key(bin_index: usize) -> usize {
+    (bin_index * 383) % (RIGHT_ASCENSION_BINS * DECLINATION_BINS)
+}
+
+fn screen_quarter(x: f32) -> usize {
+    (((x + 1.0) * 2.0).floor() as usize).min(3)
+}
+
+fn crosses_horizontal_seam(instance: Instance) -> bool {
+    let half_width = instance.size[0] / 2.0;
+    instance.center[0] - half_width < -1.0 || instance.center[0] + half_width > 1.0
+}
+
+fn seam_wrap_within_budget(wraps: bool, available: usize) -> Option<bool> {
+    if wraps {
+        (available >= 2).then_some(true)
+    } else if available > 0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn append_wrapped(instance: Instance, wraps: bool, budget: usize, instances: &mut Vec<Instance>) {
+    if instances.len() + usize::from(wraps) + 1 > budget {
+        return;
+    }
+    let offset = if instance.center[0] < 0.0 { 2.0 } else { -2.0 };
+    instances.push(instance);
+    if wraps {
+        let mut wrapped = instance;
+        wrapped.center[0] += offset;
+        instances.push(wrapped);
+    }
+}
+
+fn color_index_rgb(colour_index: f64) -> [f32; 3] {
+    // A compact black-body approximation for the familiar B-V colour index.
+    let temperature = (4600.0
+        * (1.0 / (0.92 * colour_index + 1.7) + 1.0 / (0.92 * colour_index + 0.62)))
+        .clamp(1_000.0, 40_000.0);
+    let temperature = temperature / 100.0;
+    let red = if temperature <= 66.0 {
+        255.0
+    } else {
+        (329.698_73 * (temperature - 60.0).powf(-0.133_204_76)).clamp(0.0, 255.0)
+    };
+    let green = if temperature <= 66.0 {
+        (99.470_8 * temperature.ln() - 161.119_57).clamp(0.0, 255.0)
+    } else {
+        (288.122_16 * (temperature - 60.0).powf(-0.075_514_85)).clamp(0.0, 255.0)
+    };
+    let blue = if temperature >= 66.0 {
+        255.0
+    } else if temperature <= 19.0 {
+        0.0
+    } else {
+        (138.517_73 * (temperature - 10.0).ln() - 305.044_8).clamp(0.0, 255.0)
+    };
+    [
+        (red / 255.0) as f32,
+        (green / 255.0) as f32,
+        (blue / 255.0) as f32,
+    ]
+}
+
+fn rec709_luminance(rgb: [f32; 3]) -> f32 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+fn tint_at_luminance(tint: [f32; 3], output_luminance: f32) -> [f32; 3] {
+    // For normalized temperature t in [10, 400] (1000–40000 K), the
+    // black-body approximation has a global Rec.709 linear-luminance minimum
+    // at t=10: on [10, 19], R=1, B=0 and G increases, giving Y=0.403096...
+    // On [19, 66], R=1 while G and B increase; on [66, 400], B=1 while R
+    // and G decrease, giving the other endpoint Y=0.719009... at t=400.
+    // Thus Y >= 0.403096...; the conservative 0.403 denominator bound also
+    // absorbs f32 rounding. Since B <= 0.05, output_luminance <=
+    // 0.02*tanh(2.5) < 0.01974, so every channel is at most
+    // 0.01974/0.403 < 0.049, strictly below the 0.05 channel cap.
+    // Multiplication by one scalar preserves the tint's RGB ratios. These RGB
+    // values are linear-light approximations; do not decode them as sRGB.
+    let luminance = rec709_luminance(tint);
+    if !luminance.is_finite() || luminance <= 0.0 {
+        return [output_luminance; 3];
+    }
+    let scale = output_luminance / luminance.max(MIN_STAR_TINT_LUMINANCE_BOUND);
+    tint.map(|channel| channel * scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catalog(csv: &str) -> Result<StarCatalog, CatalogError> {
+        StarCatalog::from_reader(csv.as_bytes())
+    }
+
+    #[test]
+    fn parses_quoted_optional_names_and_sorts_by_brightness() {
+        let parsed =
+            catalog("proper,ra,dec,mag,ci\n\"Alpha, the bright\",6,23,1.0,0.2\nBeta,12,-10,2.0,\n")
+                .expect("valid catalog");
+        assert_eq!(parsed.stars()[0].name.as_deref(), Some("Alpha, the bright"));
+        assert_eq!(parsed.stars()[0].colour_index, Some(0.2));
+        assert_eq!(parsed.stars()[1].name.as_deref(), Some("Beta"));
+        assert_eq!(parsed.stars()[1].colour_index, None);
+    }
+
+    #[test]
+    fn rejects_missing_headers_empty_catalog_and_bad_values() {
+        for (contents, expected) in [
+            ("ra,dec\n1,2\n", "missing required CSV column"),
+            ("ra,dec,mag\n", "no star records"),
+            ("ra,dec,mag\n1,2,7\n", "no stars with magnitude <= 6.5"),
+            ("ra,dec,mag\n,2,1\n", "ra must be"),
+            ("ra,dec,mag\n1,,1\n", "dec must be"),
+            ("ra,dec,mag\n1,2,nan\n", "mag must be finite"),
+            ("ra,dec,mag,dist\n,2,1,0\n", "ra must be"),
+            ("ra,dec,mag,dist\n1,,1,0\n", "dec must be"),
+            ("ra,dec,mag,dist\n1,2,nan,0\n", "mag must be finite"),
+            ("ra,dec,mag\n24,2,1\n", "ra must be finite and in [0, 24)"),
+            (
+                "ra,dec,mag\n1,-91,1\n",
+                "dec must be finite and in [-90, 90]",
+            ),
+            ("ra,dec,mag,ci\n1,2,1,nope\n", "ci must be"),
+            ("ra,dec,mag\n\"unterminated,2,1\n", "not terminated"),
+        ] {
+            let error = catalog(contents).expect_err("invalid catalog");
+            assert!(error.to_string().contains(expected), "{contents}: {error}");
+        }
+    }
+
+    #[test]
+    fn validates_csv_quote_termination_while_allowing_escaped_and_multiline_fields() {
+        let error = catalog("ra,dec,mag,proper\n0,0,1,\"unfinished\n6,0,2,Second\n").unwrap_err();
+        assert!(
+            error.0.contains("quoted field is not terminated"),
+            "{error}"
+        );
+        assert!(
+            error.0.contains("opened on line 2"),
+            "expected the opening quote's physical line, got {error}"
+        );
+
+        let valid =
+            catalog("ra,dec,mag,proper\n0,0,1,\"A \"\"bright\"\" star\"\n6,0,2,\"Two\nlines\"\n")
+                .expect("escaped quotes and multiline quoted names are valid");
+        assert_eq!(valid.stars()[0].name.as_deref(), Some("A \"bright\" star"));
+        assert_eq!(valid.stars()[1].name.as_deref(), Some("Two\nlines"));
+    }
+
+    #[test]
+    fn reports_physical_source_line_after_a_multiline_quoted_record() {
+        let error = catalog(
+            "ra,dec,mag,proper\n0,0,1,\"Synthetic\nmultiline name\"\nnot-a-number,0,2,Bad\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.0.contains("line 4"),
+            "expected physical source line 4, got {error}"
+        );
+    }
+
+    #[test]
+    fn reports_physical_lines_for_blank_lf_crlf_and_cr_only_records() {
+        for contents in [
+            "ra,dec,mag\n\nnot-a-number,0,2\n",
+            "ra,dec,mag\r\n\r\nnot-a-number,0,2\r\n",
+            "ra,dec,mag\r\rnot-a-number,0,2\r",
+        ] {
+            let error = catalog(contents).unwrap_err();
+            assert!(
+                error.0.contains("line 3"),
+                "expected physical source line 3 for {contents:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_record_errors_use_one_physical_line_for_crlf_and_cr_only() {
+        for contents in [
+            "ra,dec,mag\n\n0,1\n",
+            "ra,dec,mag\r\n\r\n0,1\r\n",
+            "ra,dec,mag\r\r0,1\r",
+        ] {
+            let error = catalog(contents).unwrap_err();
+            assert!(
+                error
+                    .0
+                    .starts_with("malformed CSV record on line 3: found 2 fields, expected 3"),
+                "expected one consistent physical source line for {contents:?}, got {error}"
+            );
+            assert!(
+                !error.0.contains("line:"),
+                "CSV library line metadata must not contradict the physical line: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_header_reports_physical_line_after_blank_records() {
+        for contents in [
+            &b"\n\nra,dec,mag\xff\n0,0,1\n"[..],
+            &b"\r\n\r\nra,dec,mag\xff\r\n0,0,1\r\n"[..],
+            &b"\r\rra,dec,mag\xff\r0,0,1\r"[..],
+        ] {
+            let error = StarCatalog::from_reader(contents).unwrap_err();
+            assert!(
+                error
+                    .0
+                    .starts_with("could not read CSV header row on line 3: invalid UTF-8:"),
+                "expected sanitized physical line 3 in header error, got {error}"
+            );
+            assert!(
+                !error.0.contains("line:"),
+                "CSV library line metadata must not contradict the physical line: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_quote_diagnostics_include_physical_source_line() {
+        for (contents, expected_line) in [
+            ("ra,dec,mag\n\n0,0,1,bad\"quote\n", "line 3"),
+            ("ra,dec,mag\r\n\r\n0,0,1,\"value\"tail\r\n", "line 3"),
+            ("ra,dec,mag\r\r0,0,1,\"unfinished", "opened on line 3"),
+        ] {
+            let error = catalog(contents).unwrap_err();
+            assert!(
+                error.0.contains(expected_line),
+                "expected {expected_line} for {contents:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_utf8_bom_before_parsing_a_quoted_first_header() {
+        let csv = b"\xef\xbb\xbf\"ra\",dec,mag\n0,45,1\n";
+        let catalog = StarCatalog::from_reader(csv.as_slice()).unwrap();
+        assert_eq!(catalog.stars().len(), 1);
+        assert_eq!(catalog.stars()[0].right_ascension_hours, 0.0);
+    }
+
+    #[test]
+    fn bounds_csv_record_and_total_input_bytes() {
+        let large_record = format!(
+            "ra,dec,mag,proper\n0,0,1,\"{}\"\n",
+            "x".repeat(MAX_CSV_RECORD_BYTES)
+        );
+        let error = catalog(&large_record).unwrap_err();
+        assert!(error.0.contains("CSV record exceeds"), "{error}");
+
+        let oversized = vec![b'x'; MAX_CATALOG_BYTES + 1];
+        let error = StarCatalog::from_reader(oversized.as_slice()).unwrap_err();
+        assert!(
+            error.0.contains("catalog CSV exceeds the supported size"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_catalogs_above_the_bounded_scan_limit() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for _ in 0..=MAX_CATALOG_ROWS {
+            csv.push_str("0,0,1\n");
+        }
+        let error = catalog(&csv).unwrap_err();
+        assert!(error.0.contains("supported limit of 131072"), "{error}");
+        assert!(error.0.contains("reduce the catalog"), "{error}");
+    }
+
+    #[test]
+    fn skips_blank_optional_fields_and_filters_fainter_than_limit() {
+        let parsed_catalog = catalog(
+            "proper,ra,dec,mag,ci\nBright,0,90,1.0,0.2\n\"\",1,90,6.5,\nToo faint,2,90,6.51,\n",
+        )
+        .expect("blank optional fields are allowed");
+        assert_eq!(parsed_catalog.stars()[1].name, None);
+        assert_eq!(parsed_catalog.stars()[1].colour_index, None);
+        let with_distance = catalog("ra,dec,mag,dist\n0,0,1,0\n6,0,2,\n")
+            .expect("distance is optional and a blank value is allowed");
+        assert_eq!(with_distance.stars().len(), 1);
+        assert_eq!(with_distance.stars()[0].right_ascension_hours, 6.0);
+
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(parsed_catalog),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(0),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert!(instances.len() >= 2);
+        assert!(instances.len() <= 4);
+        let brightest = instances
+            .iter()
+            .map(|instance| instance.color[0])
+            .fold(0.0_f32, f32::max);
+        let faintest = instances
+            .iter()
+            .map(|instance| instance.color[0])
+            .fold(f32::INFINITY, f32::min);
+        assert!(brightest > faintest);
+        assert!(
+            instances
+                .iter()
+                .all(|instance| instance.size[1] * 90.0 / 2.0 >= 2.0)
+        );
+    }
+
+    #[test]
+    fn projection_is_deterministic_for_known_time_and_location() {
+        let star = Star {
+            right_ascension_hours: 6.0,
+            declination_degrees: 0.0,
+            magnitude: 1.0,
+            colour_index: None,
+            name: None,
+        };
+        let timestamp = 946_693_184.772_528;
+        let actual = project_star(&star, 0.0, 0.0, timestamp).expect("star is above the horizon");
+        let expected = [0.5, 0.0];
+        assert!((actual[0] - expected[0]).abs() < 1.0e-5, "{actual:?}");
+        assert!((actual[1] - expected[1]).abs() < 1.0e-5, "{actual:?}");
+        assert_eq!(project_star(&star, 0.0, 0.0, timestamp), Some(actual));
+        assert!(project_star(&star, 0.0, 90.0, timestamp).is_none());
+        let different_latitude = project_star(&star, 45.0, 0.0, timestamp).unwrap();
+        assert!((different_latitude[1] - actual[1]).abs() > 0.1);
+        assert!(project_star(&star, 0.0, 0.0, timestamp + 21_600.0).is_none());
+    }
+
+    #[test]
+    fn precession_matches_iau_1976_reference_and_changes_2100_horizon_classification() {
+        let julian_date = 2_451_545.0 + 36_525.0;
+        let (ra, dec) = precess_j2000(0.0, 0.0, julian_date);
+        assert!((ra.to_degrees() / 15.0 - 0.085_444).abs() < 1.0e-5);
+        assert!((dec.to_degrees() - 0.556_588).abs() < 1.0e-5);
+
+        let star = Star {
+            right_ascension_hours: 0.0,
+            declination_degrees: 0.0,
+            magnitude: 1.0,
+            colour_index: None,
+            name: None,
+        };
+        // 2100-01-01 at the equator: date precession moves this star just
+        // above the horizon where its unprecessed J2000 position is below.
+        assert!(
+            project_star(&star, 0.0, -9.5, 4_102_444_800.0).is_some(),
+            "supported-century precession must affect horizon visibility"
+        );
+    }
+
+    #[test]
+    fn live_epoch_advances_but_explicit_epoch_stays_fixed() {
+        let catalog = Arc::new(catalog("ra,dec,mag\n6,0,1\n").unwrap());
+        let live = StarfieldConfig {
+            catalog: Arc::clone(&catalog),
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 1_000.0,
+            follow_elapsed: true,
+        };
+        let fixed = StarfieldConfig {
+            follow_elapsed: false,
+            ..live.clone()
+        };
+        assert_eq!(live.epoch_at(9.9), 1_000.0);
+        assert_eq!(live.epoch_at(12.5), 1_010.0);
+        assert_eq!(fixed.epoch_at(12.5), 1_000.0);
+    }
+
+    #[test]
+    fn projection_cache_hits_and_invalidates_every_projection_input() {
+        let catalog_arc = Arc::new(catalog("ra,dec,mag\n18.7,45,1\n6,45,2\n").unwrap());
+        let mut state = SceneState::default();
+        let mut config = StarfieldConfig {
+            catalog: Arc::clone(&catalog_arc),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: true,
+        };
+        state.configure_starfield(Some(config.clone()));
+        let profile = RenderProfile::pi5();
+        let mut instances = Vec::new();
+        build(
+            &profile,
+            ControlFrame::procedural(0),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        let first = state
+            .starfield_projection()
+            .as_ref()
+            .expect("snapshot cached")
+            .key
+            .clone();
+        assert_eq!(
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("first projection cached")
+                .rebuilds,
+            1
+        );
+        let first_instances = instances.clone();
+        instances.clear();
+        build(
+            &profile,
+            ControlFrame::procedural(1),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<Instance, u8>(&instances),
+            bytemuck::cast_slice::<Instance, u8>(&first_instances)
+        );
+        assert_eq!(
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("snapshot retained")
+                .key,
+            first
+        );
+        assert_eq!(
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("cache hit retained snapshot")
+                .rebuilds,
+            1,
+            "a cache hit must not rerun projection"
+        );
+
+        let key_after = |state: &SceneState,
+                         profile: &RenderProfile,
+                         elapsed: f32,
+                         aspect: f32,
+                         viewport: (u32, u32)| {
+            let mut output = Vec::new();
+            build(
+                profile,
+                ControlFrame::procedural(2),
+                elapsed,
+                aspect,
+                viewport,
+                state,
+                &mut output,
+            );
+            state
+                .starfield_projection()
+                .as_ref()
+                .expect("snapshot cached")
+                .key
+                .clone()
+        };
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90)),
+            first
+        );
+        let epoch_key = key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90));
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 4.0 / 3.0, (160, 90)),
+            epoch_key
+        );
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (320, 180)),
+            epoch_key
+        );
+        let mut tight_profile = profile.clone();
+        tight_profile.instance_count = 1;
+        assert_ne!(
+            key_after(&state, &tight_profile, 10.0, 16.0 / 9.0, (160, 90)),
+            epoch_key
+        );
+
+        let baseline = ProjectionKey::new(&config, &profile, (160, 90), 16.0 / 9.0, 0, 0.0);
+        assert_ne!(
+            ProjectionKey::new(&config, &profile, (160, 90), 16.0 / 9.0, 1, 0.0),
+            baseline,
+            "existing instances are part of cache identity"
+        );
+        let mut longitude_changed = config.clone();
+        longitude_changed.longitude_degrees = 1.0;
+        assert_ne!(
+            ProjectionKey::new(&longitude_changed, &profile, (160, 90), 16.0 / 9.0, 0, 0.0),
+            baseline,
+            "longitude is part of cache identity"
+        );
+        let other_catalog = Arc::new(catalog("ra,dec,mag\n1,45,1\n").unwrap());
+        let catalog_changed = StarfieldConfig {
+            catalog: other_catalog,
+            ..config.clone()
+        };
+        assert_ne!(
+            ProjectionKey::new(&catalog_changed, &profile, (160, 90), 16.0 / 9.0, 0, 0.0),
+            baseline,
+            "catalog identity is part of cache key"
+        );
+
+        let project =
+            |state: &SceneState, profile: &RenderProfile, existing: &mut Vec<Instance>| {
+                build(
+                    profile,
+                    ControlFrame::procedural(3),
+                    0.0,
+                    16.0 / 9.0,
+                    (160, 90),
+                    state,
+                    existing,
+                );
+            };
+        assert!(state.starfield_projection().is_some());
+        state.configure_starfield(Some(longitude_changed.clone()));
+        assert!(state.starfield_projection().is_none());
+        let mut longitude_output = Vec::new();
+        project(&state, &profile, &mut longitude_output);
+        assert_ne!(
+            bytemuck::cast_slice::<Instance, u8>(&longitude_output),
+            bytemuck::cast_slice::<Instance, u8>(&first_instances),
+            "changing longitude rebuilds actual projected output"
+        );
+        assert_eq!(state.starfield_projection().as_ref().unwrap().rebuilds, 1);
+
+        assert!(state.starfield_projection().is_some());
+        state.configure_starfield(Some(catalog_changed.clone()));
+        assert!(state.starfield_projection().is_none());
+        let mut catalog_output = Vec::new();
+        project(&state, &profile, &mut catalog_output);
+        assert_ne!(
+            bytemuck::cast_slice::<Instance, u8>(&catalog_output),
+            bytemuck::cast_slice::<Instance, u8>(&first_instances),
+            "changing catalog rebuilds actual projected output"
+        );
+        assert_eq!(state.starfield_projection().as_ref().unwrap().rebuilds, 1);
+
+        assert!(state.starfield_projection().is_some());
+        state.configure_starfield(Some(config.clone()));
+        assert!(state.starfield_projection().is_none());
+        let mut baseline_output = Vec::new();
+        project(&state, &profile, &mut baseline_output);
+        let mut prefixed_output = vec![Instance {
+            center: [0.25, 0.5, 0.0],
+            size: [1.0, 1.0],
+            color: [0.1, 0.2, 0.3, 1.0],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern: [0.0, 0.0],
+        }];
+        project(&state, &profile, &mut prefixed_output);
+        assert_eq!(prefixed_output[0].center, [0.25, 0.5, 0.0]);
+        assert_eq!(prefixed_output.len(), baseline_output.len() + 1);
+        assert_eq!(
+            state.starfield_projection().as_ref().unwrap().rebuilds,
+            2,
+            "existing instances invalidate the previous projection cache hit"
+        );
+
+        config.latitude_degrees = 44.0;
+        state.configure_starfield(Some(config));
+        assert!(state.starfield_projection().is_none());
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90)),
+            epoch_key
+        );
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog("ra,dec,mag\n1,45,1\n").unwrap()),
+            latitude_degrees: 44.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: true,
+        }));
+        assert_ne!(
+            key_after(&state, &profile, 10.0, 16.0 / 9.0, (160, 90)),
+            epoch_key
+        );
+    }
+
+    #[test]
+    fn utc_clock_resynchronizes_to_wall_clock_at_snapshot_cadence() {
+        let mut clock = UtcClock::new(1_000.0);
+        assert_eq!(clock.update(1_000.1, 0.1), 1_000.1);
+        assert!(!snapshot_due(9.9, 0.0));
+        assert!(snapshot_due(10.0, 0.0));
+        assert!(!snapshot_due(10.1, 10.0));
+
+        assert_eq!(clock.update(3_600.0, 10.0), 3_600.0);
+        assert_eq!(clock.update(3_600.2, 10.2), 3_600.2);
+        assert_eq!(clock.update(0.0, 10.1), 3_600.2);
+        assert!(!snapshot_due(19.9, 10.0));
+        assert!(snapshot_due(20.0, 10.0));
+        assert_eq!(clock.update(0.0, 20.0), 0.0);
+        assert_eq!(clock.update(10_000.0, 30.0), 10_000.0);
+        assert_eq!(clock.update(f64::NAN, 40.0), 10_000.0);
+        assert!(!snapshot_due(f64::NAN, 40.0));
+    }
+
+    #[test]
+    fn north_seam_wraps_quads_without_exceeding_the_instance_budget() {
+        let edge = Instance {
+            center: [-0.999, 0.0, 0.0],
+            size: [0.03, 0.044],
+            color: [1.0; 4],
+            rotation: 0.0,
+            scene_mix: 0.0,
+            pattern: [0.0; 2],
+        };
+        let mut instances = Vec::new();
+        append_wrapped(edge, true, 2, &mut instances);
+        assert_eq!(instances.len(), 2);
+        assert!(instances[1].center[0] > 1.0);
+        let pixels = raster(&instances, (160, 90));
+        assert!(luminance(pixels[45 * 160]) > 0.0);
+        assert!(luminance(pixels[45 * 160 + 159]) > 0.0);
+
+        let mut limited = Vec::new();
+        assert_eq!(seam_wrap_within_budget(true, 1), None);
+        if let Some(wrap) = seam_wrap_within_budget(true, 1) {
+            append_wrapped(edge, wrap, 1, &mut limited);
+        }
+        assert!(limited.is_empty(), "a seam star is atomic under the cap");
+        let pixels = raster(&limited, (160, 90));
+        assert_eq!(luminance(pixels[45 * 160]), 0.0);
+        assert_eq!(luminance(pixels[45 * 160 + 159]), 0.0);
+        assert_eq!(seam_wrap_within_budget(true, 2), Some(true));
+        assert_eq!(seam_wrap_within_budget(false, 1), Some(false));
+        assert_eq!(seam_wrap_within_budget(true, 0), None);
+    }
+
+    #[test]
+    fn one_slot_budget_continues_past_unrenderable_seam_candidates() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for _ in 0..200 {
+            csv.push_str("18.698374558,45,1\n");
+        }
+        csv.push_str("20.697374558,45,2\n");
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let mut profile = RenderProfile::pi5();
+        profile.instance_count = 1;
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &profile,
+            ControlFrame::procedural(0),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert_eq!(instances.len(), 1);
+        assert!(
+            instances[0].center[0].abs() < 0.9,
+            "later non-seam candidate should fill the single slot: {:?}",
+            instances[0].center
+        );
+    }
+
+    #[test]
+    fn coincident_faint_stars_are_drawn_before_the_brightest_star() {
+        let catalog = Arc::new(catalog("ra,dec,mag\n0,0,-1\n0,0,6\n").unwrap());
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 80.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert_eq!(instances.len(), 2);
+        assert!(instances[0].color[0] < instances[1].color[0]);
+    }
+
+    fn raster(instances: &[Instance], size: (u32, u32)) -> Vec<[f32; 3]> {
+        let (width, height) = size;
+        let mut pixels = vec![[0.0; 3]; (width * height) as usize];
+        for instance in instances {
+            let half_width = instance.size[0] / 2.0;
+            let half_height = instance.size[1] / 2.0;
+            let x_start = (((instance.center[0] - half_width + 1.0) * 0.5 * width as f32)
+                .floor()
+                .max(0.0)) as u32;
+            let x_end = (((instance.center[0] + half_width + 1.0) * 0.5 * width as f32)
+                .ceil()
+                .min(width as f32)) as u32;
+            let y_start = (((1.0 - instance.center[1] - half_height) * 0.5 * height as f32)
+                .floor()
+                .max(0.0)) as u32;
+            let y_end = (((1.0 - instance.center[1] + half_height) * 0.5 * height as f32)
+                .ceil()
+                .min(height as f32)) as u32;
+            for y in y_start..y_end {
+                let ndc_y = 1.0 - 2.0 * (y as f32 + 0.5) / height as f32;
+                for x in x_start..x_end {
+                    let ndc_x = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
+                    if (ndc_x - instance.center[0]).abs() <= half_width
+                        && (ndc_y - instance.center[1]).abs() <= half_height
+                    {
+                        pixels[(y * width + x) as usize] =
+                            [instance.color[0], instance.color[1], instance.color[2]];
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    fn luminance(pixel: [f32; 3]) -> f32 {
+        0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]
+    }
+
+    #[test]
+    fn dense_sky_publishes_held_snapshots_and_bounds_rendered_pixel_luminance() {
+        fn inverse_precess_to_j2000(ra: f64, dec: f64, julian_date: f64) -> (f64, f64) {
+            let mut j2000_ra = ra;
+            let mut j2000_dec = dec;
+            for _ in 0..5 {
+                let (date_ra, date_dec) = precess_j2000(j2000_ra, j2000_dec, julian_date);
+                let ra_delta = (ra - date_ra + std::f64::consts::PI)
+                    .rem_euclid(std::f64::consts::TAU)
+                    - std::f64::consts::PI;
+                j2000_ra = (j2000_ra + ra_delta).rem_euclid(std::f64::consts::TAU);
+                j2000_dec += dec - date_dec;
+            }
+            (j2000_ra, j2000_dec)
+        }
+
+        let base_utc = 1_795_187_247.0;
+        let mut csv = String::from("ra,dec,mag\n");
+        // Four rise/set pairs, each with a dense line of equal-magnitude
+        // stars crossing the horizon between 0.1 and 0.8 seconds.
+        for group in 0..8 {
+            let crossing_utc = base_utc + (group + 1) as f64 * 0.1;
+            let julian_date = crossing_utc / 86_400.0 + 2_440_587.5;
+            let hour_angle = if group % 2 == 0 {
+                -std::f64::consts::FRAC_PI_2
+            } else {
+                std::f64::consts::FRAC_PI_2
+            };
+            let apparent_ra = (greenwich_mean_sidereal_degrees(julian_date).to_radians()
+                - hour_angle)
+                .rem_euclid(std::f64::consts::TAU);
+            for index in 0..1024 {
+                let apparent_dec = (-80.0 + index as f64 * 160.0 / 1023.0).to_radians();
+                let (ra, dec) = inverse_precess_to_j2000(apparent_ra, apparent_dec, julian_date);
+                csv.push_str(&format!(
+                    "{},{},-2\n",
+                    ra.to_degrees() / 15.0,
+                    dec.to_degrees()
+                ));
+            }
+        }
+        // A two-pixel-spaced synthetic background grid at a fainter magnitude.
+        for dec_index in 0..32 {
+            for ra_index in 0..32 {
+                let ra = (ra_index as f64 + 0.5) * 24.0 / 32.0;
+                let dec = -80.0 + (dec_index as f64 + 0.5) * 160.0 / 32.0;
+                csv.push_str(&format!("{ra},{dec},-1.5\n"));
+            }
+        }
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: base_utc,
+            follow_elapsed: true,
+        }));
+        let profile = RenderProfile::pi5();
+        let render = |elapsed| {
+            let mut instances = Vec::new();
+            build(
+                &profile,
+                ControlFrame::procedural(6),
+                elapsed,
+                16.0 / 9.0,
+                (160, 90),
+                &state,
+                &mut instances,
+            );
+            assert!(instances.len() <= profile.instance_count);
+            raster(&instances, (160, 90))
+        };
+        let initial = render(0.0);
+        for frame in 0..=51 {
+            assert_eq!(
+                initial,
+                render(frame as f32 / 60.0),
+                "snapshot changed at frame {frame}"
+            );
+        }
+        let updated = render(10.0);
+        let max_luminance = initial
+            .iter()
+            .chain(&updated)
+            .map(|&pixel| luminance(pixel))
+            .fold(0.0_f32, f32::max);
+        let max_change = initial
+            .iter()
+            .zip(&updated)
+            .map(|(&left, &right)| (luminance(left) - luminance(right)).abs())
+            .fold(0.0_f32, f32::max);
+        let coverage = initial
+            .iter()
+            .filter(|&&pixel| luminance(pixel) > 0.0)
+            .count();
+        assert!(coverage > 0, "synthetic catalog must render stars");
+        assert!(coverage <= MAX_RENDERED_STARS * 18);
+        assert!(coverage < 160 * 90 * 28 / 100);
+        for quarter in 0..4 {
+            let has_star = initial.iter().enumerate().any(|(index, &pixel)| {
+                let x = index % 160;
+                x / 40 == quarter && luminance(pixel) > 0.0
+            });
+            assert!(has_star, "candidate selection lost sky quarter {quarter}");
+        }
+        assert!(max_luminance <= MAX_STAR_LINEAR_LUMINANCE + 1.0e-6);
+        assert!(max_change <= MAX_STAR_LINEAR_LUMINANCE + 1.0e-6);
+    }
+
+    #[test]
+    fn dense_below_horizon_catalog_keeps_all_candidates_and_skips_its_bin() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for _ in 0..120_000 {
+            csv.push_str("0,-85,1\n");
+        }
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let candidate_count: usize = catalog.candidate_bins.iter().map(Vec::len).sum();
+        assert_eq!(candidate_count, 120_000);
+        assert!(candidate_count <= MAX_CATALOG_ROWS);
+
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert!(instances.is_empty());
+    }
+
+    #[test]
+    fn diagonal_horizon_target_survives_sixteen_brighter_below_horizon_candidates() {
+        let unix_seconds = 946_728_000.0;
+        let mut csv = String::from("ra,dec,mag\n");
+        for index in 0..12 {
+            csv.push_str(&format!("{},{},5\n", 12.65 + 0.005 * index as f64, -1.0));
+        }
+        for (ra, dec) in [(12.74, -1.0), (12.65, -0.1), (12.71, -2.3), (12.73, -1.1)] {
+            csv.push_str(&format!("{ra},{dec},5\n"));
+        }
+        csv.push_str("12.72,-0.2,6\n");
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let target_index = catalog
+            .stars
+            .iter()
+            .position(|star| {
+                star.right_ascension_hours == 12.72 && star.declination_degrees == -0.2
+            })
+            .unwrap();
+        let target = &catalog.stars[target_index];
+        let bright = catalog
+            .stars
+            .iter()
+            .filter(|star| star.magnitude == 5.0)
+            .collect::<Vec<_>>();
+        let min_ra = bright
+            .iter()
+            .map(|star| star.right_ascension_hours)
+            .fold(f64::INFINITY, f64::min);
+        let max_ra = bright
+            .iter()
+            .map(|star| star.right_ascension_hours)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_dec = bright
+            .iter()
+            .map(|star| star.declination_degrees)
+            .fold(f64::INFINITY, f64::min);
+        let max_dec = bright
+            .iter()
+            .map(|star| star.declination_degrees)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(target.right_ascension_hours > min_ra && target.right_ascension_hours < max_ra);
+        assert!(target.declination_degrees > min_dec && target.declination_degrees < max_dec);
+        assert!(
+            catalog
+                .candidate_bins
+                .iter()
+                .any(|bin| bin.contains(&target_index)),
+            "the diagonal target must survive in the spatial index"
+        );
+        let projected = project_star(target, 44.6, 0.0, unix_seconds)
+            .expect("review fixture target is above the horizon");
+        for star in catalog.stars.iter().filter(|star| star.magnitude == 5.0) {
+            assert!(
+                project_star(star, 44.6, 0.0, unix_seconds).is_none(),
+                "fixture's brighter candidates should be below the horizon"
+            );
+        }
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 44.6,
+            longitude_degrees: 0.0,
+            unix_seconds,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert!(
+            instances.iter().any(|instance| {
+                (instance.center[0] - projected[0]).abs() < 1.0e-5
+                    && (instance.center[1] - projected[1]).abs() < 1.0e-5
+            }),
+            "the only visible target must survive actual scene construction"
+        );
+    }
+
+    #[test]
+    fn magnitude_brightness_and_size_keep_order_without_exceeding_output_caps() {
+        let magnitudes = [-2.0, 0.0, 1.0, 5.0, 6.0, 6.5];
+        let brightness: Vec<_> = magnitudes
+            .iter()
+            .map(|&magnitude| star_brightness(magnitude))
+            .collect();
+        let sizes: Vec<_> = brightness
+            .iter()
+            .map(|&value| star_size_pixels(value))
+            .collect();
+        assert!(brightness[0] <= MAX_STAR_LINEAR_LUMINANCE);
+        assert!(brightness[0] > brightness[1]);
+        assert!(brightness.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(sizes.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!((0.0052..=0.0054).contains(brightness.last().unwrap()));
+        assert!((2.8..=2.9).contains(sizes.last().unwrap()));
+
+        let encode_srgb = |linear: f32| {
+            let encoded = if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (encoded * 255.0).round() as u8
+        };
+        let relative_faint =
+            10.0_f64.powf(-BRIGHTNESS_DECADES_PER_MAGNITUDE * (6.5 - MIN_STAR_MAGNITUDE));
+        let previous_faint_luminance =
+            (f64::from(MAX_STAR_LINEAR_LUMINANCE) * relative_faint.sqrt()) as f32;
+        let faint_white_luminance = star_output_luminance(brightness[5]);
+        assert!(faint_white_luminance >= previous_faint_luminance * 0.97);
+        assert_eq!(encode_srgb(faint_white_luminance), 16);
+        assert!((37..=39).contains(&encode_srgb(star_output_luminance(brightness[0]))));
+
+        let csv = format!(
+            "ra,dec,mag\n{}",
+            magnitudes
+                .iter()
+                .enumerate()
+                .map(|(index, magnitude)| format!("{},60,{magnitude}\n", index as f64 + 0.1))
+                .collect::<String>()
+        );
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog(&csv).unwrap()),
+            latitude_degrees: 90.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+        assert_eq!(instances.len(), magnitudes.len());
+        assert!(instances.iter().all(|instance| {
+            instance.color[..3]
+                .iter()
+                .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+                && instance.color[3] == 1.0
+        }));
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].color[0] < pair[1].color[0])
+        );
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].size[1] < pair[1].size[1])
+        );
+    }
+
+    #[test]
+    fn luminance_scaled_tints_preserve_hue_and_bound_temperature_edges() {
+        let colour_indices = [
+            Some(100.0),     // Clamp to the 1000 K warm endpoint.
+            Some(1.5),       // Warm interior.
+            Some(0.65),      // Near-white interior.
+            Some(-1.8478),   // Clamp to the 40000 K cool endpoint.
+            Some(f64::MAX),  // Finite arithmetic edge, warm clamp.
+            Some(-f64::MAX), // Finite arithmetic edge, warm clamp.
+            None,            // Missing colour is neutral white.
+        ];
+        for colour_index in colour_indices {
+            let raw = colour_index.map(color_index_rgb).unwrap_or([1.0, 1.0, 1.0]);
+            for magnitude in [-10.0, -2.0, 6.5] {
+                let brightness = star_brightness(magnitude);
+                let expected_luminance = star_output_luminance(brightness);
+                let output = tint_at_luminance(raw, expected_luminance);
+                assert!(
+                    (rec709_luminance(output) - expected_luminance).abs() < 1.0e-6,
+                    "colour index {colour_index:?}: {output:?}"
+                );
+                assert!(
+                    output
+                        .iter()
+                        .all(|&channel| (0.0..=MAX_STAR_LINEAR_LUMINANCE).contains(&channel))
+                );
+
+                if rec709_luminance(raw) > 0.0 {
+                    let expected_scale = expected_luminance / rec709_luminance(raw);
+                    for (raw_channel, output_channel) in raw.into_iter().zip(output) {
+                        assert!(
+                            (raw_channel * expected_scale - output_channel).abs() < 1.0e-6,
+                            "luminance scaling changed tint hue for {colour_index:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let fallback_luminance = star_output_luminance(star_brightness(6.5));
+        assert_eq!(
+            tint_at_luminance([0.0, 0.0, 0.0], fallback_luminance),
+            [fallback_luminance; 3]
+        );
+        assert_eq!(
+            tint_at_luminance([f32::NAN, 0.0, 0.0], fallback_luminance),
+            [fallback_luminance; 3]
+        );
+    }
+
+    #[test]
+    fn built_faint_white_star_applies_magnitude_luminance_once() {
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog("ra,dec,mag\n18.7,45,6.5\n").unwrap()),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (160, 90),
+            &state,
+            &mut instances,
+        );
+
+        assert_eq!(instances.len(), 1);
+        let instance = instances[0];
+        let luminance = rec709_luminance([instance.color[0], instance.color[1], instance.color[2]]);
+        assert!(
+            (0.0050..=0.0053).contains(&luminance),
+            "built magnitude-6.5 white star should retain about 0.00515 linear luminance, got {luminance}"
+        );
+        assert_eq!(instance.color[3], 1.0);
+        assert!(
+            instance.color[..3]
+                .iter()
+                .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+        );
+    }
+
+    #[test]
+    fn mixed_colour_stars_keep_magnitude_order_in_rec709_luminance() {
+        let csv = "ra,dec,mag,ci\n\
+                   18.7,45,6.5,\n\
+                   18.7,45,5.5,100\n\
+                   18.7,45,5,-1.8478\n\
+                   18.7,45,4.5,1.5\n";
+        let warm = color_index_rgb(100.0);
+        assert!(
+            star_brightness(5.5) * rec709_luminance(warm) < star_brightness(6.5),
+            "fixture should expose the previous warm-versus-white luminance reversal"
+        );
+
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog(csv).unwrap()),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (960, 540),
+            &state,
+            &mut instances,
+        );
+
+        assert_eq!(instances.len(), 4);
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].center == pair[1].center)
+        );
+        assert!(instances.iter().all(|instance| {
+            instance.color[3] == 1.0
+                && instance.color[..3]
+                    .iter()
+                    .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+        }));
+        let luminances: Vec<_> = instances
+            .iter()
+            .map(|instance| {
+                rec709_luminance([instance.color[0], instance.color[1], instance.color[2]])
+            })
+            .collect();
+        assert!(
+            luminances.windows(2).all(|pair| pair[0] < pair[1]),
+            "faint-first draw order must remain increasing in Rec.709 luminance: {luminances:?}"
+        );
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].size[1] < pair[1].size[1])
+        );
+    }
+
+    #[test]
+    fn coincident_stars_remain_opaque_and_draw_faint_before_bright() {
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog: Arc::new(catalog("ra,dec,mag\n18.7,45,6.5\n18.7,45,0\n18.7,45,2\n").unwrap()),
+            latitude_degrees: 45.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        let mut instances = Vec::new();
+        build(
+            &RenderProfile::pi5(),
+            ControlFrame::procedural(6),
+            0.0,
+            16.0 / 9.0,
+            (960, 540),
+            &state,
+            &mut instances,
+        );
+
+        assert_eq!(instances.len(), 3);
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].center == pair[1].center)
+        );
+        assert!(instances.iter().all(|instance| {
+            instance.color[3] == 1.0
+                && instance.color[..3]
+                    .iter()
+                    .all(|&channel| channel <= MAX_STAR_LINEAR_LUMINANCE)
+        }));
+        assert!(
+            instances
+                .windows(2)
+                .all(|pair| pair[0].color[0] < pair[1].color[0])
+        );
+    }
+
+    #[test]
+    fn brightness_is_invariant_to_audio_even_for_dense_overlap_at_multiple_rates() {
+        let mut csv = String::from("ra,dec,mag\n");
+        for _ in 0..16_500 {
+            csv.push_str("0,0,1\n");
+        }
+        let catalog = Arc::new(catalog(&csv).unwrap());
+        let mut state = SceneState::default();
+        state.configure_starfield(Some(StarfieldConfig {
+            catalog,
+            latitude_degrees: 0.0,
+            longitude_degrees: 0.0,
+            unix_seconds: 946_728_000.0,
+            follow_elapsed: false,
+        }));
+        for profile in [RenderProfile::m1(), RenderProfile::pi5()] {
+            let mut reference = None;
+            for fps in [60.0, 120.0, 240.0] {
+                for energy in [0, 255, 0, 255] {
+                    let mut frame = ControlFrame::procedural(6);
+                    frame.energy = energy;
+                    let mut instances = Vec::new();
+                    build(
+                        &profile,
+                        frame,
+                        1.0 / fps,
+                        16.0 / 9.0,
+                        (160, 90),
+                        &state,
+                        &mut instances,
+                    );
+                    assert!(instances.len() <= profile.instance_count);
+                    let colors: Vec<_> = instances.iter().map(|instance| instance.color).collect();
+                    if let Some(reference) = &reference {
+                        assert_eq!(&colors, reference, "energy={energy}, fps={fps}");
+                    } else {
+                        reference = Some(colors);
+                    }
+                }
+            }
+        }
+    }
+}

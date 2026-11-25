@@ -184,7 +184,7 @@ pub fn step_capped(
 
 /// Enforces at most 60 colour-field steps in any one-second window; a
 /// renderer that falls behind drops steps rather than catching up.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct StepClock {
     recent: VecDeque<Duration>,
 }
