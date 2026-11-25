@@ -43,6 +43,9 @@ assets/
   scenes/   Shared scene sketches and data-driven visual definitions.
 ```
 
+For private local video browsing, see the
+[local review gallery](docs/local-review.md). It does not publish recordings.
+
 ## Shared control model
 
 The first common interface is a compact frame that every platform can interpret in its own way:
