@@ -26,16 +26,23 @@ The Linux fixture creates a private Unix stream listener and a disposable
 child. Its private temporary directory is under `/tmp`, and socket paths are
 checked against Darwin's shorter `sun_path` limit. In one case the parent
 listens before passing the FD to the child; in the other, the child creates
-its own listener. The client exchanges a
-challenge with the child, checks `SO_PEERCRED` against the known listener
-creator, and requests `UNIX_DIAG_PEER` for its own connected inode. It checks
-that the known child's reported accepted FD is the **only** FD in that child
-with the peer inode. After two observations, the child acknowledges a bounded
-hold and rejects replacement commands. The parent then repeats the cookie,
-peer, FD and client checks while the child remains held through return.
-Replacement before the hold is rechecked; replacement through the cooperative
-protocol during the hold is refused. Deadlines and child cleanup apply
-throughout.
+its own listener. The client exchanges a challenge with the child. Entering
+the calibration context duplicates the client socket, checks `SO_PEERCRED`
+against the known listener creator, and requests `UNIX_DIAG_PEER` for the
+duplicate's inode. It checks that the known child's reported accepted FD is
+the **only** FD in that child with the peer inode. After two observations, the
+child acknowledges a bounded hold and rejects replacement commands. The parent
+then repeats the cookie, peer, FD and client checks while the child remains
+held through context entry. Replacement before the hold is rechecked;
+replacement through the cooperative protocol during the hold is refused.
+Deadlines and child cleanup apply throughout.
+
+The evidence applies only to `pinned_client`, the duplicate held open within
+the calibration context. Callers must use that handle; replacing or closing
+the original client FD does not change the pinned connection and is not
+evidence about the original FD. The duplicate closes on context exit or
+failure. Pinning does not establish what the original FD referenced before
+duplication or prevent out-of-band changes to the duplicate.
 
 The test requests no netlink dump, does not read a global socket list, and
 reads FD links only under `/proc/<fixture-child-pid>/fd`. The kernel may

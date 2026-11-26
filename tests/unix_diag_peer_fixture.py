@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
-from dataclasses import dataclass
+from contextlib import ExitStack, closing, contextmanager
+from dataclasses import dataclass, field
 import math
 import os
 import re
@@ -52,6 +52,7 @@ class Calibration:
   creator: tuple[int, int, int]
   child_fd: int
   cookie: tuple[int, int]
+  pinned_client: socket.socket = field(repr=False)
 
 
 def _u32(value: int, *, nonzero: bool = False) -> bool:
@@ -241,32 +242,38 @@ def _hold_child(control: socket.socket, child_fd: int, deadline: float) -> None:
     raise EvidenceError("fixture observation barrier rejected")
 
 
+@contextmanager
 def calibrate(client: socket.socket, child, child_fd: int, expected_creator: tuple[int, int, int],
-              control: socket.socket, deadline: float) -> Calibration:
-  """Recheck evidence while the cooperative child stays held through return."""
+              control: socket.socket, deadline: float):
+  """Attest the pinned duplicate while it and the cooperative child are held."""
   _child_running(child, deadline)
-  before = _socket_identity(client)
-  creator = _peer_credentials(client)
-  if creator != expected_creator:
-    raise EvidenceError("unexpected listener creator credentials")
-  first = _query_peer(before[2], NO_COOKIE, 1, deadline)
-  _check_owner(_read_child_fds(child, deadline), child_fd, first.peer_inode)
-  second = _query_peer(before[2], first.cookie, 2, deadline)
-  if second != first:
-    raise EvidenceError("peer or socket cookie changed")
-  _check_owner(_read_child_fds(child, deadline), child_fd, second.peer_inode)
-  if _socket_identity(client) != before or _peer_credentials(client) != creator:
-    raise EvidenceError("client socket or credentials changed")
-  _child_running(child, deadline)
-  _hold_child(control, child_fd, deadline)
-  final = _query_peer(before[2], first.cookie, 3, deadline)
-  if final != first:
-    raise EvidenceError("peer or socket cookie changed")
-  _check_owner(_read_child_fds(child, deadline), child_fd, final.peer_inode)
-  if _socket_identity(client) != before or _peer_credentials(client) != creator:
-    raise EvidenceError("client socket or credentials changed")
-  _child_running(child, deadline)
-  return Calibration(before[2], first.peer_inode, creator, child_fd, first.cookie)
+  try:
+    pinned = client.dup()
+  except OSError as error:
+    raise EvidenceError("client socket unavailable") from error
+  with closing(pinned):
+    before = _socket_identity(pinned)
+    creator = _peer_credentials(pinned)
+    if creator != expected_creator:
+      raise EvidenceError("unexpected listener creator credentials")
+    first = _query_peer(before[2], NO_COOKIE, 1, deadline)
+    _check_owner(_read_child_fds(child, deadline), child_fd, first.peer_inode)
+    second = _query_peer(before[2], first.cookie, 2, deadline)
+    if second != first:
+      raise EvidenceError("peer or socket cookie changed")
+    _check_owner(_read_child_fds(child, deadline), child_fd, second.peer_inode)
+    if _socket_identity(pinned) != before or _peer_credentials(pinned) != creator:
+      raise EvidenceError("client socket or credentials changed")
+    _child_running(child, deadline)
+    _hold_child(control, child_fd, deadline)
+    final = _query_peer(before[2], first.cookie, 3, deadline)
+    if final != first:
+      raise EvidenceError("peer or socket cookie changed")
+    _check_owner(_read_child_fds(child, deadline), child_fd, final.peer_inode)
+    if _socket_identity(pinned) != before or _peer_credentials(pinned) != creator:
+      raise EvidenceError("client socket or credentials changed")
+    _child_running(child, deadline)
+    yield Calibration(before[2], first.peer_inode, creator, child_fd, first.cookie, pinned)
 
 
 def send_bytes(sock: socket.socket, data: bytes, deadline: float) -> None:

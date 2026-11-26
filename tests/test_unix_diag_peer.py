@@ -289,7 +289,9 @@ class CalibrationTests(unittest.TestCase):
     self.query = stack.enter_context(mock.patch.object(proof, "_query_peer"))
     self.fds = stack.enter_context(mock.patch.object(proof, "_read_child_fds"))
     self.hold = stack.enter_context(mock.patch.object(proof, "_hold_child"))
-    self.client = object()
+    self.client = mock.Mock()
+    self.pinned = mock.Mock()
+    self.client.dup.return_value = self.pinned
     self.control = object()
     self.child = SimpleNamespace(pid=456, poll=mock.Mock(return_value=None))
     self.creator = (123, 501, 20)
@@ -299,10 +301,16 @@ class CalibrationTests(unittest.TestCase):
     self.fds.side_effect = [{8: f"socket:[{PEER}]"}] * 3
 
   def calibrate(self):
-    return proof.calibrate(self.client, self.child, 8, self.creator, self.control, time.monotonic() + 5)
+    with proof.calibrate(self.client, self.child, 8, self.creator, self.control, time.monotonic() + 5) as evidence:
+      self.assertIs(evidence.pinned_client, self.pinned)
+      return evidence.inode, evidence.peer_inode, evidence.creator, evidence.child_fd, evidence.cookie
 
   def test_stable_evidence_rechecks_the_cookie_owner_and_credentials(self):
-    self.assertEqual(self.calibrate(), proof.Calibration(INODE, PEER, self.creator, 8, COOKIE))
+    self.assertEqual(self.calibrate(), (INODE, PEER, self.creator, 8, COOKIE))
+    self.client.dup.assert_called_once_with()
+    self.pinned.close.assert_called_once_with()
+    self.assertEqual(self.identity.call_args_list, [mock.call(self.pinned)] * 3)
+    self.assertEqual(self.credentials.call_args_list, [mock.call(self.pinned)] * 3)
     self.assertEqual(self.query.call_count, 3)
     self.assertEqual(self.query.call_args_list[0].args[:3], (INODE, proof.NO_COOKIE, 1))
     self.assertEqual(self.query.call_args_list[1].args[:3], (INODE, COOKIE, 2))
@@ -316,6 +324,7 @@ class CalibrationTests(unittest.TestCase):
     with self.assertRaisesRegex(proof.EvidenceError, "creator"):
       self.calibrate()
     self.query.assert_not_called()
+    self.pinned.close.assert_called_once_with()
 
   def test_changed_credentials_peer_cookie_and_owner_are_rejected(self):
     self.credentials.side_effect = [self.creator, (123, 502, 20)]
@@ -362,7 +371,8 @@ class CalibrationTests(unittest.TestCase):
       self.calibrate()
     self.query.reset_mock()
     with self.assertRaisesRegex(proof.EvidenceError, "timed out"):
-      proof.calibrate(self.client, self.child, 8, self.creator, self.control, time.monotonic() - 1)
+      with proof.calibrate(self.client, self.child, 8, self.creator, self.control, time.monotonic() - 1):
+        self.fail("expired calibration succeeded")
     self.query.assert_not_called()
 
   def test_barrier_failure_stops_before_final_observation(self):
@@ -381,7 +391,7 @@ class CalibrationTests(unittest.TestCase):
     self.hold.assert_called_once()
     self.assertEqual(self.fds.call_count, 2)
 
-  def test_real_client_close_and_fd_replacement_are_rejected(self):
+  def test_real_pinned_client_close_and_fd_replacement_are_rejected(self):
     for replacement in (False, True):
       with self.subTest(replacement=replacement), ExitStack() as stack:
         client, peer = socket.socketpair()
@@ -390,22 +400,58 @@ class CalibrationTests(unittest.TestCase):
           stack.enter_context(sock)
         original_inode = os.fstat(client.fileno()).st_ino
         self.assertNotEqual(original_inode, os.fstat(other.fileno()).st_ino)
-        self.identity.side_effect = self.real_identity
+        pinned = []
+
+        def identity(sock):
+          if not pinned:
+            pinned.append(sock)
+          return self.real_identity(sock)
+
+        self.identity.side_effect = identity
         self.credentials.side_effect = [self.creator, self.creator]
         self.fds.side_effect = [{8: f"socket:[{PEER}]"}] * 2
 
         def race(inode, cookie, sequence, deadline):
           if sequence == 2:
             if replacement:
-              os.dup2(other.fileno(), client.fileno())
+              os.dup2(other.fileno(), pinned[0].fileno())
             else:
-              client.close()
+              pinned[0].close()
           return proof.Diagnostic(inode, PEER, COOKIE)
 
         self.query.side_effect = race
         reason = "client socket or credentials changed" if replacement else "closed or non-UNIX client"
         with self.assertRaisesRegex(proof.EvidenceError, reason):
-          proof.calibrate(client, self.child, 8, self.creator, self.control, time.monotonic() + 5)
+          with proof.calibrate(client, self.child, 8, self.creator, self.control, time.monotonic() + 5):
+            self.fail("changed pinned socket was accepted")
+        self.assertEqual(pinned[0].fileno(), -1)
+        self.assertEqual(os.fstat(client.fileno()).st_ino, original_inode)
+
+  def test_closed_client_cannot_be_pinned(self):
+    client, peer = socket.socketpair()
+    with client, peer:
+      client.close()
+      with self.assertRaisesRegex(proof.EvidenceError, "client socket unavailable"):
+        with proof.calibrate(client, self.child, 8, self.creator, self.control, time.monotonic() + 5):
+          self.fail("closed client was accepted")
+    self.query.assert_not_called()
+
+  def test_pin_closes_if_consumer_raises(self):
+    client, peer = socket.socketpair()
+    with client, peer:
+      client.settimeout(1)
+      peer.settimeout(1)
+      self.identity.side_effect = self.real_identity
+      self.query.side_effect = lambda inode, cookie, sequence, deadline: proof.Diagnostic(inode, PEER, COOKIE)
+      pinned = None
+      with self.assertRaisesRegex(RuntimeError, "consumer failed"):
+        with proof.calibrate(client, self.child, 8, self.creator, self.control, time.monotonic() + 5) as evidence:
+          pinned = evidence.pinned_client
+          self.assertNotEqual(pinned.fileno(), client.fileno())
+          raise RuntimeError("consumer failed")
+      self.assertEqual(pinned.fileno(), -1)
+      client.sendall(b"x")
+      self.assertEqual(peer.recv(1), b"x")
 
 
 class FixtureIOTests(unittest.TestCase):
@@ -540,10 +586,12 @@ def replace_fixture_fd(fixture, deadline):
   return duplicate_fd
 
 
-def exchange_fixture_peer(fixture, deadline):
+def exchange_fixture_peer(fixture, deadline, client=None):
+  if client is None:
+    client = fixture.client
   proof.send_line(fixture.control, b"CHECK", deadline)
-  proof.send_bytes(fixture.client, proof._PING, deadline)
-  return (proof.receive_bytes(fixture.client, len(proof._PONG), deadline),
+  proof.send_bytes(client, proof._PING, deadline)
+  return (proof.receive_bytes(client, len(proof._PONG), deadline),
           proof.receive_line(fixture.control, deadline))
 
 
@@ -577,7 +625,9 @@ class PortableFixtureTests(unittest.TestCase):
         listener.bind(path)
         listener.listen(1)
         self.assertTrue(stat.S_ISSOCK(os.stat(path).st_mode))
-      for invalid in (path + "s", path[:-1] + "é", path + "\0"):
+      raw_path = os.fsencode(path)
+      check_fixture_path(raw_path[:-1] + b"\x80")
+      for invalid in (path + "s", raw_path + b"\x80", path + "\0"):
         with self.subTest(path=invalid), self.assertRaises(proof.EvidenceError):
           check_fixture_path(invalid)
 
@@ -605,8 +655,9 @@ class PortableFixtureTests(unittest.TestCase):
            mock.patch.object(proof, "_query_peer", side_effect=query) as queried, \
            mock.patch.object(proof, "_read_child_fds", side_effect=snapshot):
         with self.assertRaisesRegex(proof.EvidenceError, "missing, duplicate, or mismatched peer FD"):
-          proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
-                          fixture.creator, fixture.control, fixture.deadline)
+          with proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                               fixture.creator, fixture.control, fixture.deadline):
+            self.fail("mismatched peer FD was accepted")
       self.assertEqual(snapshots, [1, 2, 3])
       self.assertEqual(queried.call_count, 3)
       self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
@@ -632,14 +683,62 @@ class PortableFixtureTests(unittest.TestCase):
       with mock.patch.object(proof, "_peer_credentials", return_value=fixture.creator), \
            mock.patch.object(proof, "_query_peer", side_effect=query), \
            mock.patch.object(proof, "_read_child_fds", side_effect=snapshot):
-        evidence = proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
-                                   fixture.creator, fixture.control, fixture.deadline)
-      self.assertEqual(evidence.peer_inode, PEER)
-      self.assertEqual(snapshots, [1, 2, 3])
-      proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
-      self.assertEqual(proof.receive_line(fixture.control, fixture.deadline), b"BUSY")
-      self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
+        with proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                             fixture.creator, fixture.control, fixture.deadline) as evidence:
+          pinned = evidence.pinned_client
+          self.assertEqual(evidence.peer_inode, PEER)
+          self.assertEqual(snapshots, [1, 2, 3])
+          proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
+          self.assertEqual(proof.receive_line(fixture.control, fixture.deadline), b"BUSY")
+          self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline, pinned), (proof._PONG, b"CHECKED"))
+      self.assertEqual(pinned.fileno(), -1)
       fixture.finish()
+
+  def test_late_client_fd_swap_attests_only_the_pinned_socket(self):
+    with owned_fixture("direct") as fixture:
+      other, other_peer = socket.socketpair()
+      with other, other_peer:
+        original_fd = fixture.client.fileno()
+        original_inode = proof._socket_identity(fixture.client)[2]
+        replacement_inode = os.fstat(other.fileno()).st_ino
+        self.assertNotEqual(original_inode, replacement_inode)
+        snapshots = []
+        credentials = []
+        links = {fixture.child_fd: f"socket:[{PEER}]"}
+
+        def snapshot(child, deadline):
+          self.assertIs(child, fixture.child)
+          snapshots.append(links)
+          return links
+
+        def query(inode, cookie, sequence, deadline):
+          return proof.Diagnostic(inode, PEER, COOKIE)
+
+        def peer_credentials(client):
+          credentials.append(client)
+          if len(credentials) == 3:
+            self.assertEqual(len(snapshots), 3)
+            os.dup2(other.fileno(), original_fd)
+          return fixture.creator
+
+        with mock.patch.object(proof, "_peer_credentials", side_effect=peer_credentials), \
+             mock.patch.object(proof, "_query_peer", side_effect=query), \
+             mock.patch.object(proof, "_read_child_fds", side_effect=snapshot):
+          with proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                               fixture.creator, fixture.control, fixture.deadline) as evidence:
+            pinned = evidence.pinned_client
+            self.assertEqual(len(credentials), 3)
+            self.assertTrue(all(client is pinned for client in credentials))
+            self.assertNotEqual(pinned.fileno(), original_fd)
+            self.assertEqual(evidence.inode, original_inode)
+            self.assertEqual(proof._socket_identity(pinned)[2], original_inode)
+            self.assertEqual(os.fstat(original_fd).st_ino, replacement_inode)
+            self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline, pinned),
+                             (proof._PONG, b"CHECKED"))
+            proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
+            self.assertEqual(proof.receive_line(fixture.control, fixture.deadline), b"BUSY")
+        self.assertEqual(pinned.fileno(), -1)
+        fixture.finish()
 
   def test_child_is_reaped_on_fixture_failure(self):
     child = None
@@ -657,22 +756,25 @@ class PortableFixtureTests(unittest.TestCase):
 class LinuxFixtureTests(unittest.TestCase):
   def check_fixture(self, mode):
     with owned_fixture(mode) as fixture:
-      evidence = proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
-                                 fixture.creator, fixture.control, fixture.deadline)
-      self.assertEqual(evidence.creator, fixture.creator)
-      self.assertEqual(evidence.child_fd, fixture.child_fd)
-      self.assertNotEqual(evidence.inode, evidence.peer_inode)
-      fd_path = f"/proc/{fixture.child.pid}/fd/{fixture.child_fd}"
-      self.assertEqual(os.readlink(fd_path), f"socket:[{evidence.peer_inode}]")
-      proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
-      self.assertEqual(proof.receive_line(fixture.control, fixture.deadline), b"BUSY")
-      self.assertEqual(os.readlink(fd_path), f"socket:[{evidence.peer_inode}]")
-      self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
-      if mode == "activated":
-        self.assertEqual(evidence.creator[0], os.getpid())
-        self.assertNotEqual(evidence.creator[0], fixture.child.pid)
-      else:
-        self.assertEqual(evidence.creator[0], fixture.child.pid)
+      with proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                           fixture.creator, fixture.control, fixture.deadline) as evidence:
+        pinned = evidence.pinned_client
+        self.assertEqual(proof._socket_identity(pinned)[2], evidence.inode)
+        self.assertEqual(evidence.creator, fixture.creator)
+        self.assertEqual(evidence.child_fd, fixture.child_fd)
+        self.assertNotEqual(evidence.inode, evidence.peer_inode)
+        fd_path = f"/proc/{fixture.child.pid}/fd/{fixture.child_fd}"
+        self.assertEqual(os.readlink(fd_path), f"socket:[{evidence.peer_inode}]")
+        proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
+        self.assertEqual(proof.receive_line(fixture.control, fixture.deadline), b"BUSY")
+        self.assertEqual(os.readlink(fd_path), f"socket:[{evidence.peer_inode}]")
+        self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline, pinned), (proof._PONG, b"CHECKED"))
+        if mode == "activated":
+          self.assertEqual(evidence.creator[0], os.getpid())
+          self.assertNotEqual(evidence.creator[0], fixture.child.pid)
+        else:
+          self.assertEqual(evidence.creator[0], fixture.child.pid)
+      self.assertEqual(pinned.fileno(), -1)
       fixture.finish()
 
   def test_activator_created_listener_is_accepted_by_child(self):
@@ -703,8 +805,9 @@ class LinuxFixtureTests(unittest.TestCase):
 
         with mock.patch.object(proof, "_read_child_fds", side_effect=replace_after_snapshot):
           with self.assertRaisesRegex(proof.EvidenceError, "missing, duplicate, or mismatched peer FD"):
-            proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
-                            fixture.creator, fixture.control, fixture.deadline)
+            with proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                                 fixture.creator, fixture.control, fixture.deadline):
+              self.fail("mismatched peer FD was accepted")
         self.assertEqual(len(snapshots), replace_after + 1)
         self.assertEqual(len(replaced), 1)
         original_link, duplicate_fd = replaced[0]
