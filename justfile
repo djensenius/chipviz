@@ -175,6 +175,7 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test s
 python-lint:
     @${PYTHON:-python3} -m py_compile {{ python_files }} tests/sms_port_trace.py tests/test_sms_port_trace.py cores/gba/homebrew/lines/fixture/harness.py cores/gba/homebrew/lines/fixture/host_tests.py
     @${PYTHON:-python3} -m py_compile scripts/youtube_auth.py scripts/youtube_transport.py tests/test_youtube_auth.py tests/test_youtube_transport.py
+    @${PYTHON:-python3} -m py_compile tests/unix_diag_peer_fixture.py tests/test_unix_diag_peer.py
     @echo "chipviz Python lint OK"
 
 local-review-js-lint:
