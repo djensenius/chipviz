@@ -1,5 +1,6 @@
 //! Opt-in headless readback. Run only while holding the shared exclusive
-//! heavy-work lock for both the build and the GPU test.
+//! heavy-work lock for both the build and the GPU test. The PRIMARY and GL
+//! tests are separate so each can require and report its actual adapter.
 //!
 //! This compares actual offscreen bytes with independent geometric row masks;
 //! it is not presented output, a physical Pi test, or a safety assessment.
@@ -27,9 +28,9 @@ struct Offscreen {
 }
 
 impl Offscreen {
-    fn new() -> Self {
+    fn new(backends: wgpu::Backends) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends,
             ..Default::default()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -37,8 +38,12 @@ impl Offscreen {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
-        .expect("a headless WGPU PRIMARY adapter is required");
-        eprintln!("PETSCII offscreen adapter: {:?}", adapter.get_info());
+        .expect("a headless adapter for the requested WGPU backend is required");
+        let info = adapter.get_info();
+        if backends == wgpu::Backends::GL {
+            assert_eq!(info.backend, wgpu::Backend::Gl);
+        }
+        eprintln!("PETSCII offscreen adapter: {info:?}");
         for format in [
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -180,6 +185,41 @@ const CASES: [Case; 5] = [
     },
 ];
 
+// Exact rational coverage includes subpixel scene bounds and texel-boundary
+// ties. A 1x1 target must sample source (160,160), not become all black.
+const REGRESSION_CASES: [Case; 5] = [
+    Case {
+        size: (1, 1),
+        origin: (0, 0),
+        covered: (1, 1),
+        scale: (1, 320),
+    },
+    Case {
+        size: (1, 2),
+        origin: (0, 0),
+        covered: (1, 1),
+        scale: (1, 320),
+    },
+    Case {
+        size: (2, 1),
+        origin: (0, 0),
+        covered: (2, 1),
+        scale: (1, 200),
+    },
+    Case {
+        size: (191, 125),
+        origin: (0, 2),
+        covered: (191, 119),
+        scale: (191, 320),
+    },
+    Case {
+        size: (321, 101),
+        origin: (79, 0),
+        covered: (162, 101),
+        scale: (101, 200),
+    },
+];
+
 fn assert_pixels(
     image: &[u8],
     format: wgpu::TextureFormat,
@@ -241,7 +281,17 @@ fn code_changes(before: &PetsciiMeterField, after: &PetsciiMeterField) -> usize 
 #[test]
 #[ignore = "requires a headless GPU adapter and the serialized heavy-work lock"]
 fn gpu_matches_independent_quiet_and_energetic_composition() {
-    let gpu = Offscreen::new();
+    check_gpu(wgpu::Backends::PRIMARY);
+}
+
+#[test]
+#[ignore = "requires a headless GL adapter and the serialized heavy-work lock"]
+fn gpu_gl_matches_independent_quiet_and_energetic_composition() {
+    check_gpu(wgpu::Backends::GL);
+}
+
+fn check_gpu(backends: wgpu::Backends) {
+    let gpu = Offscreen::new(backends);
     assert!(matches!(
         PetsciiMeterFieldRenderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Bgra8Unorm),
         Err(RenderError::UnsupportedFormat(
@@ -288,6 +338,17 @@ fn gpu_matches_independent_quiet_and_energetic_composition() {
                     assert_ne!(&image, previous, "{format:?} {label} {:?}", case.size);
                 }
                 previous = Some(image);
+            }
+        }
+        assert_ne!(
+            expected::field_pixel(&states[1].1, 160, 160),
+            [0, 0, 0, 255]
+        );
+        for case in REGRESSION_CASES {
+            let target = gpu.target(case.size, format, usage, 1, 1);
+            for (label, state) in [&states[1], &states[3]] {
+                renderer.render(&target, state).unwrap();
+                assert_pixels(&gpu.read(&target), format, state, case, label);
             }
         }
 
@@ -372,7 +433,8 @@ fn gpu_matches_independent_quiet_and_energetic_composition() {
         }
     }
     eprintln!(
-        "PETSCII offscreen readback: both formats, six model states, five viewport cases; \
+        "PETSCII offscreen readback: both formats, six model states, five viewport cases \
+         and five fractional regressions; \
          no presentation, physical Pi, or safety conclusion"
     );
 }

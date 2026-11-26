@@ -9,8 +9,8 @@
 //! background. Unsupported codes, colours outside 0..=15, incorrect cell counts,
 //! and inconsistent artwork evidence are errors rather than valid-looking art.
 //! The exact 40x25 cell grid is row-major. The only internal GPU image is a
-//! 320x200 RGBA8 texture; CPU composition is one 256,000-byte image, plus
-//! WGPU's transient upload staging.
+//! 320x200 RGBA8 texture and a 16-byte viewport buffer; CPU composition is one
+//! 256,000-byte image, plus WGPU's transient upload staging.
 //!
 //! Targets are single-sample, single-layer, single-mip RGBA8 UNORM or sRGB
 //! render attachments, at most 8192 pixels per dimension and within the device
@@ -18,7 +18,11 @@
 //! holds encoded bytes: the shader passes them through for UNORM and decodes
 //! them to linear for an sRGB attachment, so both store the same encoded
 //! colours. Integer scaling is preferred; smaller targets use nearest-neighbour
-//! fractional scaling, with opaque black letterboxing.
+//! fractional scaling, with opaque black letterboxing. The GPU viewport always
+//! covers the integer-sized attachment, including on GL. The shader maps pixel
+//! centres using bounded integer ratios: a texel-boundary tie selects the later
+//! texel, and centres on or beyond the far edge are black. Only the local Metal
+//! adapter has been tested; GL and other backends require their own readback.
 //!
 //! Each successful call uploads, submits, and waits for that submission before
 //! returning. This bounds in-flight uploads and prevents a later frame from
@@ -35,6 +39,14 @@ pub const MAX_TARGET_DIMENSION: u32 = 8192;
 
 const TEXTURE_WIDTH: u32 = PIXEL_WIDTH as u32;
 const TEXTURE_HEIGHT: u32 = PIXEL_HEIGHT as u32;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Geometry {
+    origin: [u32; 2],
+    scale_num: u32,
+    scale_den: u32,
+}
 
 /// Invented sRGB-encoded RGBA colours; index zero is a valid foreground.
 pub const PALETTE: [[u8; 4]; 16] = [
@@ -172,8 +184,7 @@ pub struct Viewport {
     pub height: f32,
 }
 
-/// Reject zero or over-limit dimensions; prefer whole-pixel scaling when possible.
-pub fn viewport(width: u32, height: u32) -> Option<Viewport> {
+fn geometry(width: u32, height: u32) -> Option<Geometry> {
     if width == 0 || height == 0 || width > MAX_TARGET_DIMENSION || height > MAX_TARGET_DIMENSION {
         return None;
     }
@@ -181,34 +192,56 @@ pub fn viewport(width: u32, height: u32) -> Option<Viewport> {
     if scale > 0 {
         let scene_width = TEXTURE_WIDTH * scale;
         let scene_height = TEXTURE_HEIGHT * scale;
-        return Some(Viewport {
-            x: ((width - scene_width) / 2) as f32,
-            y: ((height - scene_height) / 2) as f32,
-            width: scene_width as f32,
-            height: scene_height as f32,
+        return Some(Geometry {
+            origin: [(width - scene_width) / 2, (height - scene_height) / 2],
+            scale_num: scale,
+            scale_den: 1,
         });
     }
 
-    // Keep centering exact until the final viewport conversion. Rounding a
-    // fractional scale first can move a mathematically integral edge by one
-    // target pixel (for example 192x124 at a 3/5 scale).
+    // Keep fractional scale and centering as exact, bounded integer ratios.
     if width * TEXTURE_HEIGHT <= height * TEXTURE_WIDTH {
         let scene_height = width * TEXTURE_HEIGHT;
-        Some(Viewport {
-            x: 0.0,
-            y: ((height * TEXTURE_WIDTH - scene_height) / (2 * TEXTURE_WIDTH)) as f32,
-            width: width as f32,
-            height: scene_height as f32 / TEXTURE_WIDTH as f32,
+        Some(Geometry {
+            origin: [
+                0,
+                (height * TEXTURE_WIDTH - scene_height) / (2 * TEXTURE_WIDTH),
+            ],
+            scale_num: width,
+            scale_den: TEXTURE_WIDTH,
         })
     } else {
         let scene_width = height * TEXTURE_WIDTH;
-        Some(Viewport {
-            x: ((width * TEXTURE_HEIGHT - scene_width) / (2 * TEXTURE_HEIGHT)) as f32,
-            y: 0.0,
-            width: scene_width as f32 / TEXTURE_HEIGHT as f32,
-            height: height as f32,
+        Some(Geometry {
+            origin: [
+                (width * TEXTURE_HEIGHT - scene_width) / (2 * TEXTURE_HEIGHT),
+                0,
+            ],
+            scale_num: height,
+            scale_den: TEXTURE_HEIGHT,
         })
     }
+}
+
+/// Reject zero or over-limit dimensions; prefer whole-pixel scaling when possible.
+pub fn viewport(width: u32, height: u32) -> Option<Viewport> {
+    let geometry = geometry(width, height)?;
+    Some(Viewport {
+        x: geometry.origin[0] as f32,
+        y: geometry.origin[1] as f32,
+        width: (TEXTURE_WIDTH * geometry.scale_num) as f32 / geometry.scale_den as f32,
+        height: (TEXTURE_HEIGHT * geometry.scale_num) as f32 / geometry.scale_den as f32,
+    })
+}
+
+pub(crate) fn gpu_viewport(width: u32, height: u32) -> Option<Viewport> {
+    geometry(width, height)?;
+    Some(Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,6 +251,10 @@ pub enum RenderError {
         name: &'static str,
         required: u32,
         available: u32,
+    },
+    BufferSizeLimit {
+        required: u64,
+        available: u64,
     },
     TargetFormat {
         expected: wgpu::TextureFormat,
@@ -238,8 +275,8 @@ pub enum RenderError {
     Composition(ComposeError),
 }
 
-// These are the only device limits used by the one-texture, one-target
-// pipeline. WGPU counts an RGBA8 colour attachment as eight bytes per sample.
+// Limits for one texture, one uniform buffer and one target. WGPU counts an
+// RGBA8 colour attachment as eight bytes per sample.
 pub(crate) fn validate_limits(limits: &wgpu::Limits) -> Result<u32, RenderError> {
     for (name, available, required) in [
         (
@@ -256,7 +293,7 @@ pub(crate) fn validate_limits(limits: &wgpu::Limits) -> Result<u32, RenderError>
         (
             "max_bindings_per_bind_group",
             limits.max_bindings_per_bind_group,
-            1,
+            2,
         ),
         (
             "max_sampled_textures_per_shader_stage",
@@ -264,9 +301,14 @@ pub(crate) fn validate_limits(limits: &wgpu::Limits) -> Result<u32, RenderError>
             1,
         ),
         (
-            "max_inter_stage_shader_components",
-            limits.max_inter_stage_shader_components,
-            2,
+            "max_uniform_buffers_per_shader_stage",
+            limits.max_uniform_buffers_per_shader_stage,
+            1,
+        ),
+        (
+            "max_uniform_buffer_binding_size",
+            limits.max_uniform_buffer_binding_size,
+            std::mem::size_of::<Geometry>() as u32,
         ),
         ("max_color_attachments", limits.max_color_attachments, 1),
         (
@@ -283,6 +325,13 @@ pub(crate) fn validate_limits(limits: &wgpu::Limits) -> Result<u32, RenderError>
             });
         }
     }
+    let required = std::mem::size_of::<Geometry>() as u64;
+    if limits.max_buffer_size < required {
+        return Err(RenderError::BufferSizeLimit {
+            required,
+            available: limits.max_buffer_size,
+        });
+    }
     Ok(limits.max_texture_dimension_2d.min(MAX_TARGET_DIMENSION))
 }
 
@@ -293,6 +342,7 @@ pub struct PetsciiMeterFieldRenderer<'a> {
     format: wgpu::TextureFormat,
     max_target_dimension: u32,
     texture: wgpu::Texture,
+    geometry: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
 }
@@ -324,27 +374,53 @@ impl<'a> PetsciiMeterFieldRenderer<'a> {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let geometry = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("PETSCII meter prototype geometry"),
+            size: std::mem::size_of::<Geometry>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("PETSCII meter prototype layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<Geometry>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+            ],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PETSCII meter prototype bind group"),
             layout: &layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: geometry.as_entire_binding(),
+                },
+            ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("PETSCII meter prototype shader"),
@@ -389,6 +465,7 @@ impl<'a> PetsciiMeterFieldRenderer<'a> {
             format,
             max_target_dimension,
             texture,
+            geometry,
             bind_group,
             pipeline,
         })
@@ -445,13 +522,20 @@ impl<'a> PetsciiMeterFieldRenderer<'a> {
         {
             return Err(RenderError::TargetUsage);
         }
-        let viewport = viewport(size.width, size.height).ok_or(RenderError::TargetSize {
+        let viewport = gpu_viewport(size.width, size.height).ok_or(RenderError::TargetSize {
+            width: size.width,
+            height: size.height,
+            maximum: self.max_target_dimension,
+        })?;
+        let geometry = geometry(size.width, size.height).ok_or(RenderError::TargetSize {
             width: size.width,
             height: size.height,
             maximum: self.max_target_dimension,
         })?;
         let pixels = compose_cells(cells).map_err(RenderError::Composition)?;
 
+        self.queue
+            .write_buffer(&self.geometry, 0, bytemuck::bytes_of(&geometry));
         self.queue.write_texture(
             self.texture.as_image_copy(),
             &pixels,

@@ -17,7 +17,8 @@ use petscii_meter_field::{Cell, Inputs, PetsciiMeterField, WIDTH};
 use petscii_meter_field_artwork::Pixel;
 use petscii_meter_field_render::{
     BACKGROUND, CELL_COUNT, ComposeError, FRAME_BYTES, MAX_TARGET_DIMENSION, PALETTE, RenderError,
-    UNKNOWN_CELL, Viewport, compose, compose_cells, compose_with, validate_limits, viewport,
+    UNKNOWN_CELL, Viewport, compose, compose_cells, compose_with, gpu_viewport, validate_limits,
+    viewport,
 };
 
 fn input(spectrum: u8) -> Inputs {
@@ -168,16 +169,18 @@ fn insufficient_device_limits_are_rejected_before_resource_creation() {
         max_texture_dimension_2d: 320,
         max_texture_array_layers: 1,
         max_bind_groups: 1,
-        max_bindings_per_bind_group: 1,
+        max_bindings_per_bind_group: 2,
         max_sampled_textures_per_shader_stage: 1,
-        max_inter_stage_shader_components: 2,
+        max_uniform_buffers_per_shader_stage: 1,
+        max_uniform_buffer_binding_size: 16,
+        max_buffer_size: 16,
         max_color_attachments: 1,
         max_color_attachment_bytes_per_sample: 8,
         ..wgpu::Limits::default()
     };
     assert_eq!(validate_limits(&adequate), Ok(320));
     type LimitCase = (&'static str, u32, fn(&mut wgpu::Limits));
-    let cases: [LimitCase; 8] = [
+    let cases: [LimitCase; 9] = [
         ("max_texture_dimension_2d", 320, |l| {
             l.max_texture_dimension_2d = 319
         }),
@@ -185,14 +188,17 @@ fn insufficient_device_limits_are_rejected_before_resource_creation() {
             l.max_texture_array_layers = 0
         }),
         ("max_bind_groups", 1, |l| l.max_bind_groups = 0),
-        ("max_bindings_per_bind_group", 1, |l| {
-            l.max_bindings_per_bind_group = 0
+        ("max_bindings_per_bind_group", 2, |l| {
+            l.max_bindings_per_bind_group = 1
         }),
         ("max_sampled_textures_per_shader_stage", 1, |l| {
             l.max_sampled_textures_per_shader_stage = 0
         }),
-        ("max_inter_stage_shader_components", 2, |l| {
-            l.max_inter_stage_shader_components = 1
+        ("max_uniform_buffers_per_shader_stage", 1, |l| {
+            l.max_uniform_buffers_per_shader_stage = 0
+        }),
+        ("max_uniform_buffer_binding_size", 16, |l| {
+            l.max_uniform_buffer_binding_size = 15
         }),
         ("max_color_attachments", 1, |l| l.max_color_attachments = 0),
         ("max_color_attachment_bytes_per_sample", 8, |l| {
@@ -211,6 +217,15 @@ fn insufficient_device_limits_are_rejected_before_resource_creation() {
             })
         );
     }
+    let mut too_small = adequate;
+    too_small.max_buffer_size = 15;
+    assert_eq!(
+        validate_limits(&too_small),
+        Err(RenderError::BufferSizeLimit {
+            required: 16,
+            available: 15,
+        })
+    );
     let generous = wgpu::Limits {
         max_texture_dimension_2d: MAX_TARGET_DIMENSION + 1,
         ..wgpu::Limits::default()
@@ -270,6 +285,7 @@ fn viewport_preserves_aspect_bounds_and_integer_scaling() {
     ] {
         assert_eq!(viewport(size.0, size.1), None, "{size:?}");
     }
+
     for (size, expected) in [
         (
             (320, 200),
@@ -335,4 +351,23 @@ fn viewport_preserves_aspect_bounds_and_integer_scaling() {
         assert!(view.y + view.height <= height as f32);
         assert!((view.width / view.height - 1.6).abs() < 0.00001);
     }
+}
+
+#[test]
+fn gpu_viewport_survives_gl_truncation_at_minimum_target() {
+    assert_eq!(viewport(1, 1).unwrap().height, 0.625);
+    for (width, height) in [(1, 1), (191, 125), (321, 101), (8192, 1), (1, 8192)] {
+        let view = gpu_viewport(width, height).unwrap();
+        assert_eq!(
+            (
+                view.x as i32,
+                view.y as i32,
+                view.width as i32,
+                view.height as i32
+            ),
+            (0, 0, width as i32, height as i32)
+        );
+    }
+    assert_eq!(gpu_viewport(0, 1), None);
+    assert_eq!(gpu_viewport(MAX_TARGET_DIMENSION + 1, 1), None);
 }
