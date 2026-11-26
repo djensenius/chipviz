@@ -14,10 +14,13 @@ portable-only run is not Linux evidence. The path-scoped
 these verbose tests, with read-only permissions and no user-provided secrets,
 cache, artifacts, or dependency installation.
 
-The existing Python workflow runs broader checks and is not fake-only. Other
-normal PR/check workflows can run Docker, SDK, and ROM jobs. The focused job
-does not suppress or authorize those workflows: an owner decision on that CI
-scope is required before opening a PR or otherwise triggering broader CI.
+The existing Python workflow runs broader checks and is not fake-only. The
+repository's existing, unmodified PR checks run separately on GitHub-hosted
+runners and include Docker, SDK, and ROM jobs. #244's no-Docker/SDK/ROM
+restriction applies to the fixture, local work, and its dedicated job. No
+local Docker access or suppression of standard checks is authorized. Those
+checks do not prove receiver identity or isolation. Independent exact-head
+review remains required before a PR.
 
 The Linux fixture creates a private Unix stream listener and a disposable
 child. Its private temporary directory is under `/tmp`, and socket paths are
