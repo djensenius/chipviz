@@ -225,6 +225,99 @@ production PRG, actual screen/colour RAM, raster IRQ or scene transitions.
 It does not demonstrate displayed output, target timing or physical flash
 safety.
 
+### Static SpectrumVolume display fixture (not yet verified)
+
+`tests/c64_spectrum_volume_display.c` is a separate, unlinked test PRG. It
+selects VIC bank 0 (CIA2 `$DD00` bits 0–1 = 3, outputs in `$DD02`), screen
+RAM `$0400` and uppercase/graphics character ROM `$1000` (`$D018 = $14`).
+It assumes the normal C64 memory map and ROM glyphs: screen code 32 is blank
+and 160 is a solid reverse space. `$D011 = $1B` and `$D016 = $08` select
+25-row, 40-column standard text, with ECM, bitmap and multicolour off.
+Sprites are disabled, colour RAM is `$D800`, and border/background are
+black. It disables IRQs and CIA interrupt sources, clears the 1000 cells,
+initializes palette 0 and makes one step with band 0 = 255, other bands = 0,
+energy = 255. A separate `SV_DISPLAY_BLANK` build skips the step. It publishes
+`SVD1` or `SVB1` in `sv_display_ready` only after all writes, then holds.
+Both builds need separately matched labels and maps, plus independent
+runtime isolation evidence. Assumptions including interrupt/NMI isolation,
+stack behavior and the character ROM are **not yet verified**.
+
+`scripts/c64_spectrum_volume_display.py` is a host-only contract, not an
+emulator frontend. Its independent pixel oracle specifies black plus four
+8x8 cells at (row, column, VIC ink) (8,6,6), (15,5,4), (22,4,5),
+(22,5,5). It compares all 320x200 pixels using explicit Pepto PAL RGB:
+black `#000000`, purple `#6F3D86`, green `#588D43`, blue `#352879`.
+It accepts only little-endian libretro XRGB8888 with valid dimensions and
+pitch, including padding.
+
+`tests/c64_spectrum_volume_calibration.c` is a separate, unlinked static
+calibration fixture source with the same VIC setup and ROM assumptions. It
+clears the display to code 32/black, then puts solid code 160 at the corner cells:
+top-left white (VIC 1), top-right purple (4), bottom-left green (5), and
+bottom-right blue (6). It writes `SVC1` to `sv_calibration_ready` only after
+the screen and VIC setup, then holds. A future adapter must observe that
+marker absent before boot and stable across calibration frames. The fixture
+needs its own matched labels and map and proof of memory/interrupt isolation.
+The independent host oracle searches for one corner set and checks every
+pixel of the 320x200 reference: exactly four 8x8 coloured cells and black
+elsewhere. Missing, partial, extra and ambiguous references fail.
+
+The coordinator compiled separate scene, blank and calibration PRGs with
+matched labels and maps at `208bfb1b26be9ea63f2919c32a14cc1dd0288841` using
+`cl65 V2.18 - N/A`, without emulator or GPU execution. The maps reported BSS
+ranges `$0E92-$0EBC`, `$0E4D-$0E6F` and `$0AB2-$0AB8`, respectively; the
+labels place each ready marker at its BSS start. The target configuration
+declares `__HIMEM__=$D000` and `__STACKSIZE__=$0800`. This is static linker
+evidence, not proof of dynamic stack or interrupt safety, ROM contents,
+runtime behavior or physical safety.
+
+For a separate reproduction, create an exclusive output directory and build
+all three matched PRGs, labels and maps together (requires an approved build
+slot; these commands were not rerun for this documentation change):
+
+```sh
+mkdir -p build/tests
+out=$(mktemp -d build/tests/c64-display.XXXXXX)
+cl65 -t c64 -Oirs --static-locals -Icores/c64/homebrew/src -c -o "$out/spectrum_volume.o" cores/c64/homebrew/src/spectrum_volume.c
+cl65 -t c64 -Oirs --static-locals -Icores/c64/homebrew/src -c -o "$out/scene.o" tests/c64_spectrum_volume_display.c
+cl65 -t c64 -Oirs --static-locals -DSV_DISPLAY_BLANK -Icores/c64/homebrew/src -c -o "$out/blank.o" tests/c64_spectrum_volume_display.c
+cl65 -t c64 -Oirs --static-locals -c -o "$out/calibration.o" tests/c64_spectrum_volume_calibration.c
+cl65 -t c64 -m "$out/scene.map" -Ln "$out/scene.lbl" -o "$out/scene.prg" "$out/scene.o" "$out/spectrum_volume.o"
+cl65 -t c64 -m "$out/blank.map" -Ln "$out/blank.lbl" -o "$out/blank.prg" "$out/blank.o" "$out/spectrum_volume.o"
+cl65 -t c64 -m "$out/calibration.map" -Ln "$out/calibration.lbl" -o "$out/calibration.prg" "$out/calibration.o"
+```
+
+The required VICE x64sc libretro options are `vice_external_palette=pepto-pal`
+and `vice_gfx_colors=24bit` (as in `scripts/c64_colour_field_capture.py`);
+the future adapter must set and verify these, not just assume them. The
+RGB values are taken from the pinned upstream
+[VICE Pepto PAL palette](https://github.com/VICE-Team/svn-mirror/blob/eef05c0f438bb65e81677840fa64ce81b49e60e5/vice/data/C64/pepto-pal.vpl):
+black `#000000`, white `#FFFFFF`, purple `#6F3D86`, green `#588D43`, and
+blue `#352879`. These modeled RGB values do not prove physical colors.
+`observe` remains blocked for real use; `synthetic_only=True` is for fake
+tests, not evidence of emulator readiness. A reference must be independently
+observed from this separate fixture, not derived from the scene image.
+Matching a reference does not itself prove palette configuration.
+
+Any future emulator adapter must prove reference provenance, pixel format and
+Pepto palette configuration; provide a fresh callback per `retro_run` with
+copied pixels; observe the fixture marker absent before boot and stable
+thereafter; and independently measure both KERNAL `$02A6` and raster lines
+(PAL 1/312, NTSC 0/263, early NTSC 0/262). A requested model option is not a
+measurement. The observation discards the first complete frame after ready,
+rejects missing, duplicate-only, extra, ambiguous and stale callbacks, latching
+errors across runs even when a native callback swallows exceptions, and has a
+bounded frame budget. A future adapter must serialize callback delivery and
+prove callbacks are quiescent before completion; a callback after return
+cannot invalidate an already returned result. It is not wired to the older
+capture seam, which cannot establish this callback identity. A future adapter
+also needs a separate wall-clock watchdog and trusted process cleanup: the
+frame budget cannot interrupt a hung `retro_run`. No independent raster
+measurement, safe lifecycle or emulator execution is established here;
+emulator work requires separately approved ownership and cleanup. No PAL/NTSC
+display, production integration, live timing, flash safety or publishing
+claim follows from the static build evidence or host-only checks.
+
 ## Connection path
 
 Use Raspberry Pi USB HID keyboard/joystick output as the first C64 Ultimate live
