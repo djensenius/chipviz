@@ -7,7 +7,7 @@ shared_srcs := "shared/src/control_frame.c shared/src/connection.c shared/src/in
 modern_manifest := "renderers/modern/Cargo.toml"
 pico_sdk_revision := "079c6f39023649b154152db30f1d781e884879bc"
 picotool_revision := "2041936441b48a3cc53ae3da9e805229fe8f4e18"
-python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/catalog_music_source.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gb_dmg_parity_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py scripts/package-macos-arm64.py scripts/personal-starfield-bundle.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_macos_arm64_packaging.py tests/test_personal_starfield_bundle.py tests/personal_starfield_capture_smoke.py tests/test_personal_starfield_capture_smoke.py tests/test_host_bridge.py tests/test_catalog_music_source.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_gb_dmg_parity_helpers.py tests/test_gb_lines.py tests/test_gb_lines_execution.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py scripts/c64_spectrum_volume_fixture.py tests/test_c64_spectrum_volume_fixture.py cores/sms/homebrew/field_assets.py tests/test_sms_field_assets.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/sms_procedural_test.py renderers/modern/tests/catalog_v1_reference.py scripts/local_review.py tests/test_local_review.py"
+python_files := "host/bridge/chipviz_bridge.py host/bridge/chipsynth_stream.py host/bridge/chipviz_encode.py host/bridge/catalog_music_source.py host/bridge/live_bridge.py host/bridge/n64_joybus.py host/bridge/usb_hid.py host/bridge/scene_catalog_v1.py scripts/gb_libretro_capture.py scripts/gb_dmg_parity_capture.py scripts/gba_colour_field_capture.py scripts/gba_native_controls_test.py scripts/gba_exit_integrity_test.py scripts/nes_libretro_capture.py scripts/retroarch_smoke.py scripts/check-release-assets.py scripts/package-macos-arm64.py scripts/personal-starfield-bundle.py shared/tools/build_homebrew.py shared/tools/capture_assert.py shared/tools/cvz_to_c.py shared/tools/lint_docs.py shared/tools/rust_notices.py tests/test_capture_assert.py tests/test_gba_native_cadence.py tests/test_homebrew.py tests/test_release_packaging.py tests/test_macos_arm64_packaging.py tests/test_personal_starfield_bundle.py tests/personal_starfield_capture_smoke.py tests/test_personal_starfield_capture_smoke.py tests/test_host_bridge.py tests/test_catalog_music_source.py tests/test_transports.py tests/test_n64_docker_build.py tests/test_gb_colour_field.py tests/test_gb_dmg_parity_helpers.py tests/test_gb_lines.py tests/test_gb_lines_execution.py tests/test_nes_colour_field.py tests/test_rust_notices.py tests/test_scene_catalog_v1.py tests/test_scene_catalog_v1_c.py scripts/c64_colour_field_capture.py scripts/c64_spectrum_volume_fixture.py tests/test_c64_spectrum_volume_fixture.py cores/sms/homebrew/build_candidate.py cores/sms/homebrew/field_assets.py tests/sms_candidate_smoke.py tests/sms_capture_check.py tests/sms_capture_oracle.py tests/sms_control_smoke.py tests/sms_detector_fixtures.py tests/sms_f18_rom_build.py tests/sms_fixture_build.py tests/sms_gx_f18_capture.py tests/sms_gx_poll_capture.py tests/sms_libretro_capture.py tests/sms_trace_tool.py tests/test_sms_capture_oracle.py tests/test_sms_detector_fixtures.py tests/test_sms_field_assets.py tests/test_sms_libretro_capture.py tests/test_sms_spectral.py tests/test_sms_modes.py tests/test_sms_presenter.py tests/test_sms_trace_tool.py tests/sms_procedural_test.py renderers/modern/tests/catalog_v1_reference.py scripts/local_review.py tests/test_local_review.py"
 
 default:
     just --list
@@ -117,6 +117,12 @@ sms-port-trace-c-test:
     @build/tests/sms_port_trace_test
     @echo "SMS port trace C tests OK"
 
+sms-gx-port-hook-test:
+    @mkdir -p build/tests
+    @${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic tests/sms_gx_port_hook_test.c tests/sms_port_trace.c tests/sms_port_trace_fake.c -o build/tests/sms_gx_port_hook_test
+    @build/tests/sms_gx_port_hook_test
+    @echo "SMS GX poll hook C tests OK"
+
 sms-port-trace-sanitizer:
     @mkdir -p build/tests
     @${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer tests/sms_port_trace.c tests/sms_port_trace_fake.c tests/sms_port_trace_sanitizer.c -o build/tests/sms_port_trace_sanitizer
@@ -138,7 +144,7 @@ scene-catalog-v1-ring-test:
     @build/tests/scene_catalog_v1_pairs_used
     @echo "scene catalog v1 pair consumer tests passed"
 
-c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test sms-port-trace-c-test
+c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test sms-port-trace-c-test sms-gx-port-hook-test
     @mkdir -p build/tests
     @${CC:-cc} {{ cflags }} tests/control_frame_tests.c shared/src/control_frame.c -o build/tests/control_frame_tests
     @${CC:-cc} {{ cflags }} tests/connection_tests.c {{ shared_srcs }} -o build/tests/connection_tests
