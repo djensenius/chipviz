@@ -1,6 +1,8 @@
 //! Opt-in headless readback. Run only while holding the shared exclusive
 //! heavy-work lock for both the build and the GPU test. The PRIMARY and GL
-//! tests are separate so each can require and report its actual adapter.
+//! tests are separate so each can require and report its actual adapter. A
+//! process-local mutex also serializes them when run together; the external
+//! lock remains required.
 //!
 //! This compares actual offscreen bytes with independent geometric row masks;
 //! it is not presented output, a physical Pi test, or a safety assessment.
@@ -21,6 +23,9 @@ use petscii_meter_field::{Cell, Inputs, PetsciiMeterField, WIDTH};
 use petscii_meter_field_render::{
     CELL_COUNT, ComposeError, PetsciiMeterFieldRenderer, RenderError,
 };
+use std::sync::Mutex;
+
+static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Offscreen {
     device: wgpu::Device,
@@ -291,6 +296,11 @@ fn gpu_gl_matches_independent_quiet_and_energetic_composition() {
 }
 
 fn check_gpu(backends: wgpu::Backends) {
+    // This mutex only guards exclusivity; another backend can still report
+    // its own result if a test panics.
+    let _guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let gpu = Offscreen::new(backends);
     assert!(matches!(
         PetsciiMeterFieldRenderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Bgra8Unorm),
