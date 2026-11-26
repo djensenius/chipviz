@@ -1,5 +1,5 @@
 //! Opt-in GPU readback against the native C oracle. Acquire the shared
-//! heavy-work lock before building or running either ignored test.
+//! heavy-work lock before building or running any ignored test.
 //! These offscreen bytes do not establish presentation or flash safety.
 
 #[path = "gba_blockscape_expected/mod.rs"]
