@@ -175,6 +175,7 @@ c-test: sms-procedural-test scene-catalog-v1-c-test scene-catalog-v1-ring-test s
 python-lint:
     @${PYTHON:-python3} -m py_compile {{ python_files }} tests/sms_port_trace.py tests/test_sms_port_trace.py cores/gba/homebrew/lines/fixture/harness.py cores/gba/homebrew/lines/fixture/host_tests.py
     @${PYTHON:-python3} -m py_compile scripts/youtube_auth.py scripts/youtube_transport.py tests/test_youtube_auth.py tests/test_youtube_transport.py
+    @${PYTHON:-python3} -m py_compile tests/unix_diag_peer_fixture.py tests/test_unix_diag_peer.py
     @echo "chipviz Python lint OK"
 
 local-review-js-lint:
@@ -392,9 +393,9 @@ rust-lint:
     @echo "chipviz Rust lint OK"
 
 rust-test:
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --features unmeasured-flash
-    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --features dmg-preview
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --test petscii_meter_field_render --test petscii_meter_field_gpu
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --test petscii_meter_field_render --test petscii_meter_field_gpu --features unmeasured-flash
+    @cargo test --manifest-path {{ modern_manifest }} --bins --lib --test capture_api --test dmg_preview_cli --test dmg_tile_scroll --test dmg_tile_scroll_render --test dmg_tile_scroll_gpu --test dmg_sameboy_parity --test nes_diamond_scroll --test nes_diamond_scroll_cycle --test nes_diamond_scroll_gpu --test petscii_meter_field --test petscii_meter_field_artwork --test petscii_meter_field_render --test petscii_meter_field_gpu --features dmg-preview
     @echo "chipviz Rust tests OK"
 modern-check: rust-lint
     @cargo check --manifest-path {{ modern_manifest }} --bins
