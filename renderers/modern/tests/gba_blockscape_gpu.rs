@@ -35,9 +35,13 @@ impl Offscreen {
         }))
         .expect("a headless adapter for the requested WGPU backend is required");
         let info = adapter.get_info();
-        if backends == wgpu::Backends::GL {
-            assert_eq!(info.backend, wgpu::Backend::Gl);
-        }
+        let expected = match backends {
+            wgpu::Backends::METAL => wgpu::Backend::Metal,
+            wgpu::Backends::VULKAN => wgpu::Backend::Vulkan,
+            wgpu::Backends::GL => wgpu::Backend::Gl,
+            _ => panic!("test requires one explicitly selected backend"),
+        };
+        assert_eq!(info.backend, expected);
         eprintln!("GBA Blockscape offscreen adapter: {info:?}");
         for format in [
             wgpu::TextureFormat::Rgba8Unorm,
@@ -137,19 +141,40 @@ impl Offscreen {
 }
 
 fn expected_pixel(native: &Frame, size: (u32, u32), x: u32, y: u32) -> [u8; 4] {
-    let fit = (f64::from(size.0) / WIDTH as f64).min(f64::from(size.1) / HEIGHT as f64);
-    let scale = if fit >= 1.0 { fit.floor() } else { fit };
-    let left = (f64::from(size.0) - WIDTH as f64 * scale) / 2.0;
-    let top = (f64::from(size.1) - HEIGHT as f64 * scale) / 2.0;
-    let left = if fit >= 1.0 { left.floor() } else { left };
-    let top = if fit >= 1.0 { top.floor() } else { top };
-    let source_x = (f64::from(x) + 0.5 - left) / scale;
-    let source_y = (f64::from(y) + 0.5 - top) / scale;
-    if source_x < 0.0 || source_y < 0.0 || source_x >= WIDTH as f64 || source_y >= HEIGHT as f64 {
+    let (width, height) = (u64::from(size.0), u64::from(size.1));
+    let (native_width, native_height) = (WIDTH as u64, HEIGHT as u64);
+    let whole = (width / native_width).min(height / native_height);
+    let (numerator, denominator, left_twice, top_twice) = if whole > 0 {
+        (
+            whole,
+            1,
+            (width - native_width * whole) / 2 * 2,
+            (height - native_height * whole) / 2 * 2,
+        )
+    } else {
+        let (num, den) = if width * native_height <= height * native_width {
+            (width, native_width)
+        } else {
+            (height, native_height)
+        };
+        (
+            num,
+            den,
+            width * den - native_width * num,
+            height * den - native_height * num,
+        )
+    };
+    let center_x = (u64::from(x) * 2 + 1) * denominator;
+    let center_y = (u64::from(y) * 2 + 1) * denominator;
+    if center_x < left_twice
+        || center_y < top_twice
+        || center_x >= left_twice + 2 * native_width * numerator
+        || center_y >= top_twice + 2 * native_height * numerator
+    {
         return [0, 0, 0, 255];
     }
-    let source_x = (source_x + 1e-9).floor() as usize;
-    let source_y = (source_y + 1e-9).floor() as usize;
+    let source_x = ((center_x - left_twice) / (2 * numerator)) as usize;
+    let source_y = ((center_y - top_twice) / (2 * numerator)) as usize;
     let colour = native.palette[usize::from(native.indices[source_y * WIDTH + source_x])];
     let convert = |shift: u32| ((u32::from((colour >> shift) & 31u16) * 255 + 15) / 31) as u8;
     [convert(0), convert(5), convert(10), 255]
@@ -179,9 +204,28 @@ fn assert_matches_native(
 }
 
 #[test]
-#[ignore = "requires a headless GPU adapter and the serialized heavy-work lock"]
-fn gpu_matches_native_source_and_fractional_scaling() {
-    check_gpu(wgpu::Backends::PRIMARY);
+fn reference_excludes_an_exact_fractional_right_boundary() {
+    let mut palette = [0; 256];
+    palette[0] = 0x7fff;
+    let native = Frame {
+        indices: vec![0; WIDTH * HEIGHT],
+        palette,
+    };
+    assert_eq!(expected_pixel(&native, (34, 22), 0, 11), [255; 4]);
+    assert_eq!(expected_pixel(&native, (34, 22), 32, 11), [255; 4]);
+    assert_eq!(expected_pixel(&native, (34, 22), 33, 11), [0, 0, 0, 255]);
+}
+
+#[test]
+#[ignore = "requires a headless Metal adapter and the serialized heavy-work lock"]
+fn gpu_metal_matches_native_source_and_fractional_scaling() {
+    check_gpu(wgpu::Backends::METAL);
+}
+
+#[test]
+#[ignore = "requires a headless Vulkan adapter and the serialized heavy-work lock"]
+fn gpu_vulkan_matches_native_source_and_fractional_scaling() {
+    check_gpu(wgpu::Backends::VULKAN);
 }
 
 #[test]
@@ -206,6 +250,7 @@ fn check_gpu(backends: wgpu::Backends) {
         ((1, 239), 2, 81, 6, false, 0),
         ((200, 100), 3, 19, 4, false, KEY_B),
         ((73, 40), 0, 400, 1, false, KEY_SELECT),
+        ((34, 22), 1, 21, 2, false, 0),
     ];
     let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
     for format in [

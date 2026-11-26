@@ -34,17 +34,18 @@ cargo clippy --locked --manifest-path renderers/modern/Cargo.toml --no-default-f
   --test gba_blockscape_model --test gba_blockscape_render --test gba_blockscape_gpu -- -D warnings
 ```
 
-The two ignored GPU tests must be run only while holding the shared exclusive
+The three ignored GPU tests must be run only while holding the shared exclusive
 heavy-work lock. They also share an in-process mutex when run together. Select
-one backend explicitly, for example:
+the Metal, Vulkan, or GL test explicitly, for example:
 
 ```sh
 cargo test --locked --manifest-path renderers/modern/Cargo.toml --no-default-features \
-  --test gba_blockscape_gpu gpu_matches_native_source_and_fractional_scaling -- --ignored --nocapture
+  --test gba_blockscape_gpu gpu_metal_matches_native_source_and_fractional_scaling -- --ignored --nocapture
 ```
 
 The test prints the actual adapter, compares both UNORM and sRGB offscreen
 readbacks to the native C oracle, and checks tiny and letterboxed targets.
-Record the actual adapter with any result. GL, Vulkan, physical Pi hardware,
-timing, display colour, and safety remain unverified until separately tested.
-No image or video file is produced.
+Record the actual adapter with any result. An opt-in test is not evidence of
+backend support: GL, Vulkan, physical Pi hardware, timing, display colour, and
+safety remain unverified until separately tested. No image or video file is
+produced.
