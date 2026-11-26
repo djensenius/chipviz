@@ -471,10 +471,12 @@ impl ScenePipeline {
     pub fn reset_state(&mut self) {
         let starfield = self.scene_state.starfield().cloned();
         let starfield_dispatch_enabled = self.starfield_dispatch_enabled;
+        let local_house = self.scene_state.local_house();
         self.camera = Camera::default();
         self.colour_field = colour_field::ColourField::new(self.colour_field.config());
         self.mic_layers = mic_layers::MicLayers::new(self.mic_layers.mode());
         self.scene_state = SceneState::new(self.scene_state.config());
+        self.scene_state.set_local_house(local_house);
         self.scene_state.configure_starfield(starfield);
         self.scene_state
             .configure_starfield_dispatch(starfield_dispatch_enabled);
@@ -498,6 +500,9 @@ impl ScenePipeline {
         let aspect = size_aspect(size);
         let camera = match display {
             colour_field::Display::ColourField(_) => CameraMode::ScreenSpace,
+            colour_field::Display::Native(_) if self.scene_state.local_house() => {
+                CameraMode::ScreenSpace
+            }
             colour_field::Display::Native(_) => scenes::selected_camera_configured(
                 frame.scene,
                 self.starfield_dispatch_enabled,
@@ -547,9 +552,16 @@ impl ScenePipeline {
 
     /// Replaces the registry scenes' options and restarts their state.
     pub fn configure_scenes(&mut self, config: SceneConfig) {
+        let local_house = self.scene_state.local_house();
         self.scene_state = SceneState::new(config);
+        self.scene_state.set_local_house(local_house);
         self.scene_state
             .configure_starfield_dispatch(self.starfield_dispatch_enabled);
+    }
+
+    /// Selects the local House for native displays without assigning a wire ID.
+    pub(crate) fn enable_local_house(&mut self, enabled: bool) {
+        self.scene_state.set_local_house(enabled);
     }
 
     /// Supplies the optional catalog and observer setup for registry scene 6.
@@ -802,11 +814,15 @@ impl ScenePipeline {
                     size,
                     &self.scene_state,
                 ),
-                scenes::selected_camera_configured(
-                    frame.scene,
-                    self.starfield_dispatch_enabled,
-                    self.scene_state.config(),
-                ),
+                if self.scene_state.local_house() {
+                    CameraMode::ScreenSpace
+                } else {
+                    scenes::selected_camera_configured(
+                        frame.scene,
+                        self.starfield_dispatch_enabled,
+                        self.scene_state.config(),
+                    )
+                },
             ),
         };
         prepare_starfield_attachment_colors(
