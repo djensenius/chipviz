@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -287,24 +288,28 @@ class CalibrationTests(unittest.TestCase):
     self.credentials = stack.enter_context(mock.patch.object(proof, "_peer_credentials"))
     self.query = stack.enter_context(mock.patch.object(proof, "_query_peer"))
     self.fds = stack.enter_context(mock.patch.object(proof, "_read_child_fds"))
+    self.hold = stack.enter_context(mock.patch.object(proof, "_hold_child"))
     self.client = object()
+    self.control = object()
     self.child = SimpleNamespace(pid=456, poll=mock.Mock(return_value=None))
     self.creator = (123, 501, 20)
-    self.identity.side_effect = [(4, 9, INODE), (4, 9, INODE)]
-    self.credentials.side_effect = [self.creator, self.creator]
-    self.query.side_effect = [proof.Diagnostic(INODE, PEER, COOKIE)] * 2
-    self.fds.side_effect = [{8: f"socket:[{PEER}]"}] * 2
+    self.identity.side_effect = [(4, 9, INODE)] * 3
+    self.credentials.side_effect = [self.creator] * 3
+    self.query.side_effect = [proof.Diagnostic(INODE, PEER, COOKIE)] * 3
+    self.fds.side_effect = [{8: f"socket:[{PEER}]"}] * 3
 
   def calibrate(self):
-    return proof.calibrate(self.client, self.child, 8, self.creator, time.monotonic() + 5)
+    return proof.calibrate(self.client, self.child, 8, self.creator, self.control, time.monotonic() + 5)
 
   def test_stable_evidence_rechecks_the_cookie_owner_and_credentials(self):
     self.assertEqual(self.calibrate(), proof.Calibration(INODE, PEER, self.creator, 8, COOKIE))
-    self.assertEqual(self.query.call_count, 2)
+    self.assertEqual(self.query.call_count, 3)
     self.assertEqual(self.query.call_args_list[0].args[:3], (INODE, proof.NO_COOKIE, 1))
     self.assertEqual(self.query.call_args_list[1].args[:3], (INODE, COOKIE, 2))
-    self.assertEqual(self.fds.call_count, 2)
-    self.assertEqual(self.credentials.call_count, 2)
+    self.assertEqual(self.query.call_args_list[2].args[:3], (INODE, COOKIE, 3))
+    self.assertEqual(self.fds.call_count, 3)
+    self.assertEqual(self.credentials.call_count, 3)
+    self.hold.assert_called_once_with(self.control, 8, mock.ANY)
 
   def test_wrong_creator_never_queries_the_socket(self):
     self.credentials.side_effect = [(999, 501, 20)]
@@ -357,8 +362,24 @@ class CalibrationTests(unittest.TestCase):
       self.calibrate()
     self.query.reset_mock()
     with self.assertRaisesRegex(proof.EvidenceError, "timed out"):
-      proof.calibrate(self.client, self.child, 8, self.creator, time.monotonic() - 1)
+      proof.calibrate(self.client, self.child, 8, self.creator, self.control, time.monotonic() - 1)
     self.query.assert_not_called()
+
+  def test_barrier_failure_stops_before_final_observation(self):
+    self.hold.side_effect = proof.EvidenceError("fixture observation barrier rejected")
+    with self.assertRaisesRegex(proof.EvidenceError, "barrier"):
+      self.calibrate()
+    self.assertEqual(self.query.call_count, 2)
+    self.assertEqual(self.fds.call_count, 2)
+
+  def test_held_final_cookie_mismatch_is_rejected(self):
+    self.query.side_effect = [proof.Diagnostic(INODE, PEER, COOKIE)] * 2 + [
+      proof.Diagnostic(INODE, PEER, (33, 45)),
+    ]
+    with self.assertRaisesRegex(proof.EvidenceError, "peer or socket cookie changed"):
+      self.calibrate()
+    self.hold.assert_called_once()
+    self.assertEqual(self.fds.call_count, 2)
 
   def test_real_client_close_and_fd_replacement_are_rejected(self):
     for replacement in (False, True):
@@ -384,7 +405,7 @@ class CalibrationTests(unittest.TestCase):
         self.query.side_effect = race
         reason = "client socket or credentials changed" if replacement else "closed or non-UNIX client"
         with self.assertRaisesRegex(proof.EvidenceError, reason):
-          proof.calibrate(client, self.child, 8, self.creator, time.monotonic() + 5)
+          proof.calibrate(client, self.child, 8, self.creator, self.control, time.monotonic() + 5)
 
 
 class FixtureIOTests(unittest.TestCase):
@@ -416,6 +437,25 @@ class FixtureIOTests(unittest.TestCase):
         proof.receive_bytes(slow, 2, 101.0)
     slow.recv.assert_called_once_with(2)
 
+  def test_observation_barrier_rejects_bad_ack_and_timeout(self):
+    left, right = socket.socketpair()
+    with left, right:
+      right.sendall(b"HELD 9\n")
+      with self.assertRaisesRegex(proof.EvidenceError, "barrier"):
+        proof._hold_child(left, 8, time.monotonic() + 1)
+      self.assertEqual(proof.receive_line(right, time.monotonic() + 1), b"HOLD")
+    left, right = socket.socketpair()
+    with left, right:
+      with self.assertRaisesRegex(proof.EvidenceError, "timed out"):
+        proof._hold_child(left, 8, time.monotonic() + 0.03)
+
+
+def check_fixture_path(path):
+  encoded = os.fsencode(path)
+  # Darwin's 104-byte sun_path includes the terminating NUL.
+  if not encoded or b"\0" in encoded or len(encoded) >= 104:
+    raise proof.EvidenceError("fixture socket path is too long or invalid")
+
 
 def stop_fixture_child(child, control):
   if child.poll() is None:
@@ -438,10 +478,9 @@ def stop_fixture_child(child, control):
 def owned_fixture(mode):
   deadline = time.monotonic() + 15
   with ExitStack() as stack:
-    directory = stack.enter_context(tempfile.TemporaryDirectory(prefix=".unix-peer-", dir=ROOT))
+    directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="cvz-", dir="/tmp"))
     path = str(Path(directory) / "s")
-    if len(os.fsencode(path)) >= 108:
-      raise proof.EvidenceError("fixture socket path is too long")
+    check_fixture_path(path)
     control, child_control = socket.socketpair()
     stack.enter_context(control)
     stack.enter_context(child_control)
@@ -489,6 +528,25 @@ def owned_fixture(mode):
                           creator=creator, deadline=deadline, finish=finish)
 
 
+def replace_fixture_fd(fixture, deadline):
+  proof.send_line(fixture.control, b"REPLACE", deadline)
+  message = proof.receive_line(fixture.control, deadline)
+  match = re.fullmatch(rb"REPLACED (0|[1-9][0-9]*) (0|[1-9][0-9]*)", message)
+  if not match or int(match.group(1)) != fixture.child_fd:
+    raise AssertionError(f"invalid replacement report: {message!r}")
+  duplicate_fd = int(match.group(2))
+  if duplicate_fd == fixture.child_fd:
+    raise AssertionError("replacement did not retain a distinct duplicate")
+  return duplicate_fd
+
+
+def exchange_fixture_peer(fixture, deadline):
+  proof.send_line(fixture.control, b"CHECK", deadline)
+  proof.send_bytes(fixture.client, proof._PING, deadline)
+  return (proof.receive_bytes(fixture.client, len(proof._PONG), deadline),
+          proof.receive_line(fixture.control, deadline))
+
+
 @unittest.skipUnless(os.name == "posix", "Unix socket fixture requires POSIX")
 class PortableFixtureTests(unittest.TestCase):
   def test_inherited_and_direct_listener_lifecycles(self):
@@ -497,12 +555,91 @@ class PortableFixtureTests(unittest.TestCase):
         self.assertIsNone(fixture.child.poll())
         self.assertNotEqual(fixture.child.pid, os.getpid())
         self.assertGreater(fixture.child_fd, 2)
+        self.assertEqual(Path(fixture.path).parent.parent, Path("/tmp"))
+        self.assertLess(len(os.fsencode(fixture.path)), 104)
+        self.assertEqual(stat.S_IMODE(os.stat(Path(fixture.path).parent).st_mode), 0o700)
         if mode == "direct":
-          proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
-          self.assertEqual(proof.receive_line(fixture.control, fixture.deadline),
-                           f"REPLACED {fixture.child_fd}".encode("ascii"))
+          replace_fixture_fd(fixture, fixture.deadline)
+          self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
         fixture.finish()
         self.assertEqual(fixture.child.returncode, 0)
+
+  def test_socket_path_byte_limit_in_a_private_short_directory(self):
+    with tempfile.TemporaryDirectory(prefix="cvz-", dir="/tmp") as directory:
+      self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700)
+      prefix = directory + "/"
+      count = 103 - len(os.fsencode(prefix))
+      self.assertGreater(count, 0)
+      path = prefix + "s" * count
+      self.assertEqual(len(os.fsencode(path)), 103)
+      check_fixture_path(path)
+      with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(path)
+        listener.listen(1)
+        self.assertTrue(stat.S_ISSOCK(os.stat(path).st_mode))
+      for invalid in (path + "s", path[:-1] + "é", path + "\0"):
+        with self.subTest(path=invalid), self.assertRaises(proof.EvidenceError):
+          check_fixture_path(invalid)
+
+  def test_late_replacement_before_hold_is_rechecked(self):
+    with owned_fixture("direct") as fixture:
+      snapshots = []
+      duplicate = []
+      original = {fixture.child_fd: f"socket:[{PEER}]"}
+
+      def snapshot(child, deadline):
+        self.assertIs(child, fixture.child)
+        snapshots.append(len(snapshots) + 1)
+        if len(snapshots) == 2:
+          duplicate.append(replace_fixture_fd(fixture, deadline))
+          self.assertEqual(exchange_fixture_peer(fixture, deadline), (proof._PONG, b"CHECKED"))
+        if len(snapshots) == 3:
+          # macOS has no /proc: model the actual child-reported FD swap.
+          return {fixture.child_fd: f"socket:[{PEER + 1}]", duplicate[0]: f"socket:[{PEER}]"}
+        return original
+
+      def query(inode, cookie, sequence, deadline):
+        return proof.Diagnostic(inode, PEER, COOKIE)
+
+      with mock.patch.object(proof, "_peer_credentials", return_value=fixture.creator), \
+           mock.patch.object(proof, "_query_peer", side_effect=query) as queried, \
+           mock.patch.object(proof, "_read_child_fds", side_effect=snapshot):
+        with self.assertRaisesRegex(proof.EvidenceError, "missing, duplicate, or mismatched peer FD"):
+          proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                          fixture.creator, fixture.control, fixture.deadline)
+      self.assertEqual(snapshots, [1, 2, 3])
+      self.assertEqual(queried.call_count, 3)
+      self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
+      fixture.finish()
+
+  def test_hold_refuses_replacement_after_final_snapshot_and_through_return(self):
+    with owned_fixture("direct") as fixture:
+      snapshots = []
+      links = {fixture.child_fd: f"socket:[{PEER}]"}
+
+      def snapshot(child, deadline):
+        self.assertIs(child, fixture.child)
+        snapshots.append(len(snapshots) + 1)
+        if len(snapshots) == 3:
+          proof.send_line(fixture.control, b"REPLACE", deadline)
+          self.assertEqual(proof.receive_line(fixture.control, deadline), b"BUSY")
+          self.assertEqual(exchange_fixture_peer(fixture, deadline), (proof._PONG, b"CHECKED"))
+        return links
+
+      def query(inode, cookie, sequence, deadline):
+        return proof.Diagnostic(inode, PEER, COOKIE)
+
+      with mock.patch.object(proof, "_peer_credentials", return_value=fixture.creator), \
+           mock.patch.object(proof, "_query_peer", side_effect=query), \
+           mock.patch.object(proof, "_read_child_fds", side_effect=snapshot):
+        evidence = proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                                   fixture.creator, fixture.control, fixture.deadline)
+      self.assertEqual(evidence.peer_inode, PEER)
+      self.assertEqual(snapshots, [1, 2, 3])
+      proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
+      self.assertEqual(proof.receive_line(fixture.control, fixture.deadline), b"BUSY")
+      self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
+      fixture.finish()
 
   def test_child_is_reaped_on_fixture_failure(self):
     child = None
@@ -521,12 +658,16 @@ class LinuxFixtureTests(unittest.TestCase):
   def check_fixture(self, mode):
     with owned_fixture(mode) as fixture:
       evidence = proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
-                                 fixture.creator, fixture.deadline)
+                                 fixture.creator, fixture.control, fixture.deadline)
       self.assertEqual(evidence.creator, fixture.creator)
       self.assertEqual(evidence.child_fd, fixture.child_fd)
       self.assertNotEqual(evidence.inode, evidence.peer_inode)
-      self.assertEqual(os.readlink(f"/proc/{fixture.child.pid}/fd/{fixture.child_fd}"),
-                       f"socket:[{evidence.peer_inode}]")
+      fd_path = f"/proc/{fixture.child.pid}/fd/{fixture.child_fd}"
+      self.assertEqual(os.readlink(fd_path), f"socket:[{evidence.peer_inode}]")
+      proof.send_line(fixture.control, b"REPLACE", fixture.deadline)
+      self.assertEqual(proof.receive_line(fixture.control, fixture.deadline), b"BUSY")
+      self.assertEqual(os.readlink(fd_path), f"socket:[{evidence.peer_inode}]")
+      self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
       if mode == "activated":
         self.assertEqual(evidence.creator[0], os.getpid())
         self.assertNotEqual(evidence.creator[0], fixture.child.pid)
@@ -541,26 +682,36 @@ class LinuxFixtureTests(unittest.TestCase):
     self.check_fixture("direct")
 
   def test_child_replaces_accepted_fd_during_observation(self):
-    with owned_fixture("direct") as fixture:
-      read_fds = proof._read_child_fds
-      replaced = []
+    for replace_after in (1, 2):
+      with self.subTest(replace_after=replace_after), owned_fixture("direct") as fixture:
+        read_fds = proof._read_child_fds
+        snapshots = []
+        replaced = []
 
-      def replace_after_snapshot(child, deadline):
-        links = read_fds(child, deadline)
-        if not replaced:
-          replaced.append(links[fixture.child_fd])
-          proof.send_line(fixture.control, b"REPLACE", deadline)
-          self.assertEqual(proof.receive_line(fixture.control, deadline),
-                           f"REPLACED {fixture.child_fd}".encode("ascii"))
-        return links
+        def replace_after_snapshot(child, deadline):
+          links = read_fds(child, deadline)
+          snapshots.append(links)
+          if len(snapshots) == replace_after:
+            original_link = links[fixture.child_fd]
+            duplicate_fd = replace_fixture_fd(fixture, deadline)
+            self.assertEqual(exchange_fixture_peer(fixture, deadline), (proof._PONG, b"CHECKED"))
+            changed = read_fds(child, deadline)
+            self.assertEqual(changed[duplicate_fd], original_link)
+            self.assertNotEqual(changed[fixture.child_fd], original_link)
+            replaced.append((original_link, duplicate_fd))
+          return links
 
-      with mock.patch.object(proof, "_read_child_fds", side_effect=replace_after_snapshot):
-        with self.assertRaises(proof.EvidenceError):
-          proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
-                          fixture.creator, fixture.deadline)
-      self.assertEqual(len(replaced), 1)
-      self.assertNotEqual(os.readlink(f"/proc/{fixture.child.pid}/fd/{fixture.child_fd}"), replaced[0])
-      fixture.finish()
+        with mock.patch.object(proof, "_read_child_fds", side_effect=replace_after_snapshot):
+          with self.assertRaisesRegex(proof.EvidenceError, "missing, duplicate, or mismatched peer FD"):
+            proof.calibrate(fixture.client, fixture.child, fixture.child_fd,
+                            fixture.creator, fixture.control, fixture.deadline)
+        self.assertEqual(len(snapshots), replace_after + 1)
+        self.assertEqual(len(replaced), 1)
+        original_link, duplicate_fd = replaced[0]
+        self.assertNotEqual(os.readlink(f"/proc/{fixture.child.pid}/fd/{fixture.child_fd}"), original_link)
+        self.assertEqual(os.readlink(f"/proc/{fixture.child.pid}/fd/{duplicate_fd}"), original_link)
+        self.assertEqual(exchange_fixture_peer(fixture, fixture.deadline), (proof._PONG, b"CHECKED"))
+        fixture.finish()
 
 
 if __name__ == "__main__":

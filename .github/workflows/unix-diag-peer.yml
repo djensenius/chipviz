@@ -1,0 +1,31 @@
+name: UNIX peer fixture
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/unix-diag-peer.yml
+      - tests/unix_diag_peer_fixture.py
+      - tests/test_unix_diag_peer.py
+      - tests/README-unix-diag-peer.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/unix-diag-peer.yml
+      - tests/unix_diag_peer_fixture.py
+      - tests/test_unix_diag_peer.py
+      - tests/README-unix-diag-peer.md
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    name: Focused fake socket tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run focused fixture tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_unix_diag_peer.py' -v

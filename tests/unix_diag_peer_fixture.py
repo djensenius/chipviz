@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 import math
 import os
@@ -234,9 +235,15 @@ def _check_owner(links: dict[int, str], child_fd: int, peer_inode: int) -> None:
     raise EvidenceError("missing, duplicate, or mismatched peer FD")
 
 
-def calibrate(client: socket.socket, child, child_fd: int,
-              expected_creator: tuple[int, int, int], deadline: float) -> Calibration:
-  """Compare two socket/owner snapshots while the fixture child holds its FD."""
+def _hold_child(control: socket.socket, child_fd: int, deadline: float) -> None:
+  send_line(control, b"HOLD", deadline)
+  if receive_line(control, deadline) != f"HELD {child_fd}".encode("ascii"):
+    raise EvidenceError("fixture observation barrier rejected")
+
+
+def calibrate(client: socket.socket, child, child_fd: int, expected_creator: tuple[int, int, int],
+              control: socket.socket, deadline: float) -> Calibration:
+  """Recheck evidence while the cooperative child stays held through return."""
   _child_running(child, deadline)
   before = _socket_identity(client)
   creator = _peer_credentials(client)
@@ -248,6 +255,14 @@ def calibrate(client: socket.socket, child, child_fd: int,
   if second != first:
     raise EvidenceError("peer or socket cookie changed")
   _check_owner(_read_child_fds(child, deadline), child_fd, second.peer_inode)
+  if _socket_identity(client) != before or _peer_credentials(client) != creator:
+    raise EvidenceError("client socket or credentials changed")
+  _child_running(child, deadline)
+  _hold_child(control, child_fd, deadline)
+  final = _query_peer(before[2], first.cookie, 3, deadline)
+  if final != first:
+    raise EvidenceError("peer or socket cookie changed")
+  _check_owner(_read_child_fds(child, deadline), child_fd, final.peer_inode)
   if _socket_identity(client) != before or _peer_credentials(client) != creator:
     raise EvidenceError("client socket or credentials changed")
   _child_running(child, deadline)
@@ -313,27 +328,45 @@ def _fixture_child(mode: str, path: str, control_fd: int, listener_fd: int) -> N
       listener.listen(1)
     else:
       raise EvidenceError("invalid fixture mode")
-    with listener:
+    with listener, ExitStack() as stack:
       listener.settimeout(_remaining(deadline))
       send_line(control, b"READY", deadline)
       accepted, _ = listener.accept()
-      with accepted:
-        accepted_fd = accepted.fileno()
-        send_line(control, f"ACCEPT {accepted_fd}".encode("ascii"), deadline)
-        if receive_bytes(accepted, len(_PING), deadline) != _PING:
-          raise EvidenceError("unexpected fixture challenge")
-        send_bytes(accepted, _PONG, deadline)
-        send_line(control, b"EXCHANGED", deadline)
+      stack.enter_context(accepted)
+      accepted_fd = accepted.fileno()
+      active = accepted
+      held = False
+      replaced = False
+      send_line(control, f"ACCEPT {accepted_fd}".encode("ascii"), deadline)
+      if receive_bytes(active, len(_PING), deadline) != _PING:
+        raise EvidenceError("unexpected fixture challenge")
+      send_bytes(active, _PONG, deadline)
+      send_line(control, b"EXCHANGED", deadline)
+      while True:
         command = receive_line(control, deadline)
-        if command == b"REPLACE":
+        if command == b"RELEASE":
+          return
+        if command == b"HOLD" and not held:
+          held = True
+          send_line(control, f"HELD {accepted_fd}".encode("ascii"), deadline)
+        elif command == b"REPLACE" and held:
+          send_line(control, b"BUSY", deadline)
+        elif command == b"REPLACE" and not replaced:
+          active = stack.enter_context(accepted.dup())
           accepted.close()
           replacement, spare = socket.socketpair()
-          with replacement, spare:
-            if replacement.fileno() != accepted_fd:
-              raise EvidenceError("fixture did not reuse the accepted FD")
-            send_line(control, f"REPLACED {accepted_fd}".encode("ascii"), deadline)
-            command = receive_line(control, deadline)
-        if command != b"RELEASE":
+          stack.enter_context(replacement)
+          stack.enter_context(spare)
+          if replacement.fileno() != accepted_fd:
+            raise EvidenceError("fixture did not reuse the accepted FD")
+          replaced = True
+          send_line(control, f"REPLACED {accepted_fd} {active.fileno()}".encode("ascii"), deadline)
+        elif command == b"CHECK":
+          if receive_bytes(active, len(_PING), deadline) != _PING:
+            raise EvidenceError("unexpected fixture challenge")
+          send_bytes(active, _PONG, deadline)
+          send_line(control, b"CHECKED", deadline)
+        else:
           raise EvidenceError("unexpected fixture command")
 
 
